@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meta-ads-analysis"
+version = "0.1.0"
+description = "CSV-first Meta Ads analysis workflow with normalization, scoring, and report generation."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "duckdb>=1.2,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+ingest_meta_exports = "meta_ads_analysis.cli:ingest_meta_exports_main"
+build_meta_report = "meta_ads_analysis.cli:build_meta_report_main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

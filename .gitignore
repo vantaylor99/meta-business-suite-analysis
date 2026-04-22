@@ -1,0 +1,14 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+*.egg-info/
+
+data/raw/meta_ads/*
+!data/raw/meta_ads/.gitkeep
+
+data/normalized/*
+!data/normalized/.gitkeep
+
+reports/*
+!reports/.gitkeep
