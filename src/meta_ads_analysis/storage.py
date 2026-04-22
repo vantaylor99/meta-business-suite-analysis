@@ -11,6 +11,7 @@ import duckdb
 AD_DAILY_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS ad_daily_metrics (
   ingestion_run_date DATE,
+  account_slug VARCHAR,
   source_run_path VARCHAR,
   report_date DATE,
   account_id VARCHAR,
@@ -35,6 +36,8 @@ CREATE TABLE IF NOT EXISTS ad_daily_metrics (
   results DOUBLE,
   result_label VARCHAR,
   cost_per_result DOUBLE,
+  app_installs DOUBLE,
+  cost_per_app_install DOUBLE,
   purchase_count DOUBLE,
   purchase_value DOUBLE,
   purchase_roas DOUBLE,
@@ -57,6 +60,7 @@ CREATE TABLE IF NOT EXISTS ad_daily_metrics (
 CREATIVE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS creative_lookup (
   ingestion_run_date DATE,
+  account_slug VARCHAR,
   ad_id VARCHAR,
   ad_name VARCHAR,
   creative_type VARCHAR,
@@ -77,20 +81,40 @@ def connect(db_path: Path) -> duckdb.DuckDBPyConnection:
 def initialize_database(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(AD_DAILY_TABLE_SQL)
     con.execute(CREATIVE_TABLE_SQL)
+    con.execute("ALTER TABLE ad_daily_metrics ADD COLUMN IF NOT EXISTS account_slug VARCHAR")
+    con.execute("ALTER TABLE creative_lookup ADD COLUMN IF NOT EXISTS account_slug VARCHAR")
 
 
 def replace_run_rows(
     con: duckdb.DuckDBPyConnection,
+    account_slug: str | None,
     run_date: str,
     normalized_rows: list[dict[str, Any]],
     creative_rows: list[dict[str, Any]],
 ) -> None:
     initialize_database(con)
-    con.execute("DELETE FROM ad_daily_metrics WHERE ingestion_run_date = ?", [run_date])
-    con.execute("DELETE FROM creative_lookup WHERE ingestion_run_date = ?", [run_date])
+    if account_slug is None:
+        con.execute(
+            "DELETE FROM ad_daily_metrics WHERE ingestion_run_date = ? AND account_slug IS NULL",
+            [run_date],
+        )
+        con.execute(
+            "DELETE FROM creative_lookup WHERE ingestion_run_date = ? AND account_slug IS NULL",
+            [run_date],
+        )
+    else:
+        con.execute(
+            "DELETE FROM ad_daily_metrics WHERE ingestion_run_date = ? AND account_slug = ?",
+            [run_date, account_slug],
+        )
+        con.execute(
+            "DELETE FROM creative_lookup WHERE ingestion_run_date = ? AND account_slug = ?",
+            [run_date, account_slug],
+        )
 
     ad_columns = [
         "ingestion_run_date",
+        "account_slug",
         "source_run_path",
         "report_date",
         "account_id",
@@ -115,6 +139,8 @@ def replace_run_rows(
         "results",
         "result_label",
         "cost_per_result",
+        "app_installs",
+        "cost_per_app_install",
         "purchase_count",
         "purchase_value",
         "purchase_roas",
@@ -140,6 +166,7 @@ def replace_run_rows(
 
     creative_columns = [
         "ingestion_run_date",
+        "account_slug",
         "ad_id",
         "ad_name",
         "creative_type",
@@ -156,6 +183,7 @@ def replace_run_rows(
     creative_insert_rows = [
         {
             "ingestion_run_date": run_date,
+            "account_slug": account_slug,
             **row,
         }
         for row in creative_rows
@@ -166,16 +194,33 @@ def replace_run_rows(
         )
 
 
-def fetch_run_rows(con: duckdb.DuckDBPyConnection, run_date: str) -> list[dict[str, Any]]:
-    result = con.execute(
-        """
-        SELECT *
-        FROM ad_daily_metrics
-        WHERE ingestion_run_date = ?
-        ORDER BY report_date, campaign_name, adset_name, ad_name
-        """,
-        [run_date],
-    )
+def fetch_run_rows(
+    con: duckdb.DuckDBPyConnection,
+    run_date: str,
+    account_slug: str | None = None,
+) -> list[dict[str, Any]]:
+    if account_slug is None:
+        result = con.execute(
+            """
+            SELECT *
+            FROM ad_daily_metrics
+            WHERE ingestion_run_date = ?
+              AND account_slug IS NULL
+            ORDER BY report_date, campaign_name, adset_name, ad_name
+            """,
+            [run_date],
+        )
+    else:
+        result = con.execute(
+            """
+            SELECT *
+            FROM ad_daily_metrics
+            WHERE ingestion_run_date = ?
+              AND account_slug = ?
+            ORDER BY report_date, campaign_name, adset_name, ad_name
+            """,
+            [run_date, account_slug],
+        )
     columns = [item[0] for item in result.description]
     return [dict(zip(columns, row, strict=False)) for row in result.fetchall()]
 

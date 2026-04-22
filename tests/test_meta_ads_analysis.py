@@ -3,13 +3,18 @@ from __future__ import annotations
 import csv
 import json
 import sys
+from datetime import date
 from pathlib import Path
+from unittest.mock import Mock
 
+from meta_ads_analysis.account_registry import load_account_registry, resolve_account
 from meta_ads_analysis.analyze import build_report_payload
-from meta_ads_analysis.cli import build_meta_report_main, ingest_meta_exports_main
+from meta_ads_analysis.cli import build_meta_report_main, ingest_meta_exports_main, sync_meta_api_main
+from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
 from meta_ads_analysis.reporting import render_markdown_report
 from meta_ads_analysis.storage import connect, fetch_run_rows, replace_run_rows
+from meta_ads_analysis.sync_api import resolve_date_window
 from meta_ads_analysis.utils import ensure_dir
 
 
@@ -55,6 +60,8 @@ def test_ingest_flattens_action_fields_and_preserves_measurement_flags(tmp_path:
                 "Outbound clicks": "220",
                 "Purchases": "2",
                 "Purchase ROAS": "",
+                "App installs": "11",
+                "Cost per app install": "7.27",
             },
         ],
     )
@@ -85,6 +92,7 @@ def test_ingest_flattens_action_fields_and_preserves_measurement_flags(tmp_path:
     assert len(artifacts.normalized_rows) == 2
 
     creative_a = next(row for row in artifacts.normalized_rows if row["ad_id"] == "1001")
+    assert creative_a["account_slug"] is None
     assert creative_a["purchase_count"] == 6
     assert creative_a["purchase_value"] == 900
     assert round(creative_a["purchase_roas"], 2) == 7.5
@@ -96,9 +104,11 @@ def test_ingest_flattens_action_fields_and_preserves_measurement_flags(tmp_path:
     assert creative_a["creative_headline"] == "Buy now"
 
     creative_b = next(row for row in artifacts.normalized_rows if row["ad_id"] == "1002")
-    assert creative_b["tracking_confidence"] == "low_purchase_value_missing"
+    assert creative_b["tracking_confidence"] == "low_results_without_revenue"
     assert creative_b["purchase_count"] == 2
     assert creative_b["purchase_value"] is None
+    assert creative_b["app_installs"] == 11
+    assert round(creative_b["cost_per_app_install"], 2) == 7.27
 
 
 def test_report_highlights_waste_fatigue_scaling_and_insufficient_data(tmp_path: Path) -> None:
@@ -208,7 +218,7 @@ def test_report_highlights_waste_fatigue_scaling_and_insufficient_data(tmp_path:
     artifacts = ingest_raw_exports(input_dir, run_date)
     db_path = tmp_path / "meta_ads.duckdb"
     with connect(db_path) as con:
-        replace_run_rows(con, run_date, artifacts.normalized_rows, artifacts.creative_rows)
+        replace_run_rows(con, None, run_date, artifacts.normalized_rows, artifacts.creative_rows)
         rows = fetch_run_rows(con, run_date)
 
     payload = build_report_payload(rows, run_date)
@@ -262,6 +272,8 @@ def test_cli_functions_write_outputs(tmp_path: Path, monkeypatch) -> None:
         "argv",
         [
             "ingest_meta_exports",
+            "--account",
+            "Pollen Sense",
             "--run-date",
             run_date,
             "--input-dir",
@@ -279,6 +291,8 @@ def test_cli_functions_write_outputs(tmp_path: Path, monkeypatch) -> None:
         "argv",
         [
             "build_meta_report",
+            "--account",
+            "Pollen Sense",
             "--run-date",
             run_date,
             "--db-path",
@@ -289,13 +303,373 @@ def test_cli_functions_write_outputs(tmp_path: Path, monkeypatch) -> None:
     )
     build_meta_report_main()
 
-    assert (normalized_root / run_date / "ad_daily_metrics.csv").exists()
-    assert (normalized_root / run_date / "ingestion_summary.json").exists()
+    assert (normalized_root / "pollen_sense" / run_date / "ad_daily_metrics.csv").exists()
+    assert (normalized_root / "pollen_sense" / run_date / "ingestion_summary.json").exists()
     assert (reports_root / run_date / "meta_ads_report.md").exists()
     assert (reports_root / run_date / "meta_ads_report.json").exists()
 
     summary = json.loads((reports_root / run_date / "meta_ads_report.json").read_text(encoding="utf-8"))
     assert summary["account_summary"]["ad_count"] == 1
+    assert summary["account_slug"] == "pollen_sense"
+
+
+def test_report_uses_app_installs_as_secondary_signal_when_results_are_sparse(tmp_path: Path) -> None:
+    run_date = "2026-04-21"
+    input_dir = tmp_path / "raw" / run_date
+    ensure_dir(input_dir)
+
+    performance_rows: list[dict[str, str]] = []
+    for day in range(1, 9):
+        date_string = f"2026-04-{day:02d}"
+        performance_rows.append(
+            {
+                "Day": date_string,
+                "Campaign name": "Install Campaign",
+                "Ad set name": "Install Set",
+                "Ad ID": "3001",
+                "Ad name": "Install Leader",
+                "Amount spent": "15",
+                "Impressions": "4000",
+                "Reach": "3200",
+                "Frequency": "1.2",
+                "Outbound clicks": "90",
+                "Results": "",
+                "App installs": "5",
+                "Cost per app install": "3.0",
+            }
+        )
+        performance_rows.append(
+            {
+                "Day": date_string,
+                "Campaign name": "Install Campaign",
+                "Ad set name": "Install Set",
+                "Ad ID": "3002",
+                "Ad name": "Install Laggard",
+                "Amount spent": "20",
+                "Impressions": "4500",
+                "Reach": "3600",
+                "Frequency": "1.3",
+                "Outbound clicks": "70",
+                "Results": "",
+                "App installs": "1",
+                "Cost per app install": "20.0",
+            }
+        )
+
+    _write_csv(input_dir / "performance_daily.csv", performance_rows)
+    artifacts = ingest_raw_exports(input_dir, run_date)
+
+    payload = build_report_payload(artifacts.normalized_rows, run_date)
+    waste_names = [item["ad_name"] for item in payload["budget_waste"]]
+
+    assert "Install Laggard" in waste_names
+    assert payload["account_summary"]["total_app_installs"] == 48.0
+
+
+def test_storage_keeps_same_run_date_separate_by_account_slug(tmp_path: Path) -> None:
+    db_path = tmp_path / "meta_ads.duckdb"
+    run_date = "2026-04-21"
+
+    pollen_rows = [
+        {
+            "ingestion_run_date": run_date,
+            "account_slug": "pollen_sense",
+            "source_run_path": "raw/pollen_sense/2026-04-21",
+            "report_date": "2026-04-21",
+            "account_id": "",
+            "account_name": "",
+            "campaign_id": "1",
+            "campaign_name": "Campaign",
+            "adset_id": "1",
+            "adset_name": "Set",
+            "ad_id": "1",
+            "ad_name": "Pollen Ad",
+            "objective": "",
+            "spend": 10.0,
+            "impressions": 100,
+            "reach": 90,
+            "frequency": 1.1,
+            "clicks": 5,
+            "link_clicks": 5,
+            "outbound_clicks": 5,
+            "ctr": 0.05,
+            "cpc": 2.0,
+            "cpm": 100.0,
+            "results": 1.0,
+            "result_label": "In-app subscriptions",
+            "cost_per_result": 10.0,
+            "app_installs": 2.0,
+            "cost_per_app_install": 5.0,
+            "purchase_count": 0.0,
+            "purchase_value": 0.0,
+            "purchase_roas": None,
+            "video_3s_plays": None,
+            "thruplays": None,
+            "hook_rate": None,
+            "hold_rate": None,
+            "average_order_value": None,
+            "creative_type": None,
+            "creative_copy": None,
+            "creative_headline": None,
+            "launch_date": None,
+            "preview_link": None,
+            "post_link": None,
+            "has_video_metrics": False,
+            "tracking_confidence": "low_results_without_revenue",
+        }
+    ]
+    divine_rows = [
+        {
+            **pollen_rows[0],
+            "account_slug": "divine_designs",
+            "source_run_path": "raw/divine_designs/2026-04-21",
+            "ad_id": "2",
+            "ad_name": "Divine Ad",
+        }
+    ]
+
+    with connect(db_path) as con:
+        replace_run_rows(con, "pollen_sense", run_date, pollen_rows, [])
+        replace_run_rows(con, "divine_designs", run_date, divine_rows, [])
+
+        pollen = fetch_run_rows(con, run_date, "pollen_sense")
+        divine = fetch_run_rows(con, run_date, "divine_designs")
+
+    assert [row["ad_name"] for row in pollen] == ["Pollen Ad"]
+    assert [row["ad_name"] for row in divine] == ["Divine Ad"]
+
+
+def test_account_registry_resolves_valid_slug(tmp_path: Path) -> None:
+    config_path = tmp_path / "meta_ads_accounts.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "Pollen Sense",
+                        "account_name": "Pollen Sense",
+                        "ad_account_id": "12345",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accounts = load_account_registry(config_path)
+    account = resolve_account("pollen_sense", config_path)
+
+    assert "pollen_sense" in accounts
+    assert account.ad_account_id == "act_12345"
+
+
+def test_default_date_window_uses_trailing_30_days() -> None:
+    date_from, date_to = resolve_date_window(date(2026, 4, 22))
+    assert date_from == "2026-03-24"
+    assert date_to == "2026-04-22"
+
+
+def test_meta_api_client_paginates() -> None:
+    first = Mock()
+    first.status_code = 200
+    first.json.return_value = {
+        "data": [{"id": "1"}],
+        "paging": {"next": "https://example.com/page-2"},
+    }
+    second = Mock()
+    second.status_code = 200
+    second.json.return_value = {
+        "data": [{"id": "2"}],
+        "paging": {},
+    }
+    session = Mock()
+    session.get.side_effect = [first, second]
+
+    client = MetaMarketingApiClient("token", session=session)
+    rows = list(client.iter_paginated("/act_123/insights", params={"fields": "ad_id"}))
+
+    assert rows == [{"id": "1"}, {"id": "2"}]
+    assert session.get.call_count == 2
+
+
+def test_meta_api_client_raises_operator_friendly_error() -> None:
+    response = Mock()
+    response.status_code = 400
+    response.json.return_value = {"error": {"message": "Bad token", "code": 190}}
+    response.text = "Bad token"
+    session = Mock()
+    session.get.return_value = response
+
+    client = MetaMarketingApiClient("token", session=session)
+
+    try:
+        list(client.iter_paginated("/act_123/insights", params={"fields": "ad_id"}))
+    except MetaApiError as exc:
+        assert "Bad token" in str(exc)
+    else:
+        raise AssertionError("Expected MetaApiError")
+
+
+def test_sync_api_full_pipeline_with_mocked_client(tmp_path: Path, monkeypatch) -> None:
+    raw_root = tmp_path / "raw"
+    normalized_root = tmp_path / "normalized"
+    reports_root = tmp_path / "reports"
+    db_path = tmp_path / "meta_ads.duckdb"
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "pollen_sense",
+                        "account_name": "Pollen Sense",
+                        "ad_account_id": "act_12345",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def fetch_insights(self, *args, **kwargs) -> list[dict[str, object]]:
+            return [
+                {
+                    "account_id": "act_12345",
+                    "account_name": "Pollen Sense",
+                    "campaign_id": "200",
+                    "campaign_name": "Subscriptions",
+                    "adset_id": "300",
+                    "adset_name": "Spring",
+                    "ad_id": "400",
+                    "ad_name": "API Ad",
+                    "date_start": "2026-04-22",
+                    "date_stop": "2026-04-22",
+                    "reach": "1000",
+                    "impressions": "1200",
+                    "frequency": "1.2",
+                    "clicks": "50",
+                    "ctr": "4.2",
+                    "cpc": "1.1",
+                    "cpm": "45.0",
+                    "spend": "55.0",
+                    "objective": "APP_INSTALLS",
+                    "actions": [
+                        {"action_type": "app_custom_event.fb_mobile_subscribe", "value": "2"},
+                        {"action_type": "mobile_app_install", "value": "10"},
+                    ],
+                    "cost_per_action_type": [
+                        {"action_type": "app_custom_event.fb_mobile_subscribe", "value": "27.5"},
+                        {"action_type": "mobile_app_install", "value": "5.5"},
+                    ],
+                    "video_3_sec_watched_actions": [
+                        {"action_type": "video_view", "value": "300"}
+                    ],
+                    "video_thruplay_watched_actions": [
+                        {"action_type": "video_thruplay_watched_actions", "value": "90"}
+                    ],
+                }
+            ]
+
+        def fetch_ads(self, *args, **kwargs) -> list[dict[str, object]]:
+            return [
+                {
+                    "id": "400",
+                    "name": "API Ad",
+                    "created_time": "2026-04-01T00:00:00+0000",
+                    "creative": {
+                        "object_story_spec": {
+                            "video_data": {
+                                "message": "Primary text",
+                                "title": "Headline",
+                            }
+                        },
+                        "effective_object_story_id": "123_456",
+                    },
+                }
+            ]
+
+    monkeypatch.setenv("META_ACCESS_TOKEN", "token")
+    monkeypatch.setattr("meta_ads_analysis.cli.DEFAULT_RAW_ROOT", raw_root)
+    monkeypatch.setattr("meta_ads_analysis.cli.DEFAULT_NORMALIZED_ROOT", normalized_root)
+    monkeypatch.setattr("meta_ads_analysis.cli.DEFAULT_REPORTS_ROOT", reports_root)
+    monkeypatch.setattr("meta_ads_analysis.sync_api.DEFAULT_RAW_ROOT", raw_root)
+    monkeypatch.setattr("meta_ads_analysis.sync_api.DEFAULT_NORMALIZED_ROOT", normalized_root)
+    monkeypatch.setattr("meta_ads_analysis.sync_api.DEFAULT_REPORTS_ROOT", reports_root)
+    monkeypatch.setattr("meta_ads_analysis.sync_api.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    monkeypatch.setattr("meta_ads_analysis.sync_api.MetaMarketingApiClient", FakeClient)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sync_meta_api",
+            "--account",
+            "pollen_sense",
+            "--run-date",
+            "2026-04-22",
+            "--db-path",
+            str(db_path),
+        ],
+    )
+    sync_meta_api_main()
+
+    assert (raw_root / "pollen_sense" / "2026-04-22" / "performance_daily.csv").exists()
+    assert (normalized_root / "pollen_sense" / "2026-04-22" / "ad_daily_metrics.csv").exists()
+    assert (reports_root / "pollen_sense" / "2026-04-22" / "meta_ads_report.json").exists()
+    summary = json.loads(
+        (raw_root / "pollen_sense" / "2026-04-22" / "api_sync_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["completed_full_pipeline"] is True
+
+
+def test_sync_api_raw_only_writes_raw_files(tmp_path: Path, monkeypatch) -> None:
+    raw_root = tmp_path / "raw"
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "divine_designs",
+                        "account_name": "Divine Designs",
+                        "ad_account_id": "act_555",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def fetch_insights(self, *args, **kwargs) -> list[dict[str, object]]:
+            return []
+
+        def fetch_ads(self, *args, **kwargs) -> list[dict[str, object]]:
+            return []
+
+    monkeypatch.setenv("META_ACCESS_TOKEN", "token")
+    monkeypatch.setattr("meta_ads_analysis.sync_api.DEFAULT_RAW_ROOT", raw_root)
+    monkeypatch.setattr("meta_ads_analysis.sync_api.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    monkeypatch.setattr("meta_ads_analysis.sync_api.MetaMarketingApiClient", FakeClient)
+
+    from meta_ads_analysis.sync_api import sync_account_from_api, write_api_sync_summary
+
+    artifacts = sync_account_from_api(account_slug="divine_designs", run_date="2026-04-22")
+    summary_path = write_api_sync_summary(artifacts, completed_full_pipeline=False)
+
+    assert (raw_root / "divine_designs" / "2026-04-22" / "performance_daily.csv").exists()
+    assert summary_path.exists()
 
 
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:

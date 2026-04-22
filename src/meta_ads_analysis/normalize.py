@@ -21,6 +21,7 @@ from .utils import (
 @dataclass(slots=True)
 class IngestionArtifacts:
     run_date: str
+    account_slug: str | None
     input_dir: Path
     normalized_rows: list[dict[str, Any]]
     creative_rows: list[dict[str, Any]]
@@ -58,6 +59,8 @@ PERFORMANCE_ALIASES = {
     "results": ["results", "purchases", "website_purchases"],
     "result_label": ["result_indicator", "result_type", "results_indicator"],
     "cost_per_result": ["cost_per_result", "cost_per_purchase"],
+    "app_installs": ["app_installs"],
+    "cost_per_app_install": ["cost_per_app_install"],
     "purchase_count": [
         "purchases",
         "website_purchases",
@@ -134,7 +137,11 @@ PURCHASE_ROAS_KEYS = [
 ]
 
 
-def ingest_raw_exports(input_dir: Path, run_date: str) -> IngestionArtifacts:
+def ingest_raw_exports(
+    input_dir: Path,
+    run_date: str,
+    account_slug: str | None = None,
+) -> IngestionArtifacts:
     warnings: list[str] = []
     performance_path = input_dir / "performance_daily.csv"
     if not performance_path.exists():
@@ -156,12 +163,20 @@ def ingest_raw_exports(input_dir: Path, run_date: str) -> IngestionArtifacts:
         _normalize_creative_rows(read_csv_rows(creative_path), warnings) if creative_path.exists() else []
     )
 
-    merged_rows = _merge_sources(performance_rows, video_rows, creative_rows, run_date, input_dir)
+    merged_rows = _merge_sources(
+        performance_rows,
+        video_rows,
+        creative_rows,
+        run_date,
+        account_slug,
+        input_dir,
+    )
     if not merged_rows:
         warnings.append("No normalized performance rows were produced from performance_daily.csv.")
 
     return IngestionArtifacts(
         run_date=run_date,
+        account_slug=account_slug,
         input_dir=input_dir,
         normalized_rows=merged_rows,
         creative_rows=creative_rows,
@@ -172,6 +187,7 @@ def ingest_raw_exports(input_dir: Path, run_date: str) -> IngestionArtifacts:
 def normalized_fieldnames() -> list[str]:
     return [
         "ingestion_run_date",
+        "account_slug",
         "source_run_path",
         "report_date",
         "account_id",
@@ -196,6 +212,8 @@ def normalized_fieldnames() -> list[str]:
         "results",
         "result_label",
         "cost_per_result",
+        "app_installs",
+        "cost_per_app_install",
         "purchase_count",
         "purchase_value",
         "purchase_roas",
@@ -260,6 +278,7 @@ def _normalize_performance_rows(rows: list[dict[str, str]], warnings: list[str])
         results = _extract_number(cleaned, PERFORMANCE_ALIASES["results"])
         if results is None:
             results = purchase_count
+        app_installs = _extract_number(cleaned, PERFORMANCE_ALIASES["app_installs"])
 
         link_clicks = _extract_int(cleaned, PERFORMANCE_ALIASES["link_clicks"])
         outbound_clicks = _extract_int(cleaned, PERFORMANCE_ALIASES["outbound_clicks"])
@@ -290,6 +309,10 @@ def _normalize_performance_rows(rows: list[dict[str, str]], warnings: list[str])
             "results": results,
             "result_label": _get_first(cleaned, PERFORMANCE_ALIASES["result_label"]),
             "cost_per_result": _extract_number(cleaned, PERFORMANCE_ALIASES["cost_per_result"]),
+            "app_installs": app_installs,
+            "cost_per_app_install": _extract_number(
+                cleaned, PERFORMANCE_ALIASES["cost_per_app_install"]
+            ),
             "purchase_count": purchase_count,
             "purchase_value": purchase_value,
             "purchase_roas": purchase_roas,
@@ -303,6 +326,13 @@ def _normalize_performance_rows(rows: list[dict[str, str]], warnings: list[str])
         if row_normalized["cost_per_result"] is None and row_normalized["results"] not in (None, 0):
             row_normalized["cost_per_result"] = safe_divide(
                 row_normalized["spend"], row_normalized["results"]
+            )
+        if (
+            row_normalized["cost_per_app_install"] is None
+            and row_normalized["app_installs"] not in (None, 0)
+        ):
+            row_normalized["cost_per_app_install"] = safe_divide(
+                row_normalized["spend"], row_normalized["app_installs"]
             )
 
         normalized.append(row_normalized)
@@ -359,6 +389,7 @@ def _merge_sources(
     video_rows: list[dict[str, Any]],
     creative_rows: list[dict[str, Any]],
     run_date: str,
+    account_slug: str | None,
     input_dir: Path,
 ) -> list[dict[str, Any]]:
     video_lookup: dict[tuple[str | None, str | None, date], dict[str, Any]] = {}
@@ -388,7 +419,9 @@ def _merge_sources(
         )
         average_order_value = safe_divide(row.get("purchase_value"), row.get("purchase_count"))
         tracking_confidence = "high"
-        if row.get("purchase_count") not in (None, 0) and row.get("purchase_value") is None:
+        if row.get("results") not in (None, 0) and row.get("purchase_value") is None:
+            tracking_confidence = "low_results_without_revenue"
+        elif row.get("purchase_count") not in (None, 0) and row.get("purchase_value") is None:
             tracking_confidence = "low_purchase_value_missing"
         elif row.get("purchase_roas") is None and row.get("purchase_value") is None:
             tracking_confidence = "medium_roas_unavailable"
@@ -396,6 +429,7 @@ def _merge_sources(
         merged.append(
             {
                 "ingestion_run_date": run_date,
+                "account_slug": account_slug,
                 "source_run_path": str(input_dir),
                 "report_date": row["report_date"],
                 "account_id": row.get("account_id"),
@@ -420,6 +454,8 @@ def _merge_sources(
                 "results": row.get("results"),
                 "result_label": row.get("result_label"),
                 "cost_per_result": row.get("cost_per_result"),
+                "app_installs": row.get("app_installs"),
+                "cost_per_app_install": row.get("cost_per_app_install"),
                 "purchase_count": row.get("purchase_count"),
                 "purchase_value": row.get("purchase_value"),
                 "purchase_roas": row.get("purchase_roas"),

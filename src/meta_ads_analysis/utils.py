@@ -27,6 +27,13 @@ def standardize_header(value: str) -> str:
     return cleaned.strip("_")
 
 
+def slugify_name(value: str) -> str:
+    slug = standardize_header(value)
+    if not slug:
+        raise ValueError("Expected a non-empty account or company name.")
+    return slug
+
+
 def unique_headers(headers: list[str]) -> list[str]:
     counts: defaultdict[str, int] = defaultdict(int)
     unique: list[str] = []

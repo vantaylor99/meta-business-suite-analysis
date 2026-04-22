@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
   "duckdb>=1.2,<2",
+  "requests>=2.32,<3",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,7 @@ dev = [
 [project.scripts]
 ingest_meta_exports = "meta_ads_analysis.cli:ingest_meta_exports_main"
 build_meta_report = "meta_ads_analysis.cli:build_meta_report_main"
+sync_meta_api = "meta_ads_analysis.cli:sync_meta_api_main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
