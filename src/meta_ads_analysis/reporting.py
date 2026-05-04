@@ -56,6 +56,9 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             lines.append(f"- Notes: {measurement_focus['analysis_notes']}")
         lines.append("")
 
+    lines.extend(_render_window_summary(payload))
+    lines.extend(_render_trajectory_highlights(payload))
+
     lines.extend(_render_ad_section("## Budget Waste Findings", payload["budget_waste"], "waste"))
     lines.extend(_render_ad_section("## Fatigue And Staleness Findings", payload["fatigue_findings"], "fatigue"))
 
@@ -79,6 +82,71 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
     lines.append("")
 
     return "\n".join(lines).strip() + "\n"
+
+
+def _render_window_summary(payload: dict[str, Any]) -> list[str]:
+    account_windows = payload.get("account_window_summary") or {}
+    if not account_windows:
+        return []
+
+    lines = [
+        "## Performance By Window",
+        "",
+        (
+            "These windows are sliced from the same daily export and end on "
+            f"`{payload['window_comparison_meta']['window_end']}`. Treat the 3-day view as directional."
+        ),
+        "",
+        "| Window | Spend | Results | App installs | Cost / result | Cost / install | Hook rate | Coverage |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for window_key in ("30d", "7d", "3d"):
+        window = account_windows.get(window_key)
+        if not window:
+            continue
+        lines.append(
+            " | ".join(
+                [
+                    f"| `{window_key}`",
+                    f"`${window['spend']:.2f}`",
+                    f"`{_fmt(window['results'])}`",
+                    f"`{_fmt(window['app_installs'])}`",
+                    f"`{_fmt_currency(window['cost_per_result'])}`",
+                    f"`{_fmt_currency(window['cost_per_app_install'])}`",
+                    f"`{_fmt_rate(window['hook_rate'])}`",
+                    f"`{window['days_with_data']}/{window['requested_days']} days` |",
+                ]
+            )
+        )
+    lines.append("")
+    return lines
+
+
+def _render_trajectory_highlights(payload: dict[str, Any]) -> list[str]:
+    highlights = payload.get("trajectory_highlights") or []
+    lines = [
+        "## Trajectory Highlights",
+        "",
+        (
+            "These compare recent efficiency against the longer view. Short windows can be noisy, "
+            "so use them to decide what to watch, cap, or retest rather than as standalone scale proof."
+        ),
+        "",
+    ]
+    if not highlights:
+        lines.append("- No non-insufficient improving or degrading trajectory surfaced from the supplied export.")
+        lines.append("")
+        return lines
+
+    for item in highlights:
+        comparison = "7d vs 30d" if item["comparison"] == "seven_vs_thirty" else "3d vs 7d"
+        descriptor = _ad_descriptor(item)
+        lines.append(
+            f"- {descriptor}: `{item['status']}` on `{comparison}` using `{item['metric']}` "
+            f"({_fmt_percent(item['percent_change'])}). {item['reason']}"
+        )
+    lines.append("")
+    return lines
 
 
 def _render_ad_section(
@@ -144,3 +212,21 @@ def _fmt(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.2f}"
     return str(value)
+
+
+def _fmt_currency(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    return f"${value:.2f}"
+
+
+def _fmt_rate(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.2%}"
+
+
+def _fmt_percent(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value * 100:.1f}%"

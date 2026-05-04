@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from statistics import median
 from typing import Any
 
@@ -12,7 +12,11 @@ from .config import (
     FATIGUE_WINDOW_DAYS,
     MIN_FATIGUE_HISTORY_DAYS,
     MIN_SCALING_SPEND,
+    MIN_TRAJECTORY_BASE_SPEND,
+    MIN_TRAJECTORY_RECENT_SPEND,
+    MIN_TRAJECTORY_SHORT_SPEND,
     MIN_WASTE_SPEND,
+    PERFORMANCE_WINDOWS_DAYS,
     TOP_FINDINGS_LIMIT,
 )
 from .utils import clamp, percent_change, safe_divide
@@ -29,6 +33,8 @@ class WindowMetrics:
     purchase_value: float
     average_frequency: float | None
     hook_rate: float | None
+    hold_rate: float | None
+    has_video_metrics: bool
 
     @property
     def ctr(self) -> float | None:
@@ -72,8 +78,10 @@ def build_report_payload(
     adset_count = len({row.get("adset_id") or row.get("adset_name") for row in sorted_rows})
     ad_count = len(grouped)
     unique_dates = sorted({row["report_date"] for row in sorted_rows})
+    window_end = unique_dates[-1]
 
     ad_summaries = [_summarize_ad(rows_for_ad) for rows_for_ad in grouped.values()]
+    account_window_summary = _build_window_rollups(sorted_rows, window_end)
     account_roas = _reliable_roas(
         total_purchase_value,
         total_spend,
@@ -108,6 +116,8 @@ def build_report_payload(
             benchmark_hook,
         )
 
+    ad_window_summaries = _build_ad_window_summaries(grouped, window_end)
+    trajectory_highlights = _build_trajectory_highlights(ad_window_summaries)
     waste_ads = sorted(
         [item for item in ad_summaries if item["waste_status"] != "insufficient_data"],
         key=lambda item: (item["waste_score"], item["total_spend"]),
@@ -134,7 +144,13 @@ def build_report_payload(
     )[:TOP_FINDINGS_LIMIT]
 
     tracking_concerns = _build_tracking_concerns(ad_summaries)
-    actions = _build_recommendations(waste_ads, fatigued_ads, scaling_candidates, tracking_concerns)
+    actions = _build_recommendations(
+        waste_ads,
+        fatigued_ads,
+        scaling_candidates,
+        tracking_concerns,
+        trajectory_highlights,
+    )
 
     return {
         "run_date": run_date,
@@ -168,6 +184,14 @@ def build_report_payload(
             "min_waste_spend": MIN_WASTE_SPEND,
             "min_scaling_spend": MIN_SCALING_SPEND,
         },
+        "window_comparison_meta": {
+            "window_end": window_end.isoformat(),
+            "windows": list(PERFORMANCE_WINDOWS_DAYS),
+            "coverage": _build_window_coverage(sorted_rows, window_end),
+        },
+        "account_window_summary": account_window_summary,
+        "ad_window_summaries": ad_window_summaries,
+        "trajectory_highlights": trajectory_highlights,
         "budget_waste": [_serialize_ad_summary(item) for item in waste_ads],
         "fatigue_findings": [_serialize_ad_summary(item) for item in fatigued_ads],
         "hook_findings": {
@@ -261,7 +285,7 @@ def _split_windows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], li
 
 def _window_metrics(rows: list[dict[str, Any]]) -> WindowMetrics:
     if not rows:
-        return WindowMetrics(0.0, 0, 0, 0.0, 0.0, 0.0, 0.0, None, None)
+        return WindowMetrics(0.0, 0, 0, 0.0, 0.0, 0.0, 0.0, None, None, None, False)
     spend = sum(row.get("spend") or 0.0 for row in rows)
     impressions = sum(row.get("impressions") or 0 for row in rows)
     outbound_clicks = sum(row.get("outbound_clicks") or 0 for row in rows)
@@ -271,6 +295,8 @@ def _window_metrics(rows: list[dict[str, Any]]) -> WindowMetrics:
     purchase_value = sum(row.get("purchase_value") or 0.0 for row in rows)
     frequencies = [row["frequency"] for row in rows if row.get("frequency") is not None]
     total_video_3s_plays = sum(row.get("video_3s_plays") or 0.0 for row in rows)
+    total_thruplays = sum(row.get("thruplays") or 0.0 for row in rows)
+    has_video_metrics = any(row.get("has_video_metrics") for row in rows)
     return WindowMetrics(
         spend=spend,
         impressions=impressions,
@@ -280,8 +306,214 @@ def _window_metrics(rows: list[dict[str, Any]]) -> WindowMetrics:
         purchase_count=purchase_count,
         purchase_value=purchase_value,
         average_frequency=(sum(frequencies) / len(frequencies) if frequencies else None),
-        hook_rate=safe_divide(total_video_3s_plays, impressions),
+        hook_rate=safe_divide(total_video_3s_plays, impressions) if has_video_metrics else None,
+        hold_rate=safe_divide(total_thruplays, total_video_3s_plays) if has_video_metrics else None,
+        has_video_metrics=has_video_metrics,
     )
+
+
+def _build_window_rollups(
+    rows: list[dict[str, Any]],
+    window_end: date,
+) -> dict[str, dict[str, Any]]:
+    return {
+        _window_key(days): _serialize_window_metrics(
+            _window_metrics(_rows_in_trailing_window(rows, window_end, days)),
+            _rows_in_trailing_window(rows, window_end, days),
+            window_end,
+            days,
+        )
+        for days in PERFORMANCE_WINDOWS_DAYS
+    }
+
+
+def _build_ad_window_summaries(
+    grouped_rows: dict[str, list[dict[str, Any]]],
+    window_end: date,
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for rows in grouped_rows.values():
+        sorted_rows = sorted(rows, key=lambda row: row["report_date"])
+        windows = _build_window_rollups(sorted_rows, window_end)
+        trajectory = {
+            "seven_vs_thirty": _compare_windows(windows["30d"], windows["7d"], 30, 7),
+            "three_vs_seven": _compare_windows(windows["7d"], windows["3d"], 7, 3),
+        }
+        summaries.append(
+            {
+                "ad_id": sorted_rows[0].get("ad_id"),
+                "ad_name": sorted_rows[0].get("ad_name"),
+                "campaign_name": sorted_rows[0].get("campaign_name"),
+                "adset_name": sorted_rows[0].get("adset_name"),
+                "windows": windows,
+                "trajectory": trajectory,
+            }
+        )
+    return sorted(summaries, key=lambda item: item.get("ad_name") or "")
+
+
+def _rows_in_trailing_window(
+    rows: list[dict[str, Any]],
+    window_end: date,
+    days: int,
+) -> list[dict[str, Any]]:
+    window_start = window_end - timedelta(days=days - 1)
+    return [row for row in rows if window_start <= row["report_date"] <= window_end]
+
+
+def _build_window_coverage(rows: list[dict[str, Any]], window_end: date) -> dict[str, dict[str, Any]]:
+    coverage: dict[str, dict[str, Any]] = {}
+    for days in PERFORMANCE_WINDOWS_DAYS:
+        window_rows = _rows_in_trailing_window(rows, window_end, days)
+        dates = sorted({row["report_date"] for row in window_rows})
+        coverage[_window_key(days)] = {
+            "requested_days": days,
+            "days_with_data": len(dates),
+            "start_date": dates[0].isoformat() if dates else None,
+            "end_date": dates[-1].isoformat() if dates else None,
+            "coverage_note": (
+                f"{len(dates)} of {days} requested days had exported rows."
+                if len(dates) < days
+                else None
+            ),
+        }
+    return coverage
+
+
+def _serialize_window_metrics(
+    metrics: WindowMetrics,
+    rows: list[dict[str, Any]],
+    window_end: date,
+    requested_days: int,
+) -> dict[str, Any]:
+    dates = sorted({row["report_date"] for row in rows})
+    roas = _reliable_roas(
+        metrics.purchase_value,
+        metrics.spend,
+        metrics.results,
+        any(row.get("tracking_confidence") == "low_results_without_revenue" for row in rows),
+    )
+    return {
+        "requested_days": requested_days,
+        "window_start": (window_end - timedelta(days=requested_days - 1)).isoformat(),
+        "window_end": window_end.isoformat(),
+        "days_with_data": len(dates),
+        "spend": round(metrics.spend, 2),
+        "impressions": metrics.impressions,
+        "outbound_clicks": metrics.outbound_clicks,
+        "outbound_ctr": _round_optional(metrics.ctr, 4),
+        "results": round(metrics.results, 2),
+        "app_installs": round(metrics.app_installs, 2),
+        "purchase_count": round(metrics.purchase_count, 2),
+        "purchase_value": round(metrics.purchase_value, 2),
+        "blended_roas": _round_optional(roas, 4),
+        "cost_per_result": _round_optional(metrics.cost_per_result, 2),
+        "cost_per_app_install": _round_optional(metrics.cost_per_app_install, 2),
+        "cpa": _round_optional(metrics.cpa, 2),
+        "average_frequency": _round_optional(metrics.average_frequency, 4),
+        "hook_rate": _round_optional(metrics.hook_rate, 4),
+        "hold_rate": _round_optional(metrics.hold_rate, 4),
+        "has_video_metrics": metrics.has_video_metrics,
+    }
+
+
+def _compare_windows(
+    base: dict[str, Any],
+    recent: dict[str, Any],
+    base_days: int,
+    recent_days: int,
+) -> dict[str, Any]:
+    base_min_spend = MIN_TRAJECTORY_BASE_SPEND if base_days == 30 else MIN_TRAJECTORY_RECENT_SPEND
+    recent_min_spend = MIN_TRAJECTORY_SHORT_SPEND if recent_days == 3 else MIN_TRAJECTORY_RECENT_SPEND
+    if base["spend"] < base_min_spend or recent["spend"] < recent_min_spend:
+        return {
+            "status": "insufficient_data",
+            "metric": None,
+            "percent_change": None,
+            "reason": (
+                f"{base_days}d spend ${base['spend']:.2f} or {recent_days}d spend "
+                f"${recent['spend']:.2f} is below the trajectory review floor."
+            ),
+        }
+
+    metric = _select_trajectory_metric(base, recent)
+    if metric is None:
+        return {
+            "status": "insufficient_data",
+            "metric": None,
+            "percent_change": None,
+            "reason": f"{base_days}d and {recent_days}d windows do not have comparable result or install efficiency.",
+        }
+
+    base_value = base[metric]
+    recent_value = recent[metric]
+    change = percent_change(recent_value, base_value)
+    if change is None:
+        return {
+            "status": "insufficient_data",
+            "metric": metric,
+            "percent_change": None,
+            "reason": f"{metric} could not be compared between {base_days}d and {recent_days}d windows.",
+        }
+
+    if change <= -0.15:
+        status = "improving"
+        direction = "improved"
+    elif change >= 0.15:
+        status = "degrading"
+        direction = "worsened"
+    else:
+        status = "flat"
+        direction = "held roughly flat"
+
+    return {
+        "status": status,
+        "metric": metric,
+        "percent_change": round(change, 4),
+        "reason": (
+            f"{metric.replace('_', ' ')} {direction} from ${base_value:.2f} over {base_days}d "
+            f"to ${recent_value:.2f} over {recent_days}d."
+        ),
+    }
+
+
+def _select_trajectory_metric(base: dict[str, Any], recent: dict[str, Any]) -> str | None:
+    if (base["results"] or recent["results"]) and base["cost_per_result"] is not None and recent["cost_per_result"] is not None:
+        return "cost_per_result"
+    if (
+        (base["app_installs"] or recent["app_installs"])
+        and base["cost_per_app_install"] is not None
+        and recent["cost_per_app_install"] is not None
+    ):
+        return "cost_per_app_install"
+    return None
+
+
+def _build_trajectory_highlights(ad_window_summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    highlights: list[dict[str, Any]] = []
+    for ad in ad_window_summaries:
+        for comparison_key, comparison in ad["trajectory"].items():
+            if comparison["status"] not in {"improving", "degrading"}:
+                continue
+            highlights.append(
+                {
+                    "ad_id": ad["ad_id"],
+                    "ad_name": ad["ad_name"],
+                    "campaign_name": ad["campaign_name"],
+                    "adset_name": ad["adset_name"],
+                    "comparison": comparison_key,
+                    **comparison,
+                }
+            )
+    return sorted(
+        highlights,
+        key=lambda item: abs(item["percent_change"] or 0),
+        reverse=True,
+    )[:TOP_FINDINGS_LIMIT]
+
+
+def _window_key(days: int) -> str:
+    return f"{days}d"
 
 
 def _apply_fatigue(summary: dict[str, Any]) -> None:
@@ -525,6 +757,7 @@ def _build_recommendations(
     fatigued_ads: list[dict[str, Any]],
     scaling_candidates: list[dict[str, Any]],
     tracking_concerns: list[str],
+    trajectory_highlights: list[dict[str, Any]],
 ) -> list[str]:
     actions: list[str] = []
     if waste_ads:
@@ -541,6 +774,16 @@ def _build_recommendations(
         top = scaling_candidates[0]
         actions.append(
             f"Consider carefully scaling {top['ad_name']} because it pairs stronger efficiency with manageable fatigue risk."
+        )
+    degrading = next((item for item in trajectory_highlights if item["status"] == "degrading"), None)
+    improving = next((item for item in trajectory_highlights if item["status"] == "improving"), None)
+    if degrading:
+        actions.append(
+            f"Review recent delivery on {degrading['ad_name']} because short-window efficiency is degrading versus the longer view."
+        )
+    elif improving:
+        actions.append(
+            f"Hold {improving['ad_name']} for a controlled read because recent efficiency is improving, but avoid scaling from short-window data alone."
         )
     if tracking_concerns:
         actions.append(
@@ -593,6 +836,10 @@ def _median_defined(values: list[float | None]) -> float | None:
     if not defined:
         return None
     return median(defined)
+
+
+def _round_optional(value: float | None, digits: int) -> float | None:
+    return round(value, digits) if value is not None else None
 
 
 def _dominant_result_label(rows: list[dict[str, Any]]) -> str | None:

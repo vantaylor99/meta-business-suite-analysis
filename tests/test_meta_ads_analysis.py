@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -366,6 +366,66 @@ def test_report_uses_app_installs_as_secondary_signal_when_results_are_sparse(tm
     assert payload["account_summary"]["total_app_installs"] == 48.0
 
 
+def test_report_builds_multi_window_trajectory_from_daily_rows() -> None:
+    run_date = "2026-04-30"
+    rows: list[dict[str, object]] = []
+    start = date(2026, 4, 1)
+    for index in range(30):
+        report_date = start + timedelta(days=index)
+        is_recent_week = index >= 23
+        rows.append(
+            _daily_metric_row(
+                report_date,
+                ad_id="5001",
+                ad_name="Improving Ad",
+                spend=10.0,
+                app_installs=5.0 if is_recent_week else 1.0,
+            )
+        )
+        rows.append(
+            _daily_metric_row(
+                report_date,
+                ad_id="5002",
+                ad_name="Degrading Ad",
+                spend=10.0,
+                app_installs=1.0 if is_recent_week else 5.0,
+            )
+        )
+
+    payload = build_report_payload(rows, run_date)
+    by_name = {item["ad_name"]: item for item in payload["ad_window_summaries"]}
+
+    assert payload["window_comparison_meta"]["window_end"] == "2026-04-30"
+    assert payload["account_window_summary"]["30d"]["days_with_data"] == 30
+    assert by_name["Improving Ad"]["trajectory"]["seven_vs_thirty"]["status"] == "improving"
+    assert by_name["Degrading Ad"]["trajectory"]["seven_vs_thirty"]["status"] == "degrading"
+    assert by_name["Improving Ad"]["trajectory"]["three_vs_seven"]["status"] == "insufficient_data"
+
+    rendered = render_markdown_report(payload)
+    assert "## Performance By Window" in rendered
+    assert "## Trajectory Highlights" in rendered
+
+
+def test_report_marks_clipped_window_coverage() -> None:
+    run_date = "2026-04-10"
+    rows = [
+        _daily_metric_row(
+            date(2026, 4, 1) + timedelta(days=index),
+            ad_id="6001",
+            ad_name="Short Coverage Ad",
+            spend=10.0,
+            app_installs=1.0,
+        )
+        for index in range(10)
+    ]
+
+    payload = build_report_payload(rows, run_date)
+    coverage = payload["window_comparison_meta"]["coverage"]["30d"]
+
+    assert coverage["days_with_data"] == 10
+    assert coverage["coverage_note"] == "10 of 30 requested days had exported rows."
+
+
 def test_storage_keeps_same_run_date_separate_by_account_slug(tmp_path: Path) -> None:
     db_path = tmp_path / "meta_ads.duckdb"
     run_date = "2026-04-21"
@@ -685,3 +745,36 @@ def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _daily_metric_row(
+    report_date: date,
+    *,
+    ad_id: str,
+    ad_name: str,
+    spend: float,
+    app_installs: float,
+) -> dict[str, object]:
+    return {
+        "report_date": report_date,
+        "campaign_id": "campaign-1",
+        "campaign_name": "Trajectory Campaign",
+        "adset_id": "adset-1",
+        "adset_name": "Trajectory Set",
+        "ad_id": ad_id,
+        "ad_name": ad_name,
+        "creative_type": "Dynamic",
+        "spend": spend,
+        "purchase_value": 0.0,
+        "purchase_count": 0.0,
+        "results": 0.0,
+        "result_label": "In-app subscriptions",
+        "app_installs": app_installs,
+        "impressions": 1000,
+        "outbound_clicks": 20,
+        "frequency": 1.1,
+        "video_3s_plays": 400,
+        "thruplays": 100,
+        "has_video_metrics": True,
+        "tracking_confidence": "medium_roas_unavailable",
+    }

@@ -77,6 +77,8 @@ This will fetch:
 
 - `2026-03-24` through `2026-04-22`
 
+Reports also derive 30-day, 7-day, and 3-day performance windows from this same daily pull. You do not need separate API syncs for each window; the report slices the exported daily rows ending on the latest exported day and labels short-window reads as directional when data is thin.
+
 You can override the window:
 
 ```powershell
