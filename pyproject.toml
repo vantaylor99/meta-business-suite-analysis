@@ -22,6 +22,9 @@ dev = [
 ingest_meta_exports = "meta_ads_analysis.cli:ingest_meta_exports_main"
 build_meta_report = "meta_ads_analysis.cli:build_meta_report_main"
 sync_meta_api = "meta_ads_analysis.cli:sync_meta_api_main"
+sync_meta_cli = "meta_ads_analysis.cli:sync_meta_cli_main"
+propose_meta_actions = "meta_ads_analysis.cli:propose_meta_actions_main"
+apply_meta_actions = "meta_ads_analysis.cli:apply_meta_actions_main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

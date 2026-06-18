@@ -93,3 +93,5 @@ Every written analysis should use this structure:
 - Do not assume revenue is healthy just because Meta reports results or app installs.
 - Do not recommend scaling solely off hook rate without downstream conversion evidence.
 - Do not collapse missing data into zeros unless the normalized output already did so intentionally.
+- Do not execute Meta account changes directly from a written analysis. Use the action workflow: generate `action_plan.json`, require explicit approval, dry-run, then execute approved actions.
+- Keep Meta AI / Advantage+ creative features off by default. Do not enable automatic text variations, image expansion, visual touch-ups, generated music, flexible media, or AI-generated creative variants unless a human explicitly requests that exact change.

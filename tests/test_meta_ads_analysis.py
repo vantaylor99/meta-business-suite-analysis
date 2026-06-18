@@ -7,6 +7,12 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import Mock
 
+from meta_ads_analysis.actions import (
+    apply_action_plan,
+    build_action_plan,
+    build_meta_cli_command,
+    enrich_action_plan_with_live_state,
+)
 from meta_ads_analysis.account_registry import load_account_registry, resolve_account
 from meta_ads_analysis.analyze import build_report_payload
 from meta_ads_analysis.cli import build_meta_report_main, ingest_meta_exports_main, sync_meta_api_main
@@ -14,7 +20,7 @@ from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
 from meta_ads_analysis.reporting import render_markdown_report
 from meta_ads_analysis.storage import connect, fetch_run_rows, replace_run_rows
-from meta_ads_analysis.sync_api import resolve_date_window
+from meta_ads_analysis.sync_api import resolve_date_window, sync_account_from_cli
 from meta_ads_analysis.utils import ensure_dir
 
 
@@ -730,6 +736,357 @@ def test_sync_api_raw_only_writes_raw_files(tmp_path: Path, monkeypatch) -> None
 
     assert (raw_root / "divine_designs" / "2026-04-22" / "performance_daily.csv").exists()
     assert summary_path.exists()
+
+
+def test_sync_cli_writes_raw_files_from_meta_cli_payload(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "divine_designs",
+                        "account_name": "Divine Designs",
+                        "ad_account_id": "act_555",
+                        "measurement_focus": {
+                            "primary_result_action_type": "purchase",
+                            "primary_result_label": "Website purchases",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_runner(command, check, capture_output, text):
+        assert command[:6] == ["meta", "--output", "json", "ads", "--ad-account-id", "act_555"]
+        if command[6:8] == ["ad", "list"]:
+            return Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": "3",
+                            "name": "CLI Ad",
+                            "adset_id": "2",
+                            "campaign_id": "1",
+                            "status": "ACTIVE",
+                            "effective_status": "ACTIVE",
+                        }
+                    ]
+                ),
+                stderr="",
+            )
+        assert command[-2:] == ["--ad-id", "3"]
+        payload = {
+            "data": [
+                {
+                    "account_id": "act_555",
+                    "account_name": "Divine Designs",
+                    "campaign_id": "1",
+                    "campaign_name": "Campaign",
+                    "adset_id": "2",
+                    "adset_name": "Set",
+                    "ad_id": "3",
+                    "ad_name": "CLI Ad",
+                    "date_start": "2026-06-15",
+                    "date_stop": "2026-06-15",
+                    "impressions": "1000",
+                    "spend": "50",
+                    "actions": [
+                        {"action_type": "purchase", "value": "2"},
+                        {"action_type": "video_view", "value": "300"},
+                    ],
+                    "action_values": [{"action_type": "purchase", "value": "120"}],
+                    "purchase_roas": [{"action_type": "purchase", "value": "2.4"}],
+                }
+            ]
+        }
+        return Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    artifacts = sync_account_from_cli(
+        account_slug="divine_designs",
+        run_date="2026-06-16",
+        raw_root=raw_root,
+        accounts_config_path=accounts_path,
+        meta_binary="meta",
+        runner=fake_runner,
+    )
+
+    assert artifacts.api_version == "meta-cli"
+    assert (raw_root / "divine_designs" / "2026-06-16" / "performance_daily.csv").exists()
+    assert artifacts.performance_rows[0]["Ad name"] == "CLI Ad"
+    assert artifacts.performance_rows[0]["Results"] == "2"
+    assert artifacts.creative_rows[0]["Ad ID"] == "3"
+
+
+def test_sync_cli_default_filter_skips_old_paused_ads(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "divine_designs",
+                        "account_name": "Divine Designs",
+                        "ad_account_id": "act_555",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    insight_ad_ids: list[str] = []
+
+    def fake_runner(command, check, capture_output, text):
+        if command[6:8] == ["ad", "list"]:
+            return Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": "active",
+                            "name": "Active Ad",
+                            "status": "ACTIVE",
+                            "effective_status": "ACTIVE",
+                            "updated_time": "2026-01-01T00:00:00+0000",
+                        },
+                        {
+                            "id": "recent-paused",
+                            "name": "Recently Paused Ad",
+                            "status": "PAUSED",
+                            "effective_status": "PAUSED",
+                            "updated_time": "2026-06-10T00:00:00+0000",
+                        },
+                        {
+                            "id": "old-paused",
+                            "name": "Old Paused Ad",
+                            "status": "PAUSED",
+                            "effective_status": "PAUSED",
+                            "updated_time": "2026-04-01T00:00:00+0000",
+                        },
+                    ]
+                ),
+                stderr="",
+            )
+        ad_id = command[-1]
+        insight_ad_ids.append(ad_id)
+        return Mock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "data": [
+                        {
+                            "ad_id": ad_id,
+                            "ad_name": f"{ad_id} name",
+                            "date_start": "2026-06-15",
+                            "date_stop": "2026-06-15",
+                            "spend": "1",
+                        }
+                    ]
+                }
+            ),
+            stderr="",
+        )
+
+    artifacts = sync_account_from_cli(
+        account_slug="divine_designs",
+        run_date="2026-06-16",
+        raw_root=raw_root,
+        accounts_config_path=accounts_path,
+        runner=fake_runner,
+    )
+
+    assert insight_ad_ids == ["active", "recent-paused"]
+    assert len(artifacts.performance_rows) == 2
+    assert "selected 2 of 3 ads" in artifacts.warnings[0]
+
+
+def test_action_plan_proposes_approved_pause_path_for_high_waste_ad() -> None:
+    payload = {
+        "account_slug": "pollen_sense",
+        "run_date": "2026-05-04",
+        "budget_waste": [
+            {
+                "ad_id": "123",
+                "ad_name": "Waste Ad",
+                "campaign_name": "Campaign",
+                "adset_name": "Ad Set",
+                "total_spend": 250.0,
+                "total_results": 0.0,
+                "total_app_installs": 1.0,
+                "waste_score": 82.0,
+                "waste_status": "high",
+                "waste_reasons": ["spent without results"],
+                "tracking_confidence": "medium_roas_unavailable",
+            }
+        ],
+        "fatigue_findings": [],
+        "scaling_candidates": [],
+        "tracking_concerns": ["ROAS is not fully reliable."],
+    }
+
+    plan = build_action_plan(payload)
+
+    pause = next(action for action in plan["actions"] if action["action_type"] == "pause_ad")
+    assert pause["status"] == "proposed"
+    assert pause["executable"] is True
+    assert pause["approval_required"] is True
+    assert pause["params"] == {"status": "paused"}
+    assert "Advantage+ creative enhancements" in plan["guardrails"]["meta_ai_features"]["keep_disabled"]
+
+
+def test_meta_cli_command_only_allows_explicit_pause_without_meta_ai_params() -> None:
+    action = {
+        "action_type": "pause_ad",
+        "target": {"id": "123"},
+        "params": {"status": "paused"},
+    }
+
+    command = build_meta_cli_command(action, "act_999", meta_binary="meta")
+
+    assert command == [
+        "meta",
+        "--no-input",
+        "-o",
+        "json",
+        "ads",
+        "--ad-account-id",
+        "act_999",
+        "ad",
+        "update",
+        "123",
+        "--status",
+        "paused",
+    ]
+
+    action["params"]["advantage_plus_creative"] = True
+    try:
+        build_meta_cli_command(action, "act_999")
+    except ValueError as exc:
+        assert "Meta AI" in str(exc)
+    else:
+        raise AssertionError("Expected Meta AI guardrail to block action")
+
+
+def test_apply_action_plan_dry_run_requires_approval(tmp_path: Path, monkeypatch) -> None:
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "pollen_sense",
+                        "account_name": "Pollen Sense",
+                        "ad_account_id": "12345",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+
+    plan = {
+        "account_slug": "pollen_sense",
+        "run_date": "2026-05-04",
+        "actions": [
+            {
+                "action_id": "pause_ad_123",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "target": {"id": "123"},
+                "params": {"status": "paused"},
+            }
+        ],
+    }
+
+    skipped = apply_action_plan(plan, execute=False)
+    assert skipped[0].status == "skipped"
+    assert skipped[0].reason == "Action is not approved."
+
+    plan["actions"][0]["status"] = "approved"
+    dry_run = apply_action_plan(plan, execute=False)
+    assert dry_run[0].status == "dry_run"
+    assert dry_run[0].command is not None
+    assert "act_12345" in dry_run[0].command
+
+
+def test_live_state_enrichment_marks_only_ad_status_paused_as_resolved(tmp_path: Path, monkeypatch) -> None:
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "pollen_sense",
+                        "account_name": "Pollen Sense",
+                        "ad_account_id": "12345",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    plan = {
+        "account_slug": "pollen_sense",
+        "run_date": "2026-06-16",
+        "actions": [
+            {
+                "action_id": "pause_ad_1",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "approval_required": True,
+                "target": {"type": "ad", "id": "1"},
+                "params": {"status": "paused"},
+                "rationale": "Pause bad ad.",
+            },
+            {
+                "action_id": "pause_ad_2",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "approval_required": True,
+                "target": {"type": "ad", "id": "2"},
+                "params": {"status": "paused"},
+                "rationale": "Pause bad ad.",
+            },
+        ],
+    }
+
+    def fake_runner(command, check, capture_output, text):
+        ad_id = command[-1]
+        status = "PAUSED" if ad_id == "1" else "ACTIVE"
+        effective_status = "PAUSED" if ad_id == "1" else "ADSET_PAUSED"
+        return Mock(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": ad_id,
+                        "name": f"Ad {ad_id}",
+                        "status": status,
+                        "effective_status": effective_status,
+                    }
+                ]
+            ),
+            stderr="",
+        )
+
+    enriched = enrich_action_plan_with_live_state(plan, runner=fake_runner)
+    by_id = {action["action_id"]: action for action in enriched["actions"]}
+
+    assert by_id["pause_ad_1"]["status"] == "already_resolved"
+    assert by_id["pause_ad_1"]["executable"] is False
+    assert by_id["pause_ad_2"]["status"] == "proposed"
+    assert by_id["pause_ad_2"]["executable"] is True
+    assert by_id["pause_ad_2"]["live_state"]["effective_status"] == "ADSET_PAUSED"
 
 
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:

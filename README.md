@@ -9,11 +9,13 @@ The workflow is:
 3. Run `ingest_meta_exports`.
 4. Run `build_meta_report`.
 5. Review the generated report in `reports/<account_slug>/<run_date>/`.
+6. Generate an approved action plan before making Meta account changes.
 
 The implementation keeps one normalized reporting pipeline and supports two input paths:
 
 - manual Ads Manager exports
 - direct API sync into the same raw CSV contract
+- guarded Meta CLI actions from approved report findings
 
 ## Install
 
@@ -132,6 +134,36 @@ Optional overrides:
 - `--db-path data/normalized/meta_ads.duckdb`
 - `--api-version v22.0`
 
+### Sync data through the installed Meta CLI
+
+Use this when the Meta CLI is authenticated but `META_ACCESS_TOKEN` is not available in the shell:
+
+```powershell
+sync_meta_cli --account divine_designs --run-date 2026-06-16
+```
+
+If the installed script is not on your `PATH`, use:
+
+```powershell
+python -m meta_ads_analysis sync-cli --account divine_designs --run-date 2026-06-16
+```
+
+This uses `meta ads insights get`, writes the same raw CSV contract as the API sync, then runs ingest and report unless `--raw-only` is provided.
+
+The CLI sync defaults to a faster ad selection mode:
+
+```powershell
+python -m meta_ads_analysis sync-cli --account divine_designs --run-date 2026-06-16 --ad-filter active_or_recently_updated --max-workers 6
+```
+
+Filter options:
+
+- `active_or_recently_updated` skips old paused ads while keeping active and recently changed ads.
+- `active` only queries currently active/effectively active ads.
+- `all` queries every ad returned by the Meta CLI and is slowest.
+
+Use `--max-workers 1` for sequential calls if the Meta CLI or API starts rate-limiting parallel requests.
+
 ### Ingest and normalize exports
 
 ```powershell
@@ -173,6 +205,76 @@ This writes:
 - Markdown report: `reports/pollen_sense/2026-04-21/meta_ads_report.md`
 - JSON summary: `reports/pollen_sense/2026-04-21/meta_ads_report.json`
 
+### Propose account actions
+
+```powershell
+propose_meta_actions --account pollen_sense --run-date 2026-04-21
+```
+
+If the installed script is not on your `PATH`, use:
+
+```powershell
+python -m meta_ads_analysis propose-actions --account pollen_sense --run-date 2026-04-21
+```
+
+To include current live Meta status for ads in the plan:
+
+```powershell
+python -m meta_ads_analysis propose-actions --account pollen_sense --run-date 2026-04-21 --enrich-live-state
+```
+
+Live-state enrichment checks whether proposed ad-level actions are already resolved, for example when an ad is already paused.
+
+This reads `meta_ads_report.json` and writes:
+
+- Action plan: `reports/<account_slug>/<run_date>/action_plan.json`
+
+The action plan is intentionally approval-based. Executable actions start with:
+
+```json
+"status": "proposed"
+```
+
+To allow execution, review the rationale and evidence, then change only the intended actions to:
+
+```json
+"status": "approved"
+```
+
+V1 only executes conservative `pause_ad` actions for high-waste ads. Scaling, creative refreshes, and measurement concerns are logged as non-executable operator tasks until a human supplies exact budget or creative instructions.
+
+### Dry-run or apply approved actions
+
+Dry-run approved actions first:
+
+```powershell
+apply_meta_actions --account pollen_sense --run-date 2026-04-21
+```
+
+Actually execute approved actions through the installed Meta CLI:
+
+```powershell
+apply_meta_actions --account pollen_sense --run-date 2026-04-21 --execute
+```
+
+If the installed script is not on your `PATH`, use:
+
+```powershell
+python -m meta_ads_analysis apply-actions --account pollen_sense --run-date 2026-04-21 --execute
+```
+
+This writes a timestamped results log:
+
+- `reports/<account_slug>/<run_date>/action_results_<timestamp>.json`
+
+The executor uses the installed `meta` CLI and currently sends commands shaped like:
+
+```text
+meta --no-input -o json ads --ad-account-id <act_id> ad update <ad_id> --status paused
+```
+
+Meta AI / Advantage+ creative features are kept out of the action surface. The action executor only changes explicit status fields in approved actions and blocks parameters that try to set Meta AI or Advantage+ creative controls.
+
 ## What The Report Covers
 
 - Executive summary
@@ -203,6 +305,7 @@ That prompt tells the agent to:
 - Raw exports and generated reports are ignored by git by default because they usually contain sensitive business data.
 - ROAS quality depends on the measurement setup behind the ad account. If purchase value tracking is weak, the report will say so instead of pretending the numbers are clean.
 - The Meta API sync is read-only and uses `results` first, `app_installs` second, and ROAS only when revenue visibility is trustworthy.
+- Meta CLI execution is intentionally not automatic. Generate a plan, review it, approve specific actions, dry-run, then use `--execute`.
 
 See [AGENTS.md](/C:/van-and-kim-venture-strategy/meta-business-suite-analysis/AGENTS.md) for the analysis contract that Codex or another agent should follow when reviewing the generated data.
 

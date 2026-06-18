@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +227,139 @@ def sync_account_from_api(
     )
 
 
+def sync_account_from_cli(
+    *,
+    account_slug: str,
+    run_date: str,
+    raw_root: Path | None = None,
+    accounts_config_path: Path | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    meta_binary: str = "meta",
+    ad_filter: str = "active_or_recently_updated",
+    max_workers: int = 6,
+    runner: Any | None = None,
+) -> ApiSyncArtifacts:
+    effective_raw_root = raw_root or DEFAULT_RAW_ROOT
+    effective_accounts_config_path = accounts_config_path or DEFAULT_ACCOUNTS_CONFIG_PATH
+    account = resolve_account(account_slug, effective_accounts_config_path)
+    resolved_run_date = _require_date(run_date, "run_date")
+    resolved_date_from, resolved_date_to = resolve_date_window(
+        resolved_run_date,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    raw_dir = effective_raw_root / account.account_slug / resolved_run_date.isoformat()
+    ensure_dir(raw_dir)
+
+    warnings: list[str] = []
+    insights_fields = [
+        "account_id",
+        "account_name",
+        "campaign_id",
+        "campaign_name",
+        "adset_id",
+        "adset_name",
+        "ad_id",
+        "ad_name",
+        "date_start",
+        "date_stop",
+        "reach",
+        "impressions",
+        "frequency",
+        "clicks",
+        "inline_link_clicks",
+        "outbound_clicks",
+        "ctr",
+        "inline_link_click_ctr",
+        "cpc",
+        "cost_per_inline_link_click",
+        "cpm",
+        "spend",
+        "objective",
+        "actions",
+        "action_values",
+        "cost_per_action_type",
+        "purchase_roas",
+    ]
+    ad_list_command = [
+        meta_binary,
+        "--output",
+        "json",
+        "ads",
+        "--ad-account-id",
+        account.ad_account_id,
+        "ad",
+        "list",
+        "--limit",
+        "500",
+    ]
+    ad_rows = _extract_cli_data(_run_meta_cli_json(ad_list_command, runner=runner))
+    ad_rows_for_insights = _filter_cli_ads_for_sync(
+        ad_rows,
+        date_from=resolved_date_from,
+        mode=ad_filter,
+    )
+    if not ad_rows:
+        warnings.append("Meta CLI returned no ads from ad list; falling back to account-level insights.")
+    elif len(ad_rows_for_insights) < len(ad_rows):
+        warnings.append(
+            f"Meta CLI ad filter '{ad_filter}' selected {len(ad_rows_for_insights)} of {len(ad_rows)} ads for insights."
+        )
+
+    base_command = [
+        meta_binary,
+        "--output",
+        "json",
+        "ads",
+        "--ad-account-id",
+        account.ad_account_id,
+        "insights",
+        "get",
+        "--since",
+        resolved_date_from,
+        "--until",
+        resolved_date_to,
+        "--time-increment",
+        "daily",
+        "--fields",
+        ",".join(insights_fields),
+        "--limit",
+        "500",
+    ]
+    insights_rows: list[dict[str, Any]] = []
+    if ad_rows:
+        insights_rows = _fetch_cli_insights_for_ads(
+            base_command,
+            ad_rows_for_insights,
+            runner=runner,
+            max_workers=max_workers,
+        )
+    else:
+        payload = _run_meta_cli_json(base_command, runner=runner)
+        insights_rows = _extract_cli_data(payload)
+    performance_rows = [_build_performance_row(row, account, warnings) for row in insights_rows]
+    video_rows = [_build_video_row(row) for row in insights_rows]
+    creative_rows = _build_cli_creative_rows(ad_rows or insights_rows)
+
+    write_csv_rows(raw_dir / "performance_daily.csv", performance_rows, PERFORMANCE_HEADERS)
+    write_csv_rows(raw_dir / "video_daily.csv", video_rows, VIDEO_HEADERS)
+    write_csv_rows(raw_dir / "creative_lookup.csv", creative_rows, CREATIVE_HEADERS)
+
+    return ApiSyncArtifacts(
+        account=account,
+        run_date=resolved_run_date.isoformat(),
+        date_from=resolved_date_from,
+        date_to=resolved_date_to,
+        raw_dir=raw_dir,
+        performance_rows=performance_rows,
+        video_rows=video_rows,
+        creative_rows=creative_rows,
+        warnings=sorted(set(warnings)),
+        api_version="meta-cli",
+    )
+
+
 def write_api_sync_summary(
     artifacts: ApiSyncArtifacts,
     *,
@@ -254,6 +389,154 @@ def write_api_sync_summary(
     summary_path = artifacts.raw_dir / "api_sync_summary.json"
     write_json(summary_path, payload)
     return summary_path
+
+
+def _run_meta_cli_json(command: list[str], *, runner: Any | None = None) -> Any:
+    effective_runner = runner or subprocess.run
+    completed = effective_runner(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        detail = stderr or stdout or f"exit status {completed.returncode}"
+        raise RuntimeError(f"Meta CLI command failed: {detail}")
+    try:
+        return json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Meta CLI returned non-JSON output: {exc}") from exc
+
+
+def _extract_cli_data(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        return [item for item in payload["data"] if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _build_cli_creative_rows(insights_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for item in insights_rows:
+        ad_id = str(item.get("ad_id") or item.get("id") or "").strip()
+        ad_name = str(item.get("ad_name") or item.get("name") or "").strip()
+        if not ad_id and not ad_name:
+            continue
+        key = ad_id or ad_name
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "Ad ID": ad_id,
+                "Ad name": ad_name,
+                "Media type": "",
+                "Primary text": "",
+                "Headline": "",
+                "Launch date": "",
+                "Preview link": "",
+                "Post link": "",
+            }
+        )
+    return rows
+
+
+def _fetch_cli_insights_for_ads(
+    base_command: list[str],
+    ad_rows: list[dict[str, Any]],
+    *,
+    runner: Any | None,
+    max_workers: int,
+) -> list[dict[str, Any]]:
+    valid_ad_rows = [row for row in ad_rows if str(row.get("id") or "").strip()]
+    if runner is not None or max_workers <= 1 or len(valid_ad_rows) <= 1:
+        rows: list[dict[str, Any]] = []
+        for ad_row in valid_ad_rows:
+            rows.extend(_fetch_cli_insights_for_ad(base_command, ad_row, runner=runner))
+        return rows
+
+    worker_count = max(1, min(max_workers, len(valid_ad_rows)))
+    rows = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(_fetch_cli_insights_for_ad, base_command, ad_row, runner=None)
+            for ad_row in valid_ad_rows
+        ]
+        for future in futures:
+            rows.extend(future.result())
+    return rows
+
+
+def _fetch_cli_insights_for_ad(
+    base_command: list[str],
+    ad_row: dict[str, Any],
+    *,
+    runner: Any | None,
+) -> list[dict[str, Any]]:
+    ad_id = str(ad_row.get("id") or "").strip()
+    payload = _run_meta_cli_json([*base_command, "--ad-id", ad_id], runner=runner)
+    return [_merge_cli_ad_context(item, ad_row) for item in _extract_cli_data(payload)]
+
+
+def _filter_cli_ads_for_sync(
+    ad_rows: list[dict[str, Any]],
+    *,
+    date_from: str,
+    mode: str,
+) -> list[dict[str, Any]]:
+    if mode == "all":
+        return ad_rows
+    if mode not in {"active", "active_or_recently_updated"}:
+        raise ValueError("ad_filter must be one of: active_or_recently_updated, active, all.")
+
+    window_start = _require_date(date_from, "date_from")
+    selected: list[dict[str, Any]] = []
+    for row in ad_rows:
+        if _ad_is_activeish(row):
+            selected.append(row)
+            continue
+        if mode == "active_or_recently_updated" and _ad_changed_on_or_after(row, window_start):
+            selected.append(row)
+    return selected
+
+
+def _ad_is_activeish(row: dict[str, Any]) -> bool:
+    status = str(row.get("status") or "").upper()
+    effective_status = str(row.get("effective_status") or "").upper()
+    return status == "ACTIVE" or effective_status in {"ACTIVE", "WITH_ISSUES", "ADSET_PAUSED", "CAMPAIGN_PAUSED"}
+
+
+def _ad_changed_on_or_after(row: dict[str, Any], window_start: date) -> bool:
+    for key in ("updated_time", "created_time"):
+        parsed = _parse_cli_datetime(row.get(key))
+        if parsed is not None and parsed >= window_start:
+            return True
+    return False
+
+
+def _parse_cli_datetime(value: Any) -> date | None:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return parse_date(raw)
+
+
+def _merge_cli_ad_context(insights_row: dict[str, Any], ad_row: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(insights_row)
+    merged.setdefault("ad_id", ad_row.get("id"))
+    merged.setdefault("ad_name", ad_row.get("name"))
+    merged.setdefault("adset_id", ad_row.get("adset_id"))
+    merged.setdefault("campaign_id", ad_row.get("campaign_id"))
+    return merged
 
 
 def default_normalized_dir(run_date: str, account_slug: str) -> Path:
