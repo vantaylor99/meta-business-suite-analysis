@@ -230,7 +230,9 @@ def _summarize_ad(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "ad_id": rows[0].get("ad_id"),
         "ad_name": rows[0].get("ad_name"),
+        "campaign_id": rows[0].get("campaign_id"),
         "campaign_name": rows[0].get("campaign_name"),
+        "adset_id": rows[0].get("adset_id"),
         "adset_name": rows[0].get("adset_name"),
         "creative_type": rows[0].get("creative_type"),
         "tracking_confidence": _worst_tracking_confidence(rows),
@@ -796,7 +798,9 @@ def _serialize_ad_summary(summary: dict[str, Any]) -> dict[str, Any]:
     return {
         "ad_id": summary["ad_id"],
         "ad_name": summary["ad_name"],
+        "campaign_id": summary.get("campaign_id"),
         "campaign_name": summary["campaign_name"],
+        "adset_id": summary.get("adset_id"),
         "adset_name": summary["adset_name"],
         "creative_type": summary["creative_type"],
         "days_active": summary["days_active"],

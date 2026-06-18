@@ -20,6 +20,15 @@ from .actions import (
 )
 from .analyze import build_report_payload
 from .account_registry import resolve_account
+from .briefs import (
+    build_operator_brief,
+    default_operator_brief_json_path,
+    default_operator_brief_path,
+    find_previous_report_run,
+    load_plan,
+    load_report,
+    write_operator_brief,
+)
 from .config import DEFAULT_DB_PATH, DEFAULT_NORMALIZED_ROOT, DEFAULT_RAW_ROOT, DEFAULT_REPORTS_ROOT
 from .normalize import creative_fieldnames, ingest_raw_exports, normalized_fieldnames
 from .reporting import render_markdown_report
@@ -457,3 +466,91 @@ def apply_meta_actions_main() -> None:
     mode = "executed" if args.execute else "dry-run"
     print(f"Completed {mode} for {account_slug} on {run_date}: {results_path}")
     print(f"Runnable approved actions: {executed_or_ready}; blocked or failed: {blocked_or_failed}")
+
+
+def operator_brief_main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Build a concise operator brief from an action plan and report."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument(
+        "--run-date",
+        help="Report run date. Defaults to latest reports/<account_slug>/YYYY-MM-DD folder.",
+    )
+    parser.add_argument(
+        "--reports-root",
+        default=str(DEFAULT_REPORTS_ROOT),
+        help="Reports root. Defaults to reports/.",
+    )
+    parser.add_argument(
+        "--plan-path",
+        help="Override action plan path. Defaults to reports/<account>/<run_date>/action_plan.json.",
+    )
+    parser.add_argument(
+        "--report-path",
+        help="Override report JSON path. Defaults to reports/<account>/<run_date>/meta_ads_report.json.",
+    )
+    parser.add_argument(
+        "--output-path",
+        help="Override Markdown brief path. Defaults to reports/<account>/<run_date>/operator_brief.md.",
+    )
+    parser.add_argument(
+        "--json-output-path",
+        help="Override JSON brief path. Defaults to reports/<account>/<run_date>/operator_brief.json.",
+    )
+    parser.add_argument(
+        "--no-previous",
+        action="store_true",
+        help="Skip comparison against the previous report run.",
+    )
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    reports_root = Path(args.reports_root)
+    run_date = args.run_date or find_latest_report_run(account_slug, reports_root)
+    plan_path = Path(args.plan_path) if args.plan_path else default_action_plan_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    report_path = Path(args.report_path) if args.report_path else (
+        reports_root / account_slug / run_date / "meta_ads_report.json"
+    )
+    if not plan_path.exists():
+        raise SystemExit(f"Action plan not found: {plan_path}. Run propose-actions first.")
+    if not report_path.exists():
+        raise SystemExit(f"Report JSON not found: {report_path}. Run report first.")
+
+    previous_plan = None
+    previous_report = None
+    if not args.no_previous:
+        previous_run = find_previous_report_run(account_slug, run_date, reports_root)
+        if previous_run:
+            previous_plan_path = default_action_plan_path(account_slug, previous_run, reports_root)
+            previous_report_path = reports_root / account_slug / previous_run / "meta_ads_report.json"
+            if previous_plan_path.exists():
+                previous_plan = load_plan(previous_plan_path)
+            if previous_report_path.exists():
+                previous_report = load_report(previous_report_path)
+
+    brief = build_operator_brief(
+        plan=load_plan(plan_path),
+        report=load_report(report_path),
+        previous_plan=previous_plan,
+        previous_report=previous_report,
+    )
+    markdown_path = Path(args.output_path) if args.output_path else default_operator_brief_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    json_path = (
+        Path(args.json_output_path)
+        if args.json_output_path
+        else default_operator_brief_json_path(account_slug, run_date, reports_root)
+    )
+    write_operator_brief(brief=brief, markdown_path=markdown_path, json_path=json_path)
+    print(f"Wrote operator brief for {account_slug} on {run_date}: {markdown_path}")
+    print(f"Brief JSON: {json_path}")

@@ -24,6 +24,7 @@ class MetaAdsAccount:
     secondary_metric_label: str | None = None
     roas_role: str | None = None
     analysis_notes: str | None = None
+    action_policy: dict[str, object] | None = None
 
 
 def load_account_registry(
@@ -52,6 +53,13 @@ def load_account_registry(
             focus = measurement_focus
         else:
             raise ValueError("measurement_focus must be an object when provided.")
+        action_policy = item.get("action_policy")
+        if action_policy is None:
+            policy = {}
+        elif isinstance(action_policy, dict):
+            policy = action_policy
+        else:
+            raise ValueError("action_policy must be an object when provided.")
         account_slug = slugify_name(str(item.get("account_slug") or item.get("account_name") or ""))
         if account_slug in accounts:
             raise ValueError(f"Duplicate account_slug in registry: {account_slug}")
@@ -81,6 +89,7 @@ def load_account_registry(
             secondary_metric_label=_none_if_blank(focus.get("secondary_metric_label")),
             roas_role=_none_if_blank(focus.get("roas_role")),
             analysis_notes=_none_if_blank(focus.get("analysis_notes")),
+            action_policy=policy,
         )
     if not accounts:
         raise ValueError("Account registry is empty.")

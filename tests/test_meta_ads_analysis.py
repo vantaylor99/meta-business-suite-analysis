@@ -15,6 +15,7 @@ from meta_ads_analysis.actions import (
 )
 from meta_ads_analysis.account_registry import load_account_registry, resolve_account
 from meta_ads_analysis.analyze import build_report_payload
+from meta_ads_analysis.briefs import build_operator_brief, render_operator_brief
 from meta_ads_analysis.cli import build_meta_report_main, ingest_meta_exports_main, sync_meta_api_main
 from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
@@ -939,6 +940,318 @@ def test_action_plan_proposes_approved_pause_path_for_high_waste_ad() -> None:
     assert "Advantage+ creative enhancements" in plan["guardrails"]["meta_ai_features"]["keep_disabled"]
 
 
+def test_action_plan_uses_pollen_policy_for_medium_waste_pause(tmp_path: Path, monkeypatch) -> None:
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "pollen_sense",
+                        "account_name": "Pollen Sense",
+                        "ad_account_id": "12345",
+                        "action_policy": {
+                            "primary_goal": "maximize_in_app_subscriptions",
+                            "pause_if_no_primary_and_secondary_cost_above": 3.0,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    payload = {
+        "account_slug": "pollen_sense",
+        "run_date": "2026-06-16",
+        "budget_waste": [
+            {
+                "ad_id": "install-expensive",
+                "ad_name": "Install Expensive",
+                "total_spend": 120.0,
+                "total_results": 0.0,
+                "total_app_installs": 10.0,
+                "cost_per_app_install": 12.0,
+                "waste_score": 50.0,
+                "waste_status": "medium",
+                "waste_reasons": ["install fallback is expensive"],
+            }
+        ],
+        "fatigue_findings": [],
+        "scaling_candidates": [],
+        "tracking_concerns": [],
+    }
+
+    plan = build_action_plan(payload)
+
+    pause = next(action for action in plan["actions"] if action["action_type"] == "pause_ad")
+    assert pause["target"]["id"] == "install-expensive"
+    assert "app-install fallback" in pause["rationale"]
+
+
+def test_action_plan_builds_divine_budget_increase_candidate(tmp_path: Path, monkeypatch) -> None:
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "divine_designs",
+                        "account_name": "Divine Designs",
+                        "ad_account_id": "act_555",
+                        "action_policy": {
+                            "primary_goal": "roas",
+                            "scale_roas_floor": 3.0,
+                            "max_budget_increase_percent": 20,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    payload = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-16",
+        "budget_waste": [],
+        "fatigue_findings": [],
+        "scaling_candidates": [
+            {
+                "ad_id": "ad-1",
+                "ad_name": "Scale Ad",
+                "campaign_id": "campaign-1",
+                "campaign_name": "Campaign",
+                "adset_id": "adset-1",
+                "adset_name": "Ad Set",
+                "scaling_candidate": True,
+                "scaling_score": 80.0,
+                "total_spend": 500.0,
+                "total_results": 50.0,
+                "cost_per_result": 10.0,
+                "blended_roas": 3.5,
+            }
+        ],
+        "tracking_concerns": [],
+    }
+
+    plan = build_action_plan(payload)
+
+    budget = next(action for action in plan["actions"] if action["action_type"] == "increase_adset_budget")
+    assert budget["target"]["id"] == "adset-1"
+    assert budget["params"]["max_increase_percent"] == 20
+    assert budget["params"]["new_daily_budget_cents"] is None
+    assert budget["executable"] is False
+
+
+def test_report_to_action_plan_preserves_adset_id_for_divine_scale_policy(tmp_path: Path, monkeypatch) -> None:
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "divine_designs",
+                        "account_name": "Divine Designs",
+                        "ad_account_id": "act_555",
+                        "action_policy": {
+                            "primary_goal": "roas",
+                            "scale_roas_floor": 3.0,
+                            "max_budget_increase_percent": 20,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    rows = [
+        {
+            "report_date": date(2026, 6, 1),
+            "campaign_id": "campaign-1",
+            "campaign_name": "Scale Campaign",
+            "adset_id": "adset-winner",
+            "adset_name": "Scale Set",
+            "ad_id": "winner",
+            "ad_name": "Scale Winner",
+            "creative_type": "Video",
+            "spend": 100.0,
+            "purchase_value": 400.0,
+            "purchase_count": 20.0,
+            "results": 20.0,
+            "result_label": "Website purchases",
+            "app_installs": 0.0,
+            "impressions": 10000,
+            "outbound_clicks": 500,
+            "frequency": 1.1,
+            "video_3s_plays": 4500,
+            "thruplays": 2000,
+            "has_video_metrics": True,
+            "tracking_confidence": "high",
+        },
+        {
+            "report_date": date(2026, 6, 1),
+            "campaign_id": "campaign-1",
+            "campaign_name": "Scale Campaign",
+            "adset_id": "adset-laggard",
+            "adset_name": "Laggard Set",
+            "ad_id": "laggard",
+            "ad_name": "Laggard",
+            "creative_type": "Video",
+            "spend": 100.0,
+            "purchase_value": 100.0,
+            "purchase_count": 5.0,
+            "results": 5.0,
+            "result_label": "Website purchases",
+            "app_installs": 0.0,
+            "impressions": 10000,
+            "outbound_clicks": 250,
+            "frequency": 1.1,
+            "video_3s_plays": 2500,
+            "thruplays": 800,
+            "has_video_metrics": True,
+            "tracking_confidence": "high",
+        },
+    ]
+
+    report = build_report_payload(rows, "2026-06-16")
+    report["account_slug"] = "divine_designs"
+    plan = build_action_plan(report)
+
+    budget = next(action for action in plan["actions"] if action["action_type"] == "increase_adset_budget")
+    assert budget["target"]["id"] == "adset-winner"
+    assert budget["target"]["source_ad_id"] == "winner"
+
+
+def test_operator_brief_separates_review_manual_and_meta_ai_followups() -> None:
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-16",
+        "account_action_policy": {
+            "primary_goal": "roas",
+            "target_roas": 3.0,
+        },
+        "actions": [
+            {
+                "action_id": "pause_ad_1",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "target": {"type": "ad", "id": "ad-1", "name": "Bad Ad"},
+                "params": {"status": "paused"},
+                "rationale": "ROAS is below the account floor.",
+            },
+            {
+                "action_id": "increase_adset_budget_1",
+                "action_type": "increase_adset_budget",
+                "status": "approved",
+                "executable": True,
+                "target": {"type": "adset", "id": "adset-1", "name": "Scale Set"},
+                "params": {
+                    "current_daily_budget_cents": 10000,
+                    "new_daily_budget_cents": 12000,
+                    "max_increase_percent": 20,
+                },
+                "rationale": "ROAS meets the scale floor.",
+            },
+            {
+                "action_id": "disable_meta_ai_controls_adset-2",
+                "action_type": "disable_meta_ai_controls",
+                "status": "proposed",
+                "executable": False,
+                "target": {"type": "adset", "id": "adset-2", "name": "Automated Set"},
+                "params": {},
+                "rationale": "Advantage controls were detected.",
+            },
+        ],
+    }
+    previous_plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-05-04",
+        "actions": [
+            {
+                "action_id": "pause_ad_old",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+            }
+        ],
+    }
+    report = {
+        "run_date": "2026-06-16",
+        "account_summary": {
+            "total_spend": 200.0,
+            "total_results": 25.0,
+            "total_app_installs": 0.0,
+            "blended_roas": 2.5,
+        },
+    }
+    previous_report = {
+        "run_date": "2026-05-04",
+        "account_summary": {
+            "total_spend": 150.0,
+            "total_results": 10.0,
+            "total_app_installs": 0.0,
+            "blended_roas": 1.5,
+        },
+    }
+
+    brief = build_operator_brief(
+        plan=plan,
+        report=report,
+        previous_plan=previous_plan,
+        previous_report=previous_report,
+    )
+    markdown = render_operator_brief(brief)
+
+    assert brief["summary"]["approved_executable_count"] == 1
+    assert brief["ready_for_review"][0]["action_id"] == "pause_ad_1"
+    assert brief["approved_to_execute"][0]["action_id"] == "increase_adset_budget_1"
+    assert brief["meta_ai_followups"][0]["action_id"] == "disable_meta_ai_controls_adset-2"
+    assert "Optimize toward 3 blended ROAS or better." in markdown
+    assert "Spend change: +50.00" in markdown
+
+
+def test_operator_brief_moves_failed_live_lookup_to_do_not_touch() -> None:
+    plan = {
+        "account_slug": "pollen_sense",
+        "run_date": "2026-05-04",
+        "account_action_policy": {
+            "primary_goal": "maximize_in_app_subscriptions",
+            "secondary_cost_per_app_install_target": 3.0,
+        },
+        "actions": [
+            {
+                "action_id": "pause_ad_1",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "target": {"type": "ad", "id": "ad-1", "name": "Needs Live Check"},
+                "params": {"status": "paused"},
+                "rationale": "Waste risk.",
+                "live_state": {"lookup_status": "failed", "error": "network unavailable"},
+            },
+            {
+                "action_id": "refresh_creative_1",
+                "action_type": "refresh_creative",
+                "status": "proposed",
+                "executable": False,
+                "target": {"type": "ad", "id": "ad-2", "name": "Tired Creative"},
+                "params": {},
+                "rationale": "Creative fatigue.",
+                "live_state": {"lookup_status": "failed", "error": "network unavailable"},
+            }
+        ],
+    }
+
+    brief = build_operator_brief(plan=plan)
+
+    assert brief["ready_for_review"] == []
+    assert brief["do_not_touch_yet"][0]["action_id"] == "pause_ad_1"
+    assert brief["needs_human_judgment"][0]["action_id"] == "refresh_creative_1"
+
+
 def test_meta_cli_command_only_allows_explicit_pause_without_meta_ai_params() -> None:
     action = {
         "action_type": "pause_ad",
@@ -970,6 +1283,43 @@ def test_meta_cli_command_only_allows_explicit_pause_without_meta_ai_params() ->
         assert "Meta AI" in str(exc)
     else:
         raise AssertionError("Expected Meta AI guardrail to block action")
+
+
+def test_meta_cli_command_allows_capped_adset_budget_increase() -> None:
+    action = {
+        "action_type": "increase_adset_budget",
+        "target": {"id": "adset-1"},
+        "params": {
+            "current_daily_budget_cents": 10000,
+            "new_daily_budget_cents": 12000,
+            "max_increase_percent": 20,
+        },
+    }
+
+    command = build_meta_cli_command(action, "act_999", meta_binary="meta")
+
+    assert command == [
+        "meta",
+        "--no-input",
+        "-o",
+        "json",
+        "ads",
+        "--ad-account-id",
+        "act_999",
+        "adset",
+        "update",
+        "adset-1",
+        "--daily-budget",
+        "12000",
+    ]
+
+    action["params"]["new_daily_budget_cents"] = 13000
+    try:
+        build_meta_cli_command(action, "act_999")
+    except ValueError as exc:
+        assert "exceeds max increase" in str(exc)
+    else:
+        raise AssertionError("Expected budget cap guardrail to block action")
 
 
 def test_apply_action_plan_dry_run_requires_approval(tmp_path: Path, monkeypatch) -> None:
@@ -1087,6 +1437,128 @@ def test_live_state_enrichment_marks_only_ad_status_paused_as_resolved(tmp_path:
     assert by_id["pause_ad_2"]["status"] == "proposed"
     assert by_id["pause_ad_2"]["executable"] is True
     assert by_id["pause_ad_2"]["live_state"]["effective_status"] == "ADSET_PAUSED"
+
+
+def test_live_state_enrichment_redacts_meta_cli_tokens_on_failure(tmp_path: Path, monkeypatch) -> None:
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "pollen_sense",
+                        "account_name": "Pollen Sense",
+                        "ad_account_id": "12345",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    plan = {
+        "account_slug": "pollen_sense",
+        "run_date": "2026-06-16",
+        "actions": [
+            {
+                "action_id": "pause_ad_1",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "target": {"type": "ad", "id": "ad-1"},
+                "params": {"status": "paused"},
+            }
+        ],
+    }
+
+    def fake_runner(command, check, capture_output, text):
+        return Mock(
+            returncode=1,
+            stdout="",
+            stderr=(
+                "GET /v25.0/ad-1?access_token=EAAabcdefghijklmnopqrstuvwx1234567890&fields=name "
+                "token EAAabcdefghijklmnopqrstuvwx1234567890"
+            ),
+        )
+
+    enriched = enrich_action_plan_with_live_state(plan, runner=fake_runner)
+    error = enriched["actions"][0]["live_state"]["error"]
+
+    assert "EAAabcdefghijklmnopqrstuvwx1234567890" not in error
+    assert "access_token=[REDACTED]" in error
+    assert "[REDACTED_META_TOKEN]" in error
+
+
+def test_live_state_enrichment_flags_meta_ai_adset_controls(tmp_path: Path, monkeypatch) -> None:
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "divine_designs",
+                        "account_name": "Divine Designs",
+                        "ad_account_id": "12345",
+                        "action_policy": {"disable_meta_ai_features": True},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-16",
+        "account_action_policy": {"disable_meta_ai_features": True},
+        "actions": [
+            {
+                "action_id": "consider_scale_budget_1",
+                "action_type": "consider_scale_budget",
+                "status": "proposed",
+                "executable": False,
+                "target": {"type": "ad", "id": "ad-1"},
+                "params": {},
+            }
+        ],
+    }
+
+    def fake_runner(command, check, capture_output, text):
+        if command[-2:] == ["ad", "get"] or command[-3] == "ad":
+            return Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": "ad-1",
+                            "name": "Ad 1",
+                            "status": "ACTIVE",
+                            "effective_status": "ACTIVE",
+                            "adset_id": "adset-1",
+                        }
+                    ]
+                ),
+                stderr="",
+            )
+        return Mock(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": "adset-1",
+                        "name": "Ad Set 1",
+                        "status": "ACTIVE",
+                        "effective_status": "ACTIVE",
+                        "targeting": '{"targeting_automation":{"advantage_audience":1}}',
+                    }
+                ]
+            ),
+            stderr="",
+        )
+
+    enriched = enrich_action_plan_with_live_state(plan, runner=fake_runner)
+
+    assert any(action["action_type"] == "disable_meta_ai_controls" for action in enriched["actions"])
 
 
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:

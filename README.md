@@ -223,7 +223,7 @@ To include current live Meta status for ads in the plan:
 python -m meta_ads_analysis propose-actions --account pollen_sense --run-date 2026-04-21 --enrich-live-state
 ```
 
-Live-state enrichment checks whether proposed ad-level actions are already resolved, for example when an ad is already paused.
+Live-state enrichment checks whether proposed ad-level actions are already resolved, for example when an ad is already paused. It also checks ad set state for current daily budgets and signs of Meta AI / Advantage audience automation.
 
 This reads `meta_ads_report.json` and writes:
 
@@ -241,7 +241,12 @@ To allow execution, review the rationale and evidence, then change only the inte
 "status": "approved"
 ```
 
-V1 only executes conservative `pause_ad` actions for high-waste ads. Scaling, creative refreshes, and measurement concerns are logged as non-executable operator tasks until a human supplies exact budget or creative instructions.
+Executable actions are conservative:
+
+- `pause_ad` for high-waste ads or account-policy waste risk.
+- `increase_adset_budget` for qualifying scale candidates, capped by the account policy and requiring live current-budget evidence before execution.
+
+Creative refreshes, measurement concerns, and Meta AI / Advantage control remediation are logged as non-executable operator tasks until a human supplies exact instructions or the Meta CLI exposes a safe explicit field.
 
 ### Dry-run or apply approved actions
 
@@ -271,9 +276,30 @@ The executor uses the installed `meta` CLI and currently sends commands shaped l
 
 ```text
 meta --no-input -o json ads --ad-account-id <act_id> ad update <ad_id> --status paused
+meta --no-input -o json ads --ad-account-id <act_id> adset update <adset_id> --daily-budget <cents>
 ```
 
-Meta AI / Advantage+ creative features are kept out of the action surface. The action executor only changes explicit status fields in approved actions and blocks parameters that try to set Meta AI or Advantage+ creative controls.
+Meta AI / Advantage+ features are kept out of the execution surface by default. The action executor only changes explicit approved fields and blocks parameters that try to set Meta AI or Advantage+ controls.
+
+Account action goals are configured in `config/meta_ads_accounts.json`:
+
+- Pollen Sense prioritizes in-app subscription results first, then app installs at a `$3` target.
+- Divine Designs optimizes toward `3.0` blended ROAS or better.
+
+### Build an operator brief
+
+After generating an action plan, build the short human review brief:
+
+```powershell
+python -m meta_ads_analysis operator-brief --account divine_designs --run-date 2026-06-16
+```
+
+This writes:
+
+- `reports/<account_slug>/<run_date>/operator_brief.md`
+- `reports/<account_slug>/<run_date>/operator_brief.json`
+
+The brief summarizes the account goal, what changed from the previous run, what is ready for approval, what is already approved to execute, what still needs human judgment, and any Meta AI / Advantage follow-ups.
 
 ## What The Report Covers
 
@@ -306,6 +332,7 @@ That prompt tells the agent to:
 - ROAS quality depends on the measurement setup behind the ad account. If purchase value tracking is weak, the report will say so instead of pretending the numbers are clean.
 - The Meta API sync is read-only and uses `results` first, `app_installs` second, and ROAS only when revenue visibility is trustworthy.
 - Meta CLI execution is intentionally not automatic. Generate a plan, review it, approve specific actions, dry-run, then use `--execute`.
+- Use `propose-actions --enrich-live-state` before approving budget increases so the plan has current live ad set budgets.
 
 See [AGENTS.md](/C:/van-and-kim-venture-strategy/meta-business-suite-analysis/AGENTS.md) for the analysis contract that Codex or another agent should follow when reviewing the generated data.
 

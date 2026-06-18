@@ -13,6 +13,19 @@
         "roas_role": "supporting_only_until_subscription_value_is_stable",
         "analysis_notes": "Optimize for recorded in-app subscriptions first. Use app installs as the secondary fallback when subscription volume is sparse or revenue reporting is still stabilizing."
       },
+      "action_policy": {
+        "primary_goal": "maximize_in_app_subscriptions",
+        "primary_metric": "results",
+        "primary_result_label": "In-app subscriptions",
+        "primary_result_cost_cap": null,
+        "secondary_metric": "app_installs",
+        "secondary_cost_per_app_install_target": 3.0,
+        "pause_if_no_primary_and_secondary_cost_above": 3.0,
+        "scale_if_primary_results_at_least": 1,
+        "max_budget_increase_percent": 20,
+        "disable_meta_ai_features": true,
+        "operator_brief_todo": true
+      },
       "notes": "Replace with the real Meta ad account ID before using sync-api."
     },
     {
@@ -27,6 +40,16 @@
         "secondary_metric_label": "Outbound clicks",
         "roas_role": "supporting_metric_when_purchase_value_is_trustworthy",
         "analysis_notes": "Optimize for purchases first. Use outbound clicks as a diagnostic secondary signal for under-attributed creatives, not as a replacement for purchase efficiency."
+      },
+      "action_policy": {
+        "primary_goal": "roas",
+        "primary_metric": "blended_roas",
+        "target_roas": 3.0,
+        "pause_roas_floor": 1.5,
+        "scale_roas_floor": 3.0,
+        "max_budget_increase_percent": 20,
+        "disable_meta_ai_features": true,
+        "operator_brief_todo": true
       },
       "notes": "Replace with the real Meta ad account ID before using sync-api."
     }
