@@ -15,6 +15,7 @@ because custom-audience swaps may be treated only as suggestions there.
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,7 +23,7 @@ from typing import Any
 
 from . import account_registry
 from .config import DEFAULT_REPORTS_ROOT
-from .meta_api import MetaMarketingApiClient
+from .meta_api import MetaApiError, MetaMarketingApiClient
 from .utils import ensure_dir, write_json
 
 PROPOSED_STATUS = "proposed"
@@ -248,8 +249,16 @@ def apply_rotation_plan(
     client: MetaMarketingApiClient,
     *,
     execute: bool,
+    validate_only: bool = False,
 ) -> list[RotationResult]:
-    """Dry-run or execute approved rotations, re-reading live targeting per ad set."""
+    """Dry-run, validate against Meta, or execute approved rotations.
+
+    - ``validate_only=True``: send each approved rotation to Meta with
+      ``execution_options=['validate_only']`` — a real round-trip that returns Meta's
+      validation result but changes nothing. Takes precedence over ``execute``.
+    - ``execute=True``: perform the real write.
+    - otherwise: a local dry run that records the targeting that would be sent.
+    """
     results: list[RotationResult] = []
     for rotation in plan.get("rotations") or []:
         if not isinstance(rotation, dict):
@@ -290,11 +299,27 @@ def apply_rotation_plan(
             new_excluded_ids=list(rotation.get("new_excluded") or []),
             disable_advantage_audience=bool(rotation.get("disable_advantage_audience")),
         )
+        if validate_only:
+            try:
+                response = client.update_adset(
+                    adset_id, params={"targeting": new_targeting}, validate_only=True
+                )
+            except MetaApiError as exc:
+                results.append(
+                    RotationResult(adset_id, "validation_failed", targeting=new_targeting, reason=str(exc))
+                )
+                continue
+            results.append(RotationResult(adset_id, "validated", targeting=new_targeting, response=response))
+            continue
         if not execute:
             results.append(RotationResult(adset_id, "dry_run", targeting=new_targeting))
             continue
 
-        response = client.update_adset(adset_id, params={"targeting": new_targeting})
+        try:
+            response = client.update_adset(adset_id, params={"targeting": new_targeting})
+        except MetaApiError as exc:
+            results.append(RotationResult(adset_id, "failed", targeting=new_targeting, reason=str(exc)))
+            continue
         results.append(RotationResult(adset_id, EXECUTED_STATUS, targeting=new_targeting, response=response))
     return results
 
@@ -339,6 +364,196 @@ def write_rotation_results(
                 "adset_id": item.adset_id,
                 "status": item.status,
                 "targeting": item.targeting,
+                "reason": item.reason,
+                "response": item.response,
+            }
+            for item in results
+        ],
+    }
+    ensure_dir(output_path.parent)
+    write_json(output_path, payload)
+    return output_path
+
+
+# --- Ad set rename ----------------------------------------------------------
+
+ADSET_NAME_FIELDS = ["id", "name"]
+
+
+@dataclass(slots=True)
+class RenameResult:
+    adset_id: str
+    status: str
+    old_name: str | None = None
+    new_name: str | None = None
+    reason: str | None = None
+    response: dict[str, Any] | None = None
+
+
+def friendly_audience_name(included_refs: list[dict[str, str]], names: dict[str, str]) -> str | None:
+    """Derive a human ad set name from the included audiences, preferring the seed list.
+
+    "high-value-customers.csv" -> "High Value Customers". Lookalike entries are only
+    used if no seed (non-lookalike) audience is present.
+    """
+    labels = [ref.get("name") or names.get(ref["id"], "") for ref in included_refs]
+    labels = [label for label in labels if label]
+    if not labels:
+        return None
+    seed = next((label for label in labels if not label.lower().startswith("lookalike")), labels[0])
+    base = re.sub(r"\.csv$", "", seed, flags=re.IGNORECASE)
+    base = base.replace("-facebook-fixed", "").replace("_", " ").replace("-", " ")
+    base = re.sub(r"\s+", " ", base).strip()
+    return base.title() if base else None
+
+
+def build_rename_plan(
+    adsets: list[dict[str, Any]],
+    *,
+    account_slug: str,
+    ad_account_id: str,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Propose a name per ad set derived from its current included audience.
+
+    Run this AFTER a rotation so names reflect what each ad set now targets.
+    ``overrides`` maps adset_id -> explicit name and wins over the derived name.
+    """
+    overrides = overrides or {}
+    summaries = summarize_adsets(adsets)
+    names = _name_map(summaries)
+    warnings: list[str] = []
+    renames: list[dict[str, Any]] = []
+    for summary in summaries:
+        adset_id = summary["adset_id"]
+        old_name = summary["adset_name"]
+        proposed = overrides.get(adset_id) or friendly_audience_name(summary["included"], names)
+        if not proposed:
+            warnings.append(f"Ad set {adset_id} ({old_name}) has no included audience to derive a name from; skipped.")
+            continue
+        renames.append(
+            {
+                "adset_id": adset_id,
+                "status": PROPOSED_STATUS,
+                "old_name": old_name,
+                "new_name": proposed,
+                "included": [names.get(i, i) for i in _ids(summary["included"])],
+                "unchanged": proposed == old_name,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "plan_type": "adset_rename",
+        "account_slug": account_slug,
+        "ad_account_id": ad_account_id,
+        "generated_at": _now_iso(),
+        "approval_instructions": (
+            "Review each rename. To allow it, set its status to 'approved'. Only approved "
+            "renames are sent to Meta, and only with --execute (or tested with --validate-only)."
+        ),
+        "guardrails": {"requires_explicit_approval": True, "writes_only_name": True},
+        "warnings": warnings,
+        "renames": renames,
+    }
+
+
+def apply_rename_plan(
+    plan: dict[str, Any],
+    client: MetaMarketingApiClient,
+    *,
+    execute: bool,
+    validate_only: bool = False,
+) -> list[RenameResult]:
+    """Dry-run, validate, or execute approved ad set renames (writes only the name field)."""
+    results: list[RenameResult] = []
+    for rename in plan.get("renames") or []:
+        if not isinstance(rename, dict):
+            continue
+        adset_id = str(rename.get("adset_id") or "unknown")
+        old_name = rename.get("old_name")
+        new_name = str(rename.get("new_name") or "")
+        if rename.get("status") != APPROVED_STATUS:
+            results.append(RenameResult(adset_id, "skipped", old_name, new_name, reason="Rename is not approved."))
+            continue
+        if not new_name or new_name == old_name:
+            results.append(RenameResult(adset_id, "skipped", old_name, new_name, reason="Name is unchanged."))
+            continue
+
+        live = client.get_adset(adset_id, fields=ADSET_NAME_FIELDS)
+        if live.get("name") != old_name:
+            results.append(
+                RenameResult(
+                    adset_id,
+                    "blocked",
+                    old_name,
+                    new_name,
+                    reason=f"Live name changed since the plan was built (live={live.get('name')!r}). Re-propose.",
+                )
+            )
+            continue
+
+        if validate_only:
+            try:
+                response = client.update_adset(adset_id, params={"name": new_name}, validate_only=True)
+            except MetaApiError as exc:
+                results.append(RenameResult(adset_id, "validation_failed", old_name, new_name, reason=str(exc)))
+                continue
+            results.append(RenameResult(adset_id, "validated", old_name, new_name, response=response))
+            continue
+        if not execute:
+            results.append(RenameResult(adset_id, "dry_run", old_name, new_name))
+            continue
+
+        try:
+            response = client.update_adset(adset_id, params={"name": new_name})
+        except MetaApiError as exc:
+            results.append(RenameResult(adset_id, "failed", old_name, new_name, reason=str(exc)))
+            continue
+        results.append(RenameResult(adset_id, EXECUTED_STATUS, old_name, new_name, response=response))
+    return results
+
+
+def default_rename_plan_path(
+    account_slug: str,
+    run_date: str,
+    reports_root: Path = DEFAULT_REPORTS_ROOT,
+) -> Path:
+    return reports_root / account_slug / run_date / "rename_plan.json"
+
+
+def default_rename_results_path(
+    account_slug: str,
+    run_date: str,
+    reports_root: Path = DEFAULT_REPORTS_ROOT,
+) -> Path:
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return reports_root / account_slug / run_date / f"rename_results_{timestamp}.json"
+
+
+def write_rename_plan(plan: dict[str, Any], output_path: Path) -> Path:
+    write_json(output_path, plan)
+    return output_path
+
+
+def write_rename_results(
+    *,
+    plan: dict[str, Any],
+    results: list[RenameResult],
+    output_path: Path,
+    execute: bool,
+) -> Path:
+    payload = {
+        "schema_version": 1,
+        "plan_type": "adset_rename",
+        "account_slug": plan.get("account_slug"),
+        "executed": execute,
+        "generated_at": _now_iso(),
+        "results": [
+            {
+                "adset_id": item.adset_id,
+                "status": item.status,
+                "old_name": item.old_name,
+                "new_name": item.new_name,
                 "reason": item.reason,
                 "response": item.response,
             }

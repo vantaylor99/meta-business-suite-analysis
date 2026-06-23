@@ -1399,8 +1399,8 @@ class _FakeClient:
     def get_adset(self, adset_id, *, fields):
         return self._by_id[adset_id]
 
-    def update_adset(self, adset_id, *, params):
-        self.updates.append((adset_id, params))
+    def update_adset(self, adset_id, *, params, validate_only=False):
+        self.updates.append((adset_id, params, validate_only))
         return {"id": adset_id, "success": True}
 
 
@@ -1463,8 +1463,9 @@ def test_apply_rotation_execute_writes_full_targeting_for_approved_only() -> Non
     assert statuses["as1"] == "executed"
     assert statuses["as2"] == "skipped"
     assert len(client.updates) == 1
-    adset_id, params = client.updates[0]
+    adset_id, params, validate_only = client.updates[0]
     assert adset_id == "as1"
+    assert validate_only is False
     # The full targeting object is sent, not just the audience fields.
     assert params["targeting"]["geo_locations"] == {"countries": ["US"]}
     assert params["targeting"]["custom_audiences"] == [{"id": "C"}]
@@ -1523,5 +1524,105 @@ def test_rotation_plan_disable_flag_writes_advantage_off_on_apply() -> None:
     results = apply_rotation_plan(plan, client, execute=True)
 
     assert {r.status for r in results} == {"executed"}
-    for _adset_id, params in client.updates:
+    for _adset_id, params, _validate_only in client.updates:
         assert params["targeting"]["targeting_automation"]["advantage_audience"] == 0
+
+
+from meta_ads_analysis.rotation import (
+    apply_rename_plan,
+    build_rename_plan,
+    friendly_audience_name,
+)
+
+
+def test_update_adset_validate_only_injects_execution_options() -> None:
+    resp = Mock()
+    resp.status_code = 200
+    resp.json.return_value = {"success": True}
+    session = Mock()
+    session.post.return_value = resp
+
+    client = MetaMarketingApiClient("token", session=session)
+    client.update_adset("as1", params={"name": "New Name"}, validate_only=True)
+
+    _args, kwargs = session.post.call_args
+    data = kwargs["data"]
+    assert data["name"] == "New Name"
+    assert data["execution_options"] == json.dumps(["validate_only"])
+
+    # Without the flag, no execution_options is sent.
+    client.update_adset("as1", params={"name": "New Name"})
+    assert "execution_options" not in session.post.call_args.kwargs["data"]
+
+
+def test_apply_rotation_validate_only_sends_validate_flag_and_does_not_execute() -> None:
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    for rotation in plan["rotations"]:
+        rotation["status"] = "approved"
+    client = _FakeClient(adsets)
+
+    results = apply_rotation_plan(plan, client, execute=False, validate_only=True)
+
+    assert {r.status for r in results} == {"validated"}
+    assert len(client.updates) == 3
+    assert all(validate_only is True for _id, _params, validate_only in client.updates)
+
+
+def test_friendly_audience_name_prefers_seed_over_lookalike() -> None:
+    refs = [
+        {"id": "1", "name": "Lookalike (1%) - high-value-customers.csv"},
+        {"id": "2", "name": "high-value-customers-facebook-fixed.csv"},
+    ]
+    assert friendly_audience_name(refs, {}) == "High Value Customers"
+
+
+def test_build_and_apply_rename_plan_writes_only_name() -> None:
+    adsets = [
+        {
+            "id": "as1",
+            "name": "Stills",
+            "effective_status": "ACTIVE",
+            "campaign_id": "c1",
+            "targeting": {
+                "custom_audiences": [
+                    {"id": "1", "name": "high-value-customers.csv"},
+                    {"id": "2", "name": "Lookalike (1%) - high-value-customers.csv"},
+                ]
+            },
+        }
+    ]
+    plan = build_rename_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    assert plan["renames"][0]["old_name"] == "Stills"
+    assert plan["renames"][0]["new_name"] == "High Value Customers"
+
+    plan["renames"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rename_plan(plan, client, execute=True)
+
+    assert results[0].status == "executed"
+    adset_id, params, validate_only = client.updates[0]
+    assert adset_id == "as1"
+    assert params == {"name": "High Value Customers"}
+    assert validate_only is False
+
+
+def test_apply_rename_plan_blocks_on_live_name_drift() -> None:
+    adsets = [
+        {
+            "id": "as1",
+            "name": "Renamed Already",
+            "effective_status": "ACTIVE",
+            "campaign_id": "c1",
+            "targeting": {"custom_audiences": [{"id": "1", "name": "high-value-customers.csv"}]},
+        }
+    ]
+    plan = build_rename_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    plan["renames"][0]["old_name"] = "Stale Old Name"  # simulate plan built against older state
+    plan["renames"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+
+    results = apply_rename_plan(plan, client, execute=True)
+
+    assert results[0].status == "blocked"
+    assert client.updates == []

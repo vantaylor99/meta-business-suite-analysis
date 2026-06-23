@@ -124,23 +124,48 @@ class MetaMarketingApiClient:
         params = {"fields": ",".join(fields), "access_token": self.access_token}
         return self._get_json(self._make_url(f"/{ad_id}"), params=params)
 
-    def update_ad(self, ad_id: str, *, params: dict[str, Any]) -> dict[str, Any]:
-        """POST an ad update (e.g. status). Requires an ``ads_management``-scoped token."""
+    def update_ad(
+        self,
+        ad_id: str,
+        *,
+        params: dict[str, Any],
+        validate_only: bool = False,
+    ) -> dict[str, Any]:
+        """POST an ad update (e.g. status). Requires an ``ads_management``-scoped token.
+
+        When ``validate_only`` is set, Meta validates without persisting the change.
+        """
+        return self._post_json(
+            self._make_url(f"/{ad_id}"),
+            data=self._encode_write_params(params, validate_only),
+        )
+
+    def _encode_write_params(self, params: dict[str, Any], validate_only: bool) -> dict[str, Any]:
         encoded: dict[str, Any] = {"access_token": self.access_token}
         for key, value in params.items():
             encoded[key] = value if isinstance(value, str) else json.dumps(value)
-        return self._post_json(self._make_url(f"/{ad_id}"), data=encoded)
+        if validate_only:
+            encoded["execution_options"] = json.dumps(["validate_only"])
+        return encoded
 
-    def update_adset(self, adset_id: str, *, params: dict[str, Any]) -> dict[str, Any]:
+    def update_adset(
+        self,
+        adset_id: str,
+        *,
+        params: dict[str, Any],
+        validate_only: bool = False,
+    ) -> dict[str, Any]:
         """POST an ad set update. Requires an ``ads_management``-scoped token.
 
         ``params`` values that are not plain strings are JSON-encoded, which is how
-        the Graph API expects structured fields such as ``targeting``.
+        the Graph API expects structured fields such as ``targeting``. When
+        ``validate_only`` is set, Meta runs validation and returns the result without
+        persisting any change (``execution_options=['validate_only']``).
         """
-        encoded: dict[str, Any] = {"access_token": self.access_token}
-        for key, value in params.items():
-            encoded[key] = value if isinstance(value, str) else json.dumps(value)
-        return self._post_json(self._make_url(f"/{adset_id}"), data=encoded)
+        return self._post_json(
+            self._make_url(f"/{adset_id}"),
+            data=self._encode_write_params(params, validate_only),
+        )
 
     def iter_paginated(
         self,

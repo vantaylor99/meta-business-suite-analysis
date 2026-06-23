@@ -33,11 +33,17 @@ from .config import DEFAULT_DB_PATH, DEFAULT_NORMALIZED_ROOT, DEFAULT_RAW_ROOT, 
 from .normalize import creative_fieldnames, ingest_raw_exports, normalized_fieldnames
 from .reporting import render_markdown_report
 from .rotation import (
+    apply_rename_plan,
     apply_rotation_plan,
+    build_rename_plan,
     build_rotation_plan,
+    default_rename_plan_path,
+    default_rename_results_path,
     default_rotation_plan_path,
     default_rotation_results_path,
     fetch_active_adsets,
+    write_rename_plan,
+    write_rename_results,
     write_rotation_plan,
     write_rotation_results,
 )
@@ -480,6 +486,11 @@ def apply_rotation_main() -> None:
     parser.add_argument("--results-path", help="Override rotation results path.")
     parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
     parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Send each approved rotation to Meta with validate_only: real responses, no changes.",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
         help="Actually apply approved rotations. Without this flag, apply-rotation is a dry run.",
@@ -501,18 +512,116 @@ def apply_rotation_main() -> None:
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
 
     client = client_from_env(args.api_version)
-    results = apply_rotation_plan(plan, client, execute=args.execute)
+    results = apply_rotation_plan(plan, client, execute=args.execute, validate_only=args.validate_only)
     results_path = Path(args.results_path) if args.results_path else default_rotation_results_path(
         account_slug,
         run_date,
         reports_root,
     )
     write_rotation_results(plan=plan, results=results, output_path=results_path, execute=args.execute)
-    ran = sum(1 for item in results if item.status in {"dry_run", "executed"})
-    blocked = sum(1 for item in results if item.status in {"blocked", "failed"})
-    mode = "executed" if args.execute else "dry-run"
+    ran = sum(1 for item in results if item.status in {"dry_run", "executed", "validated"})
+    blocked = sum(1 for item in results if item.status in {"blocked", "failed", "validation_failed"})
+    mode = "validate-only" if args.validate_only else ("executed" if args.execute else "dry-run")
     print(f"Completed {mode} rotation for {account_slug} on {run_date}: {results_path}")
     print(f"Runnable approved rotations: {ran}; blocked or failed: {blocked}")
+
+
+def propose_renames_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Propose ad set names derived from each ad set's current included audience (no writes)."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Plan folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument(
+        "--reports-root",
+        default=str(DEFAULT_REPORTS_ROOT),
+        help="Reports root. Defaults to reports/.",
+    )
+    parser.add_argument("--output-path", help="Override rename plan path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    reports_root = Path(args.reports_root)
+
+    client = client_from_env(args.api_version)
+    ad_account_id, adsets = fetch_active_adsets(account_slug, client=client)
+    plan = build_rename_plan(adsets, account_slug=account_slug, ad_account_id=ad_account_id)
+    output_path = Path(args.output_path) if args.output_path else default_rename_plan_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    write_rename_plan(plan, output_path)
+    print(f"Wrote rename plan for {account_slug} ({len(plan['renames'])} ad sets): {output_path}")
+    for rename in plan["renames"]:
+        flag = " (unchanged)" if rename["unchanged"] else ""
+        print(f"  {rename['old_name']!r} -> {rename['new_name']!r}{flag}")
+    for warning in plan["warnings"]:
+        print(f"  warning: {warning}")
+    print("Approve by changing a rename's status from 'proposed' to 'approved', then run apply-renames.")
+
+
+def apply_renames_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Dry-run, validate, or execute approved ad set renames through the Meta Graph API."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Plan folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument(
+        "--reports-root",
+        default=str(DEFAULT_REPORTS_ROOT),
+        help="Reports root. Defaults to reports/.",
+    )
+    parser.add_argument("--plan-path", help="Override rename plan path.")
+    parser.add_argument("--results-path", help="Override rename results path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Send each approved rename to Meta with validate_only: real responses, no changes.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually apply approved renames. Without this flag, apply-renames is a dry run.",
+    )
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    reports_root = Path(args.reports_root)
+    plan_path = Path(args.plan_path) if args.plan_path else default_rename_plan_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    if not plan_path.exists():
+        raise SystemExit(f"Rename plan not found: {plan_path}. Run propose-renames first.")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+    client = client_from_env(args.api_version)
+    results = apply_rename_plan(plan, client, execute=args.execute, validate_only=args.validate_only)
+    results_path = Path(args.results_path) if args.results_path else default_rename_results_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    write_rename_results(plan=plan, results=results, output_path=results_path, execute=args.execute)
+    ran = sum(1 for item in results if item.status in {"dry_run", "executed", "validated"})
+    blocked = sum(1 for item in results if item.status in {"blocked", "failed", "validation_failed"})
+    mode = "validate-only" if args.validate_only else ("executed" if args.execute else "dry-run")
+    print(f"Completed {mode} renames for {account_slug} on {run_date}: {results_path}")
+    print(f"Runnable approved renames: {ran}; blocked or failed: {blocked}")
 
 
 def operator_brief_main() -> None:
