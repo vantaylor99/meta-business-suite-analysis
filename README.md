@@ -149,6 +149,8 @@ python -m meta_ads_analysis apply-rotation --account pollen_sense
 python -m meta_ads_analysis apply-rotation --account pollen_sense --execute
 ```
 
+Add `--disable-advantage-audience` to `propose-rotation` to also set `advantage_audience=0` on each rotated ad set that has it enabled, so the custom audience is genuinely respected during the experiment. It only ever turns the control off, never on, and is recorded per-rotation in the plan for approval.
+
 ### Ingest and normalize exports
 
 ```powershell

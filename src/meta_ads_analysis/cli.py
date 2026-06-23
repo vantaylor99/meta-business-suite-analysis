@@ -417,6 +417,14 @@ def propose_rotation_main() -> None:
         help="How many ad sets forward to shift each audience. Defaults to 1.",
     )
     parser.add_argument(
+        "--disable-advantage-audience",
+        action="store_true",
+        help=(
+            "Also set advantage_audience=0 on each rotated ad set that has it enabled, so the "
+            "custom audience is genuinely respected. Only ever turns it off, never on."
+        ),
+    )
+    parser.add_argument(
         "--reports-root",
         default=str(DEFAULT_REPORTS_ROOT),
         help="Reports root. Defaults to reports/.",
@@ -438,6 +446,7 @@ def propose_rotation_main() -> None:
         account_slug=account_slug,
         ad_account_id=ad_account_id,
         offset=args.offset,
+        disable_advantage_audience=args.disable_advantage_audience,
     )
     output_path = Path(args.output_path) if args.output_path else default_rotation_plan_path(
         account_slug,

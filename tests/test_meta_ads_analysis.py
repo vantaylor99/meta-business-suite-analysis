@@ -1480,3 +1480,48 @@ def test_apply_rotation_blocks_when_live_targeting_drifted() -> None:
     results = apply_rotation_plan(plan, client, execute=True)
     assert results[0].status == "blocked"
     assert client.updates == []
+
+
+def test_compute_new_targeting_can_disable_advantage_audience() -> None:
+    live = _adset("as1", "Set 1", ["A"], ["B", "C"], advantage=True)["targeting"]
+
+    # Default: automation is preserved untouched.
+    kept = compute_new_targeting(live, new_included_ids=["C"], new_excluded_ids=["A", "B"])
+    assert kept["targeting_automation"] == {"advantage_audience": 1}
+
+    # Opt-in: advantage_audience forced off, other targeting preserved.
+    off = compute_new_targeting(
+        live,
+        new_included_ids=["C"],
+        new_excluded_ids=["A", "B"],
+        disable_advantage_audience=True,
+    )
+    assert off["targeting_automation"]["advantage_audience"] == 0
+    assert off["geo_locations"] == {"countries": ["US"]}
+    assert off["custom_audiences"] == [{"id": "C"}]
+
+
+def test_rotation_plan_disable_flag_writes_advantage_off_on_apply() -> None:
+    adsets = [
+        _adset("as1", "Set 1", ["A"], ["B", "C"], advantage=True),
+        _adset("as2", "Set 2", ["B"], ["A", "C"], advantage=True),
+        _adset("as3", "Set 3", ["C"], ["A", "B"], advantage=True),
+    ]
+    plan = build_rotation_plan(
+        adsets,
+        account_slug="demo",
+        ad_account_id="act_1",
+        disable_advantage_audience=True,
+    )
+    assert plan["disable_advantage_audience"] is True
+    assert all(r["disable_advantage_audience"] for r in plan["rotations"])
+    assert all("advantage_audience: on -> off" in r["diff"] for r in plan["rotations"])
+
+    for rotation in plan["rotations"]:
+        rotation["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+
+    assert {r.status for r in results} == {"executed"}
+    for _adset_id, params in client.updates:
+        assert params["targeting"]["targeting_automation"]["advantage_audience"] == 0

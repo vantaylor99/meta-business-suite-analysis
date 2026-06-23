@@ -119,6 +119,7 @@ def build_rotation_plan(
     account_slug: str,
     ad_account_id: str,
     offset: int = 1,
+    disable_advantage_audience: bool = False,
 ) -> dict[str, Any]:
     """Build a rotation plan from active ad sets.
 
@@ -157,6 +158,13 @@ def build_rotation_plan(
                 f"Ad set {summary['adset_id']} ({summary['adset_name']}) has Advantage "
                 "Audience enabled; custom-audience targeting may be treated as a suggestion."
             )
+        will_disable_aa = disable_advantage_audience and summary["advantage_audience"]
+        diff = (
+            f"include [{_label(old_included_ids, names)}] -> [{_label(new_included_ids, names)}]; "
+            f"exclude [{_label(_ids(summary['excluded']), names)}] -> [{_label(new_excluded_ids, names)}]"
+        )
+        if will_disable_aa:
+            diff += "; advantage_audience: on -> off"
         rotations.append(
             {
                 "adset_id": summary["adset_id"],
@@ -164,14 +172,12 @@ def build_rotation_plan(
                 "campaign_id": summary["campaign_id"],
                 "status": PROPOSED_STATUS,
                 "advantage_audience": summary["advantage_audience"],
+                "disable_advantage_audience": will_disable_aa,
                 "old_included": old_included_ids,
                 "old_excluded": _ids(summary["excluded"]),
                 "new_included": new_included_ids,
                 "new_excluded": new_excluded_ids,
-                "diff": (
-                    f"include [{_label(old_included_ids, names)}] -> [{_label(new_included_ids, names)}]; "
-                    f"exclude [{_label(_ids(summary['excluded']), names)}] -> [{_label(new_excluded_ids, names)}]"
-                ),
+                "diff": diff,
             }
         )
 
@@ -188,6 +194,7 @@ def build_rotation_plan(
         "account_slug": account_slug,
         "ad_account_id": ad_account_id,
         "offset": offset,
+        "disable_advantage_audience": disable_advantage_audience,
         "generated_at": _now_iso(),
         "audience_names": names,
         "approval_instructions": (
@@ -196,8 +203,9 @@ def build_rotation_plan(
         ),
         "guardrails": {
             "requires_explicit_approval": True,
-            "writes_only_custom_audiences": True,
+            "writes_only_custom_audiences": not disable_advantage_audience,
             "never_enables_advantage_audience": True,
+            "advantage_audience_disable_only_when_requested": disable_advantage_audience,
             "rescans_live_targeting_before_write": True,
         },
         "warnings": warnings,
@@ -210,8 +218,14 @@ def compute_new_targeting(
     *,
     new_included_ids: list[str],
     new_excluded_ids: list[str],
+    disable_advantage_audience: bool = False,
 ) -> dict[str, Any]:
-    """Return the full targeting object with only the custom-audience fields swapped."""
+    """Return the full targeting object with only the custom-audience fields swapped.
+
+    When ``disable_advantage_audience`` is set, ``targeting_automation.advantage_audience``
+    is forced to 0 (other automation keys are preserved). This is the only case in which
+    rotation touches targeting automation, and it can only ever turn it off, never on.
+    """
     targeting = copy.deepcopy(live_targeting) if isinstance(live_targeting, dict) else {}
     if new_included_ids:
         targeting["custom_audiences"] = [{"id": i} for i in new_included_ids]
@@ -221,6 +235,11 @@ def compute_new_targeting(
         targeting["excluded_custom_audiences"] = [{"id": i} for i in new_excluded_ids]
     else:
         targeting.pop("excluded_custom_audiences", None)
+    if disable_advantage_audience:
+        automation = targeting.get("targeting_automation")
+        automation = dict(automation) if isinstance(automation, dict) else {}
+        automation["advantage_audience"] = 0
+        targeting["targeting_automation"] = automation
     return targeting
 
 
@@ -269,6 +288,7 @@ def apply_rotation_plan(
             live_targeting,
             new_included_ids=list(rotation.get("new_included") or []),
             new_excluded_ids=list(rotation.get("new_excluded") or []),
+            disable_advantage_audience=bool(rotation.get("disable_advantage_audience")),
         )
         if not execute:
             results.append(RotationResult(adset_id, "dry_run", targeting=new_targeting))
