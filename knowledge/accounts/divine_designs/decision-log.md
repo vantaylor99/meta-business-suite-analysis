@@ -2,6 +2,16 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-22 (later) — dev-mode app blocker resolved at the root
+
+- **Both business apps ("codex", "AI Ad Analysis") published to Live** (by operator, via the
+  App Dashboard). Verified the fix: `White BG V2 - Copy` (previously blocked) re-reviewed and
+  cleared to no-issues / `IN_PROCESS`. The other 17 blocked ads still show the **stale**
+  dev-mode flag and will clear only when re-enabled/edited (re-review required).
+- **Next:** selectively re-enable the proven winners (New Pink, White BG V2 - Copy, New Black,
+  etc.) to clear them, then hold ~5–7 days and measure (the AA-off experiment).
+- `Selfie Mom - Copy` still has a separate "Tracking Pixel Required" issue (needs a pixel).
+
 ## 2026-06-22
 
 **Account changes executed (Graph API):**

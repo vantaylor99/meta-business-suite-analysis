@@ -18,6 +18,11 @@ Legend: 🟢 High · 🟡 Medium · 🔴 Low · trend ↑ rising / → stable / 
   with API-generated post IDs → created programmatically by a custom app in Dev mode. The
   creating app couldn't be confirmed via API (post `application` field needs
   `pages_read_engagement`; our token lacks it). _(API observation; divine_designs)_
+- ➕ 2026-06-22 — after both business apps ("codex", "AI Ad Analysis") were published to Live,
+  the one previously-blocked ad that got re-enabled (`White BG V2 - Copy`) cleared to
+  no-issues / `IN_PROCESS`; the other 17 still show the stale flag because they have not been
+  re-reviewed. **Confirms: publishing the app fixes it, but the WITH_ISSUES flag only clears
+  on re-review — re-enable/edit each blocked ad to trigger it.** _(direct verification; divine_designs)_
 
 **Apply:** Check `issues_info` before assuming a paused ad can be re-enabled. The fix is in the
 Meta App Dashboard (publish the app / set it Live — needs Privacy Policy URL + Category first),
