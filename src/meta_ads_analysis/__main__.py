@@ -6,11 +6,12 @@ import sys
 
 from .cli import (
     apply_meta_actions_main,
+    apply_rotation_main,
     build_meta_report_main,
     ingest_meta_exports_main,
     operator_brief_main,
     propose_meta_actions_main,
-    sync_meta_cli_main,
+    propose_rotation_main,
     sync_meta_api_main,
 )
 
@@ -18,7 +19,7 @@ from .cli import (
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
-            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|sync-cli|propose-actions|apply-actions|operator-brief> [args]\n"
+            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|propose-actions|apply-actions|propose-rotation|apply-rotation|operator-brief> [args]\n"
             "Example: python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-21"
         )
         return
@@ -35,21 +36,25 @@ def main() -> None:
     if command in {"sync_api", "sync", "sync_meta_api"}:
         sync_meta_api_main()
         return
-    if command in {"sync_cli", "sync_meta_cli"}:
-        sync_meta_cli_main()
-        return
     if command in {"propose_actions", "propose_meta_actions"}:
         propose_meta_actions_main()
         return
     if command in {"apply_actions", "apply_meta_actions"}:
         apply_meta_actions_main()
         return
+    if command in {"propose_rotation", "propose_audience_rotation"}:
+        propose_rotation_main()
+        return
+    if command in {"apply_rotation", "apply_audience_rotation"}:
+        apply_rotation_main()
+        return
     if command in {"operator_brief", "brief"}:
         operator_brief_main()
         return
 
     raise SystemExit(
-        f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, `sync-cli`, `propose-actions`, `apply-actions`, or `operator-brief`."
+        f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, "
+        "`propose-actions`, `apply-actions`, `propose-rotation`, `apply-rotation`, or `operator-brief`."
     )
 
 

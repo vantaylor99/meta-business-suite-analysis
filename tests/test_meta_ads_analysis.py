@@ -10,7 +10,7 @@ from unittest.mock import Mock
 from meta_ads_analysis.actions import (
     apply_action_plan,
     build_action_plan,
-    build_meta_cli_command,
+    build_api_operation,
     enrich_action_plan_with_live_state,
 )
 from meta_ads_analysis.account_registry import load_account_registry, resolve_account
@@ -21,7 +21,7 @@ from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
 from meta_ads_analysis.reporting import render_markdown_report
 from meta_ads_analysis.storage import connect, fetch_run_rows, replace_run_rows
-from meta_ads_analysis.sync_api import resolve_date_window, sync_account_from_cli
+from meta_ads_analysis.sync_api import resolve_date_window
 from meta_ads_analysis.utils import ensure_dir
 
 
@@ -739,173 +739,6 @@ def test_sync_api_raw_only_writes_raw_files(tmp_path: Path, monkeypatch) -> None
     assert summary_path.exists()
 
 
-def test_sync_cli_writes_raw_files_from_meta_cli_payload(tmp_path: Path) -> None:
-    raw_root = tmp_path / "raw"
-    accounts_path = tmp_path / "meta_ads_accounts.json"
-    accounts_path.write_text(
-        json.dumps(
-            {
-                "accounts": [
-                    {
-                        "account_slug": "divine_designs",
-                        "account_name": "Divine Designs",
-                        "ad_account_id": "act_555",
-                        "measurement_focus": {
-                            "primary_result_action_type": "purchase",
-                            "primary_result_label": "Website purchases",
-                        },
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    def fake_runner(command, check, capture_output, text):
-        assert command[:6] == ["meta", "--output", "json", "ads", "--ad-account-id", "act_555"]
-        if command[6:8] == ["ad", "list"]:
-            return Mock(
-                returncode=0,
-                stdout=json.dumps(
-                    [
-                        {
-                            "id": "3",
-                            "name": "CLI Ad",
-                            "adset_id": "2",
-                            "campaign_id": "1",
-                            "status": "ACTIVE",
-                            "effective_status": "ACTIVE",
-                        }
-                    ]
-                ),
-                stderr="",
-            )
-        assert command[-2:] == ["--ad-id", "3"]
-        payload = {
-            "data": [
-                {
-                    "account_id": "act_555",
-                    "account_name": "Divine Designs",
-                    "campaign_id": "1",
-                    "campaign_name": "Campaign",
-                    "adset_id": "2",
-                    "adset_name": "Set",
-                    "ad_id": "3",
-                    "ad_name": "CLI Ad",
-                    "date_start": "2026-06-15",
-                    "date_stop": "2026-06-15",
-                    "impressions": "1000",
-                    "spend": "50",
-                    "actions": [
-                        {"action_type": "purchase", "value": "2"},
-                        {"action_type": "video_view", "value": "300"},
-                    ],
-                    "action_values": [{"action_type": "purchase", "value": "120"}],
-                    "purchase_roas": [{"action_type": "purchase", "value": "2.4"}],
-                }
-            ]
-        }
-        return Mock(returncode=0, stdout=json.dumps(payload), stderr="")
-
-    artifacts = sync_account_from_cli(
-        account_slug="divine_designs",
-        run_date="2026-06-16",
-        raw_root=raw_root,
-        accounts_config_path=accounts_path,
-        meta_binary="meta",
-        runner=fake_runner,
-    )
-
-    assert artifacts.api_version == "meta-cli"
-    assert (raw_root / "divine_designs" / "2026-06-16" / "performance_daily.csv").exists()
-    assert artifacts.performance_rows[0]["Ad name"] == "CLI Ad"
-    assert artifacts.performance_rows[0]["Results"] == "2"
-    assert artifacts.creative_rows[0]["Ad ID"] == "3"
-
-
-def test_sync_cli_default_filter_skips_old_paused_ads(tmp_path: Path) -> None:
-    raw_root = tmp_path / "raw"
-    accounts_path = tmp_path / "meta_ads_accounts.json"
-    accounts_path.write_text(
-        json.dumps(
-            {
-                "accounts": [
-                    {
-                        "account_slug": "divine_designs",
-                        "account_name": "Divine Designs",
-                        "ad_account_id": "act_555",
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    insight_ad_ids: list[str] = []
-
-    def fake_runner(command, check, capture_output, text):
-        if command[6:8] == ["ad", "list"]:
-            return Mock(
-                returncode=0,
-                stdout=json.dumps(
-                    [
-                        {
-                            "id": "active",
-                            "name": "Active Ad",
-                            "status": "ACTIVE",
-                            "effective_status": "ACTIVE",
-                            "updated_time": "2026-01-01T00:00:00+0000",
-                        },
-                        {
-                            "id": "recent-paused",
-                            "name": "Recently Paused Ad",
-                            "status": "PAUSED",
-                            "effective_status": "PAUSED",
-                            "updated_time": "2026-06-10T00:00:00+0000",
-                        },
-                        {
-                            "id": "old-paused",
-                            "name": "Old Paused Ad",
-                            "status": "PAUSED",
-                            "effective_status": "PAUSED",
-                            "updated_time": "2026-04-01T00:00:00+0000",
-                        },
-                    ]
-                ),
-                stderr="",
-            )
-        ad_id = command[-1]
-        insight_ad_ids.append(ad_id)
-        return Mock(
-            returncode=0,
-            stdout=json.dumps(
-                {
-                    "data": [
-                        {
-                            "ad_id": ad_id,
-                            "ad_name": f"{ad_id} name",
-                            "date_start": "2026-06-15",
-                            "date_stop": "2026-06-15",
-                            "spend": "1",
-                        }
-                    ]
-                }
-            ),
-            stderr="",
-        )
-
-    artifacts = sync_account_from_cli(
-        account_slug="divine_designs",
-        run_date="2026-06-16",
-        raw_root=raw_root,
-        accounts_config_path=accounts_path,
-        runner=fake_runner,
-    )
-
-    assert insight_ad_ids == ["active", "recent-paused"]
-    assert len(artifacts.performance_rows) == 2
-    assert "selected 2 of 3 ads" in artifacts.warnings[0]
-
-
 def test_action_plan_proposes_approved_pause_path_for_high_waste_ad() -> None:
     payload = {
         "account_slug": "pollen_sense",
@@ -1252,40 +1085,27 @@ def test_operator_brief_moves_failed_live_lookup_to_do_not_touch() -> None:
     assert brief["needs_human_judgment"][0]["action_id"] == "refresh_creative_1"
 
 
-def test_meta_cli_command_only_allows_explicit_pause_without_meta_ai_params() -> None:
+def test_api_operation_only_allows_explicit_pause_without_meta_ai_params() -> None:
     action = {
         "action_type": "pause_ad",
         "target": {"id": "123"},
         "params": {"status": "paused"},
     }
 
-    command = build_meta_cli_command(action, "act_999", meta_binary="meta")
+    operation = build_api_operation(action)
 
-    assert command == [
-        "meta",
-        "--no-input",
-        "-o",
-        "json",
-        "ads",
-        "--ad-account-id",
-        "act_999",
-        "ad",
-        "update",
-        "123",
-        "--status",
-        "paused",
-    ]
+    assert operation == {"resource": "ad", "id": "123", "params": {"status": "PAUSED"}}
 
     action["params"]["advantage_plus_creative"] = True
     try:
-        build_meta_cli_command(action, "act_999")
+        build_api_operation(action)
     except ValueError as exc:
         assert "Meta AI" in str(exc)
     else:
         raise AssertionError("Expected Meta AI guardrail to block action")
 
 
-def test_meta_cli_command_allows_capped_adset_budget_increase() -> None:
+def test_api_operation_allows_capped_adset_budget_increase() -> None:
     action = {
         "action_type": "increase_adset_budget",
         "target": {"id": "adset-1"},
@@ -1296,26 +1116,13 @@ def test_meta_cli_command_allows_capped_adset_budget_increase() -> None:
         },
     }
 
-    command = build_meta_cli_command(action, "act_999", meta_binary="meta")
+    operation = build_api_operation(action)
 
-    assert command == [
-        "meta",
-        "--no-input",
-        "-o",
-        "json",
-        "ads",
-        "--ad-account-id",
-        "act_999",
-        "adset",
-        "update",
-        "adset-1",
-        "--daily-budget",
-        "12000",
-    ]
+    assert operation == {"resource": "adset", "id": "adset-1", "params": {"daily_budget": "12000"}}
 
     action["params"]["new_daily_budget_cents"] = 13000
     try:
-        build_meta_cli_command(action, "act_999")
+        build_api_operation(action)
     except ValueError as exc:
         assert "exceeds max increase" in str(exc)
     else:
@@ -1362,27 +1169,27 @@ def test_apply_action_plan_dry_run_requires_approval(tmp_path: Path, monkeypatch
     plan["actions"][0]["status"] = "approved"
     dry_run = apply_action_plan(plan, execute=False)
     assert dry_run[0].status == "dry_run"
-    assert dry_run[0].command is not None
-    assert "act_12345" in dry_run[0].command
+    assert dry_run[0].request == {"resource": "ad", "id": "123", "params": {"status": "PAUSED"}}
 
 
-def test_live_state_enrichment_marks_only_ad_status_paused_as_resolved(tmp_path: Path, monkeypatch) -> None:
-    accounts_path = tmp_path / "meta_ads_accounts.json"
-    accounts_path.write_text(
-        json.dumps(
-            {
-                "accounts": [
-                    {
-                        "account_slug": "pollen_sense",
-                        "account_name": "Pollen Sense",
-                        "ad_account_id": "12345",
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+class _LiveStateFakeClient:
+    """Stands in for MetaMarketingApiClient during live-state enrichment tests."""
+
+    def __init__(self, *, ads=None, adsets=None, ad_error=None):
+        self._ads = ads or {}
+        self._adsets = adsets or {}
+        self._ad_error = ad_error
+
+    def get_ad(self, ad_id, *, fields):
+        if self._ad_error is not None:
+            raise self._ad_error
+        return self._ads[ad_id]
+
+    def get_adset(self, adset_id, *, fields):
+        return self._adsets[adset_id]
+
+
+def test_live_state_enrichment_marks_only_ad_status_paused_as_resolved() -> None:
     plan = {
         "account_slug": "pollen_sense",
         "run_date": "2026-06-16",
@@ -1410,26 +1217,14 @@ def test_live_state_enrichment_marks_only_ad_status_paused_as_resolved(tmp_path:
         ],
     }
 
-    def fake_runner(command, check, capture_output, text):
-        ad_id = command[-1]
-        status = "PAUSED" if ad_id == "1" else "ACTIVE"
-        effective_status = "PAUSED" if ad_id == "1" else "ADSET_PAUSED"
-        return Mock(
-            returncode=0,
-            stdout=json.dumps(
-                [
-                    {
-                        "id": ad_id,
-                        "name": f"Ad {ad_id}",
-                        "status": status,
-                        "effective_status": effective_status,
-                    }
-                ]
-            ),
-            stderr="",
-        )
+    client = _LiveStateFakeClient(
+        ads={
+            "1": {"id": "1", "name": "Ad 1", "status": "PAUSED", "effective_status": "PAUSED"},
+            "2": {"id": "2", "name": "Ad 2", "status": "ACTIVE", "effective_status": "ADSET_PAUSED"},
+        }
+    )
 
-    enriched = enrich_action_plan_with_live_state(plan, runner=fake_runner)
+    enriched = enrich_action_plan_with_live_state(plan, client=client)
     by_id = {action["action_id"]: action for action in enriched["actions"]}
 
     assert by_id["pause_ad_1"]["status"] == "already_resolved"
@@ -1439,23 +1234,7 @@ def test_live_state_enrichment_marks_only_ad_status_paused_as_resolved(tmp_path:
     assert by_id["pause_ad_2"]["live_state"]["effective_status"] == "ADSET_PAUSED"
 
 
-def test_live_state_enrichment_redacts_meta_cli_tokens_on_failure(tmp_path: Path, monkeypatch) -> None:
-    accounts_path = tmp_path / "meta_ads_accounts.json"
-    accounts_path.write_text(
-        json.dumps(
-            {
-                "accounts": [
-                    {
-                        "account_slug": "pollen_sense",
-                        "account_name": "Pollen Sense",
-                        "ad_account_id": "12345",
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+def test_live_state_enrichment_redacts_tokens_on_api_failure() -> None:
     plan = {
         "account_slug": "pollen_sense",
         "run_date": "2026-06-16",
@@ -1471,42 +1250,21 @@ def test_live_state_enrichment_redacts_meta_cli_tokens_on_failure(tmp_path: Path
         ],
     }
 
-    def fake_runner(command, check, capture_output, text):
-        return Mock(
-            returncode=1,
-            stdout="",
-            stderr=(
-                "GET /v25.0/ad-1?access_token=EAAabcdefghijklmnopqrstuvwx1234567890&fields=name "
-                "token EAAabcdefghijklmnopqrstuvwx1234567890"
-            ),
-        )
-
-    enriched = enrich_action_plan_with_live_state(plan, runner=fake_runner)
-    error = enriched["actions"][0]["live_state"]["error"]
-
-    assert "EAAabcdefghijklmnopqrstuvwx1234567890" not in error
-    assert "access_token=[REDACTED]" in error
-    assert "[REDACTED_META_TOKEN]" in error
-
-
-def test_live_state_enrichment_flags_meta_ai_adset_controls(tmp_path: Path, monkeypatch) -> None:
-    accounts_path = tmp_path / "meta_ads_accounts.json"
-    accounts_path.write_text(
-        json.dumps(
-            {
-                "accounts": [
-                    {
-                        "account_slug": "divine_designs",
-                        "account_name": "Divine Designs",
-                        "ad_account_id": "12345",
-                        "action_policy": {"disable_meta_ai_features": True},
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
+    error = MetaApiError(
+        "GET /v25.0/ad-1?access_token=EAAabcdefghijklmnopqrstuvwx1234567890&fields=name "
+        "token EAAabcdefghijklmnopqrstuvwx1234567890"
     )
-    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    client = _LiveStateFakeClient(ad_error=error)
+
+    enriched = enrich_action_plan_with_live_state(plan, client=client)
+    message = enriched["actions"][0]["live_state"]["error"]
+
+    assert "EAAabcdefghijklmnopqrstuvwx1234567890" not in message
+    assert "access_token=[REDACTED]" in message
+    assert "[REDACTED_META_TOKEN]" in message
+
+
+def test_live_state_enrichment_flags_meta_ai_adset_controls() -> None:
     plan = {
         "account_slug": "divine_designs",
         "run_date": "2026-06-16",
@@ -1523,40 +1281,29 @@ def test_live_state_enrichment_flags_meta_ai_adset_controls(tmp_path: Path, monk
         ],
     }
 
-    def fake_runner(command, check, capture_output, text):
-        if command[-2:] == ["ad", "get"] or command[-3] == "ad":
-            return Mock(
-                returncode=0,
-                stdout=json.dumps(
-                    [
-                        {
-                            "id": "ad-1",
-                            "name": "Ad 1",
-                            "status": "ACTIVE",
-                            "effective_status": "ACTIVE",
-                            "adset_id": "adset-1",
-                        }
-                    ]
-                ),
-                stderr="",
-            )
-        return Mock(
-            returncode=0,
-            stdout=json.dumps(
-                [
-                    {
-                        "id": "adset-1",
-                        "name": "Ad Set 1",
-                        "status": "ACTIVE",
-                        "effective_status": "ACTIVE",
-                        "targeting": '{"targeting_automation":{"advantage_audience":1}}',
-                    }
-                ]
-            ),
-            stderr="",
-        )
+    client = _LiveStateFakeClient(
+        ads={
+            "ad-1": {
+                "id": "ad-1",
+                "name": "Ad 1",
+                "status": "ACTIVE",
+                "effective_status": "ACTIVE",
+                "adset_id": "adset-1",
+            }
+        },
+        adsets={
+            "adset-1": {
+                "id": "adset-1",
+                "name": "Ad Set 1",
+                "status": "ACTIVE",
+                "effective_status": "ACTIVE",
+                # The Graph API returns targeting as a JSON object, not a string.
+                "targeting": {"targeting_automation": {"advantage_audience": 1}},
+            }
+        },
+    )
 
-    enriched = enrich_action_plan_with_live_state(plan, runner=fake_runner)
+    enriched = enrich_action_plan_with_live_state(plan, client=client)
 
     assert any(action["action_type"] == "disable_meta_ai_controls" for action in enriched["actions"])
 
@@ -1607,3 +1354,129 @@ def _daily_metric_row(
         "has_video_metrics": True,
         "tracking_confidence": "medium_roas_unavailable",
     }
+
+
+# --- Audience rotation -------------------------------------------------------
+
+from meta_ads_analysis.rotation import (
+    apply_rotation_plan,
+    build_rotation_plan,
+    compute_new_targeting,
+)
+
+
+def _adset(adset_id, name, included, excluded, *, advantage=False):
+    targeting = {
+        "geo_locations": {"countries": ["US"]},
+        "age_min": 25,
+        "custom_audiences": [{"id": i, "name": f"aud-{i}"} for i in included],
+        "excluded_custom_audiences": [{"id": i, "name": f"aud-{i}"} for i in excluded],
+    }
+    if advantage:
+        targeting["targeting_automation"] = {"advantage_audience": 1}
+    return {
+        "id": adset_id,
+        "name": name,
+        "effective_status": "ACTIVE",
+        "campaign_id": "camp-1",
+        "targeting": targeting,
+    }
+
+
+def _three_adset_partition():
+    return [
+        _adset("as1", "Set 1", ["A"], ["B", "C"]),
+        _adset("as2", "Set 2", ["B"], ["A", "C"]),
+        _adset("as3", "Set 3", ["C"], ["A", "B"]),
+    ]
+
+
+class _FakeClient:
+    def __init__(self, adsets):
+        self._by_id = {a["id"]: a for a in adsets}
+        self.updates = []
+
+    def get_adset(self, adset_id, *, fields):
+        return self._by_id[adset_id]
+
+    def update_adset(self, adset_id, *, params):
+        self.updates.append((adset_id, params))
+        return {"id": adset_id, "success": True}
+
+
+def test_build_rotation_plan_shifts_audiences_and_preserves_partition_invariant() -> None:
+    plan = build_rotation_plan(
+        _three_adset_partition(),
+        account_slug="demo",
+        ad_account_id="act_1",
+        offset=1,
+    )
+    rotations = {r["adset_id"]: r for r in plan["rotations"]}
+    # Each audience moves forward one ad set: as1 gets C, as2 gets A, as3 gets B.
+    assert rotations["as1"]["new_included"] == ["C"]
+    assert rotations["as2"]["new_included"] == ["A"]
+    assert rotations["as3"]["new_included"] == ["B"]
+    # Exclusions are recomputed as "the other two" so the invariant still holds.
+    assert sorted(rotations["as1"]["new_excluded"]) == ["A", "B"]
+    assert sorted(rotations["as2"]["new_excluded"]) == ["B", "C"]
+    assert sorted(rotations["as3"]["new_excluded"]) == ["A", "C"]
+    assert all(r["status"] == "proposed" for r in plan["rotations"])
+
+
+def test_build_rotation_plan_flags_advantage_audience_and_skips_audienceless_adsets() -> None:
+    adsets = _three_adset_partition()
+    adsets[0]["targeting"]["targeting_automation"] = {"advantage_audience": 1}
+    adsets.append(_adset("as4", "No audience", [], []))
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    assert any("Advantage" in w for w in plan["warnings"])
+    assert any("as4" in w for w in plan["warnings"])
+    assert "as4" not in {r["adset_id"] for r in plan["rotations"]}
+
+
+def test_compute_new_targeting_preserves_other_fields() -> None:
+    live = _adset("as1", "Set 1", ["A"], ["B", "C"])["targeting"]
+    new = compute_new_targeting(live, new_included_ids=["C"], new_excluded_ids=["A", "B"])
+    assert new["geo_locations"] == {"countries": ["US"]}
+    assert new["age_min"] == 25
+    assert new["custom_audiences"] == [{"id": "C"}]
+    assert new["excluded_custom_audiences"] == [{"id": "A"}, {"id": "B"}]
+
+
+def test_apply_rotation_dry_run_does_not_write() -> None:
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    for rotation in plan["rotations"]:
+        rotation["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=False)
+    assert {r.status for r in results} == {"dry_run"}
+    assert client.updates == []
+
+
+def test_apply_rotation_execute_writes_full_targeting_for_approved_only() -> None:
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    plan["rotations"][0]["status"] = "approved"  # only as1 approved
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    statuses = {r.adset_id: r.status for r in results}
+    assert statuses["as1"] == "executed"
+    assert statuses["as2"] == "skipped"
+    assert len(client.updates) == 1
+    adset_id, params = client.updates[0]
+    assert adset_id == "as1"
+    # The full targeting object is sent, not just the audience fields.
+    assert params["targeting"]["geo_locations"] == {"countries": ["US"]}
+    assert params["targeting"]["custom_audiences"] == [{"id": "C"}]
+
+
+def test_apply_rotation_blocks_when_live_targeting_drifted() -> None:
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    plan["rotations"][0]["status"] = "approved"
+    # Simulate the live ad set's audience changing after the plan was built.
+    adsets[0]["targeting"]["custom_audiences"] = [{"id": "Z"}]
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert client.updates == []

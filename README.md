@@ -15,7 +15,7 @@ The implementation keeps one normalized reporting pipeline and supports two inpu
 
 - manual Ads Manager exports
 - direct API sync into the same raw CSV contract
-- guarded Meta CLI actions from approved report findings
+- guarded Meta Graph API actions from approved report findings
 
 ## Install
 
@@ -134,35 +134,20 @@ Optional overrides:
 - `--db-path data/normalized/meta_ads.duckdb`
 - `--api-version v22.0`
 
-### Sync data through the installed Meta CLI
+> **Note:** All live data sync and actions now run through the Meta Graph API. The previous `sync-cli` path (which shelled out to the `meta` CLI and required WSL on Windows) has been removed — use `sync-api` everywhere. Live writes require `META_ACCESS_TOKEN` to have the `ads_management` permission; read-only sync needs only `ads_read`.
 
-Use this when the Meta CLI is authenticated but `META_ACCESS_TOKEN` is not available in the shell:
+### Rotate audiences across active ad sets
 
-```powershell
-sync_meta_cli --account divine_designs --run-date 2026-06-16
-```
-
-If the installed script is not on your `PATH`, use:
+Experiment with moving each active ad set's custom audience forward to the next ad set, recomputing exclusions so each ad set still targets one audience and excludes the others:
 
 ```powershell
-python -m meta_ads_analysis sync-cli --account divine_designs --run-date 2026-06-16
+# Propose (reads live ad sets, writes rotation_plan.json, no writes)
+python -m meta_ads_analysis propose-rotation --account pollen_sense
+
+# After approving rotations in rotation_plan.json, dry-run then execute
+python -m meta_ads_analysis apply-rotation --account pollen_sense
+python -m meta_ads_analysis apply-rotation --account pollen_sense --execute
 ```
-
-This uses `meta ads insights get`, writes the same raw CSV contract as the API sync, then runs ingest and report unless `--raw-only` is provided.
-
-The CLI sync defaults to a faster ad selection mode:
-
-```powershell
-python -m meta_ads_analysis sync-cli --account divine_designs --run-date 2026-06-16 --ad-filter active_or_recently_updated --max-workers 6
-```
-
-Filter options:
-
-- `active_or_recently_updated` skips old paused ads while keeping active and recently changed ads.
-- `active` only queries currently active/effectively active ads.
-- `all` queries every ad returned by the Meta CLI and is slowest.
-
-Use `--max-workers 1` for sequential calls if the Meta CLI or API starts rate-limiting parallel requests.
 
 ### Ingest and normalize exports
 
@@ -246,7 +231,7 @@ Executable actions are conservative:
 - `pause_ad` for high-waste ads or account-policy waste risk.
 - `increase_adset_budget` for qualifying scale candidates, capped by the account policy and requiring live current-budget evidence before execution.
 
-Creative refreshes, measurement concerns, and Meta AI / Advantage control remediation are logged as non-executable operator tasks until a human supplies exact instructions or the Meta CLI exposes a safe explicit field.
+Creative refreshes, measurement concerns, and Meta AI / Advantage control remediation are logged as non-executable operator tasks until a human supplies exact instructions, so the executor never silently changes targeting automation.
 
 ### Dry-run or apply approved actions
 
@@ -256,7 +241,7 @@ Dry-run approved actions first:
 apply_meta_actions --account pollen_sense --run-date 2026-04-21
 ```
 
-Actually execute approved actions through the installed Meta CLI:
+Actually execute approved actions through the Meta Graph API (token needs `ads_management`):
 
 ```powershell
 apply_meta_actions --account pollen_sense --run-date 2026-04-21 --execute
@@ -330,8 +315,8 @@ That prompt tells the agent to:
 
 - Raw exports and generated reports are ignored by git by default because they usually contain sensitive business data.
 - ROAS quality depends on the measurement setup behind the ad account. If purchase value tracking is weak, the report will say so instead of pretending the numbers are clean.
-- The Meta API sync is read-only and uses `results` first, `app_installs` second, and ROAS only when revenue visibility is trustworthy.
-- Meta CLI execution is intentionally not automatic. Generate a plan, review it, approve specific actions, dry-run, then use `--execute`.
+- The Meta API reporting sync is read-only and uses `results` first, `app_installs` second, and ROAS only when revenue visibility is trustworthy.
+- Graph API execution is intentionally not automatic. Generate a plan, review it, approve specific actions, dry-run, then use `--execute`. Writes require an `ads_management`-scoped `META_ACCESS_TOKEN`.
 - Use `propose-actions --enrich-live-state` before approving budget increases so the plan has current live ad set budgets.
 
 See [AGENTS.md](/C:/van-and-kim-venture-strategy/meta-business-suite-analysis/AGENTS.md) for the analysis contract that Codex or another agent should follow when reviewing the generated data.

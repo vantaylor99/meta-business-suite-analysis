@@ -1,8 +1,15 @@
-"""Minimal Meta Marketing API client for read-only reporting sync."""
+"""Meta Marketing API client.
+
+Reporting sync is read-only. The ad set targeting methods (``list_adsets``,
+``get_adset``, ``update_adset``) are the only write-capable surface and require
+an access token with the ``ads_management`` permission. Read-only insights sync
+only needs ``ads_read``.
+"""
 
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -23,6 +30,13 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 class MetaApiError(RuntimeError):
     """Raised when the Meta API returns an operator-actionable error."""
+
+
+def client_from_env(api_version: str | None = None) -> "MetaMarketingApiClient":
+    """Build a client from META_ACCESS_TOKEN / META_API_VERSION environment variables."""
+    access_token = os.environ.get("META_ACCESS_TOKEN", "").strip()
+    effective_version = api_version or os.environ.get("META_API_VERSION") or DEFAULT_META_API_VERSION
+    return MetaMarketingApiClient(access_token=access_token, api_version=effective_version)
 
 
 class MetaMarketingApiClient:
@@ -84,6 +98,50 @@ class MetaMarketingApiClient:
         }
         return list(self.iter_paginated(f"/{ad_account_id}/ads", params=params))
 
+    def list_adsets(
+        self,
+        ad_account_id: str,
+        *,
+        fields: list[str],
+        effective_status: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Enumerate ad sets in an account, optionally filtered by effective status."""
+        params: dict[str, Any] = {
+            "fields": ",".join(fields),
+            "limit": 200,
+        }
+        if effective_status:
+            params["effective_status"] = json.dumps(list(effective_status))
+        return list(self.iter_paginated(f"/{ad_account_id}/adsets", params=params))
+
+    def get_adset(self, adset_id: str, *, fields: list[str]) -> dict[str, Any]:
+        """Fetch a single ad set's current state (used to re-read just before a write)."""
+        params = {"fields": ",".join(fields), "access_token": self.access_token}
+        return self._get_json(self._make_url(f"/{adset_id}"), params=params)
+
+    def get_ad(self, ad_id: str, *, fields: list[str]) -> dict[str, Any]:
+        """Fetch a single ad's current state."""
+        params = {"fields": ",".join(fields), "access_token": self.access_token}
+        return self._get_json(self._make_url(f"/{ad_id}"), params=params)
+
+    def update_ad(self, ad_id: str, *, params: dict[str, Any]) -> dict[str, Any]:
+        """POST an ad update (e.g. status). Requires an ``ads_management``-scoped token."""
+        encoded: dict[str, Any] = {"access_token": self.access_token}
+        for key, value in params.items():
+            encoded[key] = value if isinstance(value, str) else json.dumps(value)
+        return self._post_json(self._make_url(f"/{ad_id}"), data=encoded)
+
+    def update_adset(self, adset_id: str, *, params: dict[str, Any]) -> dict[str, Any]:
+        """POST an ad set update. Requires an ``ads_management``-scoped token.
+
+        ``params`` values that are not plain strings are JSON-encoded, which is how
+        the Graph API expects structured fields such as ``targeting``.
+        """
+        encoded: dict[str, Any] = {"access_token": self.access_token}
+        for key, value in params.items():
+            encoded[key] = value if isinstance(value, str) else json.dumps(value)
+        return self._post_json(self._make_url(f"/{adset_id}"), data=encoded)
+
     def iter_paginated(
         self,
         path_or_url: str,
@@ -110,6 +168,35 @@ class MetaMarketingApiClient:
         for attempt in range(self.max_retries + 1):
             try:
                 response = self.session.get(url, params=params, timeout=self.timeout_seconds)
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt >= self.max_retries:
+                    break
+                time.sleep(2**attempt)
+                continue
+
+            if response.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries:
+                time.sleep(2**attempt)
+                continue
+
+            if response.status_code >= 400:
+                raise MetaApiError(self._format_error(response))
+
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise MetaApiError(f"Meta API returned non-JSON response from {url}: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise MetaApiError(f"Meta API returned an unexpected response shape from {url}.")
+            return payload
+
+        raise MetaApiError(f"Meta API request failed after retries: {last_error or url}")
+
+    def _post_json(self, url: str, data: dict[str, Any]) -> dict[str, Any]:
+        last_error: str | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.post(url, data=data, timeout=self.timeout_seconds)
             except Exception as exc:
                 last_error = str(exc)
                 if attempt >= self.max_retries:

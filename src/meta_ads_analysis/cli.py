@@ -32,11 +32,19 @@ from .briefs import (
 from .config import DEFAULT_DB_PATH, DEFAULT_NORMALIZED_ROOT, DEFAULT_RAW_ROOT, DEFAULT_REPORTS_ROOT
 from .normalize import creative_fieldnames, ingest_raw_exports, normalized_fieldnames
 from .reporting import render_markdown_report
+from .rotation import (
+    apply_rotation_plan,
+    build_rotation_plan,
+    default_rotation_plan_path,
+    default_rotation_results_path,
+    fetch_active_adsets,
+    write_rotation_plan,
+    write_rotation_results,
+)
 from .sync_api import (
     default_normalized_dir,
     default_report_dir,
     sync_account_from_api,
-    sync_account_from_cli,
     write_api_sync_summary,
 )
 from .utils import ensure_dir, slugify_name, write_csv_rows, write_json
@@ -280,86 +288,6 @@ def sync_meta_api_main() -> None:
     print(f"Sync summary: {summary_path}")
 
 
-def sync_meta_cli_main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch Meta Ads data through the installed Meta CLI and build reports.")
-    parser.add_argument(
-        "--account",
-        required=True,
-        help="Account/company slug or name, e.g. pollen_sense or 'Pollen Sense'.",
-    )
-    parser.add_argument("--run-date", required=True, help="Snapshot folder date in YYYY-MM-DD format.")
-    parser.add_argument("--date-from", help="Optional reporting window start date in YYYY-MM-DD format.")
-    parser.add_argument("--date-to", help="Optional reporting window end date in YYYY-MM-DD format.")
-    parser.add_argument(
-        "--raw-only",
-        action="store_true",
-        help="Only write raw CSV exports from the CLI and skip ingest/report.",
-    )
-    parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="DuckDB database path.")
-    parser.add_argument("--meta-binary", default="meta", help="Meta CLI binary to execute. Defaults to `meta`.")
-    parser.add_argument(
-        "--ad-filter",
-        choices=["active_or_recently_updated", "active", "all"],
-        default="active_or_recently_updated",
-        help=(
-            "Which ads to query for per-ad insights. Default skips old paused ads while keeping active "
-            "and recently changed ads."
-        ),
-    )
-    parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=6,
-        help="Parallel per-ad insights calls for Meta CLI sync. Use 1 for sequential sync.",
-    )
-    args = parser.parse_args()
-
-    account_slug = _resolve_account_slug(args.account)
-    if account_slug is None:
-        raise SystemExit("--account is required for sync-cli.")
-
-    artifacts = sync_account_from_cli(
-        account_slug=account_slug,
-        run_date=args.run_date,
-        date_from=args.date_from,
-        date_to=args.date_to,
-        meta_binary=args.meta_binary,
-        ad_filter=args.ad_filter,
-        max_workers=args.max_workers,
-    )
-
-    normalized_dir = default_normalized_dir(artifacts.run_date, account_slug)
-    report_dir = default_report_dir(artifacts.run_date, account_slug)
-    if not args.raw_only:
-        ingest_run(
-            run_date=artifacts.run_date,
-            account_slug=account_slug,
-            input_dir=artifacts.raw_dir,
-            db_path=Path(args.db_path),
-            normalized_root=normalized_dir,
-        )
-        build_report_run(
-            run_date=artifacts.run_date,
-            account_slug=account_slug,
-            db_path=Path(args.db_path),
-            output_dir=report_dir,
-        )
-
-    summary_path = write_api_sync_summary(
-        artifacts,
-        normalized_dir=normalized_dir if not args.raw_only else None,
-        report_dir=report_dir if not args.raw_only else None,
-        completed_full_pipeline=not args.raw_only,
-    )
-
-    print(f"Synced Meta CLI data for {account_slug} on {artifacts.run_date}")
-    print(f"Raw exports: {artifacts.raw_dir}")
-    if not args.raw_only:
-        print(f"Normalized data: {normalized_dir}")
-        print(f"Report output: {report_dir}")
-    print(f"Sync summary: {summary_path}")
-
-
 def propose_meta_actions_main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate a human-approved Meta action plan from a report JSON."
@@ -381,9 +309,9 @@ def propose_meta_actions_main() -> None:
     parser.add_argument(
         "--enrich-live-state",
         action="store_true",
-        help="Use Meta CLI read-only ad lookups to include current live status in the action plan.",
+        help="Use read-only Graph API lookups to include current live status in the action plan.",
     )
-    parser.add_argument("--meta-binary", default="meta", help="Meta CLI binary to execute. Defaults to `meta`.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
     args = parser.parse_args()
 
     account_slug = _resolve_account_slug(args.account)
@@ -394,7 +322,9 @@ def propose_meta_actions_main() -> None:
     payload = load_report_payload(account_slug, run_date, reports_root)
     plan = build_action_plan(payload)
     if args.enrich_live_state:
-        plan = enrich_action_plan_with_live_state(plan, meta_binary=args.meta_binary)
+        from .meta_api import client_from_env
+
+        plan = enrich_action_plan_with_live_state(plan, client=client_from_env(args.api_version))
     output_path = Path(args.output_path) if args.output_path else default_action_plan_path(
         account_slug,
         run_date,
@@ -429,11 +359,7 @@ def apply_meta_actions_main() -> None:
         "--results-path",
         help="Override action results path. Defaults to timestamped action_results file.",
     )
-    parser.add_argument(
-        "--meta-binary",
-        default="meta",
-        help="Meta CLI binary to execute. Defaults to `meta`.",
-    )
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
     parser.add_argument(
         "--execute",
         action="store_true",
@@ -454,7 +380,12 @@ def apply_meta_actions_main() -> None:
     if not plan_path.exists():
         raise SystemExit(f"Action plan not found: {plan_path}. Run propose-actions first.")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    results = apply_action_plan(plan, execute=args.execute, meta_binary=args.meta_binary)
+    client = None
+    if args.execute:
+        from .meta_api import client_from_env
+
+        client = client_from_env(args.api_version)
+    results = apply_action_plan(plan, execute=args.execute, client=client)
     results_path = Path(args.results_path) if args.results_path else default_action_results_path(
         account_slug,
         run_date,
@@ -466,6 +397,113 @@ def apply_meta_actions_main() -> None:
     mode = "executed" if args.execute else "dry-run"
     print(f"Completed {mode} for {account_slug} on {run_date}: {results_path}")
     print(f"Runnable approved actions: {executed_or_ready}; blocked or failed: {blocked_or_failed}")
+
+
+def propose_rotation_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Read active ad sets and propose an audience rotation plan (no writes)."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument(
+        "--run-date",
+        help="Plan folder date under reports/<account>/. Defaults to today.",
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=1,
+        help="How many ad sets forward to shift each audience. Defaults to 1.",
+    )
+    parser.add_argument(
+        "--reports-root",
+        default=str(DEFAULT_REPORTS_ROOT),
+        help="Reports root. Defaults to reports/.",
+    )
+    parser.add_argument("--output-path", help="Override rotation plan path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    reports_root = Path(args.reports_root)
+
+    client = client_from_env(args.api_version)
+    ad_account_id, adsets = fetch_active_adsets(account_slug, client=client)
+    plan = build_rotation_plan(
+        adsets,
+        account_slug=account_slug,
+        ad_account_id=ad_account_id,
+        offset=args.offset,
+    )
+    output_path = Path(args.output_path) if args.output_path else default_rotation_plan_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    write_rotation_plan(plan, output_path)
+    print(f"Wrote rotation plan for {account_slug} ({len(plan['rotations'])} ad sets): {output_path}")
+    for warning in plan["warnings"]:
+        print(f"  warning: {warning}")
+    print("Approve by changing a rotation's status from 'proposed' to 'approved', then run apply-rotation.")
+
+
+def apply_rotation_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Dry-run or execute approved audience rotations through the Meta Graph API."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument(
+        "--run-date",
+        help="Plan folder date under reports/<account>/. Defaults to today.",
+    )
+    parser.add_argument(
+        "--reports-root",
+        default=str(DEFAULT_REPORTS_ROOT),
+        help="Reports root. Defaults to reports/.",
+    )
+    parser.add_argument("--plan-path", help="Override rotation plan path.")
+    parser.add_argument("--results-path", help="Override rotation results path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually apply approved rotations. Without this flag, apply-rotation is a dry run.",
+    )
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    reports_root = Path(args.reports_root)
+    plan_path = Path(args.plan_path) if args.plan_path else default_rotation_plan_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    if not plan_path.exists():
+        raise SystemExit(f"Rotation plan not found: {plan_path}. Run propose-rotation first.")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+    client = client_from_env(args.api_version)
+    results = apply_rotation_plan(plan, client, execute=args.execute)
+    results_path = Path(args.results_path) if args.results_path else default_rotation_results_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    write_rotation_results(plan=plan, results=results, output_path=results_path, execute=args.execute)
+    ran = sum(1 for item in results if item.status in {"dry_run", "executed"})
+    blocked = sum(1 for item in results if item.status in {"blocked", "failed"})
+    mode = "executed" if args.execute else "dry-run"
+    print(f"Completed {mode} rotation for {account_slug} on {run_date}: {results_path}")
+    print(f"Runnable approved rotations: {ran}; blocked or failed: {blocked}")
 
 
 def operator_brief_main() -> None:

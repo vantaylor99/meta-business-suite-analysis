@@ -1,8 +1,12 @@
-"""Action planning and guarded Meta CLI execution."""
+"""Action planning and guarded Meta Graph API execution.
+
+Writes (pause_ad, increase_adset_budget) and live-state reads go through
+``MetaMarketingApiClient``. Executing actions requires an ``ads_management``-scoped
+``META_ACCESS_TOKEN``; live-state reads and dry runs only need ``ads_read``.
+"""
 
 from __future__ import annotations
 
-import subprocess
 import json
 import re
 from dataclasses import dataclass
@@ -12,6 +16,7 @@ from typing import Any
 
 from . import account_registry
 from .config import DEFAULT_REPORTS_ROOT
+from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
 from .utils import ensure_dir, write_json
 
 APPROVED_STATUS = "approved"
@@ -38,10 +43,8 @@ META_AI_DISABLED_POLICY = {
 class ApplyResult:
     action_id: str
     status: str
-    command: list[str] | None
-    returncode: int | None = None
-    stdout: str | None = None
-    stderr: str | None = None
+    request: dict[str, Any] | None
+    response: dict[str, Any] | None = None
     reason: str | None = None
 
 
@@ -180,7 +183,7 @@ def build_action_plan(payload: dict[str, Any]) -> dict[str, Any]:
         "source_report": f"reports/{account_slug}/{run_date}/meta_ads_report.json",
         "approval_instructions": (
             "Review each action. To allow execution, set status to 'approved'. "
-            "Only executable actions with approved status will be sent to Meta CLI."
+            "Only executable actions with approved status are sent to the Meta Graph API."
         ),
         "guardrails": {
             "requires_explicit_approval": True,
@@ -192,17 +195,26 @@ def build_action_plan(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+AD_STATE_FIELDS = ["id", "name", "status", "effective_status", "adset_id", "campaign_id", "updated_time"]
+ADSET_STATE_FIELDS = [
+    "id",
+    "name",
+    "status",
+    "effective_status",
+    "campaign_id",
+    "daily_budget",
+    "lifetime_budget",
+    "updated_time",
+    "targeting",
+]
+
+
 def enrich_action_plan_with_live_state(
     plan: dict[str, Any],
     *,
-    meta_binary: str = "meta",
-    runner: Any | None = None,
+    client: MetaMarketingApiClient | None = None,
 ) -> dict[str, Any]:
-    account_slug = str(plan.get("account_slug") or "")
-    account = account_registry.resolve_account(
-        account_slug,
-        account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH,
-    )
+    effective_client = client or client_from_env()
     enriched = {**plan, "actions": [dict(action) for action in plan.get("actions") or []]}
     checked_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     for action in enriched["actions"]:
@@ -212,17 +224,12 @@ def enrich_action_plan_with_live_state(
         live_state: dict[str, Any] = {}
         if target.get("type") == "ad":
             try:
-                live_state = fetch_live_ad_state(
-                    str(target["id"]),
-                    account.ad_account_id,
-                    meta_binary=meta_binary,
-                    runner=runner,
-                )
-            except RuntimeError as exc:
+                live_state = fetch_live_ad_state(str(target["id"]), client=effective_client)
+            except MetaApiError as exc:
                 action["live_state"] = {
                     "checked_at": checked_at,
                     "lookup_status": "failed",
-                    "error": str(exc),
+                    "error": _redact_sensitive_text(str(exc)),
                 }
                 continue
             action["live_state"] = {"checked_at": checked_at, "lookup_status": "ok", **live_state}
@@ -232,7 +239,7 @@ def enrich_action_plan_with_live_state(
                 action["approval_required"] = False
                 action["rationale"] = f"{action.get('rationale', '').rstrip()} Live Meta state already shows this ad is paused."
         if target.get("type") == "adset" or live_state.get("adset_id"):
-            _maybe_add_live_adset_state(action, live_state, account.ad_account_id, checked_at, meta_binary, runner)
+            _maybe_add_live_adset_state(action, live_state, checked_at, effective_client)
             _populate_budget_params_from_live_state(action)
     _append_meta_ai_remediation_actions(enriched, checked_at)
     enriched["live_state_enriched_at"] = checked_at
@@ -241,29 +248,10 @@ def enrich_action_plan_with_live_state(
 
 def fetch_live_ad_state(
     ad_id: str,
-    ad_account_id: str,
     *,
-    meta_binary: str = "meta",
-    runner: Any | None = None,
+    client: MetaMarketingApiClient,
 ) -> dict[str, Any]:
-    command = [
-        meta_binary,
-        "--output",
-        "json",
-        "ads",
-        "--ad-account-id",
-        ad_account_id,
-        "ad",
-        "get",
-        ad_id,
-    ]
-    payload = _run_meta_cli_json(command, runner=runner)
-    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-        item = payload[0]
-    elif isinstance(payload, dict):
-        item = payload
-    else:
-        raise RuntimeError(f"Meta CLI returned no ad state for ad {ad_id}.")
+    item = client.get_ad(ad_id, fields=AD_STATE_FIELDS)
     return {
         "ad_id": item.get("id"),
         "name": item.get("name"),
@@ -277,31 +265,11 @@ def fetch_live_ad_state(
 
 def fetch_live_adset_state(
     adset_id: str,
-    ad_account_id: str,
     *,
-    meta_binary: str = "meta",
-    runner: Any | None = None,
+    client: MetaMarketingApiClient,
 ) -> dict[str, Any]:
-    command = [
-        meta_binary,
-        "--output",
-        "json",
-        "ads",
-        "--ad-account-id",
-        ad_account_id,
-        "adset",
-        "get",
-        adset_id,
-    ]
-    payload = _run_meta_cli_json(command, runner=runner)
-    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-        item = payload[0]
-    elif isinstance(payload, dict):
-        item = payload
-    else:
-        raise RuntimeError(f"Meta CLI returned no ad set state for ad set {adset_id}.")
-    targeting_raw = item.get("targeting")
-    targeting_text = str(targeting_raw or "")
+    item = client.get_adset(adset_id, fields=ADSET_STATE_FIELDS)
+    targeting = item.get("targeting")
     return {
         "adset_id": item.get("id"),
         "name": item.get("name"),
@@ -311,8 +279,8 @@ def fetch_live_adset_state(
         "daily_budget": item.get("daily_budget"),
         "lifetime_budget": item.get("lifetime_budget"),
         "updated_time": item.get("updated_time"),
-        "targeting_automation_detected": _targeting_automation_detected(targeting_text),
-        "targeting_automation_excerpt": _automation_excerpt(targeting_text),
+        "targeting_automation_detected": _targeting_automation_detected(targeting),
+        "targeting_automation_excerpt": _automation_excerpt(targeting),
     }
 
 
@@ -325,13 +293,9 @@ def apply_action_plan(
     plan: dict[str, Any],
     *,
     execute: bool,
-    meta_binary: str = "meta",
+    client: MetaMarketingApiClient | None = None,
 ) -> list[ApplyResult]:
-    account_slug = str(plan.get("account_slug") or "")
-    account = account_registry.resolve_account(
-        account_slug,
-        account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH,
-    )
+    effective_client = client
     results: list[ApplyResult] = []
     for action in plan.get("actions") or []:
         if not isinstance(action, dict):
@@ -344,30 +308,38 @@ def apply_action_plan(
             results.append(ApplyResult(action_id, "skipped", None, reason="Action is not approved."))
             continue
         try:
-            command = build_meta_cli_command(action, account.ad_account_id, meta_binary=meta_binary)
+            operation = build_api_operation(action)
         except ValueError as exc:
             results.append(ApplyResult(action_id, "blocked", None, reason=str(exc)))
             continue
         if not execute:
-            results.append(ApplyResult(action_id, "dry_run", command))
+            results.append(ApplyResult(action_id, "dry_run", operation))
             continue
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        results.append(
-            ApplyResult(
-                action_id,
-                EXECUTED_STATUS if completed.returncode == 0 else "failed",
-                command,
-                returncode=completed.returncode,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
+        if effective_client is None:
+            effective_client = client_from_env()
+        try:
+            response = _execute_api_operation(operation, effective_client)
+        except MetaApiError as exc:
+            results.append(
+                ApplyResult(action_id, "failed", operation, reason=_redact_sensitive_text(str(exc)))
             )
-        )
+            continue
+        results.append(ApplyResult(action_id, EXECUTED_STATUS, operation, response=response))
     return results
+
+
+def _execute_api_operation(
+    operation: dict[str, Any],
+    client: MetaMarketingApiClient,
+) -> dict[str, Any]:
+    resource = operation.get("resource")
+    node_id = str(operation.get("id") or "")
+    params = operation.get("params") if isinstance(operation.get("params"), dict) else {}
+    if resource == "ad":
+        return client.update_ad(node_id, params=params)
+    if resource == "adset":
+        return client.update_adset(node_id, params=params)
+    raise MetaApiError(f"Unknown API operation resource: {resource}")
 
 
 def write_apply_results(
@@ -382,15 +354,14 @@ def write_apply_results(
         "account_slug": plan.get("account_slug"),
         "run_date": plan.get("run_date"),
         "executed": execute,
+        "transport": "graph_api",
         "generated_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "results": [
             {
                 "action_id": item.action_id,
                 "status": item.status,
-                "command": item.command,
-                "returncode": item.returncode,
-                "stdout": item.stdout,
-                "stderr": item.stderr,
+                "request": item.request,
+                "response": item.response,
                 "reason": item.reason,
             }
             for item in results
@@ -401,7 +372,12 @@ def write_apply_results(
     return output_path
 
 
-def build_meta_cli_command(action: dict[str, Any], ad_account_id: str, *, meta_binary: str = "meta") -> list[str]:
+def build_api_operation(action: dict[str, Any]) -> dict[str, Any]:
+    """Validate an approved action and return the Graph API operation to perform.
+
+    The operation is a transport-agnostic description: ``{"resource", "id", "params"}``,
+    where ``params`` are the exact node fields to POST. This is also what a dry run records.
+    """
     action_type = str(action.get("action_type") or "")
     if action_type not in SUPPORTED_EXECUTABLE_ACTIONS:
         raise ValueError(f"Unsupported executable action_type: {action_type}")
@@ -414,20 +390,7 @@ def build_meta_cli_command(action: dict[str, Any], ad_account_id: str, *, meta_b
             raise ValueError("pause_ad action is missing target.id.")
         if status != "paused":
             raise ValueError("pause_ad action must set params.status to 'paused'.")
-        return [
-            meta_binary,
-            "--no-input",
-            "-o",
-            "json",
-            "ads",
-            "--ad-account-id",
-            ad_account_id,
-            "ad",
-            "update",
-            ad_id,
-            "--status",
-            "paused",
-        ]
+        return {"resource": "ad", "id": ad_id, "params": {"status": "PAUSED"}}
     if action_type == "increase_adset_budget":
         target = action.get("target") if isinstance(action.get("target"), dict) else {}
         params = action.get("params") if isinstance(action.get("params"), dict) else {}
@@ -446,20 +409,7 @@ def build_meta_cli_command(action: dict[str, Any], ad_account_id: str, *, meta_b
             raise ValueError(
                 f"increase_adset_budget exceeds max increase of {max_increase_percent:.0f}%."
             )
-        return [
-            meta_binary,
-            "--no-input",
-            "-o",
-            "json",
-            "ads",
-            "--ad-account-id",
-            ad_account_id,
-            "adset",
-            "update",
-            adset_id,
-            "--daily-budget",
-            str(int(round(new_budget))),
-        ]
+        return {"resource": "adset", "id": adset_id, "params": {"daily_budget": str(int(round(new_budget)))}}
     raise ValueError(f"Unhandled action_type: {action_type}")
 
 
@@ -508,25 +458,6 @@ def _enforce_no_meta_ai_params(action: dict[str, Any]) -> None:
         probe = f"{key} {value}".lower()
         if any(fragment in probe for fragment in forbidden_fragments):
             raise ValueError("Action attempts to set a Meta AI or Advantage+ creative parameter.")
-
-
-def _run_meta_cli_json(command: list[str], *, runner: Any | None = None) -> Any:
-    effective_runner = runner or subprocess.run
-    completed = effective_runner(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        stderr = _redact_sensitive_text((completed.stderr or "").strip())
-        stdout = _redact_sensitive_text((completed.stdout or "").strip())
-        detail = stderr or stdout or f"exit status {completed.returncode}"
-        raise RuntimeError(f"Meta CLI command failed: {detail}")
-    try:
-        return json.loads(completed.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Meta CLI returned non-JSON output: {exc}") from exc
 
 
 def _live_state_is_paused(live_state: dict[str, Any]) -> bool:
@@ -630,27 +561,20 @@ def _qualifies_for_budget_increase(ad: dict[str, Any], policy: dict[str, Any]) -
 def _maybe_add_live_adset_state(
     action: dict[str, Any],
     live_state: dict[str, Any],
-    ad_account_id: str,
     checked_at: str,
-    meta_binary: str,
-    runner: Any | None,
+    client: MetaMarketingApiClient,
 ) -> None:
     target = action.get("target") if isinstance(action.get("target"), dict) else {}
     adset_id = str((target.get("id") if target.get("type") == "adset" else live_state.get("adset_id")) or "").strip()
     if not adset_id:
         return
     try:
-        adset_state = fetch_live_adset_state(
-            adset_id,
-            ad_account_id,
-            meta_binary=meta_binary,
-            runner=runner,
-        )
-    except RuntimeError as exc:
+        adset_state = fetch_live_adset_state(adset_id, client=client)
+    except MetaApiError as exc:
         action["live_adset_state"] = {
             "checked_at": checked_at,
             "lookup_status": "failed",
-            "error": str(exc),
+            "error": _redact_sensitive_text(str(exc)),
         }
         return
     action["live_adset_state"] = {"checked_at": checked_at, "lookup_status": "ok", **adset_state}
@@ -699,8 +623,8 @@ def _append_meta_ai_remediation_actions(plan: dict[str, Any], checked_at: str) -
                 "params": {},
                 "rationale": (
                     "Live ad set targeting appears to include Advantage/automation controls. "
-                    "Current Meta CLI does not expose a safe explicit flag to disable these controls, "
-                    "so this is an operator/API follow-up item."
+                    "Disabling these is intentionally left as an operator follow-up rather than an "
+                    "automatic write, so the executor never silently changes targeting automation."
                 ),
                 "evidence": {
                     "checked_at": checked_at,
@@ -710,12 +634,20 @@ def _append_meta_ai_remediation_actions(plan: dict[str, Any], checked_at: str) -
         )
 
 
-def _targeting_automation_detected(targeting_text: str) -> bool:
-    lowered = targeting_text.lower()
+def _targeting_to_text(targeting: Any) -> str:
+    """Normalize targeting (Graph API dict, or legacy JSON string) to searchable text."""
+    if isinstance(targeting, (dict, list)):
+        return json.dumps(targeting)
+    return str(targeting or "")
+
+
+def _targeting_automation_detected(targeting: Any) -> bool:
+    lowered = _targeting_to_text(targeting).lower()
     return "targeting_automation" in lowered or "advantage_audience" in lowered
 
 
-def _automation_excerpt(targeting_text: str) -> str | None:
+def _automation_excerpt(targeting: Any) -> str | None:
+    targeting_text = _targeting_to_text(targeting)
     if not targeting_text:
         return None
     lowered = targeting_text.lower()

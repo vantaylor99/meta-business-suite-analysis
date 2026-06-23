@@ -8,8 +8,10 @@ python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-2
 
 ## What You Need
 
-- A Meta app with read access to the ad accounts you manage
-- A working access token with `ads_read`
+- A Meta app with access to the ad accounts you manage
+- A working access token:
+  - `ads_read` is enough for reporting sync, dry runs, and live-state reads
+  - `ads_management` is required to *execute* actions (`apply-actions --execute`, `apply-rotation --execute`)
 - Real ad account IDs in `config/meta_ads_accounts.json`
 
 ## Configuration
@@ -115,6 +117,7 @@ reports/<account_slug>/<run_date>/
 
 ## Notes
 
-- The sync is read-only. It does not modify account settings or ads.
+- The reporting sync (`sync-api`) is read-only. It does not modify account settings or ads.
+- Writes (action execution and audience rotation) go through the same Graph API client but only run with an explicit `--execute` flag and an `ads_management`-scoped token.
 - V1 runs one account at a time.
 - V1 preserves the same raw CSV contract the manual export workflow uses today.

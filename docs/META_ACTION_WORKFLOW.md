@@ -47,7 +47,7 @@ python -m meta_ads_analysis apply-actions --account pollen_sense --run-date 2026
 
 Actions are generated with `status: "proposed"`.
 
-Only executable actions with `status: "approved"` are sent to the Meta CLI. Non-executable actions remain operator tasks, even if their status is changed.
+Only executable actions with `status: "approved"` are sent to the Meta Graph API. Non-executable actions remain operator tasks, even if their status is changed.
 
 ## Account Goals
 
@@ -65,7 +65,9 @@ The executor supports:
 - `pause_ad`: pauses a specific ad with high waste risk or account-policy waste risk.
 - `increase_adset_budget`: raises a daily ad set budget only when the proposed action includes the current daily budget, the proposed new daily budget, and the increase stays within the action's `max_increase_percent`.
 
-Budget increases are intentionally capped. The plan can identify the ad set to scale, but live-state enrichment must populate the current daily budget before the executor will build a command.
+Budget increases are intentionally capped. The plan can identify the ad set to scale, but live-state enrichment must populate the current daily budget before the executor will build an operation.
+
+Writes go through the Meta Graph API (`MetaMarketingApiClient.update_ad` / `update_adset`), so the action workflow runs natively on any platform with no CLI/WSL dependency. Executing actions requires `META_ACCESS_TOKEN` to carry the `ads_management` permission; dry runs and live-state reads only need `ads_read`.
 
 The workflow intentionally does not execute:
 
@@ -91,7 +93,7 @@ The executor only allows explicit status changes for approved V1 actions. It blo
 - music generation,
 - flexible media or AI-generated creative variants.
 
-Live-state enrichment also checks ad set payloads for signs of targeting automation or Advantage audience controls. When detected, the plan adds a non-executable remediation task so the operator can disable those controls in Meta or after the CLI exposes a safe explicit field.
+Live-state enrichment also checks ad set payloads for signs of targeting automation or Advantage audience controls. When detected, the plan adds a non-executable remediation task so the operator can disable those controls in Meta. Disabling automation is intentionally left as an operator follow-up rather than an automatic write, so the executor never silently changes targeting automation.
 
 If a future workflow needs to create ads, ad sets, or creatives, it should carry this policy forward by making all AI/Advantage+ controls explicit and defaulting them to disabled.
 
@@ -107,13 +109,13 @@ Use this file as the audit trail for what was skipped, dry-run, executed, blocke
 
 ## Fresh Data
 
-When `META_ACCESS_TOKEN` is not available but the Meta CLI is authenticated, use:
+Pull fresh data from the Meta Graph API (requires `META_ACCESS_TOKEN`):
 
 ```powershell
-python -m meta_ads_analysis sync-cli --account divine_designs --run-date 2026-06-16
+python -m meta_ads_analysis sync-api --account divine_designs --run-date 2026-06-16
 ```
 
-This keeps the normal raw, normalized, and report outputs while sourcing insights from `meta ads insights get`.
+This writes the normal raw, normalized, and report outputs by sourcing insights directly from the Graph API.
 
 ## Later Phase: Operator Brief
 
