@@ -3,12 +3,18 @@
 What we're testing, what we're waiting on, and what past tests taught us. When an experiment
 concludes, copy the durable lesson into `knowledge/learnings.md`.
 
+> Hypotheses carry a confidence level too (see README rubric). When an experiment concludes,
+> fold its result into `learnings.md` as a dated ➕/➖ evidence line and adjust that learning's level.
+
 ## ACTIVE — "Does turning Advantage+ off restore the proven creatives?"
 
 - **Hypothesis:** Several creatives that performed well in other tests underperformed here
   because Advantage+ Audience was expanding delivery past the intended audience. With AA off
   (done 2026-06-22), the defined audience is respected, so those creatives should perform
   closer to their prior ROAS.
+- **Confidence in the hypothesis:** 🔴 Low → — plausible and operator-reported ("did well in
+  other tests"), but untested here and currently un-testable (creatives blocked). Will move
+  once the test below runs.
 - **Change made:** Advantage Audience disabled on all 3 active ad sets (2026-06-22).
   Audiences and exclusions left unchanged (so this is a clean one-variable test of AA).
 - **BLOCKED ON:** the **dev-mode app** issue. Most of the proven creatives (New Pink, White

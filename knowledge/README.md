@@ -35,3 +35,50 @@ repo, read this directory before touching data or taking action.
 - Keep entries concise and skimmable. This base should stay readable in a few minutes.
 - **Update this base at the end of any session** that changed an account or taught us something.
 - This directory is committed to git, so it travels to every machine and every agent.
+
+## Confidence & evidence (how we record what we learn)
+
+We record **everything** we learn — even a single observation — but every learning in
+`learnings.md` (and any belief we lean on) carries a **confidence level** and a **dated
+evidence log**, so trust is calibrated and *moves over time*: it grows as results repeat and
+shrinks when something contradicts it. The goal is honest, falsifiable knowledge — not a pile
+of confident-sounding claims.
+
+**Levels** (pair with a trend marker — ↑ rising / → stable / ↓ falling — since last review):
+
+- 🔴 **Low** — one observation, a plausible inference, or confounded/noisy evidence. A hunch;
+  don't bet big on it.
+- 🟡 **Medium** — one clean/controlled test, several consistent informal observations, or a
+  directly observed platform behavior (n=1). Reasonable to act on; re-confirm for high-stakes moves.
+- 🟢 **High** — reproduced by ≥2 *independent* tests/observations (different time, segment, or
+  account), or one deep well-powered test, or a directly verified + documented platform mechanic.
+  Rely on it.
+
+**Evidence strength** (stronger evidence can push confidence higher; weak evidence can't reach
+High on its own): controlled experiment with the variable isolated > clean before/after on the
+same entity > cross-sectional comparison of different entities (confounded) > single-window
+observation or inference. Always flag when evidence is confounded.
+
+**How confidence moves:**
+
+- A new learning enters at the level its first evidence supports (usually 🔴 Low; 🟡 Medium for
+  a clean test or a directly observed platform fact).
+- **+1 level** when *independent* evidence reproduces it (cap at 🟢 High).
+- **−1 level (or more)** when credible contradicting evidence appears; if directly refuted, drop
+  to 🔴 Low and mark *contested*, or delete it.
+- Keep the full evidence log — the current level must be justifiable from it. Each entry also
+  states **what would raise or lower it**, so it stays testable.
+- When an experiment in `experiments.md` concludes, fold its result into the relevant learning
+  as a new dated ➕/➖ evidence line and adjust the level.
+
+**Entry template:**
+
+```
+### <one-line claim>
+**Confidence:** 🟡 Medium ↑  ·  **Domain:** platform | strategy | measurement
+- ➕ YYYY-MM-DD — <supporting evidence> _(evidence type; account/source)_
+- ➖ YYYY-MM-DD — <contradicting evidence>
+**Apply:** <how to act on it>
+**Would raise / lower:** <evidence that would move confidence>
+```
+
