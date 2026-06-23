@@ -24,6 +24,12 @@ Meta App Dashboard (publish the app / set it Live — needs Privacy Policy URL +
 or recreate the creatives natively in Ads Manager. Not fixable via the ads API, and unrelated
 to the Business "Advertising settings → Apps" (app-install) page. To confirm the creating app
 via API you'd need a token with `pages_read_engagement`.
+**Key nuance:** a **Development-mode app can still fully manage your own ad account** via the
+API (reads + pause/budget/targeting) — Dev mode is fine for *control*. Live mode is needed
+*only* so posts the app *creates* can be served publicly, and **Live mode without App Review
+stays private to your own business** (no public users, no review needed). Corollary: if you'll
+create future ads *via the API*, the app must be Live; if ads are created in Ads Manager and the
+app only manages them, Dev mode is fine indefinitely.
 **Would lower:** an ad with this exact issue delivering anyway, or the flag clearing with no app change.
 
 ### While Advantage+ Audience is on, custom-audience edits are rejected and the audience is only a suggestion
