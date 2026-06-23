@@ -7,12 +7,15 @@ import sys
 from .cli import (
     apply_disable_advantage_main,
     apply_meta_actions_main,
+    apply_ops_main,
     apply_renames_main,
     apply_rotation_main,
     build_meta_report_main,
     ingest_meta_exports_main,
+    inspect_main,
     operator_brief_main,
     propose_disable_advantage_main,
+    propose_enable_ads_main,
     propose_meta_actions_main,
     propose_renames_main,
     propose_rotation_main,
@@ -23,9 +26,9 @@ from .cli import (
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
-            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|propose-actions|apply-actions|"
+            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|propose-actions|apply-actions|"
             "propose-rotation|apply-rotation|propose-disable-advantage|apply-disable-advantage|"
-            "propose-renames|apply-renames|operator-brief> [args]\n"
+            "propose-renames|apply-renames|propose-enable-ads|apply-ops|operator-brief> [args]\n"
             "Example: python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-21"
         )
         return
@@ -54,6 +57,15 @@ def main() -> None:
     if command in {"apply_rotation", "apply_audience_rotation"}:
         apply_rotation_main()
         return
+    if command in {"inspect", "snapshot"}:
+        inspect_main()
+        return
+    if command in {"propose_enable_ads", "enable_ads"}:
+        propose_enable_ads_main()
+        return
+    if command in {"apply_ops", "ops"}:
+        apply_ops_main()
+        return
     if command in {"propose_disable_advantage", "propose_disable_aa"}:
         propose_disable_advantage_main()
         return
@@ -71,9 +83,10 @@ def main() -> None:
         return
 
     raise SystemExit(
-        f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, "
+        f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, `inspect`, "
         "`propose-actions`, `apply-actions`, `propose-rotation`, `apply-rotation`, "
-        "`propose-renames`, `apply-renames`, or `operator-brief`."
+        "`propose-disable-advantage`, `apply-disable-advantage`, `propose-renames`, "
+        "`apply-renames`, `propose-enable-ads`, `apply-ops`, or `operator-brief`."
     )
 
 

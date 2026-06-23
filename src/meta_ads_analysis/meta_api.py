@@ -119,6 +119,35 @@ class MetaMarketingApiClient:
         params = {"fields": ",".join(fields), "access_token": self.access_token}
         return self._get_json(self._make_url(f"/{adset_id}"), params=params)
 
+    def list_campaigns(
+        self,
+        ad_account_id: str,
+        *,
+        fields: list[str],
+        effective_status: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"fields": ",".join(fields), "limit": 200}
+        if effective_status:
+            params["effective_status"] = json.dumps(list(effective_status))
+        return list(self.iter_paginated(f"/{ad_account_id}/campaigns", params=params))
+
+    def get_campaign(self, campaign_id: str, *, fields: list[str]) -> dict[str, Any]:
+        params = {"fields": ",".join(fields), "access_token": self.access_token}
+        return self._get_json(self._make_url(f"/{campaign_id}"), params=params)
+
+    def update_campaign(
+        self,
+        campaign_id: str,
+        *,
+        params: dict[str, Any],
+        validate_only: bool = False,
+    ) -> dict[str, Any]:
+        """POST a campaign update (e.g. status, name). Requires ``ads_management``."""
+        return self._post_json(
+            self._make_url(f"/{campaign_id}"),
+            data=self._encode_write_params(params, validate_only),
+        )
+
     def get_ad(self, ad_id: str, *, fields: list[str]) -> dict[str, Any]:
         """Fetch a single ad's current state."""
         params = {"fields": ",".join(fields), "access_token": self.access_token}

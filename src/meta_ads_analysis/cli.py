@@ -31,6 +31,17 @@ from .briefs import (
 )
 from .config import DEFAULT_DB_PATH, DEFAULT_NORMALIZED_ROOT, DEFAULT_RAW_ROOT, DEFAULT_REPORTS_ROOT
 from .normalize import creative_fieldnames, ingest_raw_exports, normalized_fieldnames
+from .control import (
+    apply_ops_plan,
+    build_account_snapshot,
+    build_enable_ads_plan,
+    default_ops_plan_path,
+    default_ops_results_path,
+    default_snapshot_path,
+    resolve_ad_account_id,
+    write_ops_results,
+    write_plan,
+)
 from .reporting import render_markdown_report
 from .rotation import (
     apply_advantage_disable_plan,
@@ -725,6 +736,125 @@ def apply_renames_main() -> None:
     mode = "validate-only" if args.validate_only else ("executed" if args.execute else "dry-run")
     print(f"Completed {mode} renames for {account_slug} on {run_date}: {results_path}")
     print(f"Runnable approved renames: {ran}; blocked or failed: {blocked}")
+
+
+def inspect_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Read-only snapshot of an ad account: campaigns -> ad sets -> ads, with status, issues, budgets, audiences."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--active-only", action="store_true", help="Only include ACTIVE campaigns/ad sets.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT), help="Reports root. Defaults to reports/.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    reports_root = Path(args.reports_root)
+
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    snap = build_account_snapshot(client, ad_account_id, active_only=args.active_only)
+    snap["account_slug"] = account_slug
+    output_path = default_snapshot_path(account_slug, run_date, reports_root)
+    write_plan(snap, output_path)
+
+    r = snap["rollup"]
+    print(f"{account_slug} [{ad_account_id}] — {r['campaigns']} campaigns, {r['adsets']} ad sets, "
+          f"{r['ads']} ads ({r['active_ads']} active); {r['ads_with_issues']} ads with issues; "
+          f"{r['adsets_with_advantage_audience']} ad sets with Advantage Audience on")
+    for c in snap["campaigns"]:
+        print(f"\n[{c['effective_status']}] CAMPAIGN {c['name']}")
+        for a in c["adsets"]:
+            aa = " AA:on" if a["advantage_audience"] else ""
+            budget = f" ${int(a['daily_budget'])/100:.0f}/day" if a.get("daily_budget") else ""
+            print(f"  [{a['effective_status']}]{budget}{aa} {a['name']}  inc={a['included_audiences']} exc={len(a['excluded_audiences'])}")
+            for ad in a["ads"]:
+                flag = f"  !! {'; '.join(ad['issues'])}" if ad["issues"] else ""
+                print(f"      [{ad['effective_status']:<14}] {ad['name']}{flag}")
+    if snap["ads_with_issues"]:
+        print(f"\nAds with delivery issues: {len(snap['ads_with_issues'])} (see {output_path})")
+    print(f"\nSnapshot: {output_path}")
+
+
+def propose_enable_ads_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Propose enabling (status ACTIVE) currently-inactive ads, optionally filtered (no writes)."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--adset-id", action="append", help="Limit to ad(s) in this ad set id (repeatable).")
+    parser.add_argument("--name-contains", help="Limit to ads whose name contains this substring.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT), help="Reports root. Defaults to reports/.")
+    parser.add_argument("--output-path", help="Override ops plan path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    reports_root = Path(args.reports_root)
+
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    plan = build_enable_ads_plan(
+        client, ad_account_id, account_slug=account_slug,
+        adset_ids=args.adset_id, name_contains=args.name_contains,
+    )
+    output_path = Path(args.output_path) if args.output_path else default_ops_plan_path(account_slug, run_date, reports_root)
+    write_plan(plan, output_path)
+    print(f"Wrote enable-ads plan for {account_slug} ({len(plan['ops'])} inactive ads): {output_path}")
+    for op in plan["ops"]:
+        print(f"  {op['name']} — {op['note']}")
+    print("Approve by setting an op's status to 'approved', then run apply-ops --validate-only / --execute.")
+
+
+def apply_ops_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Dry-run, validate, or execute an approved ops plan (set_status / set_daily_budget / rename)."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT), help="Reports root. Defaults to reports/.")
+    parser.add_argument("--plan-path", help="Override ops plan path. Defaults to ops_plan.json.")
+    parser.add_argument("--results-path", help="Override results path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    parser.add_argument("--validate-only", action="store_true", help="Send each approved op to Meta with validate_only.")
+    parser.add_argument("--execute", action="store_true", help="Actually apply approved ops. Without this, it's a dry run.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    reports_root = Path(args.reports_root)
+    plan_path = Path(args.plan_path) if args.plan_path else default_ops_plan_path(account_slug, run_date, reports_root)
+    if not plan_path.exists():
+        raise SystemExit(f"Ops plan not found: {plan_path}. Run propose-enable-ads (or author an ops plan) first.")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+    client = client_from_env(args.api_version)
+    results = apply_ops_plan(plan, client, execute=args.execute, validate_only=args.validate_only)
+    results_path = Path(args.results_path) if args.results_path else default_ops_results_path(account_slug, run_date, reports_root)
+    write_ops_results(plan=plan, results=results, output_path=results_path, execute=args.execute)
+    ran = sum(1 for r in results if r.status in {"dry_run", "validated", "executed"})
+    blocked = sum(1 for r in results if r.status in {"blocked", "failed", "validation_failed"})
+    mode = "validate-only" if args.validate_only else ("executed" if args.execute else "dry-run")
+    print(f"Completed {mode} ops for {account_slug} on {run_date}: {results_path}")
+    print(f"Runnable approved ops: {ran}; blocked or failed: {blocked}")
+    for r in results:
+        if r.reason:
+            print(f"  {r.op_id}: {r.status} — {r.reason}")
 
 
 def operator_brief_main() -> None:

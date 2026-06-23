@@ -1693,3 +1693,145 @@ def test_apply_advantage_disable_preserves_audiences_and_turns_off_aa() -> None:
     # audiences preserved exactly, not rotated
     assert t["custom_audiences"] == [{"id": "A"}]
     assert t["excluded_custom_audiences"] == [{"id": "B"}, {"id": "C"}]
+
+
+# --- Control layer (inspect + guarded ops + enable-ads) ----------------------
+
+from meta_ads_analysis.control import (
+    apply_ops_plan,
+    build_account_snapshot,
+    build_enable_ads_plan,
+    validate_op,
+)
+
+
+class _ControlFakeClient:
+    """Fake client for control-layer tests: campaigns/adsets/ads + updates."""
+
+    def __init__(self, campaigns, adsets, ads):
+        self._campaigns = campaigns
+        self._adsets = adsets
+        self._ads = ads
+        self._by_id = {e["id"]: e for e in campaigns + adsets + ads}
+        self.updates = []
+
+    def list_campaigns(self, ad_account_id, *, fields, effective_status=None):
+        return self._campaigns
+
+    def list_adsets(self, ad_account_id, *, fields, effective_status=None):
+        return self._adsets
+
+    def iter_paginated(self, path, *, params=None):
+        return list(self._ads)
+
+    def get_ad(self, node_id, *, fields):
+        return self._by_id[node_id]
+
+    def get_adset(self, node_id, *, fields):
+        return self._by_id[node_id]
+
+    def get_campaign(self, node_id, *, fields):
+        return self._by_id[node_id]
+
+    def update_ad(self, node_id, *, params, validate_only=False):
+        self.updates.append(("ad", node_id, params, validate_only))
+        return {"id": node_id, "success": True}
+
+    def update_adset(self, node_id, *, params, validate_only=False):
+        self.updates.append(("adset", node_id, params, validate_only))
+        return {"id": node_id, "success": True}
+
+    def update_campaign(self, node_id, *, params, validate_only=False):
+        self.updates.append(("campaign", node_id, params, validate_only))
+        return {"id": node_id, "success": True}
+
+
+def _control_fixture():
+    campaigns = [{"id": "c1", "name": "Camp", "status": "ACTIVE", "effective_status": "ACTIVE"}]
+    adsets = [
+        {
+            "id": "as1", "name": "Set 1", "status": "ACTIVE", "effective_status": "ACTIVE",
+            "campaign_id": "c1", "daily_budget": "10000",
+            "targeting": {
+                "custom_audiences": [{"id": "A", "name": "aud-A"}],
+                "excluded_custom_audiences": [{"id": "B", "name": "aud-B"}],
+                "targeting_automation": {"advantage_audience": 1},
+            },
+        }
+    ]
+    ads = [
+        {"id": "ad1", "name": "Winner", "status": "ACTIVE", "effective_status": "ACTIVE", "adset_id": "as1", "issues_info": []},
+        {
+            "id": "ad2", "name": "Blocked", "status": "PAUSED", "effective_status": "WITH_ISSUES", "adset_id": "as1",
+            "issues_info": [{"error_summary": "Ads creative post was created by an app that is in development mode"}],
+        },
+    ]
+    return _ControlFakeClient(campaigns, adsets, ads)
+
+
+def test_build_account_snapshot_assembles_tree_and_rollup() -> None:
+    client = _control_fixture()
+    snap = build_account_snapshot(client, "act_1")
+    assert snap["rollup"] == {
+        "campaigns": 1, "adsets": 1, "ads": 2, "active_ads": 1,
+        "ads_with_issues": 1, "adsets_with_advantage_audience": 1,
+    }
+    adset = snap["campaigns"][0]["adsets"][0]
+    assert adset["advantage_audience"] is True
+    assert adset["included_audiences"] == ["aud-A"]
+    assert len(adset["ads"]) == 2
+    assert snap["ads_with_issues"][0]["ad_name"] == "Blocked"
+
+
+def test_validate_op_enforces_guardrails() -> None:
+    validate_op({"op_id": "x", "op": "set_status", "level": "ad", "id": "ad1", "params": {"status": "ACTIVE"}})
+    # bad status
+    try:
+        validate_op({"op_id": "x", "op": "set_status", "level": "ad", "id": "ad1", "params": {"status": "DELETED"}})
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    # AI param blocked
+    try:
+        validate_op({"op_id": "x", "op": "rename", "level": "adset", "id": "as1", "params": {"name": "advantage_plus_on"}})
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    # budget at wrong level
+    try:
+        validate_op({"op_id": "x", "op": "set_daily_budget", "level": "ad", "id": "ad1", "params": {"daily_budget_cents": 100}})
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
+def test_apply_ops_enable_ad_and_budget_cap() -> None:
+    client = _control_fixture()
+    plan = {
+        "ops": [
+            {"op_id": "enable", "op": "set_status", "level": "ad", "id": "ad2", "params": {"status": "ACTIVE"}, "status": "approved"},
+            {"op_id": "bump", "op": "set_daily_budget", "level": "adset", "id": "as1",
+             "params": {"daily_budget_cents": 11000, "max_increase_percent": 20}, "status": "approved"},
+            {"op_id": "overbump", "op": "set_daily_budget", "level": "adset", "id": "as1",
+             "params": {"daily_budget_cents": 13000, "max_increase_percent": 20}, "status": "approved"},
+            {"op_id": "notapproved", "op": "set_status", "level": "ad", "id": "ad1", "params": {"status": "PAUSED"}, "status": "proposed"},
+        ]
+    }
+    results = apply_ops_plan(plan, client, execute=True)
+    by_id = {r.op_id: r for r in results}
+    assert by_id["enable"].status == "executed"
+    assert by_id["bump"].status == "executed"  # within 20% (10000 -> 11000)
+    assert by_id["overbump"].status == "blocked"  # 13000 > 12000 cap
+    assert by_id["notapproved"].status == "skipped"
+    # only the two valid approved writes hit the client
+    assert ("ad", "ad2", {"status": "ACTIVE"}, False) in client.updates
+    assert ("adset", "as1", {"daily_budget": "11000"}, False) in client.updates
+
+
+def test_build_enable_ads_plan_targets_only_inactive_ads() -> None:
+    client = _control_fixture()
+    plan = build_enable_ads_plan(client, "act_1", account_slug="demo")
+    assert plan["intent"] == "enable_ads"
+    assert [op["id"] for op in plan["ops"]] == ["ad2"]  # only the inactive one
+    assert plan["ops"][0]["params"] == {"status": "ACTIVE"}
+    assert "development mode" in plan["ops"][0]["note"]

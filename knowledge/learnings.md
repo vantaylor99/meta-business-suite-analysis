@@ -107,8 +107,16 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
 (optional real dry test) → --execute`. Commands (`python -m meta_ads_analysis <cmd>`):
 
 - `sync-api` (pull insights/ads) · `report` (build analysis).
+- `inspect` — **read-only situational-awareness snapshot**: campaign→ad set→ad tree with status,
+  effective_status, delivery issues, budgets, and audiences + rollups. Writes `account_snapshot.json`.
 - `propose-actions` / `apply-actions` — pause underperformers, capped ad set budget increases.
 - `propose-rotation` / `apply-rotation` — rotate custom audiences (optional `--disable-advantage-audience`).
 - `propose-disable-advantage` / `apply-disable-advantage` — turn Advantage Audience off in place.
 - `propose-renames` / `apply-renames` — rename ad sets to match their current audience.
-- **No** "enable ad" / creative-create / app-mode write path yet.
+- `propose-enable-ads` — propose enabling currently-inactive ads (filter by `--adset-id` / `--name-contains`).
+- `apply-ops` — **generic guarded executor** for an ops plan: `set_status` (ACTIVE/PAUSED at
+  ad/adset/campaign), `set_daily_budget` (adset/campaign, capped vs current), `rename` (any level).
+  An agent can author its own `ops_plan.json` (ops with `status: approved`) and run this. Guardrails:
+  per-op approval, budget-increase cap, no Meta-AI/Advantage params.
+- **Deliberately NOT built** (destructive / out of scope): delete, archive, creating new
+  campaigns/ad sets/ads, and arbitrary targeting edits (targeting has its own rotation tools).
