@@ -2,6 +2,18 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-23 — re-enabled proven winners
+
+- **Enabled `New Pink` (30d ROAS 3.08) and `New Black` (3.89)** in the Engaged Audience ad set
+  via `apply-ops` (validate-only `{"success": true}` → execute). Both went `ACTIVE / IN_PROCESS`
+  with no issues — confirms the dev-mode flag clears on re-review now that the apps are Live.
+  Started narrow (winners only) to keep the Advantage+-off experiment readable.
+- `White BG V2 - Copy` (5.37) was already re-reviewing on its own; left as-is.
+- Deliberately left off: the 1.4–2.0 laggards (Test-Selfie OG cluster, Christian Blue Shirt),
+  the `White BG V2` drag (1.85), the fatigued `Selfie FM - Copy`, and `Selfie Mom - Copy`
+  (needs a tracking pixel first).
+- **Next:** hold ~5–7 days, then `inspect` + `sync-api`/`report` and compare to the 2.43 baseline.
+
 ## 2026-06-22 (later) — dev-mode app blocker resolved at the root
 
 - **Both business apps ("codex", "AI Ad Analysis") published to Live** (by operator, via the
