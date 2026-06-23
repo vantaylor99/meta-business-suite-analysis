@@ -14,9 +14,16 @@ Legend: 🟢 High · 🟡 Medium · 🔴 Low · trend ↑ rising / → stable / 
 - ➕ 2026-06-22 — ~20 paused ads across all 3 active Divine Designs ad sets showed
   `issues_info = "Ads creative post was created by an app that is in development mode"`;
   matches documented Meta behavior. _(direct API observation; divine_designs)_
+- ➕ 2026-06-22 — all 22 affected creatives are dark posts on one Page (`766046059925199`)
+  with API-generated post IDs → created programmatically by a custom app in Dev mode. The
+  creating app couldn't be confirmed via API (post `application` field needs
+  `pages_read_engagement`; our token lacks it). _(API observation; divine_designs)_
 
 **Apply:** Check `issues_info` before assuming a paused ad can be re-enabled. The fix is in the
-Meta App Dashboard (publish the app / set it Live), not the ads API.
+Meta App Dashboard (publish the app / set it Live — needs Privacy Policy URL + Category first),
+or recreate the creatives natively in Ads Manager. Not fixable via the ads API, and unrelated
+to the Business "Advertising settings → Apps" (app-install) page. To confirm the creating app
+via API you'd need a token with `pages_read_engagement`.
 **Would lower:** an ad with this exact issue delivering anyway, or the flag clearing with no app change.
 
 ### While Advantage+ Audience is on, custom-audience edits are rejected and the audience is only a suggestion

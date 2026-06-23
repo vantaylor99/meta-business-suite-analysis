@@ -19,6 +19,15 @@ Append-only, dated. Newest first. Record every change to the live account + the 
   BG V2 - Copy, New Black), are `WITH_ISSUES` = "Ads creative post was created by an app
   that is in development mode" and cannot deliver until the app is set Live. Re-enabling
   them via the API will not help. `Selfie Mom - Copy` separately needs a tracking pixel.
+- **Diagnosed deeper:** all 22 affected creatives are dark posts on a single Page
+  (`766046059925199`) with API-generated post IDs → the posts were created programmatically
+  via the Marketing API by a custom app, and that app is in Development mode. The business
+  has two apps ("codex", "AI Ad Analysis"); the creating app couldn't be confirmed via API
+  (reading a post's `application` field needs `pages_read_engagement`, which our token lacks).
+  **Fix path:** set the offending app to **Live** in the App Dashboard
+  (developers.facebook.com/apps → Settings→Basic needs Privacy Policy URL + Category + icon,
+  then toggle App Mode to Live), or recreate the winning creatives natively in Ads Manager.
+  The Business "Advertising settings → Apps" (app-install) page is unrelated.
 
 **Analysis run (read-only):** full account analysis on the 30-day window (baseline in
 `profile.md`). Blended ROAS 2.43 vs 3.0 target.
