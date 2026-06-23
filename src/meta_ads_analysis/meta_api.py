@@ -132,6 +132,24 @@ class MetaMarketingApiClient:
         params = {"fields": ",".join(fields), "access_token": self.access_token}
         return self._get_json(self._make_url(f"/{ad_account_id}"), params=params)
 
+    def get_delivery_estimate(self, adset_id: str, *, fields: list[str]) -> dict[str, Any]:
+        """Estimated audience reach/size for an ad set's current targeting."""
+        params = {"fields": ",".join(fields), "access_token": self.access_token}
+        return self._get_json(self._make_url(f"/{adset_id}/delivery_estimate"), params=params)
+
+    def search_targeting(self, *, query: str, search_type: str = "adinterest", limit: int = 25) -> list[dict[str, Any]]:
+        """Search Meta's targeting catalog (default: detailed-targeting interests)."""
+        params = {"type": search_type, "q": query, "limit": limit}
+        return list(self.iter_paginated("/search", params=params))
+
+    def list_pixels(self, ad_account_id: str, *, fields: list[str]) -> list[dict[str, Any]]:
+        params = {"fields": ",".join(fields), "limit": 100}
+        return list(self.iter_paginated(f"/{ad_account_id}/adspixels", params=params))
+
+    def list_custom_conversions(self, ad_account_id: str, *, fields: list[str]) -> list[dict[str, Any]]:
+        params = {"fields": ",".join(fields), "limit": 100}
+        return list(self.iter_paginated(f"/{ad_account_id}/customconversions", params=params))
+
     def create_campaign(self, ad_account_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
         """Create a campaign (requires ``ads_management``)."""
         return self._post_json(

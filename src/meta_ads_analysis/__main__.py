@@ -14,10 +14,13 @@ from .cli import (
     apply_authoring_main,
     build_meta_report_main,
     diagnose_main,
+    estimate_main,
     ingest_meta_exports_main,
     inspect_main,
     list_audiences_main,
+    list_pixels_main,
     metrics_main,
+    search_interests_main,
     operator_brief_main,
     propose_disable_advantage_main,
     propose_duplicate_ad_main,
@@ -35,10 +38,10 @@ def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
             "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|metrics|diagnose|"
-            "list-audiences|account-info|propose-actions|apply-actions|propose-rotation|apply-rotation|"
-            "propose-disable-advantage|apply-disable-advantage|propose-renames|apply-renames|"
-            "propose-enable-ads|propose-pause-ads|apply-ops|propose-duplicate-ad|propose-lookalike|"
-            "apply-authoring|operator-brief> [args]\n"
+            "list-audiences|account-info|estimate|search-interests|list-pixels|propose-actions|"
+            "apply-actions|propose-rotation|apply-rotation|propose-disable-advantage|"
+            "apply-disable-advantage|propose-renames|apply-renames|propose-enable-ads|propose-pause-ads|"
+            "apply-ops|propose-duplicate-ad|propose-lookalike|apply-authoring|operator-brief> [args]\n"
             "Example: python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-21"
         )
         return
@@ -82,6 +85,15 @@ def main() -> None:
     if command in {"account_info", "account"}:
         account_info_main()
         return
+    if command in {"estimate", "delivery_estimate"}:
+        estimate_main()
+        return
+    if command in {"search_interests", "interests"}:
+        search_interests_main()
+        return
+    if command in {"list_pixels", "pixels"}:
+        list_pixels_main()
+        return
     if command in {"apply_authoring", "authoring"}:
         apply_authoring_main()
         return
@@ -118,10 +130,11 @@ def main() -> None:
 
     raise SystemExit(
         f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, `inspect`, `metrics`, "
-        "`diagnose`, `list-audiences`, `account-info`, `propose-actions`, `apply-actions`, "
-        "`propose-rotation`, `apply-rotation`, `propose-disable-advantage`, `apply-disable-advantage`, "
-        "`propose-renames`, `apply-renames`, `propose-enable-ads`, `propose-pause-ads`, `apply-ops`, "
-        "`propose-duplicate-ad`, `propose-lookalike`, `apply-authoring`, or `operator-brief`."
+        "`diagnose`, `list-audiences`, `account-info`, `estimate`, `search-interests`, `list-pixels`, "
+        "`propose-actions`, `apply-actions`, `propose-rotation`, `apply-rotation`, "
+        "`propose-disable-advantage`, `apply-disable-advantage`, `propose-renames`, `apply-renames`, "
+        "`propose-enable-ads`, `propose-pause-ads`, `apply-ops`, `propose-duplicate-ad`, "
+        "`propose-lookalike`, `apply-authoring`, or `operator-brief`."
     )
 
 

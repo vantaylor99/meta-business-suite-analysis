@@ -52,11 +52,15 @@ from .control import (
     default_ops_plan_path,
     default_ops_results_path,
     default_snapshot_path,
+    estimate_adset_audience,
     fetch_breakdown_metrics,
     fetch_entity_metrics,
     list_account_audiences,
+    list_account_conversions,
+    list_account_pixels,
     resolve_ad_account_id,
     scan_issues,
+    search_interests,
     write_ops_results,
     write_plan,
 )
@@ -863,6 +867,69 @@ def metrics_main() -> None:
               f"{(r['roas'] if r['roas'] is not None else 0):>7.2f}{(r['purchases'] or 0):>7.0f}"
               f"{(r['cost_per_purchase'] if r['cost_per_purchase'] is not None else 0):>9.2f}")
     print(f"\nMetrics JSON: {output_path}")
+
+
+def estimate_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(description="Estimated audience size/reach for an ad set's current targeting.")
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--adset-id", required=True, help="Ad set to estimate.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    client = client_from_env(args.api_version)
+    est = estimate_adset_audience(client, args.adset_id)
+    print(f"Ad set {args.adset_id} — estimate_ready={est['estimate_ready']}")
+    print(f"  estimated reachable (MAU): {est['mau_lower']} - {est['mau_upper']}")
+    print(f"  estimated daily active (DAU): {est['estimate_dau']}")
+
+
+def search_interests_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(description="Search detailed-targeting interests by keyword.")
+    parser.add_argument("--account", required=True, help="Account/company slug or name (for token resolution).")
+    parser.add_argument("--query", required=True, help="Keyword to search, e.g. 'jewelry'.")
+    parser.add_argument("--limit", type=int, default=25, help="Max results (default 25).")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    if _resolve_account_slug(args.account) is None:
+        raise SystemExit("--account is required.")
+    client = client_from_env(args.api_version)
+    rows = search_interests(client, args.query, limit=args.limit)
+    print(f"{len(rows)} interests for '{args.query}':")
+    print(f"{'name':<40}{'size (lower-upper)':>28}  id")
+    for r in rows:
+        size = f"{r['audience_lower']}-{r['audience_upper']}" if r.get("audience_lower") is not None else "?"
+        print(f"{str(r['name'])[:39]:<40}{size:>28}  {r['id']}")
+
+
+def list_pixels_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(description="List the account's Meta pixels and custom conversions.")
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    pixels = list_account_pixels(client, ad_account_id)
+    conversions = list_account_conversions(client, ad_account_id)
+    print(f"{account_slug}: {len(pixels)} pixel(s)")
+    for p in pixels:
+        print(f"  {p.get('name')} ({p.get('id')}) last_fired={p.get('last_fired_time')} unavailable={p.get('is_unavailable')}")
+    print(f"\n{len(conversions)} custom conversion(s)")
+    for c in conversions:
+        print(f"  {c.get('name')} ({c.get('id')}) type={c.get('custom_event_type')} archived={c.get('is_archived')}")
 
 
 def account_info_main() -> None:

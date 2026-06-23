@@ -14,6 +14,7 @@ guarded tools: rotation + advantage-audience disable).
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,11 +30,16 @@ APPROVED_STATUS = "approved"
 PROPOSED_STATUS = "proposed"
 EXECUTED_STATUS = "executed"
 
-SUPPORTED_OPS = {"set_status", "set_daily_budget", "rename"}
+TARGETING_OPS = {"set_age_range", "set_genders", "set_geo_locations", "set_placements"}
+SUPPORTED_OPS = {"set_status", "set_daily_budget", "rename"} | TARGETING_OPS
 OP_LEVELS = {
     "set_status": {"ad", "adset", "campaign"},
     "set_daily_budget": {"adset", "campaign"},
     "rename": {"ad", "adset", "campaign"},
+    "set_age_range": {"adset"},
+    "set_genders": {"adset"},
+    "set_geo_locations": {"adset"},
+    "set_placements": {"adset"},
 }
 ALLOWED_STATUSES = {"ACTIVE", "PAUSED"}
 FORBIDDEN_FRAGMENTS = ("advantage", "ai_", "creative_enhancement", "image_expansion", "text_variation")
@@ -194,6 +200,20 @@ def validate_op(op: dict[str, Any]) -> None:
     elif op_type == "rename":
         if not str(params.get("name") or "").strip():
             raise ValueError("rename requires a non-empty params.name.")
+    elif op_type == "set_age_range":
+        lo, hi = _num(params.get("age_min")), _num(params.get("age_max"))
+        if lo is None or hi is None or not (13 <= lo <= hi <= 65):
+            raise ValueError("set_age_range requires 13 <= age_min <= age_max <= 65.")
+    elif op_type == "set_genders":
+        genders = params.get("genders")
+        if not isinstance(genders, list) or any(g not in (1, 2) for g in genders):
+            raise ValueError("set_genders requires params.genders as a list subset of [1, 2] (1=male, 2=female; [] = all).")
+    elif op_type == "set_geo_locations":
+        if not isinstance(params.get("geo_locations"), dict) or not params["geo_locations"]:
+            raise ValueError("set_geo_locations requires a non-empty params.geo_locations object.")
+    elif op_type == "set_placements":
+        if not params.get("automatic") and not (isinstance(params.get("publisher_platforms"), list) and params["publisher_platforms"]):
+            raise ValueError("set_placements requires params.automatic=true or a non-empty publisher_platforms list.")
 
 
 def _get_entity(client: MetaMarketingApiClient, level: str, node_id: str, fields: list[str]) -> dict[str, Any]:
@@ -214,14 +234,45 @@ def _update_entity(
     return client.update_campaign(node_id, params=params, validate_only=validate_only)
 
 
+def _apply_targeting_change(op_type: str, params: dict[str, Any], targeting: Any) -> dict[str, Any]:
+    """Read-modify-write one targeting dimension; preserves all other fields incl. automation."""
+    t = copy.deepcopy(targeting) if isinstance(targeting, dict) else {}
+    if op_type == "set_age_range":
+        t["age_min"] = int(params["age_min"])
+        t["age_max"] = int(params["age_max"])
+        t.pop("age_range", None)
+    elif op_type == "set_genders":
+        genders = params.get("genders") or []
+        if genders:
+            t["genders"] = genders
+        else:
+            t.pop("genders", None)
+    elif op_type == "set_geo_locations":
+        t["geo_locations"] = params["geo_locations"]
+    elif op_type == "set_placements":
+        if params.get("automatic"):
+            for k in ("publisher_platforms", "facebook_positions", "instagram_positions",
+                      "audience_network_positions", "messenger_positions", "device_platforms"):
+                t.pop(k, None)
+        else:
+            t["publisher_platforms"] = params["publisher_platforms"]
+            for k in ("facebook_positions", "instagram_positions", "device_platforms"):
+                if params.get(k) is not None:
+                    t[k] = params[k]
+    return t
+
+
 def _build_request(op: dict[str, Any], client: MetaMarketingApiClient) -> dict[str, Any]:
-    """Translate an op into the Graph API params to POST. May re-read live state (budget cap)."""
+    """Translate an op into the Graph API params to POST. May re-read live state (budget cap, targeting)."""
     op_type = op["op"]
     params = op.get("params") or {}
     if op_type == "set_status":
         return {"status": str(params["status"]).upper()}
     if op_type == "rename":
         return {"name": str(params["name"])}
+    if op_type in TARGETING_OPS:
+        live = _get_entity(client, "adset", str(op["id"]), ["id", "targeting"])
+        return {"targeting": _apply_targeting_change(op_type, params, live.get("targeting"))}
     if op_type == "set_daily_budget":
         new_cents = int(_num(params.get("daily_budget_cents")))
         max_increase = _num(params.get("max_increase_percent"))
@@ -462,6 +513,53 @@ def account_info(client: MetaMarketingApiClient, ad_account_id: str) -> dict[str
         "funding_source": funding.get("display_string") if isinstance(funding, dict) else funding,
         "disable_reason": a.get("disable_reason"),
     }
+
+
+# --- Audience sizing / discovery / measurement ------------------------------
+
+
+def estimate_adset_audience(client: MetaMarketingApiClient, adset_id: str) -> dict[str, Any]:
+    """Estimated audience size / reach for an ad set's current targeting."""
+    payload = client.get_delivery_estimate(
+        adset_id, fields=["estimate_dau", "estimate_mau_lower_bound", "estimate_mau_upper_bound", "estimate_ready"]
+    )
+    data = payload.get("data") or []
+    est = data[0] if data and isinstance(data[0], dict) else {}
+    return {
+        "adset_id": adset_id,
+        "estimate_ready": est.get("estimate_ready"),
+        "estimate_dau": est.get("estimate_dau"),
+        "mau_lower": est.get("estimate_mau_lower_bound"),
+        "mau_upper": est.get("estimate_mau_upper_bound"),
+    }
+
+
+def search_interests(client: MetaMarketingApiClient, query: str, *, limit: int = 25) -> list[dict[str, Any]]:
+    """Search detailed-targeting interests (id, name, audience size, topic) for use in targeting."""
+    rows = client.search_targeting(query=query, search_type="adinterest", limit=limit)
+    return [
+        {
+            "id": r.get("id"),
+            "name": r.get("name"),
+            "audience_lower": r.get("audience_size_lower_bound"),
+            "audience_upper": r.get("audience_size_upper_bound"),
+            "topic": r.get("topic"),
+            "path": r.get("path"),
+        }
+        for r in rows
+    ]
+
+
+def list_account_pixels(client: MetaMarketingApiClient, ad_account_id: str) -> list[dict[str, Any]]:
+    """List the Meta pixels on the account (id, name, last fired, availability)."""
+    return client.list_pixels(ad_account_id, fields=["id", "name", "last_fired_time", "is_unavailable"])
+
+
+def list_account_conversions(client: MetaMarketingApiClient, ad_account_id: str) -> list[dict[str, Any]]:
+    """List custom conversions defined on the account."""
+    return client.list_custom_conversions(
+        ad_account_id, fields=["id", "name", "custom_event_type", "is_archived", "default_conversion_value"]
+    )
 
 
 # --- Delivery-issue scan ----------------------------------------------------

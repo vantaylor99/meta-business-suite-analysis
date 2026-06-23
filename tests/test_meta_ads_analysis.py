@@ -2037,3 +2037,69 @@ def test_account_info_maps_status_code() -> None:
     info = account_info(C(), "act_1")
     assert info["status"] == "ACTIVE"
     assert info["funding_source"] == "Visa ****1234"
+
+
+# --- Targeting ops + estimate / interest search / pixels --------------------
+
+from meta_ads_analysis.control import (
+    estimate_adset_audience,
+    list_account_pixels,
+    search_interests,
+    validate_op as _validate_op,
+)
+
+
+def test_targeting_ops_validation() -> None:
+    _validate_op({"op_id": "x", "op": "set_age_range", "level": "adset", "id": "as1", "params": {"age_min": 25, "age_max": 45}})
+    for bad in [
+        {"op_id": "x", "op": "set_age_range", "level": "adset", "id": "as1", "params": {"age_min": 50, "age_max": 30}},
+        {"op_id": "x", "op": "set_genders", "level": "adset", "id": "as1", "params": {"genders": [3]}},
+        {"op_id": "x", "op": "set_geo_locations", "level": "adset", "id": "as1", "params": {"geo_locations": {}}},
+        {"op_id": "x", "op": "set_placements", "level": "adset", "id": "as1", "params": {}},
+        {"op_id": "x", "op": "set_age_range", "level": "campaign", "id": "c1", "params": {"age_min": 18, "age_max": 65}},
+    ]:
+        try:
+            _validate_op(bad)
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+
+
+def test_apply_targeting_ops_read_modify_write_preserves_other_fields() -> None:
+    adsets = [_adset("as1", "Set 1", ["A"], ["B"], advantage=True)]  # has geo, age_min, automation
+    plan = {
+        "ops": [
+            {"op_id": "age", "op": "set_age_range", "level": "adset", "id": "as1", "params": {"age_min": 30, "age_max": 50}, "status": "approved"},
+            {"op_id": "place", "op": "set_placements", "level": "adset", "id": "as1", "params": {"automatic": True}, "status": "approved"},
+        ]
+    }
+    client = _FakeClient(adsets)
+    results = apply_ops_plan(plan, client, execute=True)
+    assert {r.status for r in results} == {"executed"}
+    sent = {adset_id: params for adset_id, params, _vo in client.updates}
+    # both ops re-POST the full targeting object
+    age_t = client.updates[0][1]["targeting"]
+    assert age_t["age_min"] == 30 and age_t["age_max"] == 50
+    assert age_t["geo_locations"] == {"countries": ["US"]}  # preserved
+    assert age_t["custom_audiences"] == [{"id": "A", "name": "aud-A"}]  # untouched
+    assert age_t["targeting_automation"] == {"advantage_audience": 1}  # never modified by targeting ops
+
+
+def test_estimate_and_search_and_pixels_normalize() -> None:
+    class C:
+        def get_delivery_estimate(self, adset_id, *, fields):
+            return {"data": [{"estimate_ready": True, "estimate_mau_lower_bound": 100000, "estimate_mau_upper_bound": 200000, "estimate_dau": 5000}]}
+
+        def search_targeting(self, *, query, search_type="adinterest", limit=25):
+            return [{"id": "6003", "name": "Jewelry", "audience_size_lower_bound": 1000, "audience_size_upper_bound": 2000, "topic": "Shopping"}]
+
+        def list_pixels(self, ad_account_id, *, fields):
+            return [{"id": "px1", "name": "Main Pixel", "last_fired_time": "2026-06-20", "is_unavailable": False}]
+
+    c = C()
+    est = estimate_adset_audience(c, "as1")
+    assert est["mau_lower"] == 100000 and est["mau_upper"] == 200000
+    interests = search_interests(c, "jewelry")
+    assert interests[0]["name"] == "Jewelry" and interests[0]["audience_lower"] == 1000
+    pixels = list_account_pixels(c, "act_1")
+    assert pixels[0]["name"] == "Main Pixel"

@@ -127,6 +127,9 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
 - `account-info` — account status, currency, lifetime spend, spend cap, balance, funding source.
 - `metrics --breakdown <dim>` — performance split by age, gender, country, region,
   publisher_platform, platform_position, impression_device, device_platform, etc.
+- `estimate --adset-id <id>` — estimated reachable audience size (MAU range) for an ad set.
+- `search-interests --query <kw>` — discover detailed-targeting interests (id, name, size).
+- `list-pixels` — account pixels (+ last fired) and custom conversions.
 - `propose-actions` / `apply-actions` — pause underperformers, capped ad set budget increases.
 - `propose-rotation` / `apply-rotation` — rotate custom audiences (optional `--disable-advantage-audience`).
 - `propose-disable-advantage` / `apply-disable-advantage` — turn Advantage Audience off in place.
@@ -134,10 +137,13 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
 - `propose-enable-ads` — propose enabling currently-inactive ads (filter by `--adset-id` / `--name-contains`).
 - `propose-pause-ads` — propose pausing ACTIVE ads by filter and/or a performance rule
   (`--roas-below` + `--min-spend` over a window, pulled live). Executes via `apply-ops`.
-- `apply-ops` — **generic guarded executor** for an ops plan: `set_status` (ACTIVE/PAUSED at
-  ad/adset/campaign), `set_daily_budget` (adset/campaign, capped vs current), `rename` (any level).
-  An agent can author its own `ops_plan.json` (ops with `status: approved`) and run this. Guardrails:
-  per-op approval, budget-increase cap, no Meta-AI/Advantage params.
+- `apply-ops` — **generic guarded executor** for an ops plan. Ops: `set_status` (ACTIVE/PAUSED at
+  ad/adset/campaign), `set_daily_budget` (adset/campaign, capped vs current), `rename` (any level),
+  and **targeting ops** (adset, read-modify-write the full targeting spec): `set_age_range`,
+  `set_genders`, `set_geo_locations`, `set_placements` (manual placements or `{automatic:true}` for
+  Advantage+ placements). An agent can author its own `ops_plan.json` (ops with `status: approved`)
+  and run this. Guardrails: per-op approval, budget-increase cap, no Meta-AI/Advantage params,
+  targeting ops never modify `targeting_automation`.
 - `propose-duplicate-ad` / `propose-lookalike` / `apply-authoring` — **authoring layer**: create
   campaigns/ad sets/ads (everything created **PAUSED**), duplicate an existing ad's creative into
   another ad set, create lookalike audiences. Same approval/validate-only/execute gate; rejects

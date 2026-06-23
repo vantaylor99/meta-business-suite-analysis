@@ -7,6 +7,10 @@
 - **Measurement:** optimize on purchases (Website purchases) first; ROAS is the headline
   metric but is partly derived (see learnings). Outbound clicks are a diagnostic secondary
   signal only.
+- **Pixels (as of 2026-06-23, via `list-pixels`):** two exist — `Shopify Store Pixel`
+  (2263151130774482, firing) and `Devine Designs` (1117839580144872, **never fired** — note the
+  misspelling). 0 custom conversions. The active/correct pixel is the Shopify one; the
+  `Selfie Mom - Copy` "Tracking Pixel Required" issue likely stems from a missing/incorrect pixel.
 
 ## Structure (after 2026-06-22 cleanup)
 
