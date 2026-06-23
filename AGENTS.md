@@ -1,5 +1,12 @@
 # Meta Ads Analysis Agent Guide
 
+> **Start here:** before analyzing data or taking any account action, read
+> [`knowledge/README.md`](knowledge/README.md) and the relevant
+> `knowledge/accounts/<account>/` files. That is the project's durable memory — account
+> goals, what we've already changed, what we're testing, and lessons already learned (e.g.
+> Advantage+ and dev-mode-app gotchas). Update the knowledge base at the end of any session
+> that changes an account or teaches us something.
+
 This file defines how an agent should analyze the normalized Meta ads data and how the final report should be written.
 
 ## Purpose
