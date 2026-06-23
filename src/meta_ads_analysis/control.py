@@ -308,7 +308,7 @@ def build_enable_ads_plan(
     ads = list(
         client.iter_paginated(
             f"/{ad_account_id}/ads",
-            params={"fields": ",".join(AD_FIELDS + ["name"]), "limit": 200},
+            params={"fields": ",".join(AD_FIELDS), "limit": 200},
         )
     )
     scope = set(adset_ids or [])
