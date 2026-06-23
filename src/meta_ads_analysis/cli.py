@@ -31,7 +31,17 @@ from .briefs import (
 )
 from .config import DEFAULT_DB_PATH, DEFAULT_NORMALIZED_ROOT, DEFAULT_RAW_ROOT, DEFAULT_REPORTS_ROOT
 from .normalize import creative_fieldnames, ingest_raw_exports, normalized_fieldnames
+from .authoring import (
+    apply_authoring_plan,
+    build_duplicate_ad_plan,
+    build_lookalike_plan,
+    default_authoring_plan_path,
+    default_authoring_results_path,
+    write_authoring_plan,
+    write_authoring_results,
+)
 from .control import (
+    account_info,
     apply_ops_plan,
     build_account_snapshot,
     build_enable_ads_plan,
@@ -42,6 +52,7 @@ from .control import (
     default_ops_plan_path,
     default_ops_results_path,
     default_snapshot_path,
+    fetch_breakdown_metrics,
     fetch_entity_metrics,
     list_account_audiences,
     resolve_ad_account_id,
@@ -796,6 +807,11 @@ def metrics_main() -> None:
     parser = argparse.ArgumentParser(description="Live per-entity performance (ROAS/spend/purchases) over a window.")
     parser.add_argument("--account", required=True, help="Account/company slug or name.")
     parser.add_argument("--level", choices=["account", "campaign", "adset", "ad"], default="adset")
+    parser.add_argument(
+        "--breakdown",
+        help="Split by a dimension instead of by entity (e.g. age, gender, country, "
+             "publisher_platform, platform_position, impression_device). Comma-separate for multiple.",
+    )
     parser.add_argument("--date-from", help="Window start YYYY-MM-DD. Defaults to trailing 30 days.")
     parser.add_argument("--date-to", help="Window end YYYY-MM-DD. Defaults to today.")
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
@@ -811,6 +827,27 @@ def metrics_main() -> None:
 
     client = client_from_env(args.api_version)
     ad_account_id = resolve_ad_account_id(account_slug)
+
+    if args.breakdown:
+        rows = fetch_breakdown_metrics(
+            client, ad_account_id, breakdown=args.breakdown, date_from=date_from, date_to=date_to, level=args.level
+        )
+        out = {"account_slug": account_slug, "level": args.level, "breakdown": args.breakdown,
+               "date_from": date_from, "date_to": date_to, "rows": rows}
+        output_path = default_metrics_path(account_slug, run_date, f"{args.level}_by_{args.breakdown.replace(',', '_')}", Path(args.reports_root))
+        write_plan(out, output_path)
+        total_spend = sum(r["spend"] for r in rows)
+        total_value = sum(r["purchase_value"] or 0 for r in rows)
+        print(f"{account_slug} {args.level} by {args.breakdown} {date_from}..{date_to} — spend ${total_spend:,.0f} "
+              f"value ${total_value:,.0f} ROAS {(total_value/total_spend if total_spend else 0):.2f}")
+        print(f"{'segment':<34}{'spend':>10}{'value':>10}{'ROAS':>7}{'purch':>7}")
+        for r in rows:
+            seg = ", ".join(str(v) for v in r["segment"].values())
+            print(f"{seg[:33]:<34}{r['spend']:>10.0f}{(r['purchase_value'] or 0):>10.0f}"
+                  f"{(r['roas'] if r['roas'] is not None else 0):>7.2f}{(r['purchases'] or 0):>7.0f}")
+        print(f"\nMetrics JSON: {output_path}")
+        return
+
     rows = fetch_entity_metrics(client, ad_account_id, level=args.level, date_from=date_from, date_to=date_to)
     out = {"account_slug": account_slug, "level": args.level, "date_from": date_from, "date_to": date_to, "rows": rows}
     output_path = default_metrics_path(account_slug, run_date, args.level, Path(args.reports_root))
@@ -826,6 +863,118 @@ def metrics_main() -> None:
               f"{(r['roas'] if r['roas'] is not None else 0):>7.2f}{(r['purchases'] or 0):>7.0f}"
               f"{(r['cost_per_purchase'] if r['cost_per_purchase'] is not None else 0):>9.2f}")
     print(f"\nMetrics JSON: {output_path}")
+
+
+def account_info_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(description="Show account-level status, currency, spend, spend cap, funding.")
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    client = client_from_env(args.api_version)
+    info = account_info(client, resolve_ad_account_id(account_slug))
+    print(f"{account_slug} [{info['ad_account_id']}]")
+    for k in ("name", "business_name", "status", "currency", "timezone", "amount_spent", "spend_cap", "balance", "funding_source", "disable_reason"):
+        print(f"  {k:<16}: {info.get(k)}")
+
+
+def apply_authoring_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Dry-run, validate, or execute an approved authoring plan (create campaign/adset/ad/lookalike; all created PAUSED)."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    parser.add_argument("--plan-path", help="Override authoring plan path.")
+    parser.add_argument("--results-path", help="Override results path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    parser.add_argument("--validate-only", action="store_true", help="Send each approved op to Meta with validate_only.")
+    parser.add_argument("--execute", action="store_true", help="Actually create. Without this, it's a dry run.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    plan_path = Path(args.plan_path) if args.plan_path else default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
+    if not plan_path.exists():
+        raise SystemExit(f"Authoring plan not found: {plan_path}.")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+    client = client_from_env(args.api_version)
+    results = apply_authoring_plan(plan, client, execute=args.execute, validate_only=args.validate_only)
+    results_path = Path(args.results_path) if args.results_path else default_authoring_results_path(account_slug, run_date, Path(args.reports_root))
+    write_authoring_results(plan=plan, results=results, output_path=results_path, execute=args.execute)
+    ran = sum(1 for r in results if r.status in {"dry_run", "validated", "created"})
+    blocked = sum(1 for r in results if r.status in {"blocked", "failed", "validation_failed"})
+    mode = "validate-only" if args.validate_only else ("executed" if args.execute else "dry-run")
+    print(f"Completed {mode} authoring for {account_slug}: {results_path}")
+    print(f"Runnable approved ops: {ran}; blocked or failed: {blocked}")
+    for r in results:
+        if r.created_id or r.reason:
+            print(f"  {r.op_id}: {r.status} {('-> ' + r.created_id) if r.created_id else ''} {r.reason or ''}")
+
+
+def propose_duplicate_ad_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(description="Propose duplicating an existing ad's creative into a target ad set (created PAUSED).")
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--source-ad-id", required=True, help="Ad to copy the creative from.")
+    parser.add_argument("--target-adset-id", required=True, help="Ad set to create the new ad in.")
+    parser.add_argument("--name", help="Name for the new ad. Defaults to '<source name> (copy)'.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    plan = build_duplicate_ad_plan(
+        client, ad_account_id, source_ad_id=args.source_ad_id,
+        target_adset_id=args.target_adset_id, name=args.name, account_slug=account_slug,
+    )
+    output_path = default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
+    write_authoring_plan(plan, output_path)
+    print(f"Wrote authoring plan ({plan['ops'][0]['note']}): {output_path}")
+    print("Approve the op (status -> 'approved'), then apply-authoring --validate-only / --execute. Created PAUSED.")
+
+
+def propose_lookalike_main() -> None:
+    parser = argparse.ArgumentParser(description="Propose creating a lookalike audience from a seed (no writes).")
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--name", required=True, help="Name for the new lookalike audience.")
+    parser.add_argument("--origin-audience-id", required=True, help="Seed custom audience id.")
+    parser.add_argument("--country", default="US", help="Country code for the lookalike (default US).")
+    parser.add_argument("--ratio", type=float, default=0.01, help="Lookalike ratio 0.01-0.20 (default 0.01 = 1%%).")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    ad_account_id = resolve_ad_account_id(account_slug)
+    plan = build_lookalike_plan(
+        ad_account_id, name=args.name, origin_audience_id=args.origin_audience_id,
+        country=args.country, ratio=args.ratio, account_slug=account_slug,
+    )
+    output_path = default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
+    write_authoring_plan(plan, output_path)
+    print(f"Wrote authoring plan ({plan['ops'][0]['note']}): {output_path}")
+    print("Approve the op (status -> 'approved'), then apply-authoring --validate-only / --execute.")
 
 
 def diagnose_main() -> None:

@@ -75,7 +75,8 @@ class MetaMarketingApiClient:
         date_from: str,
         date_to: str,
         level: str = "ad",
-        time_increment: int = 1,
+        time_increment: int | str = 1,
+        breakdowns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         params = {
             "fields": ",".join(fields),
@@ -84,6 +85,8 @@ class MetaMarketingApiClient:
             "time_range": json.dumps({"since": date_from, "until": date_to}),
             "limit": 500,
         }
+        if breakdowns:
+            params["breakdowns"] = ",".join(breakdowns)
         return list(self.iter_paginated(f"/{ad_account_id}/insights", params=params))
 
     def fetch_ads(
@@ -123,6 +126,37 @@ class MetaMarketingApiClient:
         """List the custom audiences available in the account (read-only)."""
         params = {"fields": ",".join(fields), "limit": 200}
         return list(self.iter_paginated(f"/{ad_account_id}/customaudiences", params=params))
+
+    def get_account(self, ad_account_id: str, *, fields: list[str]) -> dict[str, Any]:
+        """Fetch account-level info (status, currency, spend cap, amount spent, funding)."""
+        params = {"fields": ",".join(fields), "access_token": self.access_token}
+        return self._get_json(self._make_url(f"/{ad_account_id}"), params=params)
+
+    def create_campaign(self, ad_account_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
+        """Create a campaign (requires ``ads_management``)."""
+        return self._post_json(
+            self._make_url(f"/{ad_account_id}/campaigns"), data=self._encode_write_params(params, validate_only)
+        )
+
+    def create_adset(self, ad_account_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
+        """Create an ad set (requires ``ads_management``)."""
+        return self._post_json(
+            self._make_url(f"/{ad_account_id}/adsets"), data=self._encode_write_params(params, validate_only)
+        )
+
+    def create_ad(self, ad_account_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
+        """Create an ad (requires ``ads_management``)."""
+        return self._post_json(
+            self._make_url(f"/{ad_account_id}/ads"), data=self._encode_write_params(params, validate_only)
+        )
+
+    def create_custom_audience(
+        self, ad_account_id: str, *, params: dict[str, Any], validate_only: bool = False
+    ) -> dict[str, Any]:
+        """Create a custom or lookalike audience (requires ``ads_management``)."""
+        return self._post_json(
+            self._make_url(f"/{ad_account_id}/customaudiences"), data=self._encode_write_params(params, validate_only)
+        )
 
     def list_campaigns(
         self,

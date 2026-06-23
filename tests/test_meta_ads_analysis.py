@@ -1853,7 +1853,7 @@ class _MetricsFakeClient:
         self._ads = ads or []
         self._audiences = audiences or []
 
-    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1):
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1, breakdowns=None):
         return self._insights
 
     def iter_paginated(self, path, *, params=None):
@@ -1928,3 +1928,112 @@ def test_build_pause_plan_selects_underperformers_by_roas() -> None:
     ids = [op["id"] for op in plan["ops"]]
     assert ids == ["ad1"]  # only the active, below-floor, enough-spend ad
     assert plan["ops"][0]["params"] == {"status": "PAUSED"}
+
+
+# --- Authoring (create / duplicate / lookalike) + breakdowns + account-info --
+
+from meta_ads_analysis.authoring import (
+    apply_authoring_plan,
+    build_duplicate_ad_plan,
+    build_lookalike_plan,
+    validate_authoring_op,
+)
+from meta_ads_analysis.control import account_info, fetch_breakdown_metrics
+
+
+class _AuthoringFakeClient:
+    def __init__(self, ad_creative_id="cr1"):
+        self._creative_id = ad_creative_id
+        self.creates = []
+
+    def get_ad(self, ad_id, *, fields):
+        return {"id": ad_id, "name": "Source Ad", "creative": {"id": self._creative_id}}
+
+    def create_campaign(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("campaign", params, validate_only))
+        return {"id": "new_camp"}
+
+    def create_adset(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("adset", params, validate_only))
+        return {"id": "new_adset"}
+
+    def create_ad(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("ad", params, validate_only))
+        return {"id": "new_ad"}
+
+    def create_custom_audience(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("audience", params, validate_only))
+        return {"id": "new_lal"}
+
+
+def test_validate_authoring_op_guards() -> None:
+    validate_authoring_op({"kind": "create_campaign", "params": {"name": "C", "objective": "OUTCOME_SALES"}})
+    for bad in [
+        {"kind": "create_campaign", "params": {"name": "C"}},  # missing objective
+        {"kind": "create_ad", "params": {"name": "A", "adset_id": "as1"}},  # missing creative
+        {"kind": "create_lookalike", "params": {"name": "L", "origin_audience_id": "a1", "country": "US", "ratio": 0.5}},  # ratio out of range
+        {"kind": "create_campaign", "params": {"name": "advantage_audience_on", "objective": "X"}},  # AI param
+        {"kind": "create_widget", "params": {}},  # unknown kind
+    ]:
+        try:
+            validate_authoring_op(bad)
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+
+
+def test_apply_authoring_forces_paused_and_records_created_ids() -> None:
+    client = _AuthoringFakeClient()
+    plan = {
+        "ad_account_id": "act_1",
+        "ops": [
+            {"op_id": "c", "kind": "create_campaign", "params": {"name": "C", "objective": "OUTCOME_SALES"}, "status": "approved"},
+            {"op_id": "a", "kind": "create_ad", "params": {"name": "A", "adset_id": "as1", "creative": {"creative_id": "cr1"}}, "status": "approved"},
+            {"op_id": "skip", "kind": "create_campaign", "params": {"name": "D", "objective": "X"}, "status": "proposed"},
+        ],
+    }
+    results = apply_authoring_plan(plan, client, execute=True)
+    by_id = {r.op_id: r for r in results}
+    assert by_id["c"].status == "created" and by_id["c"].created_id == "new_camp"
+    assert by_id["a"].status == "created"
+    assert by_id["skip"].status == "skipped"
+    # both creates forced PAUSED
+    for kind, params, _vo in client.creates:
+        assert params["status"] == "PAUSED"
+
+
+def test_build_duplicate_ad_plan_reuses_source_creative() -> None:
+    client = _AuthoringFakeClient(ad_creative_id="cr-99")
+    plan = build_duplicate_ad_plan(client, "act_1", source_ad_id="ad1", target_adset_id="as2")
+    op = plan["ops"][0]
+    assert op["kind"] == "create_ad"
+    assert op["params"]["creative"] == {"creative_id": "cr-99"}
+    assert op["params"]["adset_id"] == "as2"
+
+
+def test_build_lookalike_plan_shape() -> None:
+    plan = build_lookalike_plan("act_1", name="LAL 2%", origin_audience_id="a1", country="US", ratio=0.02)
+    op = plan["ops"][0]
+    assert op["kind"] == "create_lookalike"
+    assert op["params"]["ratio"] == 0.02
+
+
+def test_fetch_breakdown_metrics_segments_and_roas() -> None:
+    insights = [
+        {"age": "25-34", "spend": "100", "action_values": [{"action_type": "purchase", "value": "400"}], "actions": [{"action_type": "purchase", "value": "8"}]},
+        {"age": "35-44", "spend": "200", "action_values": [{"action_type": "purchase", "value": "200"}], "actions": [{"action_type": "purchase", "value": "3"}]},
+    ]
+    client = _MetricsFakeClient(insights=insights)
+    rows = fetch_breakdown_metrics(client, "act_1", breakdown="age", date_from="2026-06-01", date_to="2026-06-30")
+    assert rows[0]["segment"] == {"age": "35-44"}  # sorted by spend desc
+    assert rows[1]["roas"] == 4.0
+
+
+def test_account_info_maps_status_code() -> None:
+    class C:
+        def get_account(self, ad_account_id, *, fields):
+            return {"name": "Acct", "account_status": 1, "currency": "USD",
+                    "funding_source_details": {"display_string": "Visa ****1234"}}
+    info = account_info(C(), "act_1")
+    assert info["status"] == "ACTIVE"
+    assert info["funding_source"] == "Visa ****1234"

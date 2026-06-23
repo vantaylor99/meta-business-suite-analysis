@@ -10,6 +10,8 @@ from .cli import (
     apply_ops_main,
     apply_renames_main,
     apply_rotation_main,
+    account_info_main,
+    apply_authoring_main,
     build_meta_report_main,
     diagnose_main,
     ingest_meta_exports_main,
@@ -18,7 +20,9 @@ from .cli import (
     metrics_main,
     operator_brief_main,
     propose_disable_advantage_main,
+    propose_duplicate_ad_main,
     propose_enable_ads_main,
+    propose_lookalike_main,
     propose_meta_actions_main,
     propose_pause_ads_main,
     propose_renames_main,
@@ -31,9 +35,10 @@ def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
             "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|metrics|diagnose|"
-            "list-audiences|propose-actions|apply-actions|propose-rotation|apply-rotation|"
+            "list-audiences|account-info|propose-actions|apply-actions|propose-rotation|apply-rotation|"
             "propose-disable-advantage|apply-disable-advantage|propose-renames|apply-renames|"
-            "propose-enable-ads|propose-pause-ads|apply-ops|operator-brief> [args]\n"
+            "propose-enable-ads|propose-pause-ads|apply-ops|propose-duplicate-ad|propose-lookalike|"
+            "apply-authoring|operator-brief> [args]\n"
             "Example: python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-21"
         )
         return
@@ -74,6 +79,18 @@ def main() -> None:
     if command in {"list_audiences", "audiences"}:
         list_audiences_main()
         return
+    if command in {"account_info", "account"}:
+        account_info_main()
+        return
+    if command in {"apply_authoring", "authoring"}:
+        apply_authoring_main()
+        return
+    if command in {"propose_duplicate_ad", "duplicate_ad"}:
+        propose_duplicate_ad_main()
+        return
+    if command in {"propose_lookalike", "lookalike"}:
+        propose_lookalike_main()
+        return
     if command in {"propose_enable_ads", "enable_ads"}:
         propose_enable_ads_main()
         return
@@ -101,9 +118,10 @@ def main() -> None:
 
     raise SystemExit(
         f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, `inspect`, `metrics`, "
-        "`diagnose`, `list-audiences`, `propose-actions`, `apply-actions`, `propose-rotation`, "
-        "`apply-rotation`, `propose-disable-advantage`, `apply-disable-advantage`, `propose-renames`, "
-        "`apply-renames`, `propose-enable-ads`, `propose-pause-ads`, `apply-ops`, or `operator-brief`."
+        "`diagnose`, `list-audiences`, `account-info`, `propose-actions`, `apply-actions`, "
+        "`propose-rotation`, `apply-rotation`, `propose-disable-advantage`, `apply-disable-advantage`, "
+        "`propose-renames`, `apply-renames`, `propose-enable-ads`, `propose-pause-ads`, `apply-ops`, "
+        "`propose-duplicate-ad`, `propose-lookalike`, `apply-authoring`, or `operator-brief`."
     )
 
 

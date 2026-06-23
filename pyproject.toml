@@ -34,9 +34,13 @@ inspect_account = "meta_ads_analysis.cli:inspect_main"
 account_metrics = "meta_ads_analysis.cli:metrics_main"
 diagnose_account = "meta_ads_analysis.cli:diagnose_main"
 list_audiences = "meta_ads_analysis.cli:list_audiences_main"
+account_info = "meta_ads_analysis.cli:account_info_main"
 propose_enable_ads = "meta_ads_analysis.cli:propose_enable_ads_main"
 propose_pause_ads = "meta_ads_analysis.cli:propose_pause_ads_main"
 apply_ops = "meta_ads_analysis.cli:apply_ops_main"
+propose_duplicate_ad = "meta_ads_analysis.cli:propose_duplicate_ad_main"
+propose_lookalike = "meta_ads_analysis.cli:propose_lookalike_main"
+apply_authoring = "meta_ads_analysis.cli:apply_authoring_main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

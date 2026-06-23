@@ -95,6 +95,17 @@ validate-only call that actually changes state.
 **Would raise:** it persists after AA-off with the full creative set, or holds in a controlled
 rotation (same creatives, swapped audience).  **Would lower:** it flips once creatives/AA are equalized.
 
+### Divine Designs: Instagram outperforms Facebook; 18-24 and 45-54 are the strongest age bands
+**Confidence:** 🔴 Low ↑  ·  **Domain:** strategy
+- ➕ 2026-06-23 — 30d `metrics --breakdown`: by `publisher_platform`, Instagram 2.79 ROAS
+  ($10.4k spend) vs Facebook 1.94 ($7.3k); by `age`, 18-24 = 3.18 and 45-54 = 2.93 (most spend)
+  led, while 55-64 (1.41) and 65+ (1.57) lagged. _(single 30-day window, account-wide, confounded
+  by creative/audience mix; not yet a controlled test)_
+
+**Apply:** Hypotheses to test, not yet rules — consider shifting weight toward Instagram and the
+strong age bands, or excluding 55+, once the dev-mode/AA cleanup settles. Re-pull to confirm.
+**Would raise:** the split persists across multiple windows or after the current changes settle.
+
 ### ROAS on this account is partly derived, not Meta-reported
 **Confidence:** 🟢 High →  ·  **Domain:** measurement
 - ➕ 2026-06-22 — 30 ads lacked a direct `purchase_roas` field; ROAS is computed from value/spend.
@@ -113,6 +124,9 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
   account/campaign/adset/ad level (`--level`, `--date-from/--date-to`). On-demand, no CSV pipeline.
 - `diagnose` — **account-wide delivery-issue scan**, grouped by issue (the dev-mode-app finder).
 - `list-audiences` — **custom-audience inventory** (id, name, subtype, size, status).
+- `account-info` — account status, currency, lifetime spend, spend cap, balance, funding source.
+- `metrics --breakdown <dim>` — performance split by age, gender, country, region,
+  publisher_platform, platform_position, impression_device, device_platform, etc.
 - `propose-actions` / `apply-actions` — pause underperformers, capped ad set budget increases.
 - `propose-rotation` / `apply-rotation` — rotate custom audiences (optional `--disable-advantage-audience`).
 - `propose-disable-advantage` / `apply-disable-advantage` — turn Advantage Audience off in place.
@@ -124,5 +138,10 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
   ad/adset/campaign), `set_daily_budget` (adset/campaign, capped vs current), `rename` (any level).
   An agent can author its own `ops_plan.json` (ops with `status: approved`) and run this. Guardrails:
   per-op approval, budget-increase cap, no Meta-AI/Advantage params.
-- **Deliberately NOT built** (destructive / out of scope): delete, archive, creating new
-  campaigns/ad sets/ads, and arbitrary targeting edits (targeting has its own rotation tools).
+- `propose-duplicate-ad` / `propose-lookalike` / `apply-authoring` — **authoring layer**: create
+  campaigns/ad sets/ads (everything created **PAUSED**), duplicate an existing ad's creative into
+  another ad set, create lookalike audiences. Same approval/validate-only/execute gate; rejects
+  Meta-AI/Advantage params.
+- **Deliberately NOT built** (destructive / out of scope): delete, archive, creative/media upload
+  (duplicate-ad reuses an existing creative instead), and arbitrary targeting edits (targeting has
+  its own rotation tools).

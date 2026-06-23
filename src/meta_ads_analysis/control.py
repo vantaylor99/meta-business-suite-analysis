@@ -402,6 +402,68 @@ def fetch_entity_metrics(
     return out
 
 
+def fetch_breakdown_metrics(
+    client: MetaMarketingApiClient,
+    ad_account_id: str,
+    *,
+    breakdown: str,
+    date_from: str,
+    date_to: str,
+    level: str = "account",
+) -> list[dict[str, Any]]:
+    """Performance split by a breakdown dimension (age, gender, country, publisher_platform,
+    platform_position, impression_device, device_platform, region, ...). Returns rows with the
+    segment value(s) + spend/value/roas/purchases, sorted by spend desc."""
+    breakdowns = [b.strip() for b in breakdown.split(",") if b.strip()]
+    rows = client.fetch_insights(
+        ad_account_id, fields=["spend", "impressions", "actions", "action_values"],
+        date_from=date_from, date_to=date_to, level=level, time_increment="all_days", breakdowns=breakdowns,
+    )
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        spend = _number(r.get("spend")) or 0.0
+        value = _find_metric(_metric_blob_list(r.get("action_values")), PURCHASE_KEYS)
+        purchases = _find_metric(_metric_blob_list(r.get("actions")), PURCHASE_KEYS)
+        out.append({
+            "segment": {b: r.get(b) for b in breakdowns},
+            "spend": round(spend, 2),
+            "purchase_value": round(value, 2) if value is not None else None,
+            "roas": round(value / spend, 2) if (value is not None and spend) else None,
+            "purchases": purchases,
+        })
+    out.sort(key=lambda x: x["spend"], reverse=True)
+    return out
+
+
+# --- Account-level info ------------------------------------------------------
+
+ACCOUNT_FIELDS = [
+    "name", "account_status", "currency", "timezone_name", "amount_spent",
+    "spend_cap", "balance", "business_name", "funding_source_details", "disable_reason",
+]
+_ACCOUNT_STATUS = {1: "ACTIVE", 2: "DISABLED", 3: "UNSETTLED", 7: "PENDING_RISK_REVIEW", 9: "IN_GRACE_PERIOD", 101: "CLOSED"}
+
+
+def account_info(client: MetaMarketingApiClient, ad_account_id: str) -> dict[str, Any]:
+    """Account-level status, currency, spend, spend cap, balance, funding source."""
+    a = client.get_account(ad_account_id, fields=ACCOUNT_FIELDS)
+    status_code = a.get("account_status")
+    funding = a.get("funding_source_details") or {}
+    return {
+        "ad_account_id": ad_account_id,
+        "name": a.get("name"),
+        "business_name": a.get("business_name"),
+        "status": _ACCOUNT_STATUS.get(status_code, status_code),
+        "currency": a.get("currency"),
+        "timezone": a.get("timezone_name"),
+        "amount_spent": a.get("amount_spent"),
+        "spend_cap": a.get("spend_cap"),
+        "balance": a.get("balance"),
+        "funding_source": funding.get("display_string") if isinstance(funding, dict) else funding,
+        "disable_reason": a.get("disable_reason"),
+    }
+
+
 # --- Delivery-issue scan ----------------------------------------------------
 
 
