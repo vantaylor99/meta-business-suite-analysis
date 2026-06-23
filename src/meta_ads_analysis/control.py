@@ -349,6 +349,184 @@ def build_enable_ads_plan(
     }
 
 
+# --- Live performance metrics -----------------------------------------------
+
+from .sync_api import PURCHASE_KEYS, _find_metric, _metric_blob_list, _number  # noqa: E402
+
+_LEVEL_KEYS = {
+    "account": ("account_id", "account_name"),
+    "campaign": ("campaign_id", "campaign_name"),
+    "adset": ("adset_id", "adset_name"),
+    "ad": ("ad_id", "ad_name"),
+}
+
+
+def fetch_entity_metrics(
+    client: MetaMarketingApiClient,
+    ad_account_id: str,
+    *,
+    level: str,
+    date_from: str,
+    date_to: str,
+) -> list[dict[str, Any]]:
+    """Live per-entity performance over a window (one aggregated row per entity).
+
+    Returns dicts with id, name, spend, purchase_value, roas, purchases, impressions,
+    cost_per_purchase — sorted by spend desc. ``level`` is account/campaign/adset/ad.
+    """
+    if level not in _LEVEL_KEYS:
+        raise ValueError(f"level must be one of {sorted(_LEVEL_KEYS)}")
+    idk, namek = _LEVEL_KEYS[level]
+    fields = [idk, namek, "spend", "impressions", "actions", "action_values", "purchase_roas"]
+    rows = client.fetch_insights(
+        ad_account_id, fields=fields, date_from=date_from, date_to=date_to,
+        level=level, time_increment="all_days",
+    )
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        spend = _number(r.get("spend")) or 0.0
+        value = _find_metric(_metric_blob_list(r.get("action_values")), PURCHASE_KEYS)
+        purchases = _find_metric(_metric_blob_list(r.get("actions")), PURCHASE_KEYS)
+        roas = (value / spend) if (value is not None and spend) else None
+        out.append({
+            "id": r.get(idk),
+            "name": r.get(namek),
+            "spend": round(spend, 2),
+            "purchase_value": round(value, 2) if value is not None else None,
+            "roas": round(roas, 2) if roas is not None else None,
+            "purchases": purchases,
+            "impressions": _number(r.get("impressions")),
+            "cost_per_purchase": round(spend / purchases, 2) if purchases else None,
+        })
+    out.sort(key=lambda x: x["spend"], reverse=True)
+    return out
+
+
+# --- Delivery-issue scan ----------------------------------------------------
+
+
+def scan_issues(client: MetaMarketingApiClient, ad_account_id: str) -> dict[str, Any]:
+    """Account-wide scan of ad delivery issues, grouped by issue summary."""
+    ads = list(
+        client.iter_paginated(f"/{ad_account_id}/ads", params={"fields": ",".join(AD_FIELDS), "limit": 200})
+    )
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for ad in ads:
+        for summary in _issue_summaries(ad):
+            groups.setdefault(summary, []).append(
+                {"id": ad.get("id"), "name": ad.get("name"), "effective_status": ad.get("effective_status")}
+            )
+    return {
+        "ad_account_id": ad_account_id,
+        "generated_at": _now_iso(),
+        "ads_scanned": len(ads),
+        "ads_with_issues": sum(1 for ad in ads if _issue_summaries(ad)),
+        "by_issue": {k: {"count": len(v), "ads": v} for k, v in sorted(groups.items(), key=lambda x: -len(x[1]))},
+    }
+
+
+# --- Custom-audience inventory ----------------------------------------------
+
+AUDIENCE_FIELDS = [
+    "id", "name", "subtype", "description", "approximate_count_lower_bound",
+    "approximate_count_upper_bound", "operation_status", "time_updated",
+]
+
+
+def list_account_audiences(client: MetaMarketingApiClient, ad_account_id: str) -> list[dict[str, Any]]:
+    """Inventory of custom audiences in the account (id, name, subtype, size, status)."""
+    auds = client.list_custom_audiences(ad_account_id, fields=AUDIENCE_FIELDS)
+    out = []
+    for a in auds:
+        op = a.get("operation_status") or {}
+        out.append({
+            "id": a.get("id"),
+            "name": a.get("name"),
+            "subtype": a.get("subtype"),
+            "size_lower": a.get("approximate_count_lower_bound"),
+            "size_upper": a.get("approximate_count_upper_bound"),
+            "status": op.get("description") if isinstance(op, dict) else op,
+        })
+    return out
+
+
+# --- Convenience builder: pause ads -----------------------------------------
+
+
+def build_pause_plan(
+    client: MetaMarketingApiClient,
+    ad_account_id: str,
+    *,
+    account_slug: str | None = None,
+    adset_ids: list[str] | None = None,
+    name_contains: str | None = None,
+    roas_below: float | None = None,
+    min_spend: float = 0.0,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """Propose pausing ACTIVE ads, by name/ad-set filter and/or a performance rule.
+
+    If ``roas_below`` is set, pulls live ad-level metrics over [date_from, date_to] and
+    selects ads whose ROAS is below the threshold with spend >= ``min_spend``.
+    """
+    ads = list(
+        client.iter_paginated(f"/{ad_account_id}/ads", params={"fields": ",".join(AD_FIELDS), "limit": 200})
+    )
+    scope = set(adset_ids or [])
+    candidates = []
+    for ad in ads:
+        if ad.get("effective_status") != "ACTIVE":
+            continue
+        if scope and str(ad.get("adset_id")) not in scope:
+            continue
+        if name_contains and name_contains.lower() not in str(ad.get("name") or "").lower():
+            continue
+        candidates.append(ad)
+
+    perf: dict[str, dict[str, Any]] = {}
+    if roas_below is not None:
+        if not (date_from and date_to):
+            raise ValueError("roas_below requires date_from and date_to.")
+        perf = {str(m["id"]): m for m in fetch_entity_metrics(client, ad_account_id, level="ad", date_from=date_from, date_to=date_to)}
+
+    ops = []
+    for ad in candidates:
+        note = "active"
+        if roas_below is not None:
+            m = perf.get(str(ad.get("id")))
+            roas = (m or {}).get("roas")
+            spend = (m or {}).get("spend") or 0.0
+            if roas is None or roas >= roas_below or spend < min_spend:
+                continue
+            note = f"ROAS {roas} on ${spend:.0f} spend (< {roas_below} floor)"
+        ops.append({
+            "op_id": f"pause_ad_{ad.get('id')}",
+            "op": "set_status",
+            "level": "ad",
+            "id": ad.get("id"),
+            "name": ad.get("name"),
+            "params": {"status": "PAUSED"},
+            "status": PROPOSED_STATUS,
+            "note": note,
+        })
+    return {
+        "schema_version": 1,
+        "plan_type": "ops",
+        "intent": "pause_ads",
+        "account_slug": account_slug,
+        "ad_account_id": ad_account_id,
+        "generated_at": _now_iso(),
+        "selection": {"roas_below": roas_below, "min_spend": min_spend, "date_from": date_from, "date_to": date_to},
+        "approval_instructions": (
+            "Review each ad. To pause it, set its op status to 'approved'. Only approved ops are "
+            "sent to Meta, and only with --execute (or tested with --validate-only)."
+        ),
+        "guardrails": {"requires_explicit_approval": True, "statuses": sorted(ALLOWED_STATUSES)},
+        "ops": ops,
+    }
+
+
 # --- Paths / writers --------------------------------------------------------
 
 
@@ -360,6 +538,18 @@ def resolve_ad_account_id(account_slug: str) -> str:
 
 def default_snapshot_path(account_slug: str, run_date: str, reports_root: Path = DEFAULT_REPORTS_ROOT) -> Path:
     return reports_root / account_slug / run_date / "account_snapshot.json"
+
+
+def default_metrics_path(account_slug: str, run_date: str, level: str, reports_root: Path = DEFAULT_REPORTS_ROOT) -> Path:
+    return reports_root / account_slug / run_date / f"metrics_{level}.json"
+
+
+def default_diagnose_path(account_slug: str, run_date: str, reports_root: Path = DEFAULT_REPORTS_ROOT) -> Path:
+    return reports_root / account_slug / run_date / "issue_scan.json"
+
+
+def default_audiences_path(account_slug: str, run_date: str, reports_root: Path = DEFAULT_REPORTS_ROOT) -> Path:
+    return reports_root / account_slug / run_date / "custom_audiences.json"
 
 
 def default_ops_plan_path(account_slug: str, run_date: str, reports_root: Path = DEFAULT_REPORTS_ROOT) -> Path:

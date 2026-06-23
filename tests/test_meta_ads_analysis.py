@@ -1835,3 +1835,96 @@ def test_build_enable_ads_plan_targets_only_inactive_ads() -> None:
     assert [op["id"] for op in plan["ops"]] == ["ad2"]  # only the inactive one
     assert plan["ops"][0]["params"] == {"status": "ACTIVE"}
     assert "development mode" in plan["ops"][0]["note"]
+
+
+# --- Metrics / diagnose / audiences / pause ---------------------------------
+
+from meta_ads_analysis.control import (
+    build_pause_plan,
+    fetch_entity_metrics,
+    list_account_audiences,
+    scan_issues,
+)
+
+
+class _MetricsFakeClient:
+    def __init__(self, insights=None, ads=None, audiences=None):
+        self._insights = insights or []
+        self._ads = ads or []
+        self._audiences = audiences or []
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1):
+        return self._insights
+
+    def iter_paginated(self, path, *, params=None):
+        return list(self._ads)
+
+    def list_custom_audiences(self, ad_account_id, *, fields):
+        return self._audiences
+
+
+def test_fetch_entity_metrics_computes_roas_and_sorts() -> None:
+    insights = [
+        {"adset_id": "as1", "adset_name": "Cheap", "spend": "100",
+         "action_values": [{"action_type": "purchase", "value": "300"}],
+         "actions": [{"action_type": "purchase", "value": "6"}], "impressions": "1000"},
+        {"adset_id": "as2", "adset_name": "Big", "spend": "500",
+         "action_values": [{"action_type": "purchase", "value": "750"}],
+         "actions": [{"action_type": "purchase", "value": "5"}], "impressions": "9000"},
+    ]
+    client = _MetricsFakeClient(insights=insights)
+    rows = fetch_entity_metrics(client, "act_1", level="adset", date_from="2026-06-01", date_to="2026-06-30")
+    assert rows[0]["name"] == "Big"  # sorted by spend desc
+    assert rows[0]["roas"] == 1.5
+    assert rows[1]["name"] == "Cheap"
+    assert rows[1]["roas"] == 3.0
+    assert rows[1]["cost_per_purchase"] == round(100 / 6, 2)
+
+
+def test_scan_issues_groups_by_summary() -> None:
+    ads = [
+        {"id": "1", "name": "A", "effective_status": "WITH_ISSUES",
+         "issues_info": [{"error_summary": "dev mode"}]},
+        {"id": "2", "name": "B", "effective_status": "WITH_ISSUES",
+         "issues_info": [{"error_summary": "dev mode"}]},
+        {"id": "3", "name": "C", "effective_status": "ACTIVE", "issues_info": []},
+    ]
+    scan = scan_issues(_MetricsFakeClient(ads=ads), "act_1")
+    assert scan["ads_scanned"] == 3
+    assert scan["ads_with_issues"] == 2
+    assert scan["by_issue"]["dev mode"]["count"] == 2
+
+
+def test_list_account_audiences_normalizes() -> None:
+    auds = [{"id": "a1", "name": "HV", "subtype": "CUSTOM",
+             "approximate_count_lower_bound": 1000, "approximate_count_upper_bound": 2000,
+             "operation_status": {"code": 200, "description": "Normal"}}]
+    out = list_account_audiences(_MetricsFakeClient(audiences=auds), "act_1")
+    assert out[0]["name"] == "HV"
+    assert out[0]["size_lower"] == 1000
+    assert out[0]["status"] == "Normal"
+
+
+def test_build_pause_plan_selects_underperformers_by_roas() -> None:
+    ads = [
+        {"id": "ad1", "name": "Loser", "effective_status": "ACTIVE", "adset_id": "as1", "issues_info": []},
+        {"id": "ad2", "name": "Winner", "effective_status": "ACTIVE", "adset_id": "as1", "issues_info": []},
+        {"id": "ad3", "name": "Paused already", "effective_status": "PAUSED", "adset_id": "as1", "issues_info": []},
+    ]
+    insights = [
+        {"ad_id": "ad1", "ad_name": "Loser", "spend": "200",
+         "action_values": [{"action_type": "purchase", "value": "200"}],
+         "actions": [{"action_type": "purchase", "value": "4"}]},
+        {"ad_id": "ad2", "ad_name": "Winner", "spend": "200",
+         "action_values": [{"action_type": "purchase", "value": "800"}],
+         "actions": [{"action_type": "purchase", "value": "10"}]},
+    ]
+    client = _MetricsFakeClient(ads=ads, insights=insights)
+    plan = build_pause_plan(
+        client, "act_1", roas_below=1.5, min_spend=100,
+        date_from="2026-06-01", date_to="2026-06-30",
+    )
+    assert plan["intent"] == "pause_ads"
+    ids = [op["id"] for op in plan["ops"]]
+    assert ids == ["ad1"]  # only the active, below-floor, enough-spend ad
+    assert plan["ops"][0]["params"] == {"status": "PAUSED"}

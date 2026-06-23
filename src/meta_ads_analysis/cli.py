@@ -35,10 +35,17 @@ from .control import (
     apply_ops_plan,
     build_account_snapshot,
     build_enable_ads_plan,
+    build_pause_plan,
+    default_audiences_path,
+    default_diagnose_path,
+    default_metrics_path,
     default_ops_plan_path,
     default_ops_results_path,
     default_snapshot_path,
+    fetch_entity_metrics,
+    list_account_audiences,
     resolve_ad_account_id,
+    scan_issues,
     write_ops_results,
     write_plan,
 )
@@ -780,6 +787,144 @@ def inspect_main() -> None:
     if snap["ads_with_issues"]:
         print(f"\nAds with delivery issues: {len(snap['ads_with_issues'])} (see {output_path})")
     print(f"\nSnapshot: {output_path}")
+
+
+def metrics_main() -> None:
+    from .meta_api import client_from_env
+    from .sync_api import resolve_date_window
+
+    parser = argparse.ArgumentParser(description="Live per-entity performance (ROAS/spend/purchases) over a window.")
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--level", choices=["account", "campaign", "adset", "ad"], default="adset")
+    parser.add_argument("--date-from", help="Window start YYYY-MM-DD. Defaults to trailing 30 days.")
+    parser.add_argument("--date-to", help="Window end YYYY-MM-DD. Defaults to today.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    date_from, date_to = resolve_date_window(date.today(), date_from=args.date_from, date_to=args.date_to)
+
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    rows = fetch_entity_metrics(client, ad_account_id, level=args.level, date_from=date_from, date_to=date_to)
+    out = {"account_slug": account_slug, "level": args.level, "date_from": date_from, "date_to": date_to, "rows": rows}
+    output_path = default_metrics_path(account_slug, run_date, args.level, Path(args.reports_root))
+    write_plan(out, output_path)
+
+    total_spend = sum(r["spend"] for r in rows)
+    total_value = sum(r["purchase_value"] or 0 for r in rows)
+    print(f"{account_slug} {args.level} metrics {date_from}..{date_to} — spend ${total_spend:,.0f} "
+          f"value ${total_value:,.0f} ROAS {(total_value/total_spend if total_spend else 0):.2f}")
+    print(f"{'name':<34}{'spend':>10}{'value':>10}{'ROAS':>7}{'purch':>7}{'CPP':>9}")
+    for r in rows:
+        print(f"{str(r['name'])[:33]:<34}{r['spend']:>10.0f}{(r['purchase_value'] or 0):>10.0f}"
+              f"{(r['roas'] if r['roas'] is not None else 0):>7.2f}{(r['purchases'] or 0):>7.0f}"
+              f"{(r['cost_per_purchase'] if r['cost_per_purchase'] is not None else 0):>9.2f}")
+    print(f"\nMetrics JSON: {output_path}")
+
+
+def diagnose_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(description="Scan the account for ad delivery issues, grouped by issue.")
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    scan = scan_issues(client, ad_account_id)
+    scan["account_slug"] = account_slug
+    output_path = default_diagnose_path(account_slug, run_date, Path(args.reports_root))
+    write_plan(scan, output_path)
+    print(f"{account_slug}: {scan['ads_with_issues']} of {scan['ads_scanned']} ads have delivery issues")
+    for issue, info in scan["by_issue"].items():
+        print(f"\n  [{info['count']}] {issue}")
+        for ad in info["ads"][:8]:
+            print(f"      - {ad['name']} ({ad['effective_status']})")
+        if info["count"] > 8:
+            print(f"      ... and {info['count'] - 8} more")
+    print(f"\nIssue scan JSON: {output_path}")
+
+
+def list_audiences_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(description="List the custom audiences available in the account.")
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    auds = list_account_audiences(client, ad_account_id)
+    output_path = default_audiences_path(account_slug, run_date, Path(args.reports_root))
+    write_plan({"account_slug": account_slug, "audiences": auds}, output_path)
+    print(f"{account_slug}: {len(auds)} custom audiences")
+    for a in auds:
+        size = f"{a['size_lower']}-{a['size_upper']}" if a.get("size_lower") is not None else "?"
+        print(f"  {str(a['name'])[:44]:<45} {str(a['subtype'] or ''):<14} size~{size} [{a.get('status')}]")
+    print(f"\nAudiences JSON: {output_path}")
+
+
+def propose_pause_ads_main() -> None:
+    from .meta_api import client_from_env
+    from .sync_api import resolve_date_window
+
+    parser = argparse.ArgumentParser(
+        description="Propose pausing ACTIVE ads by filter and/or a performance rule (no writes)."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--adset-id", action="append", help="Limit to ad(s) in this ad set id (repeatable).")
+    parser.add_argument("--name-contains", help="Limit to ads whose name contains this substring.")
+    parser.add_argument("--roas-below", type=float, help="Only ads with ROAS below this (pulls live metrics).")
+    parser.add_argument("--min-spend", type=float, default=0.0, help="With --roas-below, require at least this spend.")
+    parser.add_argument("--date-from", help="Metrics window start (with --roas-below). Defaults to trailing 30 days.")
+    parser.add_argument("--date-to", help="Metrics window end. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    parser.add_argument("--output-path", help="Override ops plan path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    date_from = date_to = None
+    if args.roas_below is not None:
+        date_from, date_to = resolve_date_window(date.today(), date_from=args.date_from, date_to=args.date_to)
+
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    plan = build_pause_plan(
+        client, ad_account_id, account_slug=account_slug, adset_ids=args.adset_id,
+        name_contains=args.name_contains, roas_below=args.roas_below, min_spend=args.min_spend,
+        date_from=date_from, date_to=date_to,
+    )
+    output_path = Path(args.output_path) if args.output_path else default_ops_plan_path(account_slug, run_date, Path(args.reports_root))
+    write_plan(plan, output_path)
+    print(f"Wrote pause-ads plan for {account_slug} ({len(plan['ops'])} ads): {output_path}")
+    for op in plan["ops"]:
+        print(f"  {op['name']} — {op['note']}")
+    print("Approve by setting an op's status to 'approved', then run apply-ops --validate-only / --execute.")
 
 
 def propose_enable_ads_main() -> None:

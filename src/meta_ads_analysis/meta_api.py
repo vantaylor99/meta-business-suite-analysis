@@ -119,6 +119,11 @@ class MetaMarketingApiClient:
         params = {"fields": ",".join(fields), "access_token": self.access_token}
         return self._get_json(self._make_url(f"/{adset_id}"), params=params)
 
+    def list_custom_audiences(self, ad_account_id: str, *, fields: list[str]) -> list[dict[str, Any]]:
+        """List the custom audiences available in the account (read-only)."""
+        params = {"fields": ",".join(fields), "limit": 200}
+        return list(self.iter_paginated(f"/{ad_account_id}/customaudiences", params=params))
+
     def list_campaigns(
         self,
         ad_account_id: str,

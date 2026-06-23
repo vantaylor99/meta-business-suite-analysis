@@ -109,11 +109,17 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
 - `sync-api` (pull insights/ads) · `report` (build analysis).
 - `inspect` — **read-only situational-awareness snapshot**: campaign→ad set→ad tree with status,
   effective_status, delivery issues, budgets, and audiences + rollups. Writes `account_snapshot.json`.
+- `metrics` — **live per-entity performance** (ROAS / spend / purchases / CPP) over a window at
+  account/campaign/adset/ad level (`--level`, `--date-from/--date-to`). On-demand, no CSV pipeline.
+- `diagnose` — **account-wide delivery-issue scan**, grouped by issue (the dev-mode-app finder).
+- `list-audiences` — **custom-audience inventory** (id, name, subtype, size, status).
 - `propose-actions` / `apply-actions` — pause underperformers, capped ad set budget increases.
 - `propose-rotation` / `apply-rotation` — rotate custom audiences (optional `--disable-advantage-audience`).
 - `propose-disable-advantage` / `apply-disable-advantage` — turn Advantage Audience off in place.
 - `propose-renames` / `apply-renames` — rename ad sets to match their current audience.
 - `propose-enable-ads` — propose enabling currently-inactive ads (filter by `--adset-id` / `--name-contains`).
+- `propose-pause-ads` — propose pausing ACTIVE ads by filter and/or a performance rule
+  (`--roas-below` + `--min-spend` over a window, pulled live). Executes via `apply-ops`.
 - `apply-ops` — **generic guarded executor** for an ops plan: `set_status` (ACTIVE/PAUSED at
   ad/adset/campaign), `set_daily_budget` (adset/campaign, capped vs current), `rename` (any level).
   An agent can author its own `ops_plan.json` (ops with `status: approved`) and run this. Guardrails:

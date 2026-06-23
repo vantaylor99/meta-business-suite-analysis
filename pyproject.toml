@@ -31,7 +31,11 @@ apply_disable_advantage = "meta_ads_analysis.cli:apply_disable_advantage_main"
 propose_renames = "meta_ads_analysis.cli:propose_renames_main"
 apply_renames = "meta_ads_analysis.cli:apply_renames_main"
 inspect_account = "meta_ads_analysis.cli:inspect_main"
+account_metrics = "meta_ads_analysis.cli:metrics_main"
+diagnose_account = "meta_ads_analysis.cli:diagnose_main"
+list_audiences = "meta_ads_analysis.cli:list_audiences_main"
 propose_enable_ads = "meta_ads_analysis.cli:propose_enable_ads_main"
+propose_pause_ads = "meta_ads_analysis.cli:propose_pause_ads_main"
 apply_ops = "meta_ads_analysis.cli:apply_ops_main"
 
 [tool.pytest.ini_options]

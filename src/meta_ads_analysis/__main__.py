@@ -11,12 +11,16 @@ from .cli import (
     apply_renames_main,
     apply_rotation_main,
     build_meta_report_main,
+    diagnose_main,
     ingest_meta_exports_main,
     inspect_main,
+    list_audiences_main,
+    metrics_main,
     operator_brief_main,
     propose_disable_advantage_main,
     propose_enable_ads_main,
     propose_meta_actions_main,
+    propose_pause_ads_main,
     propose_renames_main,
     propose_rotation_main,
     sync_meta_api_main,
@@ -26,9 +30,10 @@ from .cli import (
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
-            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|propose-actions|apply-actions|"
-            "propose-rotation|apply-rotation|propose-disable-advantage|apply-disable-advantage|"
-            "propose-renames|apply-renames|propose-enable-ads|apply-ops|operator-brief> [args]\n"
+            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|metrics|diagnose|"
+            "list-audiences|propose-actions|apply-actions|propose-rotation|apply-rotation|"
+            "propose-disable-advantage|apply-disable-advantage|propose-renames|apply-renames|"
+            "propose-enable-ads|propose-pause-ads|apply-ops|operator-brief> [args]\n"
             "Example: python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-21"
         )
         return
@@ -60,8 +65,20 @@ def main() -> None:
     if command in {"inspect", "snapshot"}:
         inspect_main()
         return
+    if command in {"metrics", "performance"}:
+        metrics_main()
+        return
+    if command in {"diagnose", "scan_issues"}:
+        diagnose_main()
+        return
+    if command in {"list_audiences", "audiences"}:
+        list_audiences_main()
+        return
     if command in {"propose_enable_ads", "enable_ads"}:
         propose_enable_ads_main()
+        return
+    if command in {"propose_pause_ads", "pause_ads"}:
+        propose_pause_ads_main()
         return
     if command in {"apply_ops", "ops"}:
         apply_ops_main()
@@ -83,10 +100,10 @@ def main() -> None:
         return
 
     raise SystemExit(
-        f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, `inspect`, "
-        "`propose-actions`, `apply-actions`, `propose-rotation`, `apply-rotation`, "
-        "`propose-disable-advantage`, `apply-disable-advantage`, `propose-renames`, "
-        "`apply-renames`, `propose-enable-ads`, `apply-ops`, or `operator-brief`."
+        f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, `inspect`, `metrics`, "
+        "`diagnose`, `list-audiences`, `propose-actions`, `apply-actions`, `propose-rotation`, "
+        "`apply-rotation`, `propose-disable-advantage`, `apply-disable-advantage`, `propose-renames`, "
+        "`apply-renames`, `propose-enable-ads`, `propose-pause-ads`, `apply-ops`, or `operator-brief`."
     )
 
 
