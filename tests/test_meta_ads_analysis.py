@@ -1502,6 +1502,27 @@ def test_compute_new_targeting_can_disable_advantage_audience() -> None:
     assert off["custom_audiences"] == [{"id": "C"}]
 
 
+def test_compute_new_targeting_strips_age_range_when_disabling_advantage_audience() -> None:
+    # Meta rejects age_range once targeting automation is off; it must be dropped.
+    live = {
+        "geo_locations": {"countries": ["US"]},
+        "age_min": 18,
+        "age_max": 65,
+        "age_range": [18, 65],
+        "custom_audiences": [{"id": "A"}],
+        "targeting_automation": {"advantage_audience": 1},
+    }
+    off = compute_new_targeting(
+        live, new_included_ids=["C"], new_excluded_ids=["A"], disable_advantage_audience=True
+    )
+    assert "age_range" not in off
+    assert off["age_min"] == 18 and off["age_max"] == 65
+
+    # Without disabling, age_range is preserved untouched.
+    kept = compute_new_targeting(live, new_included_ids=["C"], new_excluded_ids=["A"])
+    assert kept["age_range"] == [18, 65]
+
+
 def test_rotation_plan_disable_flag_writes_advantage_off_on_apply() -> None:
     adsets = [
         _adset("as1", "Set 1", ["A"], ["B", "C"], advantage=True),

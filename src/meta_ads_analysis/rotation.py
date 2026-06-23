@@ -155,10 +155,17 @@ def build_rotation_plan(
         preserved_excluded = [i for i in _ids(summary["excluded"]) if i not in pool_set]
         new_excluded_ids = [i for i in pool if i not in set(new_included_ids)] + preserved_excluded
         if summary["advantage_audience"]:
-            warnings.append(
-                f"Ad set {summary['adset_id']} ({summary['adset_name']}) has Advantage "
-                "Audience enabled; custom-audience targeting may be treated as a suggestion."
-            )
+            if disable_advantage_audience:
+                warnings.append(
+                    f"Ad set {summary['adset_id']} ({summary['adset_name']}) has Advantage "
+                    "Audience enabled; this rotation will turn it off so the audience change is accepted."
+                )
+            else:
+                warnings.append(
+                    f"Ad set {summary['adset_id']} ({summary['adset_name']}) has Advantage Audience "
+                    "enabled; Meta will REJECT the audience change unless you re-run with "
+                    "--disable-advantage-audience."
+                )
         will_disable_aa = disable_advantage_audience and summary["advantage_audience"]
         diff = (
             f"include [{_label(old_included_ids, names)}] -> [{_label(new_included_ids, names)}]; "
@@ -241,6 +248,10 @@ def compute_new_targeting(
         automation = dict(automation) if isinstance(automation, dict) else {}
         automation["advantage_audience"] = 0
         targeting["targeting_automation"] = automation
+        # age_range is an automation-managed field; Meta rejects it once targeting
+        # automation is disabled ("targeting_automation must be enabled to use age_range").
+        # age_min/age_max remain as the real age controls.
+        targeting.pop("age_range", None)
     return targeting
 
 
