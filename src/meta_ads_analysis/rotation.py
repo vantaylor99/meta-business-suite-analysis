@@ -386,6 +386,158 @@ def write_rotation_results(
     return output_path
 
 
+# --- Disable Advantage Audience (in place, audiences unchanged) --------------
+
+
+def build_advantage_disable_plan(
+    adsets: list[dict[str, Any]],
+    *,
+    account_slug: str,
+    ad_account_id: str,
+) -> dict[str, Any]:
+    """Plan to turn Advantage Audience off on each ad set, keeping audiences as-is.
+
+    Only ad sets that currently have it enabled get an actionable item; others are
+    recorded as already-off. Inclusions and exclusions are preserved verbatim.
+    """
+    summaries = summarize_adsets(adsets)
+    names = _name_map(summaries)
+    items: list[dict[str, Any]] = []
+    for summary in summaries:
+        items.append(
+            {
+                "adset_id": summary["adset_id"],
+                "adset_name": summary["adset_name"],
+                "status": PROPOSED_STATUS,
+                "advantage_audience": summary["advantage_audience"],
+                "included": _ids(summary["included"]),
+                "excluded": _ids(summary["excluded"]),
+                "included_labels": [names.get(i, i) for i in _ids(summary["included"])],
+                "excluded_labels": [names.get(i, i) for i in _ids(summary["excluded"])],
+            }
+        )
+    return {
+        "schema_version": 1,
+        "plan_type": "advantage_disable",
+        "account_slug": account_slug,
+        "ad_account_id": ad_account_id,
+        "generated_at": _now_iso(),
+        "audience_names": names,
+        "approval_instructions": (
+            "Review each ad set. To allow the change, set its status to 'approved'. Only "
+            "approved items are sent to Meta, and only with --execute (or tested with --validate-only)."
+        ),
+        "guardrails": {
+            "requires_explicit_approval": True,
+            "preserves_audiences": True,
+            "writes_only_advantage_audience_off_and_age_range": True,
+        },
+        "items": items,
+    }
+
+
+def apply_advantage_disable_plan(
+    plan: dict[str, Any],
+    client: MetaMarketingApiClient,
+    *,
+    execute: bool,
+    validate_only: bool = False,
+) -> list[RotationResult]:
+    """Dry-run, validate, or execute approved Advantage Audience disables.
+
+    Audiences are preserved exactly; only advantage_audience=0 is written (with the
+    automation-managed age_range dropped). Re-reads live targeting per ad set.
+    """
+    results: list[RotationResult] = []
+    for item in plan.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        adset_id = str(item.get("adset_id") or "unknown")
+        if item.get("status") != APPROVED_STATUS:
+            results.append(RotationResult(adset_id, "skipped", reason="Item is not approved."))
+            continue
+
+        live = client.get_adset(adset_id, fields=ADSET_FIELDS)
+        live_targeting = live.get("targeting") if isinstance(live.get("targeting"), dict) else {}
+        if not advantage_audience_enabled(live_targeting):
+            results.append(RotationResult(adset_id, "skipped", reason="Advantage Audience is already off."))
+            continue
+
+        live_included = _ids(_audience_refs(live_targeting.get("custom_audiences")))
+        live_excluded = _ids(_audience_refs(live_targeting.get("excluded_custom_audiences")))
+        new_targeting = compute_new_targeting(
+            live_targeting,
+            new_included_ids=live_included,
+            new_excluded_ids=live_excluded,
+            disable_advantage_audience=True,
+        )
+        if validate_only:
+            try:
+                response = client.update_adset(adset_id, params={"targeting": new_targeting}, validate_only=True)
+            except MetaApiError as exc:
+                results.append(RotationResult(adset_id, "validation_failed", targeting=new_targeting, reason=str(exc)))
+                continue
+            results.append(RotationResult(adset_id, "validated", targeting=new_targeting, response=response))
+            continue
+        if not execute:
+            results.append(RotationResult(adset_id, "dry_run", targeting=new_targeting))
+            continue
+
+        try:
+            response = client.update_adset(adset_id, params={"targeting": new_targeting})
+        except MetaApiError as exc:
+            results.append(RotationResult(adset_id, "failed", targeting=new_targeting, reason=str(exc)))
+            continue
+        results.append(RotationResult(adset_id, EXECUTED_STATUS, targeting=new_targeting, response=response))
+    return results
+
+
+def default_advantage_disable_plan_path(
+    account_slug: str,
+    run_date: str,
+    reports_root: Path = DEFAULT_REPORTS_ROOT,
+) -> Path:
+    return reports_root / account_slug / run_date / "advantage_disable_plan.json"
+
+
+def default_advantage_disable_results_path(
+    account_slug: str,
+    run_date: str,
+    reports_root: Path = DEFAULT_REPORTS_ROOT,
+) -> Path:
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return reports_root / account_slug / run_date / f"advantage_disable_results_{timestamp}.json"
+
+
+def write_advantage_disable_results(
+    *,
+    plan: dict[str, Any],
+    results: list[RotationResult],
+    output_path: Path,
+    execute: bool,
+) -> Path:
+    payload = {
+        "schema_version": 1,
+        "plan_type": "advantage_disable",
+        "account_slug": plan.get("account_slug"),
+        "executed": execute,
+        "generated_at": _now_iso(),
+        "results": [
+            {
+                "adset_id": item.adset_id,
+                "status": item.status,
+                "targeting": item.targeting,
+                "reason": item.reason,
+                "response": item.response,
+            }
+            for item in results
+        ],
+    }
+    ensure_dir(output_path.parent)
+    write_json(output_path, payload)
+    return output_path
+
+
 # --- Ad set rename ----------------------------------------------------------
 
 ADSET_NAME_FIELDS = ["id", "name"]

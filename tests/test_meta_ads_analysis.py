@@ -1647,3 +1647,49 @@ def test_apply_rename_plan_blocks_on_live_name_drift() -> None:
 
     assert results[0].status == "blocked"
     assert client.updates == []
+
+
+from meta_ads_analysis.rotation import (
+    apply_advantage_disable_plan,
+    build_advantage_disable_plan,
+)
+
+
+def test_build_advantage_disable_plan_flags_on_vs_off() -> None:
+    adsets = [
+        _adset("as1", "Set 1", ["A"], ["B"], advantage=True),
+        _adset("as2", "Set 2", ["B"], ["A"], advantage=False),
+    ]
+    plan = build_advantage_disable_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    by_id = {i["adset_id"]: i for i in plan["items"]}
+    assert by_id["as1"]["advantage_audience"] is True
+    assert by_id["as2"]["advantage_audience"] is False
+    # audiences captured verbatim
+    assert by_id["as1"]["included"] == ["A"]
+    assert by_id["as1"]["excluded"] == ["B"]
+
+
+def test_apply_advantage_disable_preserves_audiences_and_turns_off_aa() -> None:
+    adsets = [
+        _adset("as1", "Set 1", ["A"], ["B", "C"], advantage=True),
+        _adset("as2", "Set 2", ["B"], ["A"], advantage=False),
+    ]
+    plan = build_advantage_disable_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    for item in plan["items"]:
+        item["status"] = "approved"
+    client = _FakeClient(adsets)
+
+    results = apply_advantage_disable_plan(plan, client, execute=True)
+    by_id = {r.adset_id: r for r in results}
+
+    # AA was on for as1 -> executed; off for as2 -> skipped (no write)
+    assert by_id["as1"].status == "executed"
+    assert by_id["as2"].status == "skipped"
+    assert len(client.updates) == 1
+    adset_id, params, validate_only = client.updates[0]
+    assert adset_id == "as1"
+    t = params["targeting"]
+    assert t["targeting_automation"]["advantage_audience"] == 0
+    # audiences preserved exactly, not rotated
+    assert t["custom_audiences"] == [{"id": "A"}]
+    assert t["excluded_custom_audiences"] == [{"id": "B"}, {"id": "C"}]

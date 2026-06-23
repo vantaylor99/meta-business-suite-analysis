@@ -33,15 +33,20 @@ from .config import DEFAULT_DB_PATH, DEFAULT_NORMALIZED_ROOT, DEFAULT_RAW_ROOT, 
 from .normalize import creative_fieldnames, ingest_raw_exports, normalized_fieldnames
 from .reporting import render_markdown_report
 from .rotation import (
+    apply_advantage_disable_plan,
     apply_rename_plan,
     apply_rotation_plan,
+    build_advantage_disable_plan,
     build_rename_plan,
     build_rotation_plan,
+    default_advantage_disable_plan_path,
+    default_advantage_disable_results_path,
     default_rename_plan_path,
     default_rename_results_path,
     default_rotation_plan_path,
     default_rotation_results_path,
     fetch_active_adsets,
+    write_advantage_disable_results,
     write_rename_plan,
     write_rename_results,
     write_rotation_plan,
@@ -524,6 +529,104 @@ def apply_rotation_main() -> None:
     mode = "validate-only" if args.validate_only else ("executed" if args.execute else "dry-run")
     print(f"Completed {mode} rotation for {account_slug} on {run_date}: {results_path}")
     print(f"Runnable approved rotations: {ran}; blocked or failed: {blocked}")
+
+
+def propose_disable_advantage_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Propose turning Advantage Audience off on active ad sets, keeping audiences as-is (no writes)."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Plan folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument(
+        "--reports-root",
+        default=str(DEFAULT_REPORTS_ROOT),
+        help="Reports root. Defaults to reports/.",
+    )
+    parser.add_argument("--output-path", help="Override plan path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    reports_root = Path(args.reports_root)
+
+    client = client_from_env(args.api_version)
+    ad_account_id, adsets = fetch_active_adsets(account_slug, client=client)
+    plan = build_advantage_disable_plan(adsets, account_slug=account_slug, ad_account_id=ad_account_id)
+    output_path = Path(args.output_path) if args.output_path else default_advantage_disable_plan_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    write_rotation_plan(plan, output_path)
+    on = sum(1 for item in plan["items"] if item["advantage_audience"])
+    print(f"Wrote Advantage-Audience disable plan for {account_slug}: {output_path}")
+    print(f"Ad sets with Advantage Audience currently on: {on} of {len(plan['items'])}")
+    for item in plan["items"]:
+        flag = "ON -> off" if item["advantage_audience"] else "already off"
+        print(f"  {item['adset_name']!r}: {flag}")
+    print("Approve by changing an item's status from 'proposed' to 'approved', then run apply-disable-advantage.")
+
+
+def apply_disable_advantage_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Dry-run, validate, or execute approved Advantage Audience disables through the Graph API."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Plan folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument(
+        "--reports-root",
+        default=str(DEFAULT_REPORTS_ROOT),
+        help="Reports root. Defaults to reports/.",
+    )
+    parser.add_argument("--plan-path", help="Override plan path.")
+    parser.add_argument("--results-path", help="Override results path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Send each approved change to Meta with validate_only: real responses, no changes.",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually apply. Without this flag, this is a dry run.",
+    )
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    reports_root = Path(args.reports_root)
+    plan_path = Path(args.plan_path) if args.plan_path else default_advantage_disable_plan_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    if not plan_path.exists():
+        raise SystemExit(f"Plan not found: {plan_path}. Run propose-disable-advantage first.")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+    client = client_from_env(args.api_version)
+    results = apply_advantage_disable_plan(plan, client, execute=args.execute, validate_only=args.validate_only)
+    results_path = Path(args.results_path) if args.results_path else default_advantage_disable_results_path(
+        account_slug,
+        run_date,
+        reports_root,
+    )
+    write_advantage_disable_results(plan=plan, results=results, output_path=results_path, execute=args.execute)
+    ran = sum(1 for item in results if item.status in {"dry_run", "executed", "validated"})
+    blocked = sum(1 for item in results if item.status in {"blocked", "failed", "validation_failed"})
+    mode = "validate-only" if args.validate_only else ("executed" if args.execute else "dry-run")
+    print(f"Completed {mode} Advantage-Audience disable for {account_slug} on {run_date}: {results_path}")
+    print(f"Runnable approved items: {ran}; blocked or failed: {blocked}")
 
 
 def propose_renames_main() -> None:

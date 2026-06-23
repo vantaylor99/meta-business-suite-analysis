@@ -26,6 +26,8 @@ propose_meta_actions = "meta_ads_analysis.cli:propose_meta_actions_main"
 apply_meta_actions = "meta_ads_analysis.cli:apply_meta_actions_main"
 propose_rotation = "meta_ads_analysis.cli:propose_rotation_main"
 apply_rotation = "meta_ads_analysis.cli:apply_rotation_main"
+propose_disable_advantage = "meta_ads_analysis.cli:propose_disable_advantage_main"
+apply_disable_advantage = "meta_ads_analysis.cli:apply_disable_advantage_main"
 propose_renames = "meta_ads_analysis.cli:propose_renames_main"
 apply_renames = "meta_ads_analysis.cli:apply_renames_main"
 
