@@ -1365,6 +1365,59 @@ def apply_ops_main() -> None:
             print(f"  {r.op_id}: {r.status} — {r.reason}")
 
 
+def followups_main() -> None:
+    from datetime import date as _date
+
+    from .followups import add_followup, due_followups, iter_followups, mark_done
+
+    parser = argparse.ArgumentParser(
+        prog="followups", description="Due-date-aware account follow-up tasks (separate from agent tickets)."
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+    p_due = sub.add_parser("due", help="List ONLY tasks due/overdue for an account (the check-in entry point).")
+    p_due.add_argument("--account", required=True)
+    p_due.add_argument("--as-of", help="Treat this date as 'today' (YYYY-MM-DD).")
+    p_list = sub.add_parser("list", help="List open follow-ups (with --all, include done).")
+    p_list.add_argument("--account", required=True)
+    p_list.add_argument("--all", action="store_true")
+    p_add = sub.add_parser("add", help="Add a follow-up task.")
+    p_add.add_argument("--account", required=True)
+    p_add.add_argument("--title", required=True)
+    p_add.add_argument("--due", required=True, help="Due date YYYY-MM-DD.")
+    p_add.add_argument("--note", default="", help="Body: what to do, why, how.")
+    p_done = sub.add_parser("done", help="Mark a follow-up done (archives it).")
+    p_done.add_argument("--account", required=True)
+    p_done.add_argument("task_id", help="The task id (filename stem) shown by `due`/`list`.")
+    args = parser.parse_args()
+
+    if args.action == "due":
+        as_of = _date.fromisoformat(args.as_of) if args.as_of else _date.today()
+        due = due_followups(args.account, as_of=as_of)
+        if not due:
+            print(f"No follow-ups due for {args.account} as of {as_of}.")
+            return
+        print(f"{len(due)} follow-up(s) due for {args.account} as of {as_of}:")
+        for f in due:
+            overdue = " (OVERDUE)" if f.due and f.due < as_of else ""
+            print(f"  [{f.due}]{overdue} {f.title}  — id: {f.task_id}")
+        print("\nRead a task's body with its file, act on it, then `followups done --account "
+              f"{args.account} <id>`.")
+    elif args.action == "list":
+        items = iter_followups(args.account, include_done=args.all)
+        print(f"{len(items)} follow-up(s) for {args.account}{' (incl. done)' if args.all else ' (open)'}:")
+        for f in items:
+            print(f"  [{f.due or 'no-date'}] {f.status:<6} {f.title}  — id: {f.task_id}")
+    elif args.action == "add":
+        path = add_followup(
+            account=args.account, title=args.title, due=args.due, note=args.note,
+            created=_date.today().isoformat(),
+        )
+        print(f"Added follow-up (due {args.due}): {path}")
+    elif args.action == "done":
+        dest = mark_done(account=args.account, task_id=args.task_id, completed=_date.today().isoformat())
+        print(f"Marked done: {dest}")
+
+
 def operator_brief_main() -> None:
     parser = argparse.ArgumentParser(
         description="Build a concise operator brief from an action plan and report."

@@ -2,6 +2,20 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-23 — first pipeline ad created (PAUSED): Mission Call / He Lives
+
+- Ran the video→ad pipeline end to end: `intake-video` on "mission call opening.MOV" (UGC mission-call
+  reveal, vertical) → agent drafted 5 copy options grounded in `winning_copy.md` (missionary-gift +
+  faith angles) → `upload-video` (video_id 2224235811675934) → created the ad **PAUSED**.
+- **Path decision: B (single-text in the proven Engaged ad set), not a Dynamic Creative ad set.**
+  Rationale: creative > audience > copy in impact; a DC ad set needs ~$150/day to learn and would
+  add a fresh-learning silo mid-relearn; we already know the winning angles, so one strong text
+  (option 1, missionary-gift) is an informed bet. Logged in learnings (revised "standard practice").
+- Ad: `Mission Call Opening - He Lives (missionary gift)` (id **120246788494170733**) in Engaged
+  Audience, → shopdivinedesigns.com, Shop Now, thumbnail = video's preferred frame. PAUSED / no issues.
+- Follow-up created (due 2026-06-30): review/enable, then evaluate after ~1 week and consider A/B-ing
+  the other 4 copy options. **Not yet enabled — awaiting operator review.**
+
 ## 2026-06-23 (decision) — placement policy: Feed + Reels + Stories, exclude FB in-stream
 
 - **Decision:** keep the manual placement set at **Facebook/Instagram Feed + Reels + Stories** and

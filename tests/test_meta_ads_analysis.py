@@ -2305,3 +2305,37 @@ def test_create_video_ad_rejects_more_than_five_primary_texts() -> None:
         raise AssertionError("expected ValueError")
     except ValueError:
         pass
+
+
+# --- Follow-up task system --------------------------------------------------
+
+from datetime import date as _date
+
+from meta_ads_analysis import followups as _fu
+
+
+def test_followups_add_due_and_done(tmp_path: Path) -> None:
+    root = tmp_path / "followups"
+    # one due-soon, one future
+    _fu.add_followup(account="divine_designs", title="Evaluate Mission Call ad", due="2026-06-30",
+                     note="Check ROAS vs Engaged baseline.", created="2026-06-23", root=root)
+    _fu.add_followup(account="divine_designs", title="Quarterly audience refresh", due="2026-09-01",
+                     note="", created="2026-06-23", root=root)
+
+    # 'due' filters by date: only the 2026-06-30 one is due as of 2026-07-01
+    due = _fu.due_followups("divine_designs", as_of=_date(2026, 7, 1), root=root)
+    assert [f.title for f in due] == ["Evaluate Mission Call ad"]
+    # nothing due earlier
+    assert _fu.due_followups("divine_designs", as_of=_date(2026, 6, 1), root=root) == []
+    # both are open
+    assert len(_fu.iter_followups("divine_designs", root=root)) == 2
+
+    # mark the due one done -> it leaves the open list and stops being 'due'
+    tid = due[0].task_id
+    _fu.mark_done(account="divine_designs", task_id=tid, completed="2026-07-01", root=root)
+    assert _fu.due_followups("divine_designs", as_of=_date(2026, 7, 1), root=root) == []
+    open_items = _fu.iter_followups("divine_designs", root=root)
+    assert [f.title for f in open_items] == ["Quarterly audience refresh"]
+    # done archive is readable with include_done
+    all_items = _fu.iter_followups("divine_designs", root=root, include_done=True)
+    assert any(f.status == "done" for f in all_items)

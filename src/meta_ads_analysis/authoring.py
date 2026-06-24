@@ -158,6 +158,8 @@ def _build_create(op: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             video_data["link_description"] = params["description"]
         if params.get("image_hash"):
             video_data["image_hash"] = params["image_hash"]
+        elif params.get("image_url"):
+            video_data["image_url"] = params["image_url"]
         request = {
             "name": params["name"],
             "adset_id": str(params["adset_id"]),
@@ -271,6 +273,7 @@ def build_video_ad_plan(
     descriptions: list[str] | None = None,
     call_to_action_type: str = "SHOP_NOW",
     image_hash: str | None = None,
+    image_url: str | None = None,
     account_slug: str | None = None,
 ) -> dict[str, Any]:
     """Plan to create a video ad (PAUSED) from an uploaded video_id.
@@ -297,6 +300,8 @@ def build_video_ad_plan(
             params["description"] = description
     if image_hash:
         params["image_hash"] = image_hash
+    elif image_url:
+        params["image_url"] = image_url
     op = {
         "op_id": f"video_ad_{video_id}_to_{adset_id}",
         "kind": "create_video_ad",
