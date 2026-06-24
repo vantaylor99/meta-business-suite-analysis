@@ -2,6 +2,18 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-23 (status check) — health restored, short learning-phase dip
+
+- Dev-mode blocker fully cleared: **24 of 26 ads now ACTIVE** (most of the library re-enabled,
+  operator-side), Advantage+ off on all 3 ad sets. Remaining issues: 3 ads with "No Valid
+  Formats" (`Cody`, `selfie FM SP`, `Selfie Mom - Copy`) — a creative-format problem, not dev-mode.
+- Performance: **7-day ROAS 1.93** vs 30-day 2.42 and the 3.0 target. Attributed to the
+  learning-phase reset from the AA-off + renames + ~18-ad mass re-enable over the prior ~48h.
+  Expect noise for a few more days before judging.
+- Bright spot: **New Pink 3.20 (7d)** validating in Engaged Audience. Watch: `White BG V2 - Copy`
+  dipped 5.63 → 1.33 (fatigue/relearn). Engaged Audience still best on 30d (3.72) — recommended
+  home for the next ad.
+
 ## 2026-06-23 — re-enabled proven winners
 
 - **Enabled `New Pink` (30d ROAS 3.08) and `New Black` (3.89)** in the Engaged Audience ad set
