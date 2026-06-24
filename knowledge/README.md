@@ -40,6 +40,13 @@ your reference/base** — mirror the angles and phrasing that already win on thi
 to the new creative. Also follow `knowledge/ad_copy_best_practices.md`. If `winning_copy.md` is
 stale or missing, regenerate it with `copy-library` first.
 
+## Knowledge architecture (per-account vs general; where this is headed)
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md): `learnings.md` holds **universal facts + cross-account
+patterns**; `accounts/<slug>/` holds **per-account** knowledge. Account observations get **promoted**
+to general once corroborated across multiple accounts (confidence rises with each independent
+account). This is the path toward the multi-account specialist template.
+
 ## How this relates to the other docs
 
 - `AGENTS.md` — *how to analyze* the data and write the report (the analysis contract).
