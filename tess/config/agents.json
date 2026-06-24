@@ -1,0 +1,20 @@
+{
+  "_comment": "Per-agent model/effort selection for the tess runner. Difficulty (easy|medium|hard, default medium) picks the model; the pipeline stage picks the effort; overrides[stage][difficulty] pins a specific cell's model and/or effort. See tess/README.md § Model & Effort Selection. Built-in defaults live in scripts/lib/model-selection.mjs; this file is deep-merged over them, so a partial file only restates what it changes. model/effort values are agent-specific — a null or missing value means 'pass no flag, use the agent's own default'.",
+  "claude": {
+    "model": {
+      "easy": "claude-sonnet-4-6",
+      "medium": "claude-opus-4-8",
+      "hard": "claude-opus-4-8"
+    },
+    "effort": {
+      "fix": "high",
+      "plan": "high",
+      "implement": "xhigh",
+      "review": "high",
+      "default": "high"
+    },
+    "overrides": {
+      "review": { "easy": { "model": "claude-opus-4-8", "effort": "medium" } }
+    }
+  }
+}

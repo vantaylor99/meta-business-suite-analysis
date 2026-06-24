@@ -1,0 +1,21 @@
+{
+	"name": "tess",
+	"version": "0.2.0",
+	"private": true,
+	"type": "module",
+	"description": "Agent-driven ticketing system",
+	"bin": {
+		"tess-search": "scripts/search.mjs"
+	},
+	"scripts": {
+		"index": "node scripts/index.mjs",
+		"mcp-search": "node scripts/mcp-search.mjs",
+		"search": "node scripts/search.mjs"
+	},
+	"dependencies": {
+		"@huggingface/transformers": "^3.0.0",
+		"@modelcontextprotocol/sdk": "^1.0.0",
+		"better-sqlite3": "^12.9.0",
+		"sqlite-vec": "^0.1.6"
+	}
+}
