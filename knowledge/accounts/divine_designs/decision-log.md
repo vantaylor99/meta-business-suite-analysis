@@ -2,6 +2,19 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-24 (action) — placement policy applied to High Value Customers; Selfie Mom unblocked
+
+- **Verified at the ad-set level first** (120d, High Value Customers specifically, not account-wide):
+  Feed+Reels+Stories = 96% of spend / **99% of value** (1.82 ROAS); the dropped placements = 4% of
+  spend / **1% of value at 0.32 ROAS** (mostly FB in-stream video, money-losing). So fix #2 is a net
+  positive, not a sacrifice.
+- **Applied:** set High Value Customers (120245034013770733) to manual placements
+  (FB/IG Feed + Reels + Stories) and enabled `Selfie Mom - Copy` (120246062743790733).
+  Result: Selfie Mom **ACTIVE / IN_PROCESS, "No Valid Formats" cleared.**
+- Side effect (accepted): the 4 sibling Test-Selfie OG ads re-learn under the new placements; the ad
+  set was already soft/mid-relearn, so expect a few noisy days. Lesson reinforced: constraining
+  placements to Feed+Reels+Stories fixes "No Valid Formats" for single-video ads.
+
 ## 2026-06-24 (status check) — Mission Call ad delivering; recent window soft (learning churn)
 
 - Mission Call ad is **ACTIVE/delivering** ($88/2d, 0 purchases — <1 day live, no signal yet).
