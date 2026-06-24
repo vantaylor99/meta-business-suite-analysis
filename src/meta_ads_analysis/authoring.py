@@ -73,9 +73,19 @@ def validate_authoring_op(op: dict[str, Any]) -> None:
         if not isinstance(params.get("creative"), dict):
             raise ValueError("create_ad requires params.creative (e.g. {'creative_id': '<id>'}).")
     elif kind == "create_video_ad":
-        for req in ("name", "adset_id", "video_id", "page_id", "message", "link"):
+        for req in ("name", "adset_id", "video_id", "page_id", "link"):
             if not str(params.get(req) or "").strip():
                 raise ValueError(f"create_video_ad requires params.{req}.")
+        texts = params.get("primary_texts")
+        has_multi = isinstance(texts, list) and any(str(t).strip() for t in texts)
+        if not has_multi and not str(params.get("message") or "").strip():
+            raise ValueError("create_video_ad requires params.message or a non-empty params.primary_texts list.")
+        if isinstance(texts, list) and len(texts) > 5:
+            raise ValueError("create_video_ad supports at most 5 primary_texts.")
+        for field in ("headlines", "descriptions"):
+            vals = params.get(field)
+            if isinstance(vals, list) and len(vals) > 5:
+                raise ValueError(f"create_video_ad supports at most 5 {field}.")
     elif kind == "create_lookalike":
         if not str(params.get("name") or "").strip():
             raise ValueError("create_lookalike requires params.name.")
@@ -103,13 +113,44 @@ def _build_create(op: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         params["status"] = "PAUSED"
         return "create_ad", params
     if kind == "create_video_ad":
+        cta_type = params.get("call_to_action_type", "SHOP_NOW")
+        texts = [str(t).strip() for t in (params.get("primary_texts") or []) if str(t).strip()]
+        if texts:
+            # Multiple text options: Meta optimizes among the operator-written copy we provide
+            # (asset_feed_spec). This text optimization is the intended behavior here; we do NOT
+            # add the deprecated standard_enhancements field (Meta rejects it). The account's
+            # "no Advantage+ creative" stance concerns image/visual AI manipulation, not picking
+            # among our own texts — no image media is generated since we supply the video as-is.
+            video_asset: dict[str, Any] = {"video_id": str(params["video_id"])}
+            if params.get("image_hash"):
+                video_asset["thumbnail_hash"] = params["image_hash"]
+            afs: dict[str, Any] = {
+                "ad_formats": ["SINGLE_VIDEO"],
+                "videos": [video_asset],
+                "bodies": [{"text": t} for t in texts[:5]],
+                "call_to_action_types": [cta_type],
+                "link_urls": [{"website_url": params["link"]}],
+            }
+            headlines = [str(t).strip() for t in (params.get("headlines") or []) if str(t).strip()]
+            descriptions = [str(t).strip() for t in (params.get("descriptions") or []) if str(t).strip()]
+            if headlines:
+                afs["titles"] = [{"text": t} for t in headlines[:5]]
+            if descriptions:
+                afs["descriptions"] = [{"text": t} for t in descriptions[:5]]
+            request = {
+                "name": params["name"],
+                "adset_id": str(params["adset_id"]),
+                "status": "PAUSED",
+                "creative": {
+                    "object_story_spec": {"page_id": str(params["page_id"])},
+                    "asset_feed_spec": afs,
+                },
+            }
+            return "create_ad", request
         video_data: dict[str, Any] = {
             "video_id": str(params["video_id"]),
             "message": params["message"],
-            "call_to_action": {
-                "type": params.get("call_to_action_type", "SHOP_NOW"),
-                "value": {"link": params["link"]},
-            },
+            "call_to_action": {"type": cta_type, "value": {"link": params["link"]}},
         }
         if params.get("title"):
             video_data["title"] = params["title"]
@@ -221,23 +262,39 @@ def build_video_ad_plan(
     adset_id: str,
     video_id: str,
     page_id: str,
-    message: str,
     link: str,
+    message: str | None = None,
     title: str | None = None,
     description: str | None = None,
+    primary_texts: list[str] | None = None,
+    headlines: list[str] | None = None,
+    descriptions: list[str] | None = None,
     call_to_action_type: str = "SHOP_NOW",
     image_hash: str | None = None,
     account_slug: str | None = None,
 ) -> dict[str, Any]:
-    """Plan to create a video ad (created PAUSED) from an already-uploaded video_id."""
+    """Plan to create a video ad (PAUSED) from an uploaded video_id.
+
+    Pass ``primary_texts`` (and optionally ``headlines``/``descriptions``) for the standard
+    multiple-text-options ad (Meta optimizes among them); or ``message``/``title``/``description``
+    for a single-text ad.
+    """
     params: dict[str, Any] = {
         "name": name, "adset_id": adset_id, "video_id": video_id, "page_id": page_id,
-        "message": message, "link": link, "call_to_action_type": call_to_action_type,
+        "link": link, "call_to_action_type": call_to_action_type,
     }
-    if title:
-        params["title"] = title
-    if description:
-        params["description"] = description
+    if primary_texts:
+        params["primary_texts"] = primary_texts
+        if headlines:
+            params["headlines"] = headlines
+        if descriptions:
+            params["descriptions"] = descriptions
+    else:
+        params["message"] = message
+        if title:
+            params["title"] = title
+        if description:
+            params["description"] = description
     if image_hash:
         params["image_hash"] = image_hash
     op = {

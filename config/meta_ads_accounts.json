@@ -32,6 +32,7 @@
       "account_slug": "divine_designs",
       "account_name": "Divine Designs",
       "ad_account_id": "1506116630658438",
+      "default_destination_url": "https://www.shopdivinedesigns.com",
       "measurement_focus": {
         "primary_metric": "results",
         "primary_result_action_type": "purchase",

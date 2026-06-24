@@ -6,7 +6,18 @@
 > account as your base, then adapt to the new creative.
 
 The agent reads the creative brief (transcript + frames) plus this guide and the account
-profile, then drafts **5 primary texts, 5 headlines, and 5 descriptions**. Keep copy grounded
+profile, then drafts **5 primary texts, 5 headlines, and 5 descriptions**.
+
+## Standard practice (applies to every ad)
+
+- **Ship all options in ONE ad.** Put up to **5 primary texts + 5 headlines + 5 descriptions**
+  in a single ad (Meta's multiple-text-options via `asset_feed_spec`) and let Meta optimize which
+  combination shows. This is operator-written copy we control — it is NOT "Advantage+ creative
+  enhancements" (image expansion / music / auto-rewrites), which stay **off** per account policy.
+- **Then prune.** After the ad runs ~1 week, follow up on which text is winning and trim the ad
+  down to the best-performing option(s). Schedule that follow-up when the ad goes live.
+- **Capitalization rule:** **"Elder" and "Sister" are ALWAYS capitalized** (missionary titles) —
+  in every primary text, headline, and description. Keep copy grounded
 in what the video actually says/shows — never invent product claims not supported by the brief.
 
 ## The three fields

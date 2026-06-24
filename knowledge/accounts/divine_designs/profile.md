@@ -4,6 +4,12 @@
 - **Primary goal:** **3.0 blended ROAS account-wide.** (config policy: `primary_goal: roas`,
   `target_roas: 3.0`, `pause_roas_floor: 1.5`, `scale_roas_floor: 3.0`,
   `max_budget_increase_percent: 20`.)
+- **Default destination URL:** **https://www.shopdivinedesigns.com** — every ad points here
+  unless we deliberately decide to deep-link to a specific product page (a future test). Also in
+  `config/meta_ads_accounts.json` as `default_destination_url`.
+- **Copy conventions:** **"Elder" and "Sister" are always capitalized** (missionary titles). Ship
+  every ad with **up to 5 primary texts (+ up to 5 headlines / 5 descriptions)** and let Meta
+  optimize among them, then prune to the winner after ~1 week (see ad_copy_best_practices.md).
 - **Measurement:** optimize on purchases (Website purchases) first; ROAS is the headline
   metric but is partly derived (see learnings). Outbound clicks are a diagnostic secondary
   signal only.

@@ -63,6 +63,21 @@ app only manages them, Dev mode is fine indefinitely.
 **Would raise:** a few more clean uses with no surprise mutation → High.  **Would lower:** any
 validate-only call that actually changes state.
 
+### Multiple text options (asset_feed_spec) = "Dynamic Creative" → needs its own ad set (max 1 ad)
+**Confidence:** 🟢 High →  ·  **Domain:** platform
+- ➕ 2026-06-23 — creating a video ad with 5 primary texts (`asset_feed_spec.bodies`) into the
+  existing **Engaged Audience** ad set failed: *"Dynamic Creative Ad Set allows at most one active
+  ad in it"* (subcode 1885553). Also: including the **deprecated `standard_enhancements`** opt-out
+  field is rejected (*"should not include standard enhancements… set individual features instead"*,
+  subcode 3858504) — so omit it. _(direct API diagnosis; divine_designs)_
+
+**Apply:** To ship multiple operator-written text options (Meta optimizing among them, then prune to
+the winner — the desired workflow): create a **dedicated Dynamic Creative ad set**
+(`is_dynamic_creative: true`) that holds that **single** multi-text ad. To put an ad into an
+existing shared ad set instead, it must be **single-text** (object_story_spec); run more variants
+as separate single-text ads if you want to A/B inside a normal ad set. `create_video_ad` with
+`primary_texts` builds the asset_feed_spec creative; it requires a DC ad set as the home.
+
 ### "No Valid Formats" = creative incompatible with the selected placements
 **Confidence:** 🟢 High →  ·  **Domain:** platform
 - ➕ 2026-06-23 — 3 Divine Designs video ads (`Selfie Mom - Copy`, `Cody`, `selfie FM SP`) showed

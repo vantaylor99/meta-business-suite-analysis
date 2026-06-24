@@ -2268,3 +2268,40 @@ def test_set_creative_op_validates_and_builds_request() -> None:
     results = _apply(plan, client, execute=True)
     assert results[0].status == "executed"
     assert captured["params"] == {"creative": {"creative_id": "cr9"}}
+
+
+def test_create_video_ad_multi_text_uses_asset_feed_spec_and_opts_out_enhancements() -> None:
+    plan = build_video_ad_plan(
+        "act_1", name="Mission Ad", adset_id="as1", video_id="vid1", page_id="page9",
+        link="https://www.shopdivinedesigns.com",
+        primary_texts=["t1", "t2", "t3", "t4", "t5"],
+        headlines=["h1", "h2"], descriptions=["d1"], call_to_action_type="SHOP_NOW",
+    )
+    op = plan["ops"][0]
+    from meta_ads_analysis.authoring import validate_authoring_op as _va
+    _va(op)
+    client = _AuthoringFakeClient()
+    op["status"] = "approved"
+    results = apply_authoring_plan(plan, client, execute=True)
+    assert results[0].status == "created"
+    _kind, params, _vo = client.creates[0]
+    assert params["status"] == "PAUSED"
+    afs = params["creative"]["asset_feed_spec"]
+    assert [b["text"] for b in afs["bodies"]] == ["t1", "t2", "t3", "t4", "t5"]
+    assert [t["text"] for t in afs["titles"]] == ["h1", "h2"]
+    assert afs["link_urls"][0]["website_url"] == "https://www.shopdivinedesigns.com"
+    assert afs["videos"][0]["video_id"] == "vid1"
+    # Must NOT include the deprecated standard_enhancements field (Meta rejects it).
+    assert "degrees_of_freedom_spec" not in params["creative"]
+
+
+def test_create_video_ad_rejects_more_than_five_primary_texts() -> None:
+    from meta_ads_analysis.authoring import validate_authoring_op as _va
+    op = {"kind": "create_video_ad", "params": {
+        "name": "x", "adset_id": "as1", "video_id": "v", "page_id": "p", "link": "u",
+        "primary_texts": ["1", "2", "3", "4", "5", "6"]}}
+    try:
+        _va(op)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
