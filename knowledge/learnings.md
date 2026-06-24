@@ -79,6 +79,13 @@ validate-only call that actually changes state.
   (it moves/rewrites your primary text/headline and can truncate, breaking tested copy) and be
   cautious with video touch-ups if the creative is intentional.
 
+- ➕ 2026-06-24 — correlational join (30 ads, ≥$100 spend, 120d, spend-weighted ROAS): the
+  additive/essential cohort trends positive — `enhance_cta` 3.98 vs 2.96 without, brightness 5.90
+  vs 2.92 (n=6), `inline_comment` 3.56 vs 2.74, essentials-on 3.40 vs essentials-off 2.93. A few
+  trend negative (`ig_video_native_subtitle` 2.06, `video_filtering` 2.78) but those almost
+  certainly ride on weaker video ads — **confounded, small samples, NOT causal**. Consistent with
+  "keep additive on, don't blanket-disable." Causal proof needs an A/B test. _(own-account read)_
+
 **Apply:** Two *different* axes that the old "disable_meta_ai_features" stance conflated:
 1. **Advantage+ AUDIENCE (targeting)** — correctly OFF (it overrode our custom audiences; proven).
 2. **Advantage+ CREATIVE enhancements** — do NOT blanket-disable. Match what works: keep the
