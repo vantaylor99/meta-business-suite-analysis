@@ -1367,6 +1367,74 @@ def apply_ops_main() -> None:
             print(f"  {r.op_id}: {r.status} — {r.reason}")
 
 
+def experiment_main() -> None:
+    from datetime import date as _date
+
+    from .experiment import define_experiment, list_experiments, load_experiment, read_experiment
+
+    parser = argparse.ArgumentParser(prog="experiment", description="A/B experiment harness: define a test and read it out with significance.")
+    sub = parser.add_subparsers(dest="action", required=True)
+    pd = sub.add_parser("define", help="Define an A/B experiment (control vs variant, one variable).")
+    pd.add_argument("--account", required=True)
+    pd.add_argument("--id", required=True, help="Short experiment id (slug).")
+    pd.add_argument("--hypothesis", required=True)
+    pd.add_argument("--variable", required=True, help="The single thing changed (e.g. 'enhance_cta on vs off').")
+    pd.add_argument("--level", choices=["ad", "adset", "campaign"], default="ad")
+    pd.add_argument("--control", nargs="+", required=True, help="Control entity id(s).")
+    pd.add_argument("--variant", nargs="+", required=True, help="Variant entity id(s).")
+    pd.add_argument("--metric", default="roas")
+    pd.add_argument("--days", type=int, default=14)
+    pd.add_argument("--start", help="Start date YYYY-MM-DD (default today).")
+    pd.add_argument("--notes", default="")
+    pr = sub.add_parser("readout", help="Pull both arms and compare with a significance check.")
+    pr.add_argument("--account", required=True)
+    pr.add_argument("--id", required=True)
+    pr.add_argument("--as-of", help="Treat this date as 'today'.")
+    pr.add_argument("--min-conversions", type=int, default=25)
+    pr.add_argument("--api-version")
+    pl = sub.add_parser("list", help="List experiments for an account.")
+    pl.add_argument("--account", required=True)
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+
+    if args.action == "define":
+        path = define_experiment(
+            account=account_slug, exp_id=args.id, hypothesis=args.hypothesis, variable=args.variable,
+            level=args.level, control_ids=args.control, variant_ids=args.variant, metric=args.metric,
+            start_date=args.start or _date.today().isoformat(), planned_days=args.days, notes=args.notes,
+            created=_date.today().isoformat(),
+        )
+        print(f"Defined experiment '{args.id}': {path}")
+        print(f"  {args.variable}  | control {args.control} vs variant {args.variant} | {args.days}d")
+    elif args.action == "list":
+        items = list_experiments(account_slug)
+        print(f"{len(items)} experiment(s) for {account_slug}:")
+        for e in items:
+            print(f"  [{e.status}] {e.id} — {e.variable} (since {e.start_date}, {e.planned_days}d)")
+    elif args.action == "readout":
+        from .meta_api import client_from_env
+        exp = load_experiment(account_slug, args.id)
+        client = client_from_env(args.api_version)
+        ad_account_id = resolve_ad_account_id(account_slug)
+        as_of = _date.fromisoformat(args.as_of) if args.as_of else _date.today()
+        r = read_experiment(client, ad_account_id, exp, as_of=as_of, min_conversions=args.min_conversions)
+        c, v = r["control"], r["variant"]
+        print(f"Experiment '{exp.id}' — {exp.variable}  | window {r['window']} (level {exp.level})")
+        print(f"  hypothesis: {exp.hypothesis}")
+        print(f"  {'':<10}{'spend':>9}{'value':>9}{'ROAS':>7}{'purch':>7}{'impr':>9}{'CVR':>9}")
+        for label, a in (("control", c), ("variant", v)):
+            print(f"  {label:<10}{a['spend']:>9.0f}{a['purchase_value']:>9.0f}"
+                  f"{(a['roas'] if a['roas'] is not None else 0):>7.2f}{a['purchases']:>7}{a['impressions']:>9}"
+                  f"{(a['cvr'] if a['cvr'] is not None else 0):>9.4f}")
+        if r["roas_lift_pct"] is not None:
+            print(f"  ROAS lift (variant vs control): {r['roas_lift_pct']:+.1f}%  | conversion-rate p-value: {r['conversion_rate_pvalue']}")
+        print(f"\n  VERDICT: {r['verdict']}")
+        print(f"  caveat: {r['caveat']}")
+
+
 def watch_main() -> None:
     from datetime import date as _date
 

@@ -2439,3 +2439,101 @@ def test_build_watch_report_protects_young_flags_mature() -> None:
     # only flaggable (urgent/underperforming) go on the watchlist
     assert "m1" in report["watchlist"]["ads"] and "y1" not in report["watchlist"]["ads"]
     assert report["watchlist"]["ads"]["m1"]["times_flagged"] == 1
+
+
+# --- A/B experiment harness ----------------------------------------------------
+
+from datetime import date as _date_e
+
+from meta_ads_analysis import experiment as _exp
+
+
+class _ExpFakeClient:
+    def __init__(self, insights):
+        self._insights = insights
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1, breakdowns=None):
+        return self._insights
+
+
+def test_two_proportion_pvalue_detects_clear_difference() -> None:
+    # 100/10000 vs 300/10000 — a large, obviously-significant gap.
+    p = _exp.two_proportion_pvalue(300, 10000, 100, 10000)
+    assert p is not None and p < 0.001
+
+
+def test_two_proportion_pvalue_identical_rates_not_significant() -> None:
+    p = _exp.two_proportion_pvalue(150, 10000, 150, 10000)
+    assert p == 1.0
+
+
+def test_two_proportion_pvalue_guards_degenerate_inputs() -> None:
+    assert _exp.two_proportion_pvalue(0, 0, 1, 10) is None   # empty arm
+    assert _exp.two_proportion_pvalue(0, 100, 0, 100) is None  # pooled rate 0
+
+
+def test_define_load_list_experiment_roundtrip(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(_exp, "EXPERIMENTS_ROOT", tmp_path)
+    path = _exp.define_experiment(
+        account="Demo Account", exp_id="enh-cta", hypothesis="enhance_cta lifts ROAS",
+        variable="enhance_cta on vs off", level="ad", control_ids=["c1"], variant_ids=["v1"],
+        start_date="2026-06-01", planned_days=14, notes="", created="2026-06-01",
+    )
+    assert path.exists()
+    loaded = _exp.load_experiment("demo_account", "enh-cta")
+    assert loaded.variable == "enhance_cta on vs off"
+    assert loaded.control_ids == ["c1"] and loaded.variant_ids == ["v1"]
+    items = _exp.list_experiments("demo_account")
+    assert [e.id for e in items] == ["enh-cta"]
+
+
+def test_define_experiment_rejects_bad_inputs(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(_exp, "EXPERIMENTS_ROOT", tmp_path)
+    import pytest
+    with pytest.raises(ValueError):
+        _exp.define_experiment(account="d", exp_id="x", hypothesis="h", variable="v",
+                               level="bogus", control_ids=["c"], variant_ids=["v"],
+                               start_date="2026-06-01", created="2026-06-01")
+    with pytest.raises(ValueError):
+        _exp.define_experiment(account="d", exp_id="x", hypothesis="h", variable="v",
+                               level="ad", control_ids=[], variant_ids=["v"],
+                               start_date="2026-06-01", created="2026-06-01")
+
+
+def _exp_obj(**over):
+    base = dict(id="t", account="demo", hypothesis="h", variable="enh on/off", level="ad",
+                control_ids=["c1"], variant_ids=["v1"], metric="roas",
+                start_date="2026-06-01", planned_days=14, status="active", notes="", created="2026-06-01")
+    base.update(over)
+    return _exp.Experiment(**base)
+
+
+def test_read_experiment_insufficient_data_gate() -> None:
+    insights = [
+        {"ad_id": "c1", "ad_name": "Control", "spend": "100",
+         "action_values": [{"action_type": "purchase", "value": "300"}],
+         "actions": [{"action_type": "purchase", "value": "5"}], "impressions": "1000"},
+        {"ad_id": "v1", "ad_name": "Variant", "spend": "100",
+         "action_values": [{"action_type": "purchase", "value": "400"}],
+         "actions": [{"action_type": "purchase", "value": "6"}], "impressions": "1000"},
+    ]
+    r = _exp.read_experiment(_ExpFakeClient(insights), "act_1", _exp_obj(), as_of=_date_e(2026, 6, 24))
+    assert r["control"]["roas"] == 3.0 and r["variant"]["roas"] == 4.0
+    assert r["roas_lift_pct"] == round((4.0 / 3.0 - 1) * 100, 1)
+    assert "INSUFFICIENT DATA" in r["verdict"]   # only 5/6 purchases, below default 25
+
+
+def test_read_experiment_calls_significant_winner() -> None:
+    insights = [
+        {"ad_id": "c1", "ad_name": "Control", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "2000"}],
+         "actions": [{"action_type": "purchase", "value": "100"}], "impressions": "100000"},
+        {"ad_id": "v1", "ad_name": "Variant", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "6000"}],
+         "actions": [{"action_type": "purchase", "value": "300"}], "impressions": "100000"},
+    ]
+    r = _exp.read_experiment(_ExpFakeClient(insights), "act_1", _exp_obj(), as_of=_date_e(2026, 6, 24),
+                             min_conversions=25)
+    assert r["conversion_rate_pvalue"] is not None and r["conversion_rate_pvalue"] < 0.05
+    assert "SIGNIFICANT" in r["verdict"] and "variant" in r["verdict"]
+    assert r["variant"]["roas"] == 6.0 and r["control"]["roas"] == 2.0

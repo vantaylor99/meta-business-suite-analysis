@@ -34,6 +34,25 @@ concludes, copy the durable lesson into `knowledge/learnings.md`.
 - **Caveat / interpretation:** re-enabling ads + AA-off happen together, so a positive result
   shows the *combination* works, not AA alone. Good enough for optimization; note it when reading.
 
+## PLANNED — creative-enhancement A/B (the 2026-07-07 follow-up)
+
+> We believe enhancements (the additive set) helped our winners, but that's **correlational** —
+> the winners happened to run with them on. This is the test that makes it causal. Tooling is now
+> built: the `experiment` harness (`define` / `readout`). Discuss scope with the operator on 07-07.
+>
+> **Setup (one variable = enhancements on vs off):**
+> 1. Pick one stable, delivering ad as the control (enhancements ON via our default OPT_IN set).
+> 2. `propose-duplicate-ad` to clone it into a **matched separate ad set** (same audience/budget;
+>    separate ad set avoids the two arms competing for the same auction → cleaner read).
+> 3. `apply-ops set_creative_features` on the clone to flip the enhancements **OFF** — nothing else.
+> 4. `experiment define --account divine_designs --id enh-on-vs-off --variable "enhancements on vs off"
+>    --level ad --control <orig ad id> --variant <clone ad id> --days 14`.
+> 5. Hold ~14d (low daily purchase volume → need the window to clear the 25-purchases/arm gate).
+> 6. `experiment readout --account divine_designs --id enh-on-vs-off` → fold the verdict into
+>    `learnings.md` as a dated ➕/➖ line and adjust the creative-enhancements learning's confidence.
+> - **Caveat the readout prints:** significance is on conversion-rate; if both arms ever share an
+>   ad set they compete. Matched separate ad sets (step 2) is what keeps this honest.
+
 ## PLANNED / DEFERRED — audience rotation (isolate audience vs creative)
 
 - **Question:** Is "High Value Customers" weak (1.78) because of the high-value audience or

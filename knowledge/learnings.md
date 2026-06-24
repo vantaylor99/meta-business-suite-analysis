@@ -196,6 +196,16 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
   (urgent/underperforming/watch), with a significance floor + a protective grace that never flags
   ads created/changed within ~5 days for killing (uses `updated_time`, so mid-relearn ads are safe).
   Persistent watchlist tracks consistency. Flag-only — AI/human decides, pauses via the guarded flow.
+- `experiment define|list|readout` — **A/B experiment harness** that turns opinions into evidence.
+  `define` records a test (hypothesis, the ONE variable changed, control vs variant entity ids, a
+  window) at `knowledge/accounts/<slug>/experiments/<id>.json` so the record travels with the repo.
+  `readout` pulls both arms live, compares ROAS, runs a two-proportion z-test on conversion rate
+  (purchases/impressions, pure-Python via `math.erf`), and gates with a `--min-conversions` (default
+  25) "needs more data" floor so we don't call a winner early. **Setup of the two arms reuses
+  existing tools** — `propose-duplicate-ad` to clone, then `apply-ops set_creative_features` /
+  `set_placements` to flip the single variable; for a zero-overlap audience split Meta's native
+  split-test is more rigorous, this is a pragmatic in-repo A/B (directional→solid by isolation).
+  Caveat surfaced in the readout: significance is on conversion-rate; arms sharing an ad set compete.
 - `list-audiences` — **custom-audience inventory** (id, name, subtype, size, status).
 - `account-info` — account status, currency, lifetime spend, spend cap, balance, funding source.
 - `metrics --breakdown <dim>` — performance split by age, gender, country, region,
