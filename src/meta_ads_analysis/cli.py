@@ -48,6 +48,8 @@ from .control import (
     build_copy_library,
     build_enable_ads_plan,
     build_pause_plan,
+    DEFAULT_OPT_IN_FEATURES,
+    DEFAULT_OPT_OUT_FEATURES,
     default_winning_copy_path,
     default_audiences_path,
     default_diagnose_path,
@@ -1363,6 +1365,51 @@ def apply_ops_main() -> None:
     for r in results:
         if r.reason:
             print(f"  {r.op_id}: {r.status} — {r.reason}")
+
+
+def propose_creative_features_main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Propose setting creative enhancement features on an ad (default: additive ON, Text Improvements OFF)."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--ad-id", required=True, help="Ad to set creative features on.")
+    parser.add_argument("--opt-in", nargs="*", help="Features to OPT_IN (default: the account additive set).")
+    parser.add_argument("--opt-out", nargs="*", help="Features to OPT_OUT (default: text_optimizations, replace_media_text).")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    opt_in = args.opt_in if args.opt_in is not None else DEFAULT_OPT_IN_FEATURES
+    opt_out = args.opt_out if args.opt_out is not None else DEFAULT_OPT_OUT_FEATURES
+    plan = {
+        "schema_version": 1,
+        "plan_type": "ops",
+        "intent": "set_creative_features",
+        "account_slug": account_slug,
+        "approval_instructions": "Set the op's status to 'approved', then apply-ops --validate-only / --execute.",
+        "guardrails": {"requires_explicit_approval": True},
+        "ops": [
+            {
+                "op_id": f"creative_features_{args.ad_id}",
+                "op": "set_creative_features",
+                "level": "ad",
+                "id": args.ad_id,
+                "params": {"opt_in": opt_in, "opt_out": opt_out},
+                "status": "proposed",
+                "note": f"OPT_IN {opt_in}; OPT_OUT {opt_out}",
+            }
+        ],
+    }
+    output_path = default_ops_plan_path(account_slug, run_date, Path(args.reports_root))
+    write_plan(plan, output_path)
+    print(f"Wrote creative-features ops plan for ad {args.ad_id}: {output_path}")
+    print(f"  OPT_IN:  {opt_in}")
+    print(f"  OPT_OUT: {opt_out}")
+    print("Approve the op (status -> 'approved'), then apply-ops --validate-only / --execute.")
 
 
 def followups_main() -> None:

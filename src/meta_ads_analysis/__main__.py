@@ -29,6 +29,7 @@ from .cli import (
     propose_duplicate_ad_main,
     propose_enable_ads_main,
     propose_lookalike_main,
+    propose_creative_features_main,
     propose_meta_actions_main,
     propose_pause_ads_main,
     propose_renames_main,
@@ -46,7 +47,7 @@ def main() -> None:
             "list-audiences|account-info|estimate|search-interests|list-pixels|copy-library|followups|propose-actions|"
             "apply-actions|propose-rotation|apply-rotation|propose-disable-advantage|"
             "apply-disable-advantage|propose-renames|apply-renames|propose-enable-ads|propose-pause-ads|"
-            "apply-ops|propose-duplicate-ad|propose-lookalike|apply-authoring|intake-video|"
+            "apply-ops|propose-creative-features|propose-duplicate-ad|propose-lookalike|apply-authoring|intake-video|"
             "upload-video|propose-video-ad|operator-brief> [args]\n"
             "Example: python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-21"
         )
@@ -129,6 +130,9 @@ def main() -> None:
         return
     if command in {"propose_pause_ads", "pause_ads"}:
         propose_pause_ads_main()
+        return
+    if command in {"propose_creative_features", "creative_features"}:
+        propose_creative_features_main()
         return
     if command in {"apply_ops", "ops"}:
         apply_ops_main()

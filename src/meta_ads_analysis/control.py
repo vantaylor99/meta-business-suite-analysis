@@ -31,17 +31,27 @@ PROPOSED_STATUS = "proposed"
 EXECUTED_STATUS = "executed"
 
 TARGETING_OPS = {"set_age_range", "set_genders", "set_geo_locations", "set_placements"}
-SUPPORTED_OPS = {"set_status", "set_daily_budget", "rename", "set_creative"} | TARGETING_OPS
+SUPPORTED_OPS = {"set_status", "set_daily_budget", "rename", "set_creative", "set_creative_features"} | TARGETING_OPS
 OP_LEVELS = {
     "set_status": {"ad", "adset", "campaign"},
     "set_daily_budget": {"adset", "campaign"},
     "rename": {"ad", "adset", "campaign"},
     "set_creative": {"ad"},
+    "set_creative_features": {"ad"},
     "set_age_range": {"adset"},
     "set_genders": {"adset"},
     "set_geo_locations": {"adset"},
     "set_placements": {"adset"},
 }
+
+# Account default for creative enhancements (data + research, 2026-06-24): additive/visual ON,
+# copy-rewriting OFF. NB: the umbrella `standard_enhancements` field is deprecated — set individual
+# features only. Tune per validate-only feedback (not every feature is valid for every creative).
+DEFAULT_OPT_IN_FEATURES = [
+    "enhance_cta", "inline_comment", "show_summary", "show_destination_blurbs",
+    "reveal_details_over_time", "site_extensions", "product_extensions", "image_brightness_and_contrast",
+]
+DEFAULT_OPT_OUT_FEATURES = ["text_optimizations", "replace_media_text"]
 ALLOWED_STATUSES = {"ACTIVE", "PAUSED"}
 FORBIDDEN_FRAGMENTS = ("advantage", "ai_", "creative_enhancement", "image_expansion", "text_variation")
 
@@ -204,6 +214,11 @@ def validate_op(op: dict[str, Any]) -> None:
     elif op_type == "set_creative":
         if not str(params.get("creative_id") or "").strip():
             raise ValueError("set_creative requires params.creative_id (an existing valid creative).")
+    elif op_type == "set_creative_features":
+        opt_in = params.get("opt_in") or []
+        opt_out = params.get("opt_out") or []
+        if not isinstance(opt_in, list) or not isinstance(opt_out, list) or not (opt_in or opt_out):
+            raise ValueError("set_creative_features requires non-empty params.opt_in and/or params.opt_out lists.")
     elif op_type == "set_age_range":
         lo, hi = _num(params.get("age_min")), _num(params.get("age_max"))
         if lo is None or hi is None or not (13 <= lo <= hi <= 65):
@@ -276,6 +291,29 @@ def _build_request(op: dict[str, Any], client: MetaMarketingApiClient) -> dict[s
         return {"name": str(params["name"])}
     if op_type == "set_creative":
         return {"creative": {"creative_id": str(params["creative_id"])}}
+    if op_type == "set_creative_features":
+        # Creatives are immutable; to change enhancement enrollment we re-attach the SAME creative
+        # content with a degrees_of_freedom_spec. Read the current creative and rebuild it.
+        ad = client.get_ad(str(op["id"]), fields=["creative{object_story_spec,asset_feed_spec}"])
+        cr = ad.get("creative") if isinstance(ad.get("creative"), dict) else {}
+        new_creative: dict[str, Any] = {}
+        if isinstance(cr.get("object_story_spec"), dict):
+            oss = copy.deepcopy(cr["object_story_spec"])
+            # Read-back video_data can carry BOTH image_hash and image_url; Meta rejects re-posting
+            # both ("ObjectStorySpecRedundant"). Keep the hash, drop the redundant url.
+            vd = oss.get("video_data")
+            if isinstance(vd, dict) and vd.get("image_hash") and vd.get("image_url"):
+                vd.pop("image_url", None)
+            new_creative["object_story_spec"] = oss
+        if isinstance(cr.get("asset_feed_spec"), dict):
+            new_creative["asset_feed_spec"] = copy.deepcopy(cr["asset_feed_spec"])
+        feats: dict[str, Any] = {}
+        for f in params.get("opt_in") or []:
+            feats[str(f)] = {"enroll_status": "OPT_IN"}
+        for f in params.get("opt_out") or []:
+            feats[str(f)] = {"enroll_status": "OPT_OUT"}
+        new_creative["degrees_of_freedom_spec"] = {"creative_features_spec": feats}
+        return {"creative": new_creative}
     if op_type in TARGETING_OPS:
         live = _get_entity(client, "adset", str(op["id"]), ["id", "targeting"])
         return {"targeting": _apply_targeting_change(op_type, params, live.get("targeting"))}

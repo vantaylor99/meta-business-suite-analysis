@@ -2,6 +2,20 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-24 — built set_creative_features; applied default policy to the Mission Call ad
+
+- Built a `set_creative_features` ops op (re-attaches the creative with a `degrees_of_freedom_spec`
+  per-feature enroll, since creatives are immutable) + `propose-creative-features` CLI with an
+  account default (additive ON, copy/AI OFF). Two API gotchas learned + handled: the umbrella
+  `standard_enhancements` field is deprecated (set individual features), and read-back video_data
+  carries both `image_hash` and `image_url` (must drop one). 69 tests pass.
+- Applied it to the Mission Call ad (120246788494170733): 8 additive features OPT_IN
+  (enhance_cta, image_brightness_and_contrast, inline_comment, product_extensions,
+  reveal_details_over_time, show_destination_blurbs, show_summary, site_extensions); Meta opted out
+  all others (incl. text_optimizations, replace_media_text). Verified. Ad still PAUSED (re-reviewing
+  the new creative). Policy codified in profile.md.
+- Follow-up added (due 2026-07-07): discuss a real on-vs-off A/B test to measure causal lift.
+
 ## 2026-06-23 — first pipeline ad created (PAUSED): Mission Call / He Lives
 
 - Ran the video→ad pipeline end to end: `intake-video` on "mission call opening.MOV" (UGC mission-call

@@ -7,6 +7,14 @@
 - **Default destination URL:** **https://www.shopdivinedesigns.com** — every ad points here
   unless we deliberately decide to deep-link to a specific product page (a future test). Also in
   `config/meta_ads_accounts.json` as `default_destination_url`.
+- **Creative-enhancements policy (2026-06-24):** additive/visual enhancements **ON**, everything
+  else **OFF**. Default OPT_IN set = `enhance_cta, inline_comment, show_summary,
+  show_destination_blurbs, reveal_details_over_time, site_extensions, product_extensions,
+  image_brightness_and_contrast`; OPT_OUT the rest, especially **`text_optimizations`** (rewrites
+  our tested copy) and `replace_media_text`. Apply with `propose-creative-features` →
+  `apply-ops` (defaults live in `control.DEFAULT_OPT_IN_FEATURES/DEFAULT_OPT_OUT_FEATURES`). This is
+  research- + correlation-backed, not A/B-proven — see the open follow-up to run a real test.
+  (Distinct from Advantage+ **Audience**, which stays off — see learnings.)
 - **Copy conventions:** **"Elder" and "Sister" are always capitalized** (missionary titles). Ship
   every ad with **up to 5 primary texts (+ up to 5 headlines / 5 descriptions)** and let Meta
   optimize among them, then prune to the winner after ~1 week (see ad_copy_best_practices.md).

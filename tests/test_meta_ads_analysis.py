@@ -2339,3 +2339,39 @@ def test_followups_add_due_and_done(tmp_path: Path) -> None:
     # done archive is readable with include_done
     all_items = _fu.iter_followups("divine_designs", root=root, include_done=True)
     assert any(f.status == "done" for f in all_items)
+
+
+def test_set_creative_features_rebuilds_creative_with_enroll_status() -> None:
+    from meta_ads_analysis.control import apply_ops_plan as _apply, validate_op as _v
+
+    _v({"op_id": "x", "op": "set_creative_features", "level": "ad", "id": "ad1",
+        "params": {"opt_in": ["enhance_cta"], "opt_out": ["text_optimizations"]}})
+    try:  # empty lists rejected
+        _v({"op_id": "x", "op": "set_creative_features", "level": "ad", "id": "ad1", "params": {}})
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+    class _C:
+        def __init__(self):
+            self.captured = {}
+
+        def get_ad(self, node_id, *, fields):
+            return {"id": node_id, "creative": {"object_story_spec": {"page_id": "p", "video_data": {"video_id": "v"}}}}
+
+        def update_ad(self, node_id, *, params, validate_only=False):
+            self.captured = {"id": node_id, "params": params}
+            return {"id": node_id, "success": True}
+
+    c = _C()
+    plan = {"ops": [{"op_id": "cf", "op": "set_creative_features", "level": "ad", "id": "ad1",
+                     "params": {"opt_in": ["enhance_cta", "image_brightness_and_contrast"],
+                                "opt_out": ["text_optimizations"]}, "status": "approved"}]}
+    res = _apply(plan, c, execute=True)
+    assert res[0].status == "executed"
+    creative = c.captured["params"]["creative"]
+    assert creative["object_story_spec"]["page_id"] == "p"  # original content preserved
+    feats = creative["degrees_of_freedom_spec"]["creative_features_spec"]
+    assert feats["enhance_cta"]["enroll_status"] == "OPT_IN"
+    assert feats["image_brightness_and_contrast"]["enroll_status"] == "OPT_IN"
+    assert feats["text_optimizations"]["enroll_status"] == "OPT_OUT"
