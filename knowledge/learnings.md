@@ -63,6 +63,29 @@ app only manages them, Dev mode is fine indefinitely.
 **Would raise:** a few more clean uses with no surprise mutation → High.  **Would lower:** any
 validate-only call that actually changes state.
 
+### Creative *enhancements* ≠ Advantage *Audience*; our winners ran with enhancements ON
+**Confidence:** 🟡 Medium →  ·  **Domain:** strategy
+- ➕ 2026-06-24 — pulled `degrees_of_freedom_spec` on active Divine Designs ads: the proven
+  performers (White BG V2 - Copy, New Pink, New Black, Cody - Copy, Missionaries Copy/2…) all ran
+  with **many creative enhancements OPT_IN** — `standard_enhancements`, `enhance_cta`,
+  `inline_comment`, `show_summary`, `reveal_details_over_time`, `site_extensions`,
+  `product_extensions`, `image_brightness_and_contrast`, `video_filtering`, some with
+  `replace_media_text` / `description_automation`. The account did well (2.4–3.25 ROAS) WITH these on.
+  The new API-created ad has ALL of them off (API default without opt-in). _(own-account read;
+  enhancement *lift* is NOT cleanly measurable — no per-feature insights breakdown; confounded.)_
+- ➕ 2026-06-24 — practitioner consensus (Jon Loomer, Metalla, Meta Help): keep **additive/visual**
+  enhancements (enhance CTA, comments, summaries, brightness/contrast, image expansion — Meta cites
+  ~4% lower cost/result for standard enhancements); **turn OFF copy-rewriting "Text Improvements"**
+  (it moves/rewrites your primary text/headline and can truncate, breaking tested copy) and be
+  cautious with video touch-ups if the creative is intentional.
+
+**Apply:** Two *different* axes that the old "disable_meta_ai_features" stance conflated:
+1. **Advantage+ AUDIENCE (targeting)** — correctly OFF (it overrode our custom audiences; proven).
+2. **Advantage+ CREATIVE enhancements** — do NOT blanket-disable. Match what works: keep the
+   additive/essential ones ON; keep **Text Improvements OFF** (protect our `winning_copy` texts);
+   A/B test visual ones if we want rigor. Don't ship new ads all-off as the lone outlier.
+**Would raise:** a clean on-vs-off A/B test quantifies the lift.
+
 ### Multiple text options (asset_feed_spec) = "Dynamic Creative" → needs its own ad set (max 1 ad)
 **Confidence:** 🟢 High →  ·  **Domain:** platform
 - ➕ 2026-06-23 — creating a video ad with 5 primary texts (`asset_feed_spec.bodies`) into the
