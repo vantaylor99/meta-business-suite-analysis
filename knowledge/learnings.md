@@ -70,10 +70,15 @@ validate-only call that actually changes state.
   All were single-video creatives running under **automatic (Advantage+) placements** — the video
   didn't satisfy every placement in the set and there was no format fallback. _(direct API diagnosis)_
 
+- ➕ 2026-06-23 — **fix confirmed live:** setting the paused "Selfie" ad set to manual placements
+  (FB/IG Feed + Reels + Stories) and re-reviewing cleared "No Valid Formats" on `Cody` +
+  `selfie FM SP` (issues → none). _(controlled experiment; divine_designs)_
+
 **Apply:** Meta's own two fixes — **change placements** (`set_placements` to a video-friendly
-manual set: Facebook/Instagram Feed + Reels + Stories) or **change the creative** (`set_creative`
-to a valid creative; creatives are immutable so you swap, not edit). Confirm the fix by applying it
-and re-reading `issues_info` (validate-only checks write validity, not delivery eligibility).
+manual set: Facebook/Instagram Feed + Reels + Stories — verified to work) or **change the creative**
+(`set_creative` to a valid creative; creatives are immutable so you swap, not edit). Note
+`set_placements` is ad-set-level (affects sibling ads). Confirm by applying and re-reading
+`issues_info` (validate-only checks write validity, not delivery eligibility).
 
 ### Targeting edits trigger a transient re-review (ad set briefly leaves ACTIVE)
 **Confidence:** 🟡 Medium →  ·  **Domain:** platform

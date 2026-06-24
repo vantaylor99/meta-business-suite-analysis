@@ -2,6 +2,20 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-23 (later) — fixed "No Valid Formats" via placements (safe experiment)
+
+- Ran a zero-spend experiment on the **paused** "Selfie" ad set (`120241591268250733`): set manual
+  placements (FB/IG **Feed + Reels + Stories**) via `set_placements`, re-enabled `Cody` +
+  `selfie FM SP` to force re-review. **Result: "No Valid Formats" cleared** (issues → none,
+  effective_status IN_PROCESS). Confirms constraining placements fixes the single-video format
+  incompatibility. **Re-paused both ads afterward** (turned off, per plan); ad set remains paused →
+  no spend. The corrected placements are left in place (that's the fix).
+- Built `set_creative` op (swap an ad onto a valid creative) as the other lever.
+- **Still open:** `Selfie Mom - Copy` (active in High Value Customers) has the same issue and is
+  NOT yet fixed — a placement change there would also affect its sibling Test-Selfie OG ads, so
+  it needs a per-ad decision (pause it, or recreate the creative). `Cody` (historical 3.04) is now
+  format-clean and could be revived into an active ad set when desired.
+
 ## 2026-06-23 (status check) — health restored, short learning-phase dip
 
 - Dev-mode blocker fully cleared: **24 of 26 ads now ACTIVE** (most of the library re-enabled,
