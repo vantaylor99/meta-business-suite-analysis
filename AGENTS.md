@@ -102,3 +102,9 @@ Every written analysis should use this structure:
 - Do not collapse missing data into zeros unless the normalized output already did so intentionally.
 - Do not execute Meta account changes directly from a written analysis. Use the action workflow: generate `action_plan.json`, require explicit approval, dry-run, then execute approved actions.
 - Keep Meta AI / Advantage+ creative features off by default. Do not enable automatic text variations, image expansion, visual touch-ups, generated music, flexible media, or AI-generated creative variants unless a human explicitly requests that exact change.
+
+## Tickets (tess)
+
+This project uses [tess](tess/) for AI-driven ticket management.
+Read and follow the ticket workflow rules in tess/agent-rules/tickets.md.
+Tickets are in the [tickets/](tickets/) directory.
