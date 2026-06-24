@@ -2241,3 +2241,30 @@ def test_build_copy_library_ranks_by_roas_and_attaches_copy() -> None:
     assert rows[0]["primary_text"] == "Best seller"
     md = render_copy_library_md("demo", rows, date_from="2026-06-01", date_to="2026-06-30")
     assert "Winner" in md and "Primary text" in md
+
+
+def test_set_creative_op_validates_and_builds_request() -> None:
+    from meta_ads_analysis.control import apply_ops_plan as _apply, validate_op as _v
+
+    _v({"op_id": "x", "op": "set_creative", "level": "ad", "id": "ad1", "params": {"creative_id": "cr9"}})
+    try:
+        _v({"op_id": "x", "op": "set_creative", "level": "ad", "id": "ad1", "params": {}})
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    # set_creative is ad-level only
+    try:
+        _v({"op_id": "x", "op": "set_creative", "level": "adset", "id": "as1", "params": {"creative_id": "cr9"}})
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+    adsets = [_adset("as1", "Set 1", ["A"], ["B"])]
+    client = _FakeClient(adsets)
+    # _FakeClient only has adset methods; add an ad updater inline
+    captured = {}
+    client.update_ad = lambda node_id, *, params, validate_only=False: captured.update({"id": node_id, "params": params}) or {"id": node_id, "success": True}
+    plan = {"ops": [{"op_id": "swap", "op": "set_creative", "level": "ad", "id": "ad1", "params": {"creative_id": "cr9"}, "status": "approved"}]}
+    results = _apply(plan, client, execute=True)
+    assert results[0].status == "executed"
+    assert captured["params"] == {"creative": {"creative_id": "cr9"}}

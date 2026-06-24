@@ -31,11 +31,12 @@ PROPOSED_STATUS = "proposed"
 EXECUTED_STATUS = "executed"
 
 TARGETING_OPS = {"set_age_range", "set_genders", "set_geo_locations", "set_placements"}
-SUPPORTED_OPS = {"set_status", "set_daily_budget", "rename"} | TARGETING_OPS
+SUPPORTED_OPS = {"set_status", "set_daily_budget", "rename", "set_creative"} | TARGETING_OPS
 OP_LEVELS = {
     "set_status": {"ad", "adset", "campaign"},
     "set_daily_budget": {"adset", "campaign"},
     "rename": {"ad", "adset", "campaign"},
+    "set_creative": {"ad"},
     "set_age_range": {"adset"},
     "set_genders": {"adset"},
     "set_geo_locations": {"adset"},
@@ -200,6 +201,9 @@ def validate_op(op: dict[str, Any]) -> None:
     elif op_type == "rename":
         if not str(params.get("name") or "").strip():
             raise ValueError("rename requires a non-empty params.name.")
+    elif op_type == "set_creative":
+        if not str(params.get("creative_id") or "").strip():
+            raise ValueError("set_creative requires params.creative_id (an existing valid creative).")
     elif op_type == "set_age_range":
         lo, hi = _num(params.get("age_min")), _num(params.get("age_max"))
         if lo is None or hi is None or not (13 <= lo <= hi <= 65):
@@ -270,6 +274,8 @@ def _build_request(op: dict[str, Any], client: MetaMarketingApiClient) -> dict[s
         return {"status": str(params["status"]).upper()}
     if op_type == "rename":
         return {"name": str(params["name"])}
+    if op_type == "set_creative":
+        return {"creative": {"creative_id": str(params["creative_id"])}}
     if op_type in TARGETING_OPS:
         live = _get_entity(client, "adset", str(op["id"]), ["id", "targeting"])
         return {"targeting": _apply_targeting_change(op_type, params, live.get("targeting"))}

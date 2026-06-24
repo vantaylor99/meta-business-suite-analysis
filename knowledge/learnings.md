@@ -63,6 +63,18 @@ app only manages them, Dev mode is fine indefinitely.
 **Would raise:** a few more clean uses with no surprise mutation → High.  **Would lower:** any
 validate-only call that actually changes state.
 
+### "No Valid Formats" = creative incompatible with the selected placements
+**Confidence:** 🟢 High →  ·  **Domain:** platform
+- ➕ 2026-06-23 — 3 Divine Designs video ads (`Selfie Mom - Copy`, `Cody`, `selfie FM SP`) showed
+  `WITH_ISSUES` / "No Valid Formats: your creative is incompatible with the selected placements."
+  All were single-video creatives running under **automatic (Advantage+) placements** — the video
+  didn't satisfy every placement in the set and there was no format fallback. _(direct API diagnosis)_
+
+**Apply:** Meta's own two fixes — **change placements** (`set_placements` to a video-friendly
+manual set: Facebook/Instagram Feed + Reels + Stories) or **change the creative** (`set_creative`
+to a valid creative; creatives are immutable so you swap, not edit). Confirm the fix by applying it
+and re-reading `issues_info` (validate-only checks write validity, not delivery eligibility).
+
 ### Targeting edits trigger a transient re-review (ad set briefly leaves ACTIVE)
 **Confidence:** 🟡 Medium →  ·  **Domain:** platform
 - ➕ 2026-06-22 — right after disabling AA, an `effective_status=["ACTIVE"]` listing returned only
@@ -142,9 +154,11 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
   (`--roas-below` + `--min-spend` over a window, pulled live). Executes via `apply-ops`.
 - `apply-ops` — **generic guarded executor** for an ops plan. Ops: `set_status` (ACTIVE/PAUSED at
   ad/adset/campaign), `set_daily_budget` (adset/campaign, capped vs current), `rename` (any level),
-  and **targeting ops** (adset, read-modify-write the full targeting spec): `set_age_range`,
+  **targeting ops** (adset, read-modify-write the full targeting spec): `set_age_range`,
   `set_genders`, `set_geo_locations`, `set_placements` (manual placements or `{automatic:true}` for
-  Advantage+ placements). An agent can author its own `ops_plan.json` (ops with `status: approved`)
+  Advantage+ placements), and `set_creative` (ad — point an ad at a different/valid creative_id, the
+  way to "fix"/swap an ad's creative since creatives are immutable). An agent can author its own
+  `ops_plan.json` (ops with `status: approved`)
   and run this. Guardrails: per-op approval, budget-increase cap, no Meta-AI/Advantage params,
   targeting ops never modify `targeting_automation`.
 - `propose-duplicate-ad` / `propose-lookalike` / `propose-video-ad` / `apply-authoring` —
