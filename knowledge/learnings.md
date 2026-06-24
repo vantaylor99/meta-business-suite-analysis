@@ -124,8 +124,9 @@ rotation (same creatives, swapped audience).  **Would lower:** it flips once cre
   in-stream video (2.62 ROAS, ~$1.3k/120d). _(120d, account-wide; auto-placement-influenced)_
 
 **Apply:** Lean Instagram-heavy and vertical-first (Stories/Reels) for new ad sets/creative.
-Restricting placements to Feed+Reels+Stories cost ~nothing here (it's where ~all value is) — useful
-both as a fix for "No Valid Formats" and as a sensible default. Consider de-weighting 55+ and Facebook.
+**Adopted default placement set for this account: Facebook/Instagram Feed + Reels + Stories,
+with FB in-stream video deliberately excluded** (2026-06-23 decision — see decision-log; the
+exclusion costs ~nothing and slightly lifts ROAS). Consider de-weighting 55+ and Facebook.
 **Would raise:** holds in a controlled per-ad-set test; **would lower:** Facebook/other placements
 gain share once creative is tailored to them.
 

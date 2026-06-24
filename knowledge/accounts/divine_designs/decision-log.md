@@ -2,6 +2,17 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-23 (decision) — placement policy: Feed + Reels + Stories, exclude FB in-stream
+
+- **Decision:** keep the manual placement set at **Facebook/Instagram Feed + Reels + Stories** and
+  **deliberately leave Facebook in-stream video OUT** (and all other non-core placements).
+- **Why (120-day `publisher_platform,platform_position` data):** Feed+Reels+Stories hold **~98% of
+  spend and value**; FB in-stream ran at **2.62 ROAS** (below the 3.25 account average) on only
+  ~$10/day; Explore / Audience Network / Marketplace / right-column / Search / Messenger / Threads
+  were ~0 spend, 0 conversions. So the exclusion costs ~nothing and slightly lifts blended ROAS.
+- **Standard going forward:** use Feed + Reels + Stories (Instagram-leaning, vertical-first) as the
+  **default placement set** for new/edited ad sets on this account unless data says otherwise.
+
 ## 2026-06-23 (later) — fixed "No Valid Formats" via placements (safe experiment)
 
 - Ran a zero-spend experiment on the **paused** "Selfie" ad set (`120241591268250733`): set manual
