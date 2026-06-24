@@ -2375,3 +2375,67 @@ def test_set_creative_features_rebuilds_creative_with_enroll_status() -> None:
     assert feats["enhance_cta"]["enroll_status"] == "OPT_IN"
     assert feats["image_brightness_and_contrast"]["enroll_status"] == "OPT_IN"
     assert feats["text_optimizations"]["enroll_status"] == "OPT_OUT"
+
+
+# --- Runaway / outlier watch scanner ----------------------------------------
+
+from datetime import date as _d
+
+from meta_ads_analysis.monitor import build_watch_report, classify_ad
+
+
+def _cls(**kw):
+    base = dict(spend=300, roas=0.5, results=0, days_since_change=30, accelerating=False,
+                min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    base.update(kw)
+    return classify_ad(**base)["classification"]
+
+
+def test_classify_ad_buckets_and_protection() -> None:
+    assert _cls(spend=50) == "insufficient"                  # below significance floor
+    assert _cls(days_since_change=2) == "watch"              # young -> protected, never urgent
+    assert _cls(roas=0.5, days_since_change=30) == "urgent"  # mature + below floor
+    assert _cls(roas=2.0, days_since_change=30) == "underperforming"  # floor<roas<target
+    assert _cls(roas=3.5, days_since_change=30) == "ok"      # at/above target
+    # $ at risk scales with how far below target
+    v = classify_ad(spend=200, roas=0.0, results=0, days_since_change=30, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["dollars_at_risk"] == 200.0
+
+
+class _WatchFakeClient:
+    def __init__(self, insights, ads_meta):
+        self._insights = insights
+        self._ads = ads_meta
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1, breakdowns=None):
+        return self._insights
+
+    def iter_paginated(self, path, *, params=None):
+        return list(self._ads)
+
+
+def test_build_watch_report_protects_young_flags_mature() -> None:
+    insights = [
+        {"ad_id": "m1", "ad_name": "Mature Loser", "spend": "300",
+         "action_values": [{"action_type": "purchase", "value": "150"}], "actions": [{"action_type": "purchase", "value": "3"}]},
+        {"ad_id": "y1", "ad_name": "Young Loser", "spend": "300",
+         "action_values": [{"action_type": "purchase", "value": "150"}], "actions": [{"action_type": "purchase", "value": "3"}]},
+        {"ad_id": "ok1", "ad_name": "Winner", "spend": "300",
+         "action_values": [{"action_type": "purchase", "value": "1200"}], "actions": [{"action_type": "purchase", "value": "20"}]},
+    ]
+    ads_meta = [
+        {"id": "m1", "name": "Mature Loser", "effective_status": "ACTIVE", "adset_id": "as1", "updated_time": "2026-06-01T00:00:00+0000"},
+        {"id": "y1", "name": "Young Loser", "effective_status": "ACTIVE", "adset_id": "as1", "updated_time": "2026-06-22T00:00:00+0000"},
+        {"id": "ok1", "name": "Winner", "effective_status": "ACTIVE", "adset_id": "as1", "updated_time": "2026-06-01T00:00:00+0000"},
+    ]
+    client = _WatchFakeClient(insights, ads_meta)
+    report = build_watch_report(client, "act_1", account_slug="demo", as_of=_d(2026, 6, 24),
+                                roas_floor=1.5, roas_target=3.0, min_spend=100, grace_days=5)
+    by_id = {r["ad_id"]: r for r in report["rows"]}
+    assert by_id["m1"]["classification"] == "urgent"
+    assert by_id["y1"]["classification"] == "watch"      # young -> protected
+    assert "ok1" not in by_id                            # winner not flagged
+    # only flaggable (urgent/underperforming) go on the watchlist
+    assert "m1" in report["watchlist"]["ads"] and "y1" not in report["watchlist"]["ads"]
+    assert report["watchlist"]["ads"]["m1"]["times_flagged"] == 1

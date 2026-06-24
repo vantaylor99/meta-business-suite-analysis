@@ -32,6 +32,17 @@ act on time-sensitive account work (a prune, a learning-phase re-check, a budget
 reading task files that aren't ready. Read a due task's body, act, then `followups done`. When a
 decision implies "check back later," record it with `followups add`.
 
+Then scan for money-bleeders:
+
+```
+python -m meta_ads_analysis watch --account <slug>
+```
+
+This flags ads that are **spending while underperforming**, but **protects new/recently-changed ads**
+(anything created or edited within ~5 days is "watch," never "urgent" — so a mid-learning or
+just-changed ad isn't killed early). It's **flag-only**: review any `urgent` items case-by-case
+(with the context it prints), then pause via `propose-pause-ads` / `apply-ops` only if warranted.
+
 ## Rule: writing ad copy
 
 **Whenever you write or generate ad copy (any new ad, or the 5 options in the video pipeline),

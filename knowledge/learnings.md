@@ -192,6 +192,10 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
 - `metrics` — **live per-entity performance** (ROAS / spend / purchases / CPP) over a window at
   account/campaign/adset/ad level (`--level`, `--date-from/--date-to`). On-demand, no CSV pipeline.
 - `diagnose` — **account-wide delivery-issue scan**, grouped by issue (the dev-mode-app finder).
+- `watch` — **read-only runaway/outlier scanner**: flags ads spending while underperforming
+  (urgent/underperforming/watch), with a significance floor + a protective grace that never flags
+  ads created/changed within ~5 days for killing (uses `updated_time`, so mid-relearn ads are safe).
+  Persistent watchlist tracks consistency. Flag-only — AI/human decides, pauses via the guarded flow.
 - `list-audiences` — **custom-audience inventory** (id, name, subtype, size, status).
 - `account-info` — account status, currency, lifetime spend, spend cap, balance, funding source.
 - `metrics --breakdown <dim>` — performance split by age, gender, country, region,

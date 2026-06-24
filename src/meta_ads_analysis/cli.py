@@ -1367,6 +1367,76 @@ def apply_ops_main() -> None:
             print(f"  {r.op_id}: {r.status} — {r.reason}")
 
 
+def watch_main() -> None:
+    from datetime import date as _date
+
+    from .meta_api import client_from_env
+    from .monitor import build_watch_report, default_watch_report_path, load_watchlist, save_watchlist
+
+    parser = argparse.ArgumentParser(
+        description="Read-only runaway/outlier scanner: flag ads spending while underperforming (protects new/changed ads)."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--as-of", help="Treat this date as 'today' (YYYY-MM-DD).")
+    parser.add_argument("--window-days", type=int, default=7, help="Judgment window (default 7).")
+    parser.add_argument("--recent-days", type=int, default=3, help="Recent window for spend-velocity (default 3).")
+    parser.add_argument("--min-spend", type=float, default=100.0, help="Significance floor (default 100).")
+    parser.add_argument("--grace-days", type=int, default=5, help="Protect ads created/changed within N days (default 5).")
+    parser.add_argument("--roas-floor", type=float, help="Override pause floor (default from account policy).")
+    parser.add_argument("--roas-target", type=float, help="Override target ROAS (default from account policy).")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    as_of = _date.fromisoformat(args.as_of) if args.as_of else _date.today()
+    run_date = args.run_date or _date.today().isoformat()
+    reports_root = Path(args.reports_root)
+
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    report = build_watch_report(
+        client, ad_account_id, account_slug=account_slug, as_of=as_of,
+        window_days=args.window_days, recent_days=args.recent_days, min_spend=args.min_spend,
+        grace_days=args.grace_days, roas_floor=args.roas_floor, roas_target=args.roas_target,
+        prior_watchlist=load_watchlist(account_slug, reports_root),
+    )
+    write_plan(report, default_watch_report_path(account_slug, run_date, reports_root))
+    save_watchlist(account_slug, report["watchlist"], reports_root)
+
+    rows = report["rows"]
+    urgent = [r for r in rows if r["classification"] == "urgent"]
+    under = [r for r in rows if r["classification"] == "underperforming"]
+    watch = [r for r in rows if r["classification"] == "watch"]
+    p = report["params"]
+    print(f"{account_slug} watch — window {report['window']} | floor {p['roas_floor']} target {p['roas_target']} "
+          f"| min-spend ${p['min_spend']:.0f} | grace {p['grace_days']}d")
+    print(f"URGENT {len(urgent)} · underperforming {len(under)} · watch(protected/learning) {len(watch)}\n")
+
+    def line(r):
+        flags = []
+        if r["accelerating"]:
+            flags.append("ACCEL")
+        if r["times_flagged"] >= 2:
+            flags.append(f"{r['times_flagged']}x running")
+        tag = (" [" + ", ".join(flags) + "]") if flags else ""
+        roas = f"{r['roas']:.2f}" if r["roas"] is not None else "0.00"
+        print(f"  {r['classification'].upper():<15} {str(r['ad_name'])[:26]:<27} ROAS {roas} | ${r['spend']:.0f} "
+              f"| ${r['dollars_at_risk']:.0f} at risk | age {r['days_since_change']}d{tag}")
+        for reason in r["reasons"]:
+            print(f"        - {reason}")
+
+    for r in urgent + under + watch:
+        line(r)
+    if not rows:
+        print("  Nothing flagged. (No delivering ad is past the significance floor and below target.)")
+    print(f"\nReport: {default_watch_report_path(account_slug, run_date, reports_root)}")
+    print("Flag-only — review the urgent ones case-by-case, then pause via propose-pause-ads / apply-ops if warranted.")
+
+
 def propose_creative_features_main() -> None:
     parser = argparse.ArgumentParser(
         description="Propose setting creative enhancement features on an ad (default: additive ON, Text Improvements OFF)."

@@ -37,6 +37,7 @@ from .cli import (
     propose_video_ad_main,
     sync_meta_api_main,
     upload_video_main,
+    watch_main,
 )
 
 
@@ -44,7 +45,7 @@ def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
             "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|metrics|diagnose|"
-            "list-audiences|account-info|estimate|search-interests|list-pixels|copy-library|followups|propose-actions|"
+            "list-audiences|account-info|estimate|search-interests|list-pixels|copy-library|watch|followups|propose-actions|"
             "apply-actions|propose-rotation|apply-rotation|propose-disable-advantage|"
             "apply-disable-advantage|propose-renames|apply-renames|propose-enable-ads|propose-pause-ads|"
             "apply-ops|propose-creative-features|propose-duplicate-ad|propose-lookalike|apply-authoring|intake-video|"
@@ -85,6 +86,9 @@ def main() -> None:
         return
     if command in {"diagnose", "scan_issues"}:
         diagnose_main()
+        return
+    if command in {"watch", "outliers"}:
+        watch_main()
         return
     if command in {"list_audiences", "audiences"}:
         list_audiences_main()
@@ -156,7 +160,7 @@ def main() -> None:
     raise SystemExit(
         f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, `inspect`, `metrics`, "
         "`diagnose`, `list-audiences`, `account-info`, `estimate`, `search-interests`, `list-pixels`, "
-        "`copy-library`, `followups`, "
+        "`copy-library`, `watch`, `followups`, "
         "`propose-actions`, `apply-actions`, `propose-rotation`, `apply-rotation`, "
         "`propose-disable-advantage`, `apply-disable-advantage`, `propose-renames`, `apply-renames`, "
         "`propose-enable-ads`, `propose-pause-ads`, `apply-ops`, `propose-duplicate-ad`, "
