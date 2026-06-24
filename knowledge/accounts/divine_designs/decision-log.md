@@ -2,6 +2,16 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-24 — Mission Call ad ENABLED (live)
+
+- Enabled the Mission Call ad (120246788494170733) → `status: ACTIVE` (eff IN_PROCESS = Meta
+  reviewing the creative; delivers once approved). No issues; parent Engaged Audience ad set +
+  campaign active. Operator (Van) approved enabling and stepped away.
+- Final config as launched: copy = option 1 (missionary-gift, Elder/Sister capitalized) →
+  shopdivinedesigns.com, Shop Now, additive creative enhancements ON / copy+AI OFF, single-text in
+  Engaged Audience. Don't judge performance for ~5–7 days (learning phase, and the account is still
+  re-stabilizing). The 2026-06-30 follow-up covers the evaluation.
+
 ## 2026-06-24 — built set_creative_features; applied default policy to the Mission Call ad
 
 - Built a `set_creative_features` ops op (re-attaches the creative with a `degrees_of_freedom_spec`
