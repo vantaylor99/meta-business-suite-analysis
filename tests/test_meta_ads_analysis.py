@@ -2560,3 +2560,66 @@ def test_readout_json_output_path(tmp_path, monkeypatch) -> None:
     assert "control" in loaded and "variant" in loaded
     assert loaded["control"]["roas"] == 2.0
     assert loaded["variant"]["roas"] == 3.0
+
+
+_EXP_CLI_INSIGHTS = [
+    {"ad_id": "c1", "ad_name": "Control", "spend": "500",
+     "action_values": [{"action_type": "purchase", "value": "1000"}],
+     "actions": [{"action_type": "purchase", "value": "50"}], "impressions": "50000"},
+    {"ad_id": "v1", "ad_name": "Variant", "spend": "500",
+     "action_values": [{"action_type": "purchase", "value": "1500"}],
+     "actions": [{"action_type": "purchase", "value": "75"}], "impressions": "50000"},
+]
+
+
+def _setup_exp_cli(tmp_path, monkeypatch):
+    """Define an experiment in a temp root and stub the Meta-touching deps so
+    `experiment_main()` can run the readout branch offline. Returns the slug/id."""
+    from meta_ads_analysis import cli as _cli
+    from meta_ads_analysis import meta_api as _meta_api
+
+    monkeypatch.setattr(_exp, "EXPERIMENTS_ROOT", tmp_path)
+    _exp.define_experiment(
+        account="demo", exp_id="enh-cta", hypothesis="enhance_cta lifts ROAS",
+        variable="enhance_cta on vs off", level="ad", control_ids=["c1"], variant_ids=["v1"],
+        start_date="2026-06-01", planned_days=14, notes="", created="2026-06-01",
+    )
+    monkeypatch.setattr(_cli, "resolve_ad_account_id", lambda slug: "act_1")
+    monkeypatch.setattr(_meta_api, "client_from_env", lambda api_version=None: _ExpFakeClient(_EXP_CLI_INSIGHTS))
+    return "demo", "enh-cta"
+
+
+def test_experiment_readout_cli_writes_json(tmp_path, monkeypatch, capsys) -> None:
+    from meta_ads_analysis.cli import experiment_main
+
+    account, exp_id = _setup_exp_cli(tmp_path, monkeypatch)
+    out = tmp_path / "new-dir" / "readout.json"   # parent does not exist yet
+    monkeypatch.setattr(sys, "argv", [
+        "experiment", "readout", "--account", account, "--id", exp_id,
+        "--as-of", "2026-06-24", "--json-output-path", str(out),
+    ])
+    experiment_main()
+
+    assert out.exists()
+    assert f"Wrote readout JSON: {out}" in capsys.readouterr().out
+    loaded = json.loads(out.read_text(encoding="utf-8"))
+    assert "SIGNIFICANT" in loaded["verdict"] and "variant" in loaded["verdict"]
+    assert loaded["control"]["roas"] == 2.0 and loaded["variant"]["roas"] == 3.0
+    for key in ("roas_lift_pct", "conversion_rate_pvalue", "generated_at"):
+        assert key in loaded
+
+
+def test_experiment_readout_cli_no_json_path_writes_nothing(tmp_path, monkeypatch, capsys) -> None:
+    from meta_ads_analysis.cli import experiment_main
+
+    account, exp_id = _setup_exp_cli(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "argv", [
+        "experiment", "readout", "--account", account, "--id", exp_id, "--as-of", "2026-06-24",
+    ])
+    experiment_main()
+
+    captured = capsys.readouterr().out
+    assert "VERDICT:" in captured                      # table still printed
+    assert "Wrote readout JSON" not in captured        # no file confirmation
+    # only the experiment-definition JSON exists; no readout file was written
+    assert not any(p.name == "readout.json" for p in tmp_path.rglob("*.json"))
