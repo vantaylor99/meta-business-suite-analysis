@@ -1,4 +1,4 @@
-description: Make every recommendation the tool gives an operator show its evidence — the number, the time window, how much data it is based on, and which ad/ad set/campaign — AND a plain confidence indicator (e.g. a High/Medium/Low band with an approximate percentage) that tells the operator how much to trust the call and how likely it is to be an ungrounded guess. Let the tool say "not enough data to recommend yet" instead of guessing. The goal is that no advice can be acted on without the facts behind it, and the agent's confidence in it, being visible and checkable.
+description: Make every recommendation the tool gives an operator show its evidence — the number, the time window, how much data it is based on, and which ad/ad set/campaign — AND a plain confidence indicator (e.g. a High/Medium/Low band with an approximate percentage) that tells the operator how much to trust the call and how likely it is to be an ungrounded guess. Let the tool say "not enough data to recommend yet" instead of guessing. The goal is that no advice can be acted on without the facts behind it, and the agent's confidence in it, being visible and checkable. External findings from the internet may be used as labeled, capped hypotheses that get routed to testing — never as a confidence boost to a live recommendation.
 files: src/meta_ads_analysis/briefs.py, src/meta_ads_analysis/analyze.py, src/meta_ads_analysis/actions.py, src/meta_ads_analysis/control.py, src/meta_ads_analysis/monitor.py, src/meta_ads_analysis/experiment.py, AGENTS.md, knowledge/README.md
 ----
 ## Why
@@ -100,6 +100,43 @@ operator-facing recommendation, including prose, must cite metric / window / sam
 This is the human/agent-facing mirror of the structural rule above, so the discipline holds even
 where there is no schema to enforce it.
 
+### 5. External evidence (the internet) — a hypothesis source, never a confirmation
+
+The tool may use external findings (Reddit, blogs, Meta's own docs, named practitioners) as input,
+but they must occupy a fundamentally different role than account data. **Account data answers "is
+this true for THIS account?" — external evidence answers "what's worth trying?"** The hard rule:
+external evidence feeds the **hypothesis / experiment queue, never the confidence score of a live
+recommendation.** If a post says "square video wins in Reels," the correct output is not "+confidence
+on this ad" — it is "worth testing," which files an A/B via the experiment harness (`experiment.py`).
+The web tells us what to test; the account tells us what's true; the A/B is the bridge.
+
+How it slots into the design:
+
+- **Grounding tier, at the bottom, capped.** In the section-3 grounding axis it sits below every
+  first-party source: `A/B-backed > direct observation > correlational read > **external/web** >
+  model inference`. Because the weaker axis caps the overall confidence, a recommendation grounded
+  *only* in web evidence can never rise above Low/Medium no matter how popular the source — usually
+  it reads as "🔴 Low (hypothesis — confirm via A/B)." This is the correct, conservative behavior.
+- **Cite the source, quote don't paraphrase.** Same auditability we demand of account numbers: a
+  link, a date, and a direct quote of the key claim — so the operator judges the source, and so the
+  model summarizing the web (itself a hallucination surface) can't invent a "consensus."
+- **Recency-weighted, NOT upvote-weighted.** Upvotes measure agreement/popularity at posting time
+  and are gameable (marketing communities are semi-adversarial / full of self-promotion) — at most
+  a weak tie-breaker, never a confidence multiplier. For Meta specifically, **recency dominates**:
+  the platform changes constantly, so an old high-upvote post about a *platform tactic* is a trap
+  (it may describe something that no longer works). Distinguish fast-rotting **platform tactics**
+  from slow-rotting **evergreen principles** and weight accordingly.
+- **Source-quality tiers.** Meta's own docs or a named practitioner who shows methodology rank above
+  an anonymous "this worked for me" anecdote — but even Meta docs describe *general* behavior, not
+  this account.
+- **Where it earns its keep: cold-start.** External priors are most valuable when the account has
+  *no* data on something new (a new creative direction, ad type, audience). There a labeled external
+  prior beats pure model guessing. The moment first-party data exists, account data dominates.
+
+Note: we already do this informally — the "practitioner consensus (Jon Loomer, Meta Help)" line in
+`learnings.md` is exactly external evidence. The goal here is to formalize it so it is always
+labeled `external`, capped, and routed to testing — so it can never masquerade as account-grade truth.
+
 ## Use cases / expected behavior
 
 - A pause recommendation on an ad with 1.2 ROAS over 14d and 43 purchases reads, in the brief and
@@ -117,6 +154,12 @@ where there is no schema to enforce it.
   A/B" — *even if the sample is large* — because the grounding axis caps it.
 - The same claim, once backed by a completed A/B experiment, reads **🟢 High** because the evidence
   tier is now top. The confidence visibly rises as the grounding improves.
+- A Reddit thread saying "broad targeting beats lookalikes now" surfaces as a **hypothesis** —
+  "🔴 Low (external, dated 2026-05; confirm via A/B)" with the link/quote — and offers to file an
+  experiment, rather than nudging the confidence of any current targeting recommendation.
+- For a brand-new ad type the account has never run, an external prior is allowed to inform the
+  *initial* call (labeled external, capped Low/Medium); once the ad accrues spend/purchases, the
+  first-party data takes over and the confidence is recomputed from it.
 
 ## Edge cases & interactions
 
@@ -138,3 +181,10 @@ where there is no schema to enforce it.
 - No false precision — bands with approximate ranges, not two-significant-figure percentages.
 - The confidence rubric must stay consistent with `learnings.md`'s 🟢/🟡/🔴 vocabulary; don't
   introduce a second, conflicting confidence scale.
+- **External/web evidence must never raise the confidence of a live recommendation** — it is capped
+  in the grounding tier and routed to the experiment queue. A code/agent path that tries to treat a
+  web finding as confirmation (rather than hypothesis) is a defect.
+- The model paraphrasing the web is a hallucination surface: require a link + date + verbatim quote
+  for any external claim used; an external claim with no citable source is not usable.
+- Upvotes/popularity must not be wired in as a confidence multiplier; recency + source-quality are
+  the weighting signals, and platform tactics decay faster than evergreen principles.
