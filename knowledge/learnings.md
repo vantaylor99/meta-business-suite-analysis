@@ -112,16 +112,22 @@ manual set: Facebook/Instagram Feed + Reels + Stories — verified to work) or *
 **Would raise:** it persists after AA-off with the full creative set, or holds in a controlled
 rotation (same creatives, swapped audience).  **Would lower:** it flips once creatives/AA are equalized.
 
-### Divine Designs: Instagram outperforms Facebook; 18-24 and 45-54 are the strongest age bands
-**Confidence:** 🔴 Low ↑  ·  **Domain:** strategy
-- ➕ 2026-06-23 — 30d `metrics --breakdown`: by `publisher_platform`, Instagram 2.79 ROAS
-  ($10.4k spend) vs Facebook 1.94 ($7.3k); by `age`, 18-24 = 3.18 and 45-54 = 2.93 (most spend)
-  led, while 55-64 (1.41) and 65+ (1.57) lagged. _(single 30-day window, account-wide, confounded
-  by creative/audience mix; not yet a controlled test)_
+### Divine Designs: Instagram (esp. Stories) outperforms Facebook; value concentrates in Feed/Reels/Stories
+**Confidence:** 🟡 Medium ↑  ·  **Domain:** strategy
+- ➕ 2026-06-23 — 30d `metrics --breakdown`: Instagram 2.79 ROAS vs Facebook 1.94; by `age`,
+  18-24 (3.18) and 45-54 (2.93) led, 55-64 (1.41) / 65+ (1.57) lagged. _(30d, account-wide, confounded)_
+- ➕ 2026-06-23 — **120d** `publisher_platform,platform_position` (corroborates + adds detail):
+  Instagram 3.63 vs Facebook 2.55; **IG Stories is the single best placement at 4.33 ROAS** ($60k
+  value), then IG Reels 3.30, IG feed 3.25, FB feed 2.66, FB Reels 2.38. **~98% of spend AND value
+  sits in Feed + Reels + Stories**; Explore / Audience Network / Marketplace / right-column / Search /
+  Messenger / Threads were ~0 spend and 0 conversions. Only notable non-core placement: FB
+  in-stream video (2.62 ROAS, ~$1.3k/120d). _(120d, account-wide; auto-placement-influenced)_
 
-**Apply:** Hypotheses to test, not yet rules — consider shifting weight toward Instagram and the
-strong age bands, or excluding 55+, once the dev-mode/AA cleanup settles. Re-pull to confirm.
-**Would raise:** the split persists across multiple windows or after the current changes settle.
+**Apply:** Lean Instagram-heavy and vertical-first (Stories/Reels) for new ad sets/creative.
+Restricting placements to Feed+Reels+Stories cost ~nothing here (it's where ~all value is) — useful
+both as a fix for "No Valid Formats" and as a sensible default. Consider de-weighting 55+ and Facebook.
+**Would raise:** holds in a controlled per-ad-set test; **would lower:** Facebook/other placements
+gain share once creative is tailored to them.
 
 ### ROAS on this account is partly derived, not Meta-reported
 **Confidence:** 🟢 High →  ·  **Domain:** measurement
