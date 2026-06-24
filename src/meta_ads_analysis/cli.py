@@ -1392,6 +1392,7 @@ def experiment_main() -> None:
     pr.add_argument("--as-of", help="Treat this date as 'today'.")
     pr.add_argument("--min-conversions", type=int, default=25)
     pr.add_argument("--api-version")
+    pr.add_argument("--json-output-path", help="Write readout result as JSON to this path (in addition to stdout).")
     pl = sub.add_parser("list", help="List experiments for an account.")
     pl.add_argument("--account", required=True)
     args = parser.parse_args()
@@ -1433,6 +1434,11 @@ def experiment_main() -> None:
             print(f"  ROAS lift (variant vs control): {r['roas_lift_pct']:+.1f}%  | conversion-rate p-value: {r['conversion_rate_pvalue']}")
         print(f"\n  VERDICT: {r['verdict']}")
         print(f"  caveat: {r['caveat']}")
+        if args.json_output_path:
+            out = Path(args.json_output_path)
+            ensure_dir(out.parent)
+            write_json(out, r)
+            print(f"Wrote readout JSON: {out}")
 
 
 def watch_main() -> None:

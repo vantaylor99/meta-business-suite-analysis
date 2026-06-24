@@ -206,6 +206,7 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
   `set_placements` to flip the single variable; for a zero-overlap audience split Meta's native
   split-test is more rigorous, this is a pragmatic in-repo A/B (directional→solid by isolation).
   Caveat surfaced in the readout: significance is on conversion-rate; arms sharing an ad set compete.
+  `readout` accepts `--json-output-path <file>` to also persist the full result dict as JSON (useful for dashboards/automation).
 - `list-audiences` — **custom-audience inventory** (id, name, subtype, size, status).
 - `account-info` — account status, currency, lifetime spend, spend cap, balance, funding source.
 - `metrics --breakdown <dim>` — performance split by age, gender, country, region,

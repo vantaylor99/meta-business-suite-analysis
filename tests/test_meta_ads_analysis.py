@@ -2537,3 +2537,26 @@ def test_read_experiment_calls_significant_winner() -> None:
     assert r["conversion_rate_pvalue"] is not None and r["conversion_rate_pvalue"] < 0.05
     assert "SIGNIFICANT" in r["verdict"] and "variant" in r["verdict"]
     assert r["variant"]["roas"] == 6.0 and r["control"]["roas"] == 2.0
+
+
+def test_readout_json_output_path(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(_exp, "EXPERIMENTS_ROOT", tmp_path)
+    insights = [
+        {"ad_id": "c1", "ad_name": "Control", "spend": "500",
+         "action_values": [{"action_type": "purchase", "value": "1000"}],
+         "actions": [{"action_type": "purchase", "value": "50"}], "impressions": "50000"},
+        {"ad_id": "v1", "ad_name": "Variant", "spend": "500",
+         "action_values": [{"action_type": "purchase", "value": "1500"}],
+         "actions": [{"action_type": "purchase", "value": "75"}], "impressions": "50000"},
+    ]
+    out = tmp_path / "output" / "readout.json"
+    r = _exp.read_experiment(_ExpFakeClient(insights), "act_1", _exp_obj(), as_of=_date_e(2026, 6, 24), min_conversions=25)
+    from meta_ads_analysis.utils import ensure_dir, write_json
+    ensure_dir(out.parent)
+    write_json(out, r)
+    import json
+    loaded = json.loads(out.read_text(encoding="utf-8"))
+    assert loaded["verdict"] == r["verdict"]
+    assert "control" in loaded and "variant" in loaded
+    assert loaded["control"]["roas"] == 2.0
+    assert loaded["variant"]["roas"] == 3.0
