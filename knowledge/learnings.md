@@ -144,10 +144,15 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
   Advantage+ placements). An agent can author its own `ops_plan.json` (ops with `status: approved`)
   and run this. Guardrails: per-op approval, budget-increase cap, no Meta-AI/Advantage params,
   targeting ops never modify `targeting_automation`.
-- `propose-duplicate-ad` / `propose-lookalike` / `apply-authoring` — **authoring layer**: create
-  campaigns/ad sets/ads (everything created **PAUSED**), duplicate an existing ad's creative into
-  another ad set, create lookalike audiences. Same approval/validate-only/execute gate; rejects
-  Meta-AI/Advantage params.
+- `propose-duplicate-ad` / `propose-lookalike` / `propose-video-ad` / `apply-authoring` —
+  **authoring layer**: create campaigns/ad sets/ads/**video ads** (everything created **PAUSED**),
+  duplicate an existing ad's creative into another ad set, create lookalike audiences. Same
+  approval/validate-only/execute gate; rejects Meta-AI/Advantage params.
+- **Video → ad pipeline** (`intake-video` → agent drafts copy → `upload-video` → `propose-video-ad`
+  → `apply-authoring`): drop a video in `data/video_intake/<account>/inbox/`, transcribe locally
+  (faster-whisper, the `media` extra + ffmpeg), the agent writes 5 copy options + picks the ad set,
+  then a PAUSED video ad is created. Full flow in `knowledge/video_ad_pipeline.md`; copy guidance in
+  `knowledge/ad_copy_best_practices.md`.
 - **Deliberately NOT built** (destructive / out of scope): delete, archive, creative/media upload
   (duplicate-ad reuses an existing creative instead), and arbitrary targeting edits (targeting has
   its own rotation tools).

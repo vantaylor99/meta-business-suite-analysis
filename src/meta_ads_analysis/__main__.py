@@ -17,6 +17,7 @@ from .cli import (
     estimate_main,
     ingest_meta_exports_main,
     inspect_main,
+    intake_video_main,
     list_audiences_main,
     list_pixels_main,
     metrics_main,
@@ -30,7 +31,9 @@ from .cli import (
     propose_pause_ads_main,
     propose_renames_main,
     propose_rotation_main,
+    propose_video_ad_main,
     sync_meta_api_main,
+    upload_video_main,
 )
 
 
@@ -41,7 +44,8 @@ def main() -> None:
             "list-audiences|account-info|estimate|search-interests|list-pixels|propose-actions|"
             "apply-actions|propose-rotation|apply-rotation|propose-disable-advantage|"
             "apply-disable-advantage|propose-renames|apply-renames|propose-enable-ads|propose-pause-ads|"
-            "apply-ops|propose-duplicate-ad|propose-lookalike|apply-authoring|operator-brief> [args]\n"
+            "apply-ops|propose-duplicate-ad|propose-lookalike|apply-authoring|intake-video|"
+            "upload-video|propose-video-ad|operator-brief> [args]\n"
             "Example: python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-21"
         )
         return
@@ -100,6 +104,15 @@ def main() -> None:
     if command in {"propose_duplicate_ad", "duplicate_ad"}:
         propose_duplicate_ad_main()
         return
+    if command in {"intake_video", "intake"}:
+        intake_video_main()
+        return
+    if command in {"upload_video"}:
+        upload_video_main()
+        return
+    if command in {"propose_video_ad", "video_ad"}:
+        propose_video_ad_main()
+        return
     if command in {"propose_lookalike", "lookalike"}:
         propose_lookalike_main()
         return
@@ -134,7 +147,8 @@ def main() -> None:
         "`propose-actions`, `apply-actions`, `propose-rotation`, `apply-rotation`, "
         "`propose-disable-advantage`, `apply-disable-advantage`, `propose-renames`, `apply-renames`, "
         "`propose-enable-ads`, `propose-pause-ads`, `apply-ops`, `propose-duplicate-ad`, "
-        "`propose-lookalike`, `apply-authoring`, or `operator-brief`."
+        "`propose-lookalike`, `apply-authoring`, `intake-video`, `upload-video`, "
+        "`propose-video-ad`, or `operator-brief`."
     )
 
 

@@ -176,6 +176,54 @@ class MetaMarketingApiClient:
             self._make_url(f"/{ad_account_id}/customaudiences"), data=self._encode_write_params(params, validate_only)
         )
 
+    def create_ad_creative(self, ad_account_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
+        """Create an ad creative (e.g. an object_story_spec) reusable across ads."""
+        return self._post_json(
+            self._make_url(f"/{ad_account_id}/adcreatives"), data=self._encode_write_params(params, validate_only)
+        )
+
+    def upload_video(self, ad_account_id: str, *, file_path: str, name: str | None = None) -> dict[str, Any]:
+        """Upload a video file to the ad account's media library. Returns {'id': <video_id>}.
+
+        Simple (non-resumable) multipart upload — fine for typical ad videos. Meta then
+        processes the video asynchronously; poll ``get_video`` for status before using it.
+        """
+        url = self._make_url(f"/{ad_account_id}/advideos")
+        data: dict[str, Any] = {"access_token": self.access_token}
+        if name:
+            data["name"] = name
+        with open(file_path, "rb") as handle:
+            response = self.session.post(
+                url, data=data, files={"source": handle}, timeout=max(self.timeout_seconds, 600)
+            )
+        return self._read_response(response, url)
+
+    def get_video(self, video_id: str, *, fields: list[str]) -> dict[str, Any]:
+        """Fetch a video's processing status/metadata (e.g. fields=['status'])."""
+        params = {"fields": ",".join(fields), "access_token": self.access_token}
+        return self._get_json(self._make_url(f"/{video_id}"), params=params)
+
+    def upload_image(self, ad_account_id: str, *, file_path: str) -> dict[str, Any]:
+        """Upload an image; returns the Graph API ``images`` map keyed by filename (with 'hash')."""
+        url = self._make_url(f"/{ad_account_id}/adimages")
+        with open(file_path, "rb") as handle:
+            response = self.session.post(
+                url, data={"access_token": self.access_token}, files={"filename": handle},
+                timeout=max(self.timeout_seconds, 120),
+            )
+        return self._read_response(response, url)
+
+    def _read_response(self, response: "requests.Response", url: str) -> dict[str, Any]:
+        if response.status_code >= 400:
+            raise MetaApiError(self._format_error(response))
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise MetaApiError(f"Meta API returned non-JSON response from {url}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise MetaApiError(f"Meta API returned an unexpected response shape from {url}.")
+        return payload
+
     def list_campaigns(
         self,
         ad_account_id: str,

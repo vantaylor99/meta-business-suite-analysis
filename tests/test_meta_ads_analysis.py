@@ -2103,3 +2103,81 @@ def test_estimate_and_search_and_pixels_normalize() -> None:
     assert interests[0]["name"] == "Jewelry" and interests[0]["audience_lower"] == 1000
     pixels = list_account_pixels(c, "act_1")
     assert pixels[0]["name"] == "Main Pixel"
+
+
+# --- Video pipeline foundation (Phase 0 + 1) --------------------------------
+
+from types import SimpleNamespace
+
+from meta_ads_analysis.authoring import build_video_ad_plan, validate_authoring_op as _validate_auth
+from meta_ads_analysis import video_intake
+
+
+def test_create_video_ad_builds_object_story_spec_and_pauses() -> None:
+    plan = build_video_ad_plan(
+        "act_1", name="My Video Ad", adset_id="as1", video_id="vid123", page_id="page9",
+        message="Buy our jewelry", link="https://shop.example/x", title="Shiny", description="Handmade",
+        call_to_action_type="SHOP_NOW",
+    )
+    op = plan["ops"][0]
+    assert op["kind"] == "create_video_ad"
+    _validate_auth(op)  # passes validation
+
+    client = _AuthoringFakeClient()
+    plan["ops"][0]["status"] = "approved"
+    results = apply_authoring_plan(plan, client, execute=True)
+    assert results[0].status == "created"
+    kind, params, _vo = client.creates[0]
+    assert kind == "ad"  # video ad is created via create_ad
+    assert params["status"] == "PAUSED"
+    spec = params["creative"]["object_story_spec"]
+    assert spec["page_id"] == "page9"
+    assert spec["video_data"]["video_id"] == "vid123"
+    assert spec["video_data"]["message"] == "Buy our jewelry"
+    assert spec["video_data"]["call_to_action"]["value"]["link"] == "https://shop.example/x"
+    assert spec["video_data"]["title"] == "Shiny"
+
+
+def test_create_video_ad_requires_core_fields() -> None:
+    try:
+        _validate_auth({"kind": "create_video_ad", "params": {"name": "X", "adset_id": "as1"}})
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
+def test_frame_timestamps_even_spacing() -> None:
+    assert video_intake.frame_timestamps(100.0, 4) == [20.0, 40.0, 60.0, 80.0]
+    assert video_intake.frame_timestamps(0, 4) == []
+    assert video_intake.frame_timestamps(100, 0) == []
+
+
+def test_process_video_builds_brief_with_injected_runner_and_transcriber(tmp_path: Path, monkeypatch) -> None:
+    # Avoid requiring ffmpeg binaries during the test.
+    monkeypatch.setattr(video_intake, "_require_binary", lambda name: None)
+
+    calls = []
+
+    def fake_runner(cmd, capture_output=False, text=False, check=False):
+        calls.append(cmd[0])
+        # ffprobe duration query returns a number on stdout
+        if cmd[0] == "ffprobe":
+            return SimpleNamespace(stdout="42.0\n", returncode=0)
+        return SimpleNamespace(stdout="", returncode=0)
+
+    def fake_transcriber(audio_path):
+        return {"text": "Handmade jewelry for everyday wear", "language": "en", "duration": 42.0,
+                "segments": [{"start": 0.0, "end": 5.0, "text": "Handmade jewelry for everyday wear"}]}
+
+    video = tmp_path / "promo.mp4"
+    video.write_bytes(b"not a real video")
+    brief = video_intake.process_video(
+        video, account_slug="divine_designs", work_dir=tmp_path / "work",
+        frame_count=3, runner=fake_runner, transcriber=fake_transcriber,
+    )
+    assert brief["transcript"] == "Handmade jewelry for everyday wear"
+    assert brief["video"]["duration_seconds"] == 42.0
+    assert len(brief["frames"]) == 3
+    assert brief["copy_options"] == {"primary_texts": [], "headlines": [], "descriptions": []}
+    assert (tmp_path / "work" / "creative_brief.json").exists()
+    assert "ffprobe" in calls and "ffmpeg" in calls

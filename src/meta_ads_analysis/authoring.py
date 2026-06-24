@@ -25,8 +25,8 @@ APPROVED_STATUS = "approved"
 PROPOSED_STATUS = "proposed"
 CREATED_STATUS = "created"
 
-CREATE_KINDS = {"create_campaign", "create_adset", "create_ad", "create_lookalike"}
-PAUSED_KINDS = {"create_campaign", "create_adset", "create_ad"}
+CREATE_KINDS = {"create_campaign", "create_adset", "create_ad", "create_video_ad", "create_lookalike"}
+PAUSED_KINDS = {"create_campaign", "create_adset", "create_ad", "create_video_ad"}
 
 
 def _now_iso() -> str:
@@ -72,6 +72,10 @@ def validate_authoring_op(op: dict[str, Any]) -> None:
             raise ValueError("create_ad requires params.adset_id.")
         if not isinstance(params.get("creative"), dict):
             raise ValueError("create_ad requires params.creative (e.g. {'creative_id': '<id>'}).")
+    elif kind == "create_video_ad":
+        for req in ("name", "adset_id", "video_id", "page_id", "message", "link"):
+            if not str(params.get(req) or "").strip():
+                raise ValueError(f"create_video_ad requires params.{req}.")
     elif kind == "create_lookalike":
         if not str(params.get("name") or "").strip():
             raise ValueError("create_lookalike requires params.name.")
@@ -98,6 +102,28 @@ def _build_create(op: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if kind == "create_ad":
         params["status"] = "PAUSED"
         return "create_ad", params
+    if kind == "create_video_ad":
+        video_data: dict[str, Any] = {
+            "video_id": str(params["video_id"]),
+            "message": params["message"],
+            "call_to_action": {
+                "type": params.get("call_to_action_type", "SHOP_NOW"),
+                "value": {"link": params["link"]},
+            },
+        }
+        if params.get("title"):
+            video_data["title"] = params["title"]
+        if params.get("description"):
+            video_data["link_description"] = params["description"]
+        if params.get("image_hash"):
+            video_data["image_hash"] = params["image_hash"]
+        request = {
+            "name": params["name"],
+            "adset_id": str(params["adset_id"]),
+            "status": "PAUSED",
+            "creative": {"object_story_spec": {"page_id": str(params["page_id"]), "video_data": video_data}},
+        }
+        return "create_ad", request
     if kind == "create_lookalike":
         request = {
             "name": params["name"],
@@ -186,6 +212,42 @@ def build_duplicate_ad_plan(
         "note": f"duplicate of ad {source_ad_id} ({src.get('name')}) into ad set {target_adset_id}; created PAUSED",
     }
     return _wrap_plan([op], ad_account_id, account_slug, intent="duplicate_ad")
+
+
+def build_video_ad_plan(
+    ad_account_id: str,
+    *,
+    name: str,
+    adset_id: str,
+    video_id: str,
+    page_id: str,
+    message: str,
+    link: str,
+    title: str | None = None,
+    description: str | None = None,
+    call_to_action_type: str = "SHOP_NOW",
+    image_hash: str | None = None,
+    account_slug: str | None = None,
+) -> dict[str, Any]:
+    """Plan to create a video ad (created PAUSED) from an already-uploaded video_id."""
+    params: dict[str, Any] = {
+        "name": name, "adset_id": adset_id, "video_id": video_id, "page_id": page_id,
+        "message": message, "link": link, "call_to_action_type": call_to_action_type,
+    }
+    if title:
+        params["title"] = title
+    if description:
+        params["description"] = description
+    if image_hash:
+        params["image_hash"] = image_hash
+    op = {
+        "op_id": f"video_ad_{video_id}_to_{adset_id}",
+        "kind": "create_video_ad",
+        "params": params,
+        "status": PROPOSED_STATUS,
+        "note": f"video ad '{name}' (video {video_id}) into ad set {adset_id}; created PAUSED",
+    }
+    return _wrap_plan([op], ad_account_id, account_slug, intent="create_video_ad")
 
 
 def build_lookalike_plan(

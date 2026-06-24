@@ -17,6 +17,10 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+# Local video intake (Whisper transcription). Also requires the system `ffmpeg` binary on PATH.
+media = [
+  "faster-whisper>=1.0",
+]
 
 [project.scripts]
 ingest_meta_exports = "meta_ads_analysis.cli:ingest_meta_exports_main"
@@ -44,6 +48,9 @@ apply_ops = "meta_ads_analysis.cli:apply_ops_main"
 propose_duplicate_ad = "meta_ads_analysis.cli:propose_duplicate_ad_main"
 propose_lookalike = "meta_ads_analysis.cli:propose_lookalike_main"
 apply_authoring = "meta_ads_analysis.cli:apply_authoring_main"
+intake_video = "meta_ads_analysis.cli:intake_video_main"
+upload_video = "meta_ads_analysis.cli:upload_video_main"
+propose_video_ad = "meta_ads_analysis.cli:propose_video_ad_main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

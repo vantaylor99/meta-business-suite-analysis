@@ -35,6 +35,7 @@ from .authoring import (
     apply_authoring_plan,
     build_duplicate_ad_plan,
     build_lookalike_plan,
+    build_video_ad_plan,
     default_authoring_plan_path,
     default_authoring_results_path,
     write_authoring_plan,
@@ -948,6 +949,113 @@ def account_info_main() -> None:
     print(f"{account_slug} [{info['ad_account_id']}]")
     for k in ("name", "business_name", "status", "currency", "timezone", "amount_spent", "spend_cap", "balance", "funding_source", "disable_reason"):
         print(f"  {k:<16}: {info.get(k)}")
+
+
+def intake_video_main() -> None:
+    from .video_intake import list_inbox_videos, process_video
+
+    parser = argparse.ArgumentParser(
+        description="Transcribe a video locally (whisper) + sample frames into a creative brief the agent can use."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--file", help="A specific video file. If omitted, processes the account's inbox folder.")
+    parser.add_argument("--model", default="base", help="faster-whisper model size (tiny/base/small/medium/large).")
+    parser.add_argument("--frames", type=int, default=4, help="Number of sample frames to extract (default 4).")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+
+    if args.file:
+        videos = [Path(args.file)]
+    else:
+        videos = list_inbox_videos(account_slug)
+        if not videos:
+            raise SystemExit(
+                f"No videos in inbox. Drop files in data/video_intake/{account_slug}/inbox/ or pass --file."
+            )
+    for video in videos:
+        print(f"Processing {video.name} ...")
+        brief = process_video(video, account_slug=account_slug, model_size=args.model, frame_count=args.frames)
+        transcript = brief["transcript"]
+        preview = (transcript[:300] + "…") if len(transcript) > 300 else transcript
+        print(f"  duration: {brief['video']['duration_seconds']}s | frames: {len(brief['frames'])}")
+        print(f"  transcript: {preview or '(empty)'}")
+        print(f"  brief: {brief['brief_path']}")
+    print("\nNext: the agent reads the brief + knowledge/ad_copy_best_practices.md, drafts 5 copy options "
+          "and an ad-set pick, then runs propose-video-ad with the chosen copy.")
+
+
+def upload_video_main() -> None:
+    import time
+
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(description="Upload a video to the ad account and report its id + processing status.")
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--file", required=True, help="Path to the video file.")
+    parser.add_argument("--name", help="Optional name for the video in the media library.")
+    parser.add_argument("--poll-seconds", type=int, default=60, help="How long to poll for 'ready' (default 60s).")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    resp = client.upload_video(ad_account_id, file_path=args.file, name=args.name)
+    video_id = resp.get("id")
+    print(f"Uploaded. video_id = {video_id}")
+    waited = 0
+    status = "?"
+    while waited < args.poll_seconds:
+        v = client.get_video(video_id, fields=["status"])
+        status = (v.get("status") or {}).get("video_status", "?")
+        if status in {"ready", "error"}:
+            break
+        time.sleep(5)
+        waited += 5
+    print(f"Processing status: {status}")
+    if status != "ready":
+        print("Video may still be processing; it's usable once status is 'ready'. Re-check with this command's id.")
+    print(f"Use this in propose-video-ad: --video-id {video_id}")
+
+
+def propose_video_ad_main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Propose a video ad (created PAUSED) from an uploaded video_id + chosen copy."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--adset-id", required=True, help="Ad set to create the ad in.")
+    parser.add_argument("--video-id", required=True, help="Uploaded video id (from upload-video).")
+    parser.add_argument("--page-id", required=True, help="Facebook Page id behind the ad.")
+    parser.add_argument("--name", required=True, help="Ad name.")
+    parser.add_argument("--message", required=True, help="Primary text.")
+    parser.add_argument("--link", required=True, help="Destination URL.")
+    parser.add_argument("--title", help="Headline.")
+    parser.add_argument("--description", help="Link description.")
+    parser.add_argument("--cta", default="SHOP_NOW", help="Call-to-action type (default SHOP_NOW).")
+    parser.add_argument("--image-hash", help="Thumbnail image hash (from upload-image), if required.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+    ad_account_id = resolve_ad_account_id(account_slug)
+    plan = build_video_ad_plan(
+        ad_account_id, name=args.name, adset_id=args.adset_id, video_id=args.video_id, page_id=args.page_id,
+        message=args.message, link=args.link, title=args.title, description=args.description,
+        call_to_action_type=args.cta, image_hash=args.image_hash, account_slug=account_slug,
+    )
+    output_path = default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
+    write_authoring_plan(plan, output_path)
+    print(f"Wrote authoring plan ({plan['ops'][0]['note']}): {output_path}")
+    print("Approve the op (status -> 'approved'), then apply-authoring --validate-only / --execute. Created PAUSED.")
 
 
 def apply_authoring_main() -> None:
