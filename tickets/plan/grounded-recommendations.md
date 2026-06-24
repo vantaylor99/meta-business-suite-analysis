@@ -71,6 +71,11 @@ abstains (section 2) rather than reporting a guessed score.
   practice"  >  model inference only. Downgraded when the recommendation asserts **causation** from
   non-experimental data. This is the *"how possible is it that this is hallucinated"* axis.
 
+  **The causal-language guard lives here** (not in a separate ticket): a recommendation that
+  asserts cause from non-experimental data must be auto-flagged and surfaced with a visible
+  "correlational — confirm via A/B" label (and offer to file an experiment), in addition to the
+  grounding downgrade. Detecting causal claims in free-text/prose is part of the section-4 rules.
+
 A recommendation can be statistically strong but weakly grounded (a confident causal story from a
 large but correlational sample). The indicator must reflect the **weaker** axis — the grounding
 axis should be able to **cap** the overall score, not be averaged away by a big sample.
