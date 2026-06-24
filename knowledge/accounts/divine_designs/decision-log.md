@@ -2,6 +2,15 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-24 (status check) — Mission Call ad delivering; recent window soft (learning churn)
+
+- Mission Call ad is **ACTIVE/delivering** ($88/2d, 0 purchases — <1 day live, no signal yet).
+- 30d ROAS **2.40** (≈flat). 7d ROAS **1.77** (down from 1.93); **Engaged Audience 7d = 1.26** vs
+  its 30d 3.61 — best ad set running cold *recently*. Attributed to stacked changes over the prior
+  days (AA-off, mass re-enable, renames, creative-features edit, new ad) all resetting learning;
+  likely transitional. **Hold judgment to the 06-30 eval; watch Engaged's recovery.**
+- Only open delivery issue: `Selfie Mom - Copy` (No Valid Formats, still pending).
+
 ## 2026-06-24 — Mission Call ad ENABLED (live)
 
 - Enabled the Mission Call ad (120246788494170733) → `status: ACTIVE` (eff IN_PROCESS = Meta
