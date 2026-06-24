@@ -45,8 +45,10 @@ from .control import (
     account_info,
     apply_ops_plan,
     build_account_snapshot,
+    build_copy_library,
     build_enable_ads_plan,
     build_pause_plan,
+    default_winning_copy_path,
     default_audiences_path,
     default_diagnose_path,
     default_metrics_path,
@@ -59,6 +61,7 @@ from .control import (
     list_account_audiences,
     list_account_conversions,
     list_account_pixels,
+    render_copy_library_md,
     resolve_ad_account_id,
     scan_issues,
     search_interests,
@@ -931,6 +934,42 @@ def list_pixels_main() -> None:
     print(f"\n{len(conversions)} custom conversion(s)")
     for c in conversions:
         print(f"  {c.get('name')} ({c.get('id')}) type={c.get('custom_event_type')} archived={c.get('is_archived')}")
+
+
+def copy_library_main() -> None:
+    from .meta_api import client_from_env
+    from .sync_api import resolve_date_window
+    from .utils import ensure_dir
+
+    parser = argparse.ArgumentParser(
+        description="Pull top ROAS ads + their copy into a winning-copy swipe file in the knowledge base."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--date-from", help="Window start YYYY-MM-DD. Defaults to trailing 30 days.")
+    parser.add_argument("--date-to", help="Window end YYYY-MM-DD. Defaults to today.")
+    parser.add_argument("--min-spend", type=float, default=50.0, help="Min spend in the window to qualify (default 50).")
+    parser.add_argument("--top", type=int, default=20, help="How many top performers to keep (default 20).")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    date_from, date_to = resolve_date_window(date.today(), date_from=args.date_from, date_to=args.date_to)
+
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    rows = build_copy_library(
+        client, ad_account_id, date_from=date_from, date_to=date_to, min_spend=args.min_spend, top_n=args.top
+    )
+    md = render_copy_library_md(account_slug, rows, date_from=date_from, date_to=date_to)
+    out_path = default_winning_copy_path(account_slug)
+    ensure_dir(out_path.parent)
+    out_path.write_text(md, encoding="utf-8")
+    print(f"Wrote winning-copy library for {account_slug} ({len(rows)} ads): {out_path}")
+    for r in rows[:8]:
+        primary = (r["primary_text"] or "")[:70]
+        print(f"  ROAS {r['roas']:>5} | ${r['spend']:>6.0f} | {r['ad_name']}: {primary}")
 
 
 def account_info_main() -> None:

@@ -130,6 +130,9 @@ All write paths follow the same gate: `proposed → approved (edit the plan JSON
 - `estimate --adset-id <id>` — estimated reachable audience size (MAU range) for an ad set.
 - `search-interests --query <kw>` — discover detailed-targeting interests (id, name, size).
 - `list-pixels` — account pixels (+ last fired) and custom conversions.
+- `copy-library` — pulls top-ROAS ads + their actual primary text/headline/description into a
+  proven-winner swipe file at `knowledge/accounts/<account>/winning_copy.md` (the base for writing
+  new ad copy; git history keeps the record over time).
 - `propose-actions` / `apply-actions` — pause underperformers, capped ad set budget increases.
 - `propose-rotation` / `apply-rotation` — rotate custom audiences (optional `--disable-advantage-audience`).
 - `propose-disable-advantage` / `apply-disable-advantage` — turn Advantage Audience off in place.

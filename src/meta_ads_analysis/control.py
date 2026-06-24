@@ -400,9 +400,121 @@ def build_enable_ads_plan(
     }
 
 
-# --- Live performance metrics -----------------------------------------------
+# --- Winning copy library (+ shared metric helpers) -------------------------
 
-from .sync_api import PURCHASE_KEYS, _find_metric, _metric_blob_list, _number  # noqa: E402
+from .config import PROJECT_ROOT  # noqa: E402
+from .sync_api import (  # noqa: E402
+    PURCHASE_KEYS,
+    _extract_headline,
+    _extract_primary_text,
+    _find_metric,
+    _infer_creative_type,
+    _metric_blob_list,
+    _number,
+)
+
+KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
+
+
+def _extract_description(object_story_spec: dict[str, Any], asset_feed_spec: dict[str, Any]) -> str:
+    for key in ("link_data", "video_data"):
+        section = object_story_spec.get(key)
+        if isinstance(section, dict):
+            for candidate in ("description", "link_description"):
+                value = section.get(candidate)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    descriptions = asset_feed_spec.get("descriptions")
+    if isinstance(descriptions, list):
+        for d in descriptions:
+            if isinstance(d, dict) and isinstance(d.get("text"), str) and d["text"].strip():
+                return d["text"].strip()
+    return ""
+
+
+def extract_creative_copy(creative: dict[str, Any]) -> dict[str, Any]:
+    """Pull primary text / headline / description / media type from an ad's creative."""
+    oss = creative.get("object_story_spec") if isinstance(creative.get("object_story_spec"), dict) else {}
+    afs = creative.get("asset_feed_spec") if isinstance(creative.get("asset_feed_spec"), dict) else {}
+    return {
+        "primary_text": _extract_primary_text(oss, afs),
+        "headline": _extract_headline(oss, afs, creative),
+        "description": _extract_description(oss, afs),
+        "media_type": _infer_creative_type(oss, afs),
+    }
+
+
+def build_copy_library(
+    client: MetaMarketingApiClient,
+    ad_account_id: str,
+    *,
+    date_from: str,
+    date_to: str,
+    min_spend: float = 50.0,
+    top_n: int = 20,
+) -> list[dict[str, Any]]:
+    """Rank ads by ROAS over a window and attach their copy — the proven-winner swipe file.
+
+    Includes any ad with spend >= min_spend in the window (active or paused), so historical
+    winners are captured. Ads with no extractable copy are skipped.
+    """
+    metrics = {
+        str(m["id"]): m
+        for m in fetch_entity_metrics(client, ad_account_id, level="ad", date_from=date_from, date_to=date_to)
+    }
+    ads = client.fetch_ads(
+        ad_account_id, fields=["id", "name", "creative{object_story_spec,asset_feed_spec,body,title}"]
+    )
+    rows: list[dict[str, Any]] = []
+    for ad in ads:
+        m = metrics.get(str(ad.get("id")))
+        if not m:
+            continue
+        roas, spend = m.get("roas"), m.get("spend") or 0.0
+        if roas is None or spend < min_spend:
+            continue
+        copy = extract_creative_copy(ad.get("creative") or {})
+        if not (copy["primary_text"] or copy["headline"]):
+            continue
+        rows.append({
+            "ad_id": ad.get("id"), "ad_name": ad.get("name"),
+            "roas": roas, "spend": round(spend, 2), "purchases": m.get("purchases"),
+            **copy,
+        })
+    rows.sort(key=lambda r: r["roas"], reverse=True)
+    return rows[:top_n]
+
+
+def render_copy_library_md(account_slug: str, rows: list[dict[str, Any]], *, date_from: str, date_to: str) -> str:
+    lines = [
+        f"# Winning ad copy — {account_slug}",
+        "",
+        f"Proven performers ranked by ROAS over **{date_from} → {date_to}** (min-spend filtered). "
+        "Regenerate with `copy-library`; git history keeps the record over time.",
+        "",
+        "**Agent: use these as the base/reference when writing new ad copy** (see "
+        "`knowledge/ad_copy_best_practices.md`). Mirror what works here; adapt to the new creative.",
+        "",
+    ]
+    if not rows:
+        lines.append("_No qualifying ads yet (need spend + extractable copy in the window)._")
+        return "\n".join(lines)
+    for i, r in enumerate(rows, 1):
+        lines += [
+            f"## {i}. {r['ad_name']} — ROAS {r['roas']} (${r['spend']:.0f} spend, {r['purchases'] or 0} purchases, {r['media_type']})",
+            f"- **Primary text:** {r['primary_text'] or '(none)'}",
+            f"- **Headline:** {r['headline'] or '(none)'}",
+            f"- **Description:** {r['description'] or '(none)'}",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def default_winning_copy_path(account_slug: str) -> Path:
+    return KNOWLEDGE_ROOT / "accounts" / account_slug / "winning_copy.md"
+
+
+# --- Live performance metrics -----------------------------------------------
 
 _LEVEL_KEYS = {
     "account": ("account_id", "account_name"),

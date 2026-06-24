@@ -2181,3 +2181,63 @@ def test_process_video_builds_brief_with_injected_runner_and_transcriber(tmp_pat
     assert brief["copy_options"] == {"primary_texts": [], "headlines": [], "descriptions": []}
     assert (tmp_path / "work" / "creative_brief.json").exists()
     assert "ffprobe" in calls and "ffmpeg" in calls
+
+
+# --- Winning-copy library ---------------------------------------------------
+
+from meta_ads_analysis.control import (
+    build_copy_library,
+    extract_creative_copy,
+    render_copy_library_md,
+)
+
+
+def test_extract_creative_copy_from_object_story_spec() -> None:
+    creative = {
+        "object_story_spec": {
+            "link_data": {
+                "message": "Handmade jewelry for everyday wear",
+                "name": "Shop the collection",
+                "description": "Free shipping over $50",
+            }
+        }
+    }
+    copy = extract_creative_copy(creative)
+    assert copy["primary_text"] == "Handmade jewelry for everyday wear"
+    assert copy["headline"] == "Shop the collection"
+    assert copy["description"] == "Free shipping over $50"
+
+
+class _CopyLibFakeClient:
+    def __init__(self, insights, ads):
+        self._insights = insights
+        self._ads = ads
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1, breakdowns=None):
+        return self._insights
+
+    def fetch_ads(self, ad_account_id, *, fields):
+        return self._ads
+
+
+def test_build_copy_library_ranks_by_roas_and_attaches_copy() -> None:
+    insights = [
+        {"ad_id": "1", "ad_name": "Winner", "spend": "200",
+         "action_values": [{"action_type": "purchase", "value": "800"}], "actions": [{"action_type": "purchase", "value": "10"}]},
+        {"ad_id": "2", "ad_name": "Mid", "spend": "200",
+         "action_values": [{"action_type": "purchase", "value": "300"}], "actions": [{"action_type": "purchase", "value": "5"}]},
+        {"ad_id": "3", "ad_name": "TinySpend", "spend": "10",
+         "action_values": [{"action_type": "purchase", "value": "90"}], "actions": [{"action_type": "purchase", "value": "1"}]},
+    ]
+    ads = [
+        {"id": "1", "name": "Winner", "creative": {"object_story_spec": {"link_data": {"message": "Best seller", "name": "Shop now"}}}},
+        {"id": "2", "name": "Mid", "creative": {"object_story_spec": {"link_data": {"message": "Nice rings", "name": "See more"}}}},
+        {"id": "3", "name": "TinySpend", "creative": {"object_story_spec": {"link_data": {"message": "x", "name": "y"}}}},
+    ]
+    client = _CopyLibFakeClient(insights, ads)
+    rows = build_copy_library(client, "act_1", date_from="2026-06-01", date_to="2026-06-30", min_spend=50, top_n=10)
+    # TinySpend filtered out (spend<50); Winner (ROAS 4.0) before Mid (1.5)
+    assert [r["ad_name"] for r in rows] == ["Winner", "Mid"]
+    assert rows[0]["primary_text"] == "Best seller"
+    md = render_copy_library_md("demo", rows, date_from="2026-06-01", date_to="2026-06-30")
+    assert "Winner" in md and "Primary text" in md
