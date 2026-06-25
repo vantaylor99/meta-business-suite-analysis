@@ -2844,6 +2844,20 @@ def test_band_presentation_matches_knowledge_vocabulary_exactly() -> None:
     }
 
 
+def test_band_vocabulary_actually_appears_in_knowledge_readme() -> None:
+    # The pin above guards the code constants; this one closes the loop the implement handoff
+    # claimed but did not enforce — that the SAME emoji+label live in knowledge/README.md, so the
+    # human rubric and the computed rubric genuinely cannot drift into two scales. If someone edits
+    # the README's emoji/label (or the code's), one of these assertions fails.
+    from meta_ads_analysis.config import PROJECT_ROOT
+
+    readme = (PROJECT_ROOT / "knowledge" / "README.md").read_text(encoding="utf-8")
+    for band in (Band.high, Band.medium, Band.low, Band.abstain):
+        pres = BAND_PRESENTATION[band]
+        assert pres["emoji"] in readme, f"{band.name} emoji {pres['emoji']!r} missing from README"
+        assert pres["label"] in readme, f"{band.name} label {pres['label']!r} missing from README"
+
+
 def test_render_helpers_produce_compact_lines() -> None:
     evidence = _recent_evidence(purchases=42.0, spend=1250.0)
     conf = assess(
