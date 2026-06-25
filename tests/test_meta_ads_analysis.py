@@ -24,6 +24,7 @@ from meta_ads_analysis.confidence import (
     Band,
     Evidence,
     EvidenceTier,
+    abstain_confidence,
     assess,
     build_regenerating_query,
     combine_bands,
@@ -2493,6 +2494,27 @@ def test_classify_ad_urgent_confidence_is_direct_observation_non_causal() -> Non
     assert v["confidence"]["band"] == "low"
 
 
+def test_classify_ad_young_ad_with_large_sample_still_abstains() -> None:
+    # The grace abstention is NOT a below-floor sample: a young ad can be heavily funded with many
+    # conversions, yet we still decline to judge it. This is exactly why grace routes through the
+    # abstain factory rather than the sample-size rubric in assess.
+    v = classify_ad(spend=5000, roas=0.5, results=400, days_since_change=2, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "watch"
+    assert v["confidence"]["band"] == "abstain"        # not high, despite 400 purchases / $5k spend
+    assert v["confidence"]["data_band"] == "abstain"
+
+
+def test_classify_ad_underperforming_carries_direct_observation_confidence() -> None:
+    # floor < roas < target on a mature ad with enough conversions → a real (non-abstain) data band.
+    v = classify_ad(spend=300, roas=2.0, results=30, days_since_change=30, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "underperforming"
+    assert v["confidence"]["grounding_tier"] == "direct_observation"
+    assert v["confidence"]["band"] == "medium"         # 30 purchases ≥ 25 floor, < 100 high-knee
+    assert v["confidence"]["causal_flag"] is False
+
+
 def test_build_watch_report_rows_carry_confidence_and_reproducible_evidence() -> None:
     insights = [
         {"ad_id": "m1", "ad_name": "Mature Loser", "spend": "300",
@@ -2871,6 +2893,32 @@ def test_assess_exposes_no_pre_baked_band_parameter() -> None:
     params = set(inspect.signature(assess).parameters)
     # The ONLY path to a band is through deterministic inputs; no caller-set band/score knob.
     assert not (params & {"band", "score", "confidence", "data_band", "grounding_band"})
+
+
+def test_abstain_confidence_factory_pins_data_axis_and_keeps_grounding_ceiling() -> None:
+    # A caller whose own domain gate refuses to score (e.g. a well-funded but too-young ad whose
+    # sample WOULD clear the floor) gets abstain via the sanctioned factory — the data axis is pinned
+    # to the floor, NOT a number, while grounding still reports the tier's honest ceiling.
+    conf = abstain_confidence(
+        tier=EvidenceTier.direct_observation,
+        factors=["too young to judge — abstain, keep running"],
+        would_raise="a matured (post-learning) window",
+    )
+    assert conf.data_band is Band.abstain
+    assert conf.grounding_band is Band.high          # direct_observation ceiling, honestly reported
+    assert conf.band is Band.abstain                 # weaker axis governs
+    assert conf.grounding_tier == "direct_observation"
+    assert conf.causal_flag is False
+    # Round-trips through the shared serializer like any other verdict.
+    assert confidence_to_dict(conf)["band"] == "abstain"
+
+
+def test_abstain_confidence_factory_exposes_no_band_knob() -> None:
+    import inspect
+
+    # The factory is an explicit *refusal* to score, not a back door to a caller-chosen band.
+    params = set(inspect.signature(abstain_confidence).parameters)
+    assert not (params & {"band", "score", "data_band", "grounding_band", "confidence"})
 
 
 def test_detect_causal_language() -> None:

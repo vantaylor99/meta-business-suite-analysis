@@ -25,16 +25,14 @@ from typing import Any
 from . import account_registry
 from .config import CONFIDENCE_CONVERSIONS_FLOOR, DEFAULT_REPORTS_ROOT
 from .confidence import (
-    Band,
     Confidence,
     Evidence,
     EvidenceTier,
+    abstain_confidence,
     assess,
     build_regenerating_query,
-    combine_bands,
     confidence_to_dict,
     evidence_to_dict,
-    grounding_strength,
 )
 from .control import fetch_entity_metrics
 from .meta_api import MetaMarketingApiClient
@@ -54,21 +52,17 @@ def _as_date(value: Any) -> date | None:
 
 
 def _abstain_confidence(factors: list[str]) -> Confidence:
-    """The monitor's explicit "too thin / too young to judge" abstention, in the shared confidence
-    vocabulary. ``abstain`` is the deliberate refusal to score data the significance floor (too little
-    spend) or the grace window (a still-learning ad) deems untrustworthy — NOT a fabricated number.
-    Grounding is ``direct_observation`` (live metrics), but the data axis abstains, so the combined
-    verdict abstains (the weaker axis governs, identical to :func:`confidence.combine_bands`)."""
-    grounding, _ = grounding_strength(EvidenceTier.direct_observation, causal_claim=False)
-    return Confidence(
-        band=combine_bands(Band.abstain, grounding),
-        data_band=Band.abstain,
-        grounding_band=grounding,
-        grounding_tier=EvidenceTier.direct_observation.name,
-        factors=list(factors),
+    """The monitor's "too thin / too young to judge" abstention, expressed through the shared
+    :func:`confidence.abstain_confidence` factory so every :class:`~confidence.Confidence` is still
+    constructed in one place. ``abstain`` is the deliberate refusal to score data the significance
+    floor (too little spend) or the grace window (a still-learning ad) deems untrustworthy — NOT a
+    fabricated number. Grounding is ``direct_observation`` (live metrics), but the data axis abstains,
+    so the combined verdict abstains (the weaker axis governs)."""
+    return abstain_confidence(
+        tier=EvidenceTier.direct_observation,
+        factors=factors,
         would_raise="more spend past the significance floor / a matured (post-learning) window",
-        would_lower="",
-        causal_flag=False,
+        causal_claim=False,
     )
 
 

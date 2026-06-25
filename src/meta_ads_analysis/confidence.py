@@ -300,6 +300,37 @@ def assess(
     )
 
 
+def abstain_confidence(
+    *,
+    tier: EvidenceTier | str,
+    factors: list[str],
+    would_raise: str,
+    causal_claim: bool = False,
+) -> Confidence:
+    """A sanctioned, explicit refusal-to-score verdict for a caller whose own domain gate (a
+    significance floor, a still-learning grace window) deems the data untrustworthy in a way the
+    sample-size rubric in :func:`assess` cannot express — e.g. a well-funded but too-young ad, whose
+    sample would otherwise clear the floor.
+
+    The data axis is pinned to ``abstain`` — the integer floor, NOT a fabricated number — and the
+    grounding axis is the tier's honest ceiling; the weaker axis governs (:func:`combine_bands`), so
+    the verdict abstains. This keeps every :class:`Confidence` construction inside this module while
+    preserving the invariant that a band is never a value the caller supplies: ``abstain`` is the
+    *absence* of a score, the only band reachable without deterministic sample inputs.
+    """
+    grounding, _ = grounding_strength(tier, causal_claim=causal_claim)
+    return Confidence(
+        band=combine_bands(Band.abstain, grounding),
+        data_band=Band.abstain,
+        grounding_band=grounding,
+        grounding_tier=_coerce_tier(tier).name,
+        factors=list(factors),
+        would_raise=would_raise,
+        would_lower="",
+        causal_flag=causal_claim,
+    )
+
+
 def render_confidence_line(conf: Confidence, *, max_factors: int = 3) -> str:
     """Compact one-line confidence renderer (emoji + label + range + top factors). Presentation
     only — the structured data lives on :class:`Confidence`."""
