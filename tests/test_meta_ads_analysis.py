@@ -42,7 +42,6 @@ from meta_ads_analysis.confidence import (
 from meta_ads_analysis.knowledge_provenance import (
     BAND_EMOJIS,
     TIER_NAMES,
-    Finding,
     lint,
     lint_profile_baseline,
     parse_learnings,
@@ -4384,6 +4383,21 @@ def test_lint_clean_vault_has_no_findings() -> None:
 
 def test_lint_errors_untagged_evidence_line() -> None:
     text = _entry("- ➕ 2026-01-01 — an evidence line with no provenance tag at all.")
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "missing_tag" in _codes(findings, "error")
+
+
+def test_tag_on_field_label_continuation_fails_loudly_not_silently() -> None:
+    # Documented parser-boundary tradeoff: a bold *field label* (`**Note:**`) at the start of a
+    # continuation line ends the evidence block, so a `_( … )_` tag stranded on such a line does NOT
+    # join. The point of this guard is the FAILURE DIRECTION — the orphaned-tag evidence must surface
+    # a loud `missing_tag` error, never silently pass as tagged. (Inline emphasis like `**not**` —
+    # no colon — does NOT end a block; that path is exercised by _CLEAN_VAULT's wrapped evidence.)
+    text = _entry(
+        "- ➕ 2026-01-01 — first physical line of the evidence",
+        "  **Note:** continuation that mistakenly carries the tag "
+        "_(src: direct_observation · acct: divine_designs)_",
+    )
     findings = lint(parse_learnings(text), today=date(2026, 1, 2))
     assert "missing_tag" in _codes(findings, "error")
 
