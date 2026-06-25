@@ -655,12 +655,12 @@ def classify_drift(
         return (
             AUDIT_CONTRADICTED,
             None,
-            [f"fresh {fresh.value:.2f} vs stored {stored_value:.2f} — {rel:.0%} drift ≥ {drift_pct:.0%}"],
+            [f"fresh {fresh.value:.2f} vs stored {stored_value:.2f} — {rel:.1%} drift ≥ {drift_pct:.0%}"],
         )
     return (
         AUDIT_CONFIRMED,
         None,
-        [f"fresh {fresh.value:.2f} ≈ stored {stored_value:.2f} — {rel:.0%} drift < {drift_pct:.0%}"],
+        [f"fresh {fresh.value:.2f} ≈ stored {stored_value:.2f} — {rel:.1%} drift < {drift_pct:.0%}"],
     )
 
 

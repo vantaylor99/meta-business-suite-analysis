@@ -74,8 +74,11 @@ account). This is the path toward the multi-account specialist template.
 - **learnings.md** holds generalized, durable facts — date-stamp each so staleness is visible, and
   give every entry a **provenance tag + `Rot:`/`Verified:` header** in the format below. Run
   `python -m meta_ads_analysis lint-vault` after editing it; the checker fails on missing/invalid
-  provenance and flags stale `fast` facts for re-verification (forthcoming `audit-vault` re-pulls the
-  numbers). A new account/specialist inherits this file as a template, so keep the discipline.
+  provenance and flags stale `fast` facts for re-verification. To actually *re-verify* a flagged
+  fact (or spot one that has quietly gone stale), run
+  `python -m meta_ads_analysis audit-vault --account <slug>`: it re-pulls each `metric:` claim
+  against fresh live data and surfaces drift (see "Re-verifying with `audit-vault`" below). A new
+  account/specialist inherits this file as a template, so keep the discipline.
 - Convert relative dates to absolute. Cite ad set / ad names and IDs so entries are actionable cold.
 - Keep entries concise and skimmable. This base should stay readable in a few minutes.
 - **Update this base at the end of any session** that changed an account or taught us something.
@@ -201,8 +204,35 @@ line with no `verify:`, a `src: external` line with no URL, an untagged evidence
 nonzero, CI-usable) and **warnings** (`⏳ re-verify` for stale `fast` facts; `--strict` makes those
 fail too). It also age-checks the one `**Rot:**`/`**Verified:**` header on `profile.md`'s
 Performance-baseline section. Time is passed in (`--today`), never read from the clock, so runs are
-deterministic. The forthcoming **`audit-vault`** pass reuses this parser to re-pull each `metric:`
+deterministic. The **`audit-vault`** pass (below) reuses this parser to re-pull each `metric:`
 line's `verify:` query against fresh data and flag drift.
+
+### Re-verifying with `audit-vault` (does the stored number still hold?)
+
+`lint-vault` checks *format* and *age*; **`audit-vault` checks the number against reality.** Run
+`python -m meta_ads_analysis audit-vault --account <slug>` (or the `audit_vault` console script).
+For every account-scoped, data-backed `metric:` claim it re-pulls that metric over a **fresh
+trailing window of the stored length, ending `--as-of` (default today)** — i.e. *current* data, not
+the original historical window (so a date mismatch in the logged `➖` is expected, not a bug) — and
+diffs fresh vs stored:
+
+- **Confirmed** (fresh ≈ stored): with `--apply`, only the entry's `**Verified:**` date is refreshed
+  — *this is how a `lint-vault ⏳ re-verify` flag clears.* The band is **not** raised (re-confirming
+  the same kind of window is not independent corroboration).
+- **Contradicted** (relative change ≥ `KNOWLEDGE_DRIFT_PCT`, 25%) or **refuted** (the fresh value
+  crosses a policy threshold — `target_roas` / `pause_roas_floor` — the stored value sat on the other
+  side of): the contradiction is surfaced **loudly (⚠️)**, and with `--apply` a dated `➖` evidence
+  line is appended and the **band is lowered one level** (🟢→🟡→🔴; a refute drops to 🔴 Low and marks
+  the claim `(contested)`). **The claim text is never edited and the entry is never deleted — a human
+  decides deletion.**
+- **Insufficient fresh data / could-not-audit:** a fresh sample below the significance floor (a quiet
+  week) or a vanished entity / missing value is reported but **abstains** — it never refutes a real
+  fact and never moves the band.
+
+It is **read-only against Meta** (only ever reads metrics) and **report-only by default** — without
+`--apply` it makes zero changes to `learnings.md`. The verdict math reuses the live
+`confidence.py` engine (the band ladder and the `data_strength` floor), so the audit and the
+recommendation engine speak one vocabulary.
 
 ## Grounding tiers (how causal is the evidence?)
 

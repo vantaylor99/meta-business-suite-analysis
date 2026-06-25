@@ -40,12 +40,24 @@ from meta_ads_analysis.confidence import (
     render_evidence_line,
 )
 from meta_ads_analysis.knowledge_provenance import (
+    AUDIT_CONFIRMED,
+    AUDIT_CONTRADICTED,
+    AUDIT_COULD_NOT,
+    AUDIT_INSUFFICIENT,
+    AUDIT_REFUTED,
     BAND_EMOJIS,
+    FreshSample,
     TIER_NAMES,
+    apply_entry_edits,
+    audit_claim,
+    classify_drift,
     lint,
     lint_profile_baseline,
+    lower_band_emoji,
     parse_learnings,
+    plan_edits,
     render_report,
+    select_auditable,
 )
 from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
@@ -4560,3 +4572,279 @@ def test_real_profile_baseline_header_is_present_and_fresh() -> None:
     assert lint_profile_baseline(text, today=date(2026, 6, 25)) == []
     stale = lint_profile_baseline(text, today=date(2027, 1, 1))
     assert len(stale) == 1 and stale[0].code == "reverify"
+
+
+# ---------------------------------------------------------------------------
+# audit-vault — drift re-check (pure verdict + markdown mutation in
+# knowledge_provenance.py; the Meta-touching orchestration in cli.py is exercised
+# with a FAKE metrics provider — never live Meta).
+# ---------------------------------------------------------------------------
+
+# A single account-level, data-backed `fast` claim — the clean case `resolve_fresh_metric` can
+# aggregate without segment matching. Stored window is 30 days (2025-12-12..2026-01-10).
+_AUDIT_VAULT = """# Durable learnings
+
+## Strategy
+
+### Divine Designs blended ROAS sits comfortably above target
+**Confidence:** 🟢 High →  ·  **Domain:** strategy
+**Rot:** fast  ·  **Verified:** 2026-01-10
+- ➕ 2026-01-10 — 30-day blended ROAS 3.74 on a healthy sample.
+  `verify: account_metrics --account divine_designs --level account --date-from 2025-12-12 --date-to 2026-01-10`
+  _(src: direct_observation · acct: divine_designs · metric: blended_roas=3.74)_
+**Apply:** keep scaling.
+"""
+
+
+def _account_rows(*, roas: float | None, spend: float = 2000.0, purchases: float = 60.0):
+    """One account-level metrics row. ``purchase_value`` is derived so the aggregate ROAS resolves to
+    ``roas``; a ``None`` roas models a window with spend but no resolvable value."""
+    value = round(roas * spend, 2) if roas is not None else None
+    return [{"id": "act", "name": "account", "spend": spend, "purchase_value": value,
+             "roas": roas, "purchases": purchases}]
+
+
+def _fixed_fetch(rows):
+    def fetch(level, breakdowns, date_from, date_to):
+        return rows
+    return fetch
+
+
+def _audit(text, fetch, *, apply, as_of=date(2026, 6, 25)):
+    from meta_ads_analysis.cli import run_vault_audit
+
+    return run_vault_audit(
+        text=text,
+        account_slug="divine_designs",
+        as_of=as_of,
+        target_roas=3.0,
+        pause_roas_floor=1.5,
+        fetch_metrics=fetch,
+        apply=apply,
+    )
+
+
+# --- pure verdict logic (classify_drift) -----------------------------------
+
+
+def test_classify_drift_confirmed_when_fresh_matches_stored() -> None:
+    # Stored 3.74, fresh 3.70 (≈1% drift, both above target) → confirmed.
+    verdict, crossed, _ = classify_drift(
+        stored_value=3.74, fresh=FreshSample(3.70, 60, 2000, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_CONFIRMED and crossed is None
+
+
+def test_classify_drift_refuted_on_policy_threshold_cross() -> None:
+    # Stored 3.74 (above target 3.0), fresh 2.10 (below) → decision flip → refuted, regardless of %.
+    verdict, crossed, _ = classify_drift(
+        stored_value=3.74, fresh=FreshSample(2.10, 60, 2000, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_REFUTED and crossed == "target_roas"
+
+
+def test_classify_drift_contradicted_on_magnitude_without_threshold_cross() -> None:
+    # Stored 10.0, fresh 6.0 (40% drift) but BOTH above target → contradicted, not refuted.
+    verdict, crossed, _ = classify_drift(
+        stored_value=10.0, fresh=FreshSample(6.0, 60, 4000, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_CONTRADICTED and crossed is None
+
+
+def test_classify_drift_insufficient_fresh_data_abstains() -> None:
+    # A noisy fresh window (2 purchases / $30) is below the significance floor → abstain, NOT a
+    # refutation — even though 2.5 < target 3.0 would otherwise flip the decision.
+    verdict, crossed, _ = classify_drift(
+        stored_value=3.74, fresh=FreshSample(2.5, 2, 30, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_INSUFFICIENT and crossed is None
+
+
+def test_classify_drift_could_not_audit_when_fresh_value_unresolved() -> None:
+    # Entity vanished / value missing for the window → could_not_audit, never scored as 0 ROAS.
+    verdict, _, _ = classify_drift(
+        stored_value=3.74, fresh=FreshSample(None, None, None, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_COULD_NOT
+
+
+def test_lower_band_emoji_walks_confidence_band_ordering() -> None:
+    # The decrement uses confidence.Band ordering (not a local emoji ladder), floored at Low.
+    assert lower_band_emoji(BAND_PRESENTATION[Band.high]["emoji"]) == BAND_PRESENTATION[Band.medium]["emoji"]
+    assert lower_band_emoji(BAND_PRESENTATION[Band.medium]["emoji"]) == BAND_PRESENTATION[Band.low]["emoji"]
+    assert lower_band_emoji(BAND_PRESENTATION[Band.low]["emoji"]) == BAND_PRESENTATION[Band.low]["emoji"]
+    assert lower_band_emoji(None) is None
+
+
+# --- selection -------------------------------------------------------------
+
+
+def test_select_auditable_skips_evergreen_no_metric_and_other_accounts() -> None:
+    text = (
+        # evergreen + metric: skipped (platform mechanics don't rot on numbers)
+        _entry(
+            "- ➕ 2026-01-01 — x. `verify: account_metrics --account divine_designs --level account` "
+            "_(src: direct_observation · acct: divine_designs · metric: roas=2.0)_",
+            header="evergreen with metric", rot="evergreen", verified="2026-01-01",
+        )
+        # fast, no metric: skipped (nothing to re-pull)
+        + _entry(
+            "- ➕ 2026-01-01 — qualitative. _(src: direct_observation · acct: divine_designs)_",
+            header="fast no metric", rot="fast", verified="2026-01-01",
+        )
+        # fast + metric for ANOTHER account: skipped for divine_designs
+        + _entry(
+            "- ➕ 2026-01-01 — y. `verify: account_metrics --account pollen_sense --level account` "
+            "_(src: direct_observation · acct: pollen_sense · metric: roas=2.0)_",
+            header="other account", rot="fast", verified="2026-01-01",
+        )
+        # fast + metric + divine_designs: the ONLY selectable claim
+        + _entry(
+            "- ➕ 2026-01-01 — z. `verify: account_metrics --account divine_designs --level account` "
+            "_(src: direct_observation · acct: divine_designs · metric: blended_roas=3.0)_",
+            header="auditable target", rot="fast", verified="2026-01-01",
+        )
+    )
+    pairs = select_auditable(parse_learnings(text), account_slug="divine_designs")
+    assert [e.claim for e, _ in pairs] == ["auditable target"]
+
+
+# --- metric resolution out of fresh rows (resolve_fresh_metric) ------------
+
+
+def test_resolve_fresh_metric_aggregates_account_level() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = _account_rows(roas=3.21, spend=1000, purchases=40)
+    value, purchases, spend = resolve_fresh_metric(rows, level="account", breakdowns=[], metric_name="blended_roas")
+    assert value == 3.21 and purchases == 40 and spend == 1000
+
+
+def test_resolve_fresh_metric_matches_a_breakdown_segment_by_name() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = [
+        {"segment": {"publisher_platform": "facebook"}, "spend": 500, "purchase_value": 970, "roas": 1.94, "purchases": 20},
+        {"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232, "roas": 2.79, "purchases": 50},
+    ]
+    # `ig_roas` → identifier token {instagram} → the instagram row.
+    value, _, _ = resolve_fresh_metric(rows, level="account", breakdowns=["publisher_platform"], metric_name="ig_roas")
+    assert value == 2.79
+
+
+def test_resolve_fresh_metric_returns_none_when_segment_is_ambiguous() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = [
+        {"segment": {"publisher_platform": "facebook"}, "spend": 500, "purchase_value": 970, "roas": 1.94, "purchases": 20},
+        {"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232, "roas": 2.79, "purchases": 50},
+    ]
+    # A metric name with no token matching any segment → unresolved (→ could_not_audit, never a guess).
+    assert resolve_fresh_metric(rows, level="account", breakdowns=["publisher_platform"], metric_name="tiktok_roas") == (None, None, None)
+
+
+def test_resolve_fresh_metric_value_missing_is_unresolved_not_zero() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # Spend but no purchase_value for the window → ROAS unresolved, NOT a fabricated 0 ROAS.
+    rows = _account_rows(roas=None, spend=300, purchases=0)
+    value, _, spend = resolve_fresh_metric(rows, level="account", breakdowns=[], metric_name="blended_roas")
+    assert value is None and spend == 300
+
+
+# --- end-to-end orchestration with a fake metrics provider -----------------
+
+
+def test_audit_confirmed_refreshes_verified_only_band_unchanged() -> None:
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=3.70)), apply=True)
+    assert counts[AUDIT_CONFIRMED] == 1
+    assert new_text is not None
+    assert "🟢 High" in new_text  # band untouched (re-confirming the same window is not corroboration)
+    assert "**Verified:** 2026-06-25" in new_text  # refreshed → clears a lint-vault ⏳ re-verify flag
+    assert "➖" not in new_text  # no contradiction logged
+
+
+def test_audit_refuted_lowers_band_logs_dated_minus_and_keeps_claim() -> None:
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=2.10)), apply=True)
+    assert counts[AUDIT_REFUTED] == 1
+    assert new_text is not None
+    # Refute → 🔴 Low + (contested); never edits the claim text; never deletes the entry.
+    assert "🔴 Low (contested)" in new_text
+    assert "Divine Designs blended ROAS sits comfortably above target" in new_text
+    # A dated ➖ carrying the fresh metric and a reproduce-the-fresh-value verify command.
+    assert "➖ 2026-06-25 — vault audit: blended_roas now 2.10 vs stored 3.74" in new_text
+    assert "verify: account_metrics --account divine_designs --level account" in new_text
+    assert "metric: blended_roas=2.10" in new_text
+    assert "**Verified:** 2026-06-25" in new_text
+    # The contradiction is called out loudly in the always-printed report.
+    assert "⚠️" in report and "CONTRADICTION" in report
+
+
+def test_audit_insufficient_fresh_data_changes_nothing() -> None:
+    # A below-floor fresh pull must not refute a real fact: no band change, no ➖, Verified unmoved.
+    report, new_text, counts = _audit(
+        _AUDIT_VAULT, _fixed_fetch(_account_rows(roas=2.5, spend=30, purchases=2)), apply=True
+    )
+    assert counts[AUDIT_INSUFFICIENT] == 1
+    assert new_text == _AUDIT_VAULT
+
+
+def test_audit_could_not_audit_when_entity_vanished() -> None:
+    # Empty fresh rows → could_not_audit; reported, never silently counted as confirmed, no edits.
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch([]), apply=True)
+    assert counts[AUDIT_COULD_NOT] == 1
+    assert new_text == _AUDIT_VAULT
+
+
+def test_audit_apply_is_idempotent_on_same_as_of() -> None:
+    fetch = _fixed_fetch(_account_rows(roas=2.10))
+    _, t1, _ = _audit(_AUDIT_VAULT, fetch, apply=True)
+    _, t2, _ = _audit(t1, fetch, apply=True)
+    assert t2 == t1  # second --apply on the same --as-of is a no-op
+    assert t1.count("➖ 2026-06-25") == 1  # exactly one drift line, not two
+
+
+def test_audit_report_only_makes_no_text_changes() -> None:
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=2.10)), apply=False)
+    assert new_text is None  # report-only ⇒ nothing to write
+    assert counts[AUDIT_REFUTED] == 1  # …but drift is still detected and reported
+
+
+# --- CLI: file I/O path (report-only never writes; --apply writes) ---------
+
+
+def _run_audit_cli(tmp_path, monkeypatch, text, rows, *, apply: bool, as_of="2026-06-25"):
+    from meta_ads_analysis import cli
+    import meta_ads_analysis.meta_api as meta_api
+
+    learnings = tmp_path / "learnings.md"
+    learnings.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(cli, "resolve_ad_account_id", lambda slug: "act_test")
+    monkeypatch.setattr(cli, "fetch_entity_metrics", lambda *a, **k: rows)
+    monkeypatch.setattr(cli, "fetch_breakdown_metrics", lambda *a, **k: rows)
+    monkeypatch.setattr(meta_api, "client_from_env", lambda version=None: Mock())
+    argv = ["audit-vault", "--account", "divine_designs", "--as-of", as_of, "--path", str(learnings)]
+    if apply:
+        argv.append("--apply")
+    monkeypatch.setattr(sys, "argv", argv)
+    cli.audit_vault_main()
+    return learnings.read_text(encoding="utf-8")
+
+
+def test_audit_vault_cli_report_only_leaves_file_byte_for_byte(tmp_path, monkeypatch, capsys) -> None:
+    out = _run_audit_cli(tmp_path, monkeypatch, _AUDIT_VAULT, _account_rows(roas=2.10), apply=False)
+    assert out == _AUDIT_VAULT  # zero file changes in report-only mode
+    printed = capsys.readouterr().out
+    assert "CONTRADICTION" in printed  # contradiction surfaced loudly even without --apply
+
+
+def test_audit_vault_cli_apply_writes_drift_to_file(tmp_path, monkeypatch) -> None:
+    out = _run_audit_cli(tmp_path, monkeypatch, _AUDIT_VAULT, _account_rows(roas=2.10), apply=True)
+    assert "🔴 Low (contested)" in out
+    assert "➖ 2026-06-25 — vault audit: blended_roas now 2.10 vs stored 3.74" in out
+    assert "**Verified:** 2026-06-25" in out

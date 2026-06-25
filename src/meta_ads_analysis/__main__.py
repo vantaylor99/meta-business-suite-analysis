@@ -12,6 +12,7 @@ from .cli import (
     apply_rotation_main,
     account_info_main,
     apply_authoring_main,
+    audit_vault_main,
     build_meta_report_main,
     copy_library_main,
     diagnose_main,
@@ -46,7 +47,7 @@ from .cli import (
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
-            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|metrics|lint-vault|diagnose|"
+            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|metrics|lint-vault|audit-vault|diagnose|"
             "list-audiences|account-info|estimate|search-interests|list-pixels|copy-library|watch|experiment|followups|propose-actions|"
             "apply-actions|propose-rotation|apply-rotation|propose-disable-advantage|"
             "apply-disable-advantage|propose-renames|apply-renames|propose-enable-ads|propose-pause-ads|"
@@ -88,6 +89,9 @@ def main() -> None:
         return
     if command in {"lint_vault", "lint"}:
         lint_vault_main()
+        return
+    if command in {"audit_vault", "audit"}:
+        audit_vault_main()
         return
     if command in {"diagnose", "scan_issues"}:
         diagnose_main()
@@ -167,7 +171,7 @@ def main() -> None:
 
     raise SystemExit(
         f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, `inspect`, `metrics`, "
-        "`lint-vault`, "
+        "`lint-vault`, `audit-vault`, "
         "`diagnose`, `list-audiences`, `account-info`, `estimate`, `search-interests`, `list-pixels`, "
         "`copy-library`, `watch`, `experiment`, `followups`, "
         "`propose-actions`, `apply-actions`, `propose-rotation`, `apply-rotation`, "
