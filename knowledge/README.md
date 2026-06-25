@@ -122,6 +122,24 @@ and it caps a causal claim that lacks an A/B test exactly the way the "evidence 
 above does. The full prose rules for **grounding tiers** and **external evidence** are in the two
 subsections that follow.
 
+**Every live recommendation is re-checked by a two-layer adversarial review before it reaches the
+operator.** Producing a band is not the last word — a fresh-eyes pass then tries to *refute* each
+pause/scale/budget call from its cited basis alone, and downgrades or drops the ones that can't
+survive:
+
+- **Deterministic layer — `src/meta_ads_analysis/review.py`.** Re-derives the band from the cited
+  evidence via `confidence.assess` and runs the *arithmetic / structural* refutations (sample-floor,
+  window-length, causal-cap, band-earned, scale/pause direction, external-cap). It is demote-only and
+  sits upstream of the guarded-write approval — it can lower a call, never raise or approve one.
+- **Semantic layer — the agent rule in [`AGENTS.md`](../AGENTS.md) ("Adversarial-review rule").** The
+  refutations code can't make: does the call contradict a learning here or a `decision-log.md` entry,
+  is the window cherry-picked over a relearning period (the reviewer may re-pull the *same* metric to
+  check, never invent one), is a prose call grounded, is web evidence being treated as confirmation
+  instead of a hypothesis.
+
+Both layers speak the **same 🟢/🟡/🔴/⚪ vocabulary** and the same verdicts (**stands / downgrade /
+refuted / insufficient**) — one confidence language, never two.
+
 **Entry template:**
 
 ```
