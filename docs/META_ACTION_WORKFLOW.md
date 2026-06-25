@@ -49,6 +49,15 @@ Actions are generated with `status: "proposed"`.
 
 Only executable actions with `status: "approved"` are sent to the Meta Graph API. Non-executable actions remain operator tasks, even if their status is changed.
 
+## Evidence and Confidence
+
+Each recommendation-bearing action (`pause_ad`, `increase_adset_budget`, `consider_scale_budget`, `refresh_creative`) carries two structured blocks:
+
+- `evidence`: the deterministic facts behind the call — the metric the decision rests on (ROAS for ROAS-goal accounts, cost-per-install for install-goal accounts), the window, the sample (purchases / spend), the entity, and a `regenerating_query` that reproduces the metric.
+- `confidence`: a computed band (`high` / `medium` / `low` / `abstain`) from the shared confidence engine. The band is never free-typed; it is derived from sample size, recency, and how causal the evidence is. Grounding caps data strength, so a large-sample correlational call can never read `high`.
+
+For the executable pause/budget paths, a sample below the significance floor (too few conversions and too little spend) does **not** become a confident pause or scale. The action is flipped to a non-executable `verdict: "insufficient_data"` recommendation — "promising test, keep running and re-check as more data accrues" — with `executable: false` and `approval_required: false`, so thin data can never be approved into a write.
+
 ## Account Goals
 
 Account-specific action policy lives in `config/meta_ads_accounts.json`.
