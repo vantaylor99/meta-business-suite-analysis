@@ -1644,6 +1644,14 @@ def operator_brief_main() -> None:
         action="store_true",
         help="Skip comparison against the previous report run.",
     )
+    parser.add_argument(
+        "--no-review",
+        action="store_true",
+        help=(
+            "Skip the adversarial review gate (escape hatch). By default the gate corrects or drops "
+            "recommendations that cannot survive a second-opinion challenge before they reach the brief."
+        ),
+    )
     args = parser.parse_args()
 
     account_slug = _resolve_account_slug(args.account)
@@ -1681,6 +1689,7 @@ def operator_brief_main() -> None:
         report=load_report(report_path),
         previous_plan=previous_plan,
         previous_report=previous_report,
+        review_enabled=not args.no_review,
     )
     markdown_path = Path(args.output_path) if args.output_path else default_operator_brief_path(
         account_slug,

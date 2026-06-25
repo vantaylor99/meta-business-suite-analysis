@@ -41,6 +41,11 @@ from meta_ads_analysis.confidence import (
 )
 from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
+from meta_ads_analysis.review import (
+    ReviewResult,
+    review_action_plan,
+    review_recommendation,
+)
 from meta_ads_analysis.reporting import render_markdown_report
 from meta_ads_analysis.storage import connect, fetch_run_rows, replace_run_rows
 from meta_ads_analysis.sync_api import resolve_date_window
@@ -1380,6 +1385,524 @@ def test_operator_brief_confidence_without_evidence_renders_band_only() -> None:
     assert "Evidence:" not in markdown
     assert "Re-check:" not in markdown
     assert "Evidence: None" not in markdown
+
+
+# ---------------------------------------------------------------------------
+# Adversarial review gate (review.py)
+# ---------------------------------------------------------------------------
+
+
+def _review_evidence(
+    *,
+    window: str,
+    purchases: float | None,
+    spend: float | None,
+    metric_value: float | None = 2.0,
+    metric_name: str = "blended_roas",
+) -> Evidence:
+    return Evidence(
+        metric_name=metric_name,
+        metric_value=metric_value,
+        metric_display=f"ROAS {metric_value:.2f}" if metric_value is not None else "ROAS n/a",
+        window=window,
+        sample_purchases=purchases,
+        sample_spend=spend,
+        entity_level="ad",
+        entity_id="123",
+        entity_name="Cody - Copy",
+        regenerating_query=None,
+    )
+
+
+def test_review_below_floor_returns_insufficient() -> None:
+    # Parent use case: the "9-purchase winner" must never reach the brief as a confident call.
+    evidence = _review_evidence(window="2026-06-19..2026-06-24", purchases=9.0, spend=40.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "consider_scale_budget"},
+        policy={},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "insufficient"
+    assert "sample_floor" in result.failed_inputs
+    assert any("floor" in reason for reason in result.reasons)
+
+
+def test_review_short_window_downgrades() -> None:
+    # ROAS 1.1 over a 3-day window: the sample clears the floor but the window may be unrepresentative.
+    evidence = _review_evidence(
+        window="2026-06-21..2026-06-24", purchases=30.0, spend=200.0, metric_value=1.1
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert "window_length" in result.failed_inputs
+    assert Band[result.revised_band] < Band[result.original_band]
+    assert any("unrepresentative" in reason for reason in result.reasons)
+
+
+def test_review_causal_correlational_downgrades() -> None:
+    # A causal claim from correlational data whose band was (hand-)inflated above the causal cap.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=4.0
+    )
+    confidence = {
+        "band": "high",
+        "data_band": "high",
+        "grounding_band": "medium",
+        "grounding_tier": "correlational",
+        "factors": [],
+        "would_raise": "",
+        "would_lower": "",
+        "causal_flag": True,
+    }
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "consider_scale_budget"},
+        policy={},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert "causal" in result.failed_inputs
+    assert Band[result.revised_band] < Band.high
+    assert any("A/B" in reason for reason in result.reasons)
+
+
+def test_review_band_earned_downgrades() -> None:
+    # The claimed band is stronger than confidence.assess recomputes from the same evidence.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=30.0, spend=200.0, metric_value=1.0
+    )
+    confidence = confidence_to_dict(
+        assess(
+            evidence=evidence,
+            tier=EvidenceTier.direct_observation,
+            spend_floor=100.0,
+            conversions_floor=25.0,
+            recency_days=1,
+        )
+    )
+    assert confidence["band"] == "medium"  # precondition: the rubric supports medium
+    confidence["band"] = "high"  # ...but the stored band drifted up to high
+
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert "band_earned" in result.failed_inputs
+    assert result.revised_band == "medium"
+    assert Band[result.revised_band] < Band.high
+
+
+def test_review_external_caps_at_low() -> None:
+    # External evidence is a hypothesis: a live call grounded in it cannot read above low.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=3.0
+    )
+    confidence = {
+        "band": "medium",
+        "data_band": "medium",
+        "grounding_band": "low",
+        "grounding_tier": "external",
+        "factors": [],
+        "would_raise": "",
+        "would_lower": "",
+        "causal_flag": False,
+    }
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "consider_scale_budget"},
+        policy={},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert "external" in result.failed_inputs
+    assert result.revised_band == "low"
+    assert any("experiment define" in reason for reason in result.reasons)
+
+
+def test_review_direction_contradiction_refutes() -> None:
+    # Pausing an ad whose cited ROAS is well above the account target contradicts its own number.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=6.0
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "pause_ad"},
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert result.revised_band is None  # refuted carries no corrected band
+
+
+def test_review_clean_call_stands() -> None:
+    # A pause with a large sample, a long recent window, and a direct-observation tier survives.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=1.0
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert isinstance(result, ReviewResult)
+    assert result.verdict == "stands"
+    assert result.failed_inputs == []
+    assert result.revised_band is None
+    assert result.original_band == confidence_to_dict(confidence)["band"]
+
+
+def _confidence_action(
+    *,
+    action_id: str,
+    action_type: str,
+    status: str,
+    executable: bool,
+    evidence: Evidence,
+    confidence,
+    rationale: str = "Cited rationale.",
+) -> dict:
+    return {
+        "action_id": action_id,
+        "action_type": action_type,
+        "status": status,
+        "executable": executable,
+        "target": {"type": "ad", "id": "123", "name": "Cody - Copy"},
+        "params": {"status": "paused"} if action_type == "pause_ad" else {},
+        "rationale": rationale,
+        "evidence": evidence_to_dict(evidence),
+        "confidence": confidence_to_dict(confidence),
+    }
+
+
+def test_review_action_plan_below_floor_flips_to_keep_running() -> None:
+    evidence = _review_evidence(window="2026-06-19..2026-06-24", purchases=9.0, spend=40.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _confidence_action(
+                action_id="consider_scale_budget_123",
+                action_type="consider_scale_budget",
+                status="proposed",
+                executable=False,
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    reviewed = review_action_plan(plan)
+    action = reviewed["actions"][0]
+
+    assert action["review"]["verdict"] == "insufficient"
+    assert action["executable"] is False
+    assert action["verdict"] == "insufficient_data"
+    assert action["confidence"]["band"] == "abstain"
+    assert any("floor" in reason for reason in action["review"]["reasons"])
+    # The input plan was not mutated.
+    assert "review" not in plan["actions"][0]
+
+
+def test_review_action_plan_skips_non_recommendation_actions() -> None:
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            {
+                "action_id": "measurement_review_1",
+                "action_type": "measurement_review",
+                "status": "proposed",
+                "executable": False,
+                "target": {"type": "account", "id": "acct"},
+                "params": {},
+                "rationale": "Verify the pixel.",
+                "evidence": {},
+            }
+        ],
+    }
+
+    reviewed = review_action_plan(plan)
+    action = reviewed["actions"][0]
+
+    assert "review" not in action  # no confidence block → never reviewed
+    assert action == plan["actions"][0]  # passed through untouched
+
+
+def test_review_gate_only_ever_demotes() -> None:
+    clean_evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=1.0
+    )
+    clean_conf = assess(
+        evidence=clean_evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    winner_evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=6.0
+    )
+    winner_conf = assess(
+        evidence=winner_evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "account_action_policy": {"primary_goal": "roas", "target_roas": 3.0},
+        "actions": [
+            _confidence_action(
+                action_id="pause_ad_clean",
+                action_type="pause_ad",
+                status="proposed",
+                executable=True,
+                evidence=clean_evidence,
+                confidence=clean_conf,
+            ),
+            _confidence_action(
+                action_id="pause_ad_winner",
+                action_type="pause_ad",
+                status="approved",
+                executable=True,
+                evidence=winner_evidence,
+                confidence=winner_conf,
+            ),
+        ],
+    }
+
+    reviewed = review_action_plan(plan)
+
+    for before, after in zip(plan["actions"], reviewed["actions"]):
+        # executable is never raised
+        assert not (after["executable"] and not before["executable"])
+        # status is never promoted to approved
+        assert not (after.get("status") == "approved" and before.get("status") != "approved")
+        # the band is never raised
+        assert Band[after["confidence"]["band"]] <= Band[before["confidence"]["band"]]
+
+    # the winner was actually demoted (refuted), proving the gate fired
+    winner = reviewed["actions"][1]
+    assert winner["review"]["verdict"] == "refuted"
+    assert winner["executable"] is False
+    assert winner["status"] == "proposed"
+
+
+def test_review_action_plan_is_idempotent() -> None:
+    short_window_evidence = _review_evidence(
+        window="2026-06-21..2026-06-24", purchases=30.0, spend=200.0, metric_value=1.1
+    )
+    short_window_conf = assess(
+        evidence=short_window_evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    clean_evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=1.0
+    )
+    clean_conf = assess(
+        evidence=clean_evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _confidence_action(
+                action_id="pause_ad_short",
+                action_type="pause_ad",
+                status="approved",
+                executable=True,
+                evidence=short_window_evidence,
+                confidence=short_window_conf,
+            ),
+            _confidence_action(
+                action_id="pause_ad_clean",
+                action_type="pause_ad",
+                status="proposed",
+                executable=True,
+                evidence=clean_evidence,
+                confidence=clean_conf,
+            ),
+        ],
+    }
+
+    once = review_action_plan(plan)
+    twice = review_action_plan(once)
+
+    assert once["actions"][0]["review"]["verdict"] == "downgrade"  # precondition: a real correction
+    assert twice == once
+
+
+def test_operator_brief_review_refuted_direction_surfaced_not_approved() -> None:
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=6.0
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "account_action_policy": {"primary_goal": "roas", "target_roas": 3.0},
+        "actions": [
+            _confidence_action(
+                action_id="pause_ad_winner",
+                action_type="pause_ad",
+                status="approved",
+                executable=True,
+                evidence=evidence,
+                confidence=confidence,
+                rationale="High waste risk.",
+            )
+        ],
+    }
+
+    brief = build_operator_brief(plan=plan)
+
+    assert brief["approved_to_execute"] == []
+    assert [a["action_id"] for a in brief["refuted_or_downgraded_by_review"]] == ["pause_ad_winner"]
+    assert brief["summary"]["reviewed_out_count"] == 1
+
+    markdown = render_operator_brief(brief)
+    approved_section = markdown.split("## Approved To Execute", 1)[1].split("## ", 1)[0]
+    assert "pause_ad_winner" not in approved_section
+    review_section = markdown.split("## Refuted / Downgraded By Review", 1)[1]
+    assert "pause_ad_winner" in review_section
+    assert "direction" in review_section
+
+
+def test_operator_brief_no_review_reproduces_pre_gate_behavior() -> None:
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=6.0
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "account_action_policy": {"primary_goal": "roas", "target_roas": 3.0},
+        "actions": [
+            _confidence_action(
+                action_id="pause_ad_winner",
+                action_type="pause_ad",
+                status="approved",
+                executable=True,
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    brief = build_operator_brief(plan=plan, review_enabled=False)
+
+    # With the gate off the contradictory call is NOT filtered (escape hatch reproduces old behavior).
+    assert [a["action_id"] for a in brief["approved_to_execute"]] == ["pause_ad_winner"]
+    assert brief["refuted_or_downgraded_by_review"] == []
 
 
 def test_api_operation_only_allows_explicit_pause_without_meta_ai_params() -> None:

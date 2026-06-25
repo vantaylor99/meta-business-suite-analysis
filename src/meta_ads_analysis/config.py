@@ -35,3 +35,11 @@ CONFIDENCE_RECENCY_STALE_DAYS = 14
 # ``min_conversions`` default (25). A sample below BOTH this and the relevant spend floor abstains
 # ("insufficient data") instead of being scored as a confident pause/scale.
 CONFIDENCE_CONVERSIONS_FLOOR = 25
+
+# Adversarial-review gate (see review.py). The minimum representative window span for the
+# ``window_length`` refutation check: a recommendation resting on a window shorter than this many
+# days is downgraded ("window may be unrepresentative; recommend a wider window"). This is the ONLY
+# new number the gate introduces — the floor and recency re-checks deliberately reuse the producer's
+# existing constants (MIN_WASTE_SPEND / MIN_SCALING_SPEND, CONFIDENCE_CONVERSIONS_FLOOR,
+# CONFIDENCE_RECENCY_STALE_DAYS) so the gate and the producer share one set of thresholds.
+REVIEW_MIN_WINDOW_DAYS = 7
