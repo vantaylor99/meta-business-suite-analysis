@@ -8,7 +8,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import review
 from .config import DEFAULT_REPORTS_ROOT
+from .confidence import (
+    BAND_PRESENTATION,
+    Band,
+    Confidence,
+    confidence_from_dict,
+    evidence_from_dict,
+    render_confidence_line,
+    render_evidence_line,
+)
 from .utils import ensure_dir, write_json
 
 
@@ -64,17 +74,29 @@ def build_operator_brief(
     report: dict[str, Any] | None = None,
     previous_plan: dict[str, Any] | None = None,
     previous_report: dict[str, Any] | None = None,
+    review_enabled: bool = True,
 ) -> dict[str, Any]:
+    # Run the adversarial review gate FIRST so corrected/dropped calls never reach the operator. The
+    # gate is read-only w.r.t. the input plan (returns a new plan) and only ever demotes; --no-review
+    # (review_enabled=False) reproduces the pre-gate brief behavior exactly.
+    if review_enabled:
+        plan = review.review_action_plan(plan)
+
     actions = [action for action in plan.get("actions") or [] if isinstance(action, dict)]
     previous_actions = [
         action for action in (previous_plan or {}).get("actions", []) if isinstance(action, dict)
     ]
     action_counts = Counter(str(action.get("action_type") or "unknown") for action in actions)
     status_counts = Counter(str(action.get("status") or "unknown") for action in actions)
-    executable_actions = [action for action in actions if action.get("executable")]
+    # Calls the review gate refuted or marked insufficient are surfaced in their own section (never
+    # silently deleted) and removed from every other bucket so they cannot also read as approvable.
+    reviewed_out_actions = [action for action in actions if _review_demoted(action)]
+    reviewed_out_ids = {action.get("action_id") for action in reviewed_out_actions}
+    actions_in_play = [action for action in actions if action.get("action_id") not in reviewed_out_ids]
+    executable_actions = [action for action in actions_in_play if action.get("executable")]
     blocked_actions = [
         action
-        for action in actions
+        for action in actions_in_play
         if action.get("status") in {"blocked", "failed"} or _live_lookup_blocks_action(action)
     ]
     blocked_action_ids = {action.get("action_id") for action in blocked_actions}
@@ -90,10 +112,14 @@ def build_operator_brief(
     ]
     manual_actions = [
         action
-        for action in actions
+        for action in actions_in_play
         if not action.get("executable") and action.get("action_id") not in blocked_action_ids
     ]
-    meta_ai_actions = [action for action in actions if action.get("action_type") == "disable_meta_ai_controls"]
+    meta_ai_actions = [
+        action
+        for action in actions_in_play
+        if action.get("action_type") == "disable_meta_ai_controls"
+    ]
     new_action_ids = sorted(
         {str(action.get("action_id")) for action in actions if action.get("action_id")}
         - {str(action.get("action_id")) for action in previous_actions if action.get("action_id")}
@@ -117,6 +143,7 @@ def build_operator_brief(
             "manual_action_count": len(manual_actions),
             "blocked_or_failed_count": len(blocked_actions),
             "meta_ai_followup_count": len(meta_ai_actions),
+            "reviewed_out_count": len(reviewed_out_actions),
             "action_counts": dict(sorted(action_counts.items())),
             "status_counts": dict(sorted(status_counts.items())),
         },
@@ -131,7 +158,18 @@ def build_operator_brief(
         "needs_human_judgment": [_brief_action(action) for action in manual_actions],
         "do_not_touch_yet": [_brief_action(action) for action in blocked_actions],
         "meta_ai_followups": [_brief_action(action) for action in meta_ai_actions],
+        "refuted_or_downgraded_by_review": [_brief_action(action) for action in reviewed_out_actions],
     }
+
+
+def _review_demoted(action: dict[str, Any]) -> bool:
+    """True when the adversarial review gate refuted or marked an action insufficient (so it belongs
+    in the dedicated review section, surfaced rather than silently dropped). A ``stands`` or
+    ``downgrade`` verdict leaves the action in its normal section."""
+    review_block = action.get("review")
+    if not isinstance(review_block, dict):
+        return False
+    return review_block.get("verdict") in {"refuted", "insufficient"}
 
 
 def render_operator_brief(brief: dict[str, Any]) -> str:
@@ -170,7 +208,9 @@ def render_operator_brief(brief: dict[str, Any]) -> str:
         ("Needs Human Judgment", brief.get("needs_human_judgment") or []),
         ("Do Not Touch Yet", brief.get("do_not_touch_yet") or []),
         ("Meta AI Follow-Ups", brief.get("meta_ai_followups") or []),
+        ("Refuted / Downgraded By Review", brief.get("refuted_or_downgraded_by_review") or []),
     ]
+    account_slug = brief.get("account_slug")
     for title, actions in sections:
         lines.extend(["", f"## {title}"])
         if not actions:
@@ -183,7 +223,108 @@ def render_operator_brief(brief: dict[str, Any]) -> str:
                 f"targeting {action.get('target_name') or action.get('target_id') or 'unknown target'}: "
                 f"{action.get('rationale') or 'No rationale supplied.'}"
             )
+            lines.extend(_render_action_evidence(action, account_slug=account_slug))
+            lines.extend(_render_review_note(action))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_review_note(action: dict[str, Any]) -> list[str]:
+    """Render the adversarial-review note under an action bullet.
+
+    For a refuted/insufficient call (shown in the "Refuted / Downgraded By Review" section) this names
+    the verdict, the failing rubric input(s), and the reason — so the operator sees exactly what was
+    filtered and why. For a ``downgrade`` that kept the action in its own section, it appends a compact
+    "↓ Review:" line. ``stands`` renders nothing."""
+    review_block = action.get("review")
+    if not isinstance(review_block, dict):
+        return []
+    verdict = review_block.get("verdict")
+    reasons = [str(reason) for reason in (review_block.get("reasons") or [])]
+    failed = [str(item) for item in (review_block.get("failed_inputs") or [])]
+    if verdict == "downgrade":
+        detail = "; ".join(reasons) if reasons else "stated confidence reduced"
+        return [f"{_BLOCK_INDENT}↓ Review: {detail}"]
+    if verdict in {"refuted", "insufficient"}:
+        label = "Refuted" if verdict == "refuted" else "Insufficient data"
+        head = f"{_BLOCK_INDENT}Review — {label}"
+        if failed:
+            head += f" [{', '.join(failed)}]"
+        if reasons:
+            head += ": " + "; ".join(reasons)
+        return [head]
+    return []
+
+
+# Markdown indent for the evidence/confidence sub-lines beneath each action bullet.
+_BLOCK_INDENT = "    "
+
+
+def _render_action_evidence(action: dict[str, Any], *, account_slug: Any) -> list[str]:
+    """Render the compact evidence + confidence block beneath one action bullet.
+
+    Additive and skimmable: a labeled line each for the facts, the confidence band, (when the claim
+    is causal) the correlational caveat + offer to file an A/B, the exact re-check command, and what
+    would move the band. Renders nothing when the action carries no evidence/confidence (e.g.
+    measurement_review actions) — never prints ``None``. The band/emoji vocabulary comes straight
+    from ``confidence.py`` so the brief speaks the one confidence language."""
+    evidence_block = action.get("evidence") if isinstance(action.get("evidence"), dict) else {}
+    confidence_block = action.get("confidence") if isinstance(action.get("confidence"), dict) else {}
+    if not evidence_block and not confidence_block:
+        return []
+
+    lines: list[str] = []
+    if evidence_block:
+        evidence = evidence_from_dict(evidence_block)
+        # Drop the inline regen query — it gets its own labeled "Re-check:" line below.
+        lines.append(f"{_BLOCK_INDENT}Evidence: {render_evidence_line(evidence, include_regen=False)}")
+
+    confidence: Confidence | None = None
+    if confidence_block:
+        confidence = confidence_from_dict(confidence_block)
+        lines.append(f"{_BLOCK_INDENT}Confidence: {_render_brief_confidence(confidence)}")
+        if confidence.causal_flag:
+            lines.append(f"{_BLOCK_INDENT}{_render_causal_offer(account_slug)}")
+
+    regen = evidence_block.get("regenerating_query")
+    if regen:
+        lines.append(f"{_BLOCK_INDENT}Re-check: {regen}")
+
+    if confidence is not None:
+        raise_lower = _render_raise_lower(confidence)
+        if raise_lower:
+            lines.append(f"{_BLOCK_INDENT}{raise_lower}")
+
+    return lines
+
+
+def _render_brief_confidence(conf: Confidence) -> str:
+    """One-line confidence for the brief. Defers to ``confidence.render_confidence_line`` for scored
+    bands; an ``abstain`` reads as a promising test ("Insufficient data — keep running"), distinct
+    from a 🔴 Low verdict and never a percentage."""
+    if conf.band is Band.abstain:
+        head = f"{BAND_PRESENTATION[Band.abstain]['emoji']} Insufficient data — keep running"
+        if conf.factors:
+            head += " — " + "; ".join(conf.factors[:3])
+        return head
+    return render_confidence_line(conf)
+
+
+def _render_causal_offer(account_slug: Any) -> str:
+    """Surface the correlational caveat and the offer to confirm it with an A/B. The brief only
+    surfaces the text — it does not auto-file the experiment."""
+    command = "experiment define"
+    if account_slug:
+        command += f" --account {account_slug}"
+    return f"⚠️ correlational — confirm via A/B — file one to confirm: {command} …"
+
+
+def _render_raise_lower(conf: Confidence) -> str | None:
+    parts = []
+    if conf.would_raise:
+        parts.append(f"Would raise: {conf.would_raise}")
+    if conf.would_lower:
+        parts.append(f"Would lower: {conf.would_lower}")
+    return " · ".join(parts) if parts else None
 
 
 def write_operator_brief(
@@ -212,6 +353,14 @@ def _brief_action(action: dict[str, Any]) -> dict[str, Any]:
         "adset_name": target.get("adset_name"),
         "params": action.get("params") if isinstance(action.get("params"), dict) else {},
         "rationale": action.get("rationale"),
+        # Carry the structured evidence + computed confidence straight through (computed once, in the
+        # action plan — never recomputed here). Empty dict when the action carries none, so the
+        # renderer can omit the block gracefully.
+        "evidence": action.get("evidence") if isinstance(action.get("evidence"), dict) else {},
+        "confidence": action.get("confidence") if isinstance(action.get("confidence"), dict) else {},
+        # Adversarial-review verdict (additive, like evidence/confidence). Empty dict when the action
+        # was not reviewed (e.g. informational actions, or review disabled).
+        "review": action.get("review") if isinstance(action.get("review"), dict) else {},
     }
 
 

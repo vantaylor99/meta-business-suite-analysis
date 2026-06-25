@@ -10,12 +10,25 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 from . import account_registry
-from .config import DEFAULT_REPORTS_ROOT
+from .config import (
+    CONFIDENCE_CONVERSIONS_FLOOR,
+    DEFAULT_REPORTS_ROOT,
+    MIN_SCALING_SPEND,
+    MIN_WASTE_SPEND,
+)
+from .confidence import (
+    Evidence,
+    EvidenceTier,
+    assess,
+    build_regenerating_query,
+    confidence_to_dict,
+    evidence_to_dict,
+)
 from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
 from .utils import ensure_dir, write_json
 
@@ -37,6 +50,28 @@ META_AI_DISABLED_POLICY = {
         "It does not enable Meta AI or Advantage+ creative features."
     ),
 }
+
+
+# Grounding tier per action type. The pause/budget paths read the entity's own live/exported API
+# metrics → direct_observation. The scale-candidate and fatigue calls lean on a cross-sectional or
+# prior-vs-recent (trajectory) comparison → correlational (so they can never read High on sample size
+# alone; see confidence.combine_bands).
+_ACTION_GROUNDING_TIER = {
+    "pause_ad": EvidenceTier.direct_observation,
+    "increase_adset_budget": EvidenceTier.direct_observation,
+    "consider_scale_budget": EvidenceTier.correlational,
+    "refresh_creative": EvidenceTier.correlational,
+}
+# Spend floor per action type — reuses the existing gates rather than inventing new constants.
+_ACTION_SPEND_FLOOR = {
+    "pause_ad": MIN_WASTE_SPEND,
+    "increase_adset_budget": MIN_SCALING_SPEND,
+    "consider_scale_budget": MIN_SCALING_SPEND,
+    "refresh_creative": MIN_WASTE_SPEND,
+}
+# Action types whose confidence drops below the data floor must NOT be emitted as a confident
+# pause/scale — they flip to a non-executable "insufficient data — keep running" recommendation.
+_ABSTENTION_GUARDED_ACTIONS = {"pause_ad", "increase_adset_budget"}
 
 
 @dataclass(slots=True)
@@ -131,13 +166,10 @@ def build_action_plan(payload: dict[str, Any]) -> dict[str, Any]:
                 f"results {ad.get('total_results')}, app installs {ad.get('total_app_installs')}, "
                 f"waste score {ad.get('waste_score')}."
             ),
-            "evidence": {
-                "waste_score": ad.get("waste_score"),
-                "waste_status": ad.get("waste_status"),
-                "waste_reasons": ad.get("waste_reasons") or [],
-                "tracking_confidence": ad.get("tracking_confidence"),
-            },
         }
+        _attach_confidence(
+            action, ad, policy=policy, account_slug=str(account_slug), run_date=str(run_date)
+        )
         _append_once(actions, seen_action_ids, action)
 
     for ad in payload.get("fatigue_findings") or []:
@@ -148,6 +180,9 @@ def build_action_plan(payload: dict[str, Any]) -> dict[str, Any]:
             ad,
             "Fatigue finding should be handled by refreshing, rotating, or rebuilding creative before more spend is added.",
         )
+        _attach_confidence(
+            action, ad, policy=policy, account_slug=str(account_slug), run_date=str(run_date)
+        )
         _append_once(actions, seen_action_ids, action)
 
     for ad in payload.get("scaling_candidates") or []:
@@ -156,9 +191,15 @@ def build_action_plan(payload: dict[str, Any]) -> dict[str, Any]:
             ad,
             "Scaling candidate needs an operator-selected budget amount before it can become executable.",
         )
+        _attach_confidence(
+            action, ad, policy=policy, account_slug=str(account_slug), run_date=str(run_date)
+        )
         _append_once(actions, seen_action_ids, action)
         budget_action = _build_budget_increase_action(ad, policy)
         if budget_action is not None:
+            _attach_confidence(
+                budget_action, ad, policy=policy, account_slug=str(account_slug), run_date=str(run_date)
+            )
             _append_once(actions, seen_action_ids, budget_action)
 
     for index, concern in enumerate(payload.get("tracking_concerns") or [], start=1):
@@ -473,6 +514,172 @@ def _action_policy_for_account(account_slug: str) -> dict[str, Any]:
     except (FileNotFoundError, KeyError, ValueError):
         return {}
     return dict(account.action_policy or {})
+
+
+def evaluate_action_confidence(
+    ad: dict[str, Any],
+    *,
+    action_type: str,
+    policy: dict[str, Any],
+    account_slug: str | None,
+    run_date: str | None,
+    rationale: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the structured ``evidence`` + computed ``confidence`` blocks for an ad-derived action.
+
+    The metric is the one the call actually rests on (ROAS for ROAS-goal accounts, cost-per-install
+    for install-goal accounts — mirroring ``_should_pause_ad``/``_qualifies_for_budget_increase``).
+    Sample size / window / recency come from the ad summary the report already carries; the band is
+    computed by :func:`confidence.assess` — never typed by the caller. ``rationale`` is passed as the
+    causal-language probe so an accidentally causal rationale downgrades grounding.
+    """
+    goal = policy.get("primary_goal")
+    metric_name, metric_value, metric_display = _select_action_metric(ad, goal)
+    first_seen = _iso_date_str(ad.get("first_seen"))
+    last_seen = _iso_date_str(ad.get("last_seen"))
+    if first_seen and last_seen:
+        window = f"{first_seen}..{last_seen}"
+    else:
+        window = first_seen or last_seen or "n/a"
+    evidence = Evidence(
+        metric_name=metric_name,
+        metric_value=metric_value,
+        metric_display=metric_display,
+        window=window,
+        sample_purchases=_number(ad.get("total_purchase_count")),
+        sample_spend=_number(ad.get("total_spend")),
+        entity_level="ad",
+        entity_id=_optional_str(ad.get("ad_id")),
+        entity_name=ad.get("ad_name"),
+        regenerating_query=build_regenerating_query(account_slug, "ad", first_seen, last_seen),
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=_ACTION_GROUNDING_TIER.get(action_type, EvidenceTier.direct_observation),
+        spend_floor=_ACTION_SPEND_FLOOR.get(action_type, MIN_WASTE_SPEND),
+        conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=_recency_days(run_date, last_seen),
+        causal_text=rationale,
+    )
+    return evidence_to_dict(evidence), confidence_to_dict(confidence)
+
+
+def _attach_confidence(
+    action: dict[str, Any],
+    ad: dict[str, Any],
+    *,
+    policy: dict[str, Any],
+    account_slug: str | None,
+    run_date: str | None,
+) -> None:
+    """Attach the structured ``evidence`` + ``confidence`` blocks to an action, and — for the
+    executable pause/budget paths — abstain (flip to a non-executable "keep running" recommendation)
+    when the sample is below the significance floor, so thin data can never become a confident
+    pause/scale and can never be approved into a write."""
+    action_type = str(action.get("action_type") or "")
+    evidence_block, confidence_block = evaluate_action_confidence(
+        ad,
+        action_type=action_type,
+        policy=policy,
+        account_slug=account_slug,
+        run_date=run_date,
+        rationale=action.get("rationale"),
+    )
+    action["evidence"] = evidence_block
+    action["confidence"] = confidence_block
+    if action_type in _ABSTENTION_GUARDED_ACTIONS and confidence_block.get("band") == "abstain":
+        _abstain_action(action, evidence_block, action_type)
+
+
+def _abstain_action(
+    action: dict[str, Any],
+    evidence_block: dict[str, Any],
+    action_type: str,
+) -> None:
+    """Turn a below-floor pause/scale into a non-executable "insufficient data — keep running"
+    recommendation. Generalizes monitor.py's significance-floor discipline into the action plan:
+    promising test, NOT a winner/loser verdict."""
+    action["status"] = PROPOSED_STATUS
+    action["executable"] = False
+    action["approval_required"] = False
+    action["verdict"] = "insufficient_data"
+    verb = "scaling" if action_type == "increase_adset_budget" else "pausing"
+    purchases = _fmt_sample_count(evidence_block.get("sample_purchases"))
+    spend = evidence_block.get("sample_spend")
+    spend_str = f"${spend:,.0f}" if isinstance(spend, (int, float)) else "n/a"
+    window = evidence_block.get("window") or "n/a"
+    action["rationale"] = (
+        f"Insufficient data to recommend {verb} yet — only {purchases} purchases / {spend_str} spend "
+        f"over {window} is below the significance floor. Treat as a promising test: keep running and "
+        f"re-check as more data accrues."
+    )
+
+
+def _select_action_metric(
+    ad: dict[str, Any],
+    goal: str | None,
+) -> tuple[str, float | None, str]:
+    """Pick the metric the action rests on and its display string. ROAS for ROAS-goal accounts,
+    cost-per-install for install-goal accounts; otherwise whichever is present."""
+    roas = _number(ad.get("blended_roas"))
+    cost_per_install = _number(ad.get("cost_per_app_install"))
+    if goal == "maximize_in_app_subscriptions":
+        return "cost_per_app_install", cost_per_install, _fmt_cost_per_install(cost_per_install)
+    if goal == "roas":
+        return "blended_roas", roas, _fmt_roas(roas)
+    if roas is not None:
+        return "blended_roas", roas, _fmt_roas(roas)
+    if cost_per_install is not None:
+        return "cost_per_app_install", cost_per_install, _fmt_cost_per_install(cost_per_install)
+    return "blended_roas", None, _fmt_roas(None)
+
+
+def _fmt_roas(value: float | None) -> str:
+    return f"ROAS {value:.2f}" if value is not None else "ROAS n/a"
+
+
+def _fmt_cost_per_install(value: float | None) -> str:
+    return f"cost/install ${value:.2f}" if value is not None else "cost/install n/a"
+
+
+def _fmt_sample_count(value: Any) -> str:
+    number = _number(value)
+    if number is None:
+        return "0"
+    return f"{int(number)}" if float(number).is_integer() else f"{number:g}"
+
+
+def _iso_date_str(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        return value
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    iso = _iso_date_str(value)
+    if not iso:
+        return None
+    try:
+        return date.fromisoformat(iso[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def _recency_days(run_date: Any, last_seen: Any) -> int | None:
+    run = _parse_iso_date(run_date)
+    last = _parse_iso_date(last_seen)
+    if run is None or last is None:
+        return None
+    return (run - last).days
+
+
+def _optional_str(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
 
 
 def _should_pause_ad(ad: dict[str, Any], policy: dict[str, Any]) -> tuple[bool, str]:

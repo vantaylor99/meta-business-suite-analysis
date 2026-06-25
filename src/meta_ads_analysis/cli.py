@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date
+import re
+from datetime import date, timedelta
 from pathlib import Path
 
 from .actions import (
@@ -875,6 +876,340 @@ def metrics_main() -> None:
     print(f"\nMetrics JSON: {output_path}")
 
 
+def lint_vault_main() -> None:
+    """Lint the knowledge vault: enforce provenance tags on every learning and age out stale facts.
+
+    Scans ``knowledge/learnings.md`` (full enforcement) and, if present, the divine_designs
+    ``profile.md`` baseline header (staleness only). CI-usable: exits 1 on any error.
+    """
+    from .config import KNOWLEDGE_REVERIFY_DAYS, PROJECT_ROOT
+    from .knowledge_provenance import (
+        lint,
+        lint_profile_baseline,
+        parse_learnings,
+        render_report,
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Lint the knowledge vault: require provenance tags + flag stale (fast) facts."
+    )
+    parser.add_argument("--path", help="learnings.md to lint (default: knowledge/learnings.md).")
+    parser.add_argument(
+        "--profile",
+        help="profile.md to scan for baseline staleness "
+        "(default: knowledge/accounts/divine_designs/profile.md; skipped if missing).",
+    )
+    parser.add_argument("--today", help="Override today (YYYY-MM-DD) for staleness math.")
+    parser.add_argument(
+        "--reverify-days",
+        type=int,
+        default=KNOWLEDGE_REVERIFY_DAYS,
+        help=f"Age (days) after which a fast fact is flagged re-verify (default {KNOWLEDGE_REVERIFY_DAYS}).",
+    )
+    parser.add_argument("--strict", action="store_true", help="Treat ⏳ warnings as failures too.")
+    args = parser.parse_args()
+
+    today = date.fromisoformat(args.today) if args.today else date.today()
+    learnings_path = Path(args.path) if args.path else PROJECT_ROOT / "knowledge" / "learnings.md"
+    entries = parse_learnings(learnings_path.read_text(encoding="utf-8"))
+    findings = lint(entries, today=today, reverify_days=args.reverify_days)
+
+    profile_path = (
+        Path(args.profile)
+        if args.profile
+        else PROJECT_ROOT / "knowledge" / "accounts" / "divine_designs" / "profile.md"
+    )
+    if profile_path.exists():
+        findings += lint_profile_baseline(
+            profile_path.read_text(encoding="utf-8"),
+            today=today,
+            reverify_days=args.reverify_days,
+            label=profile_path.name,
+        )
+
+    report, exit_code = render_report(findings, entries_count=len(entries), strict=args.strict)
+    print(report)
+    raise SystemExit(exit_code)
+
+
+# --- audit-vault (drift re-check) -------------------------------------------------------------
+#
+# `audit-vault` re-pulls each stored `metric:` claim over a FRESH trailing window and diffs it
+# against the stored value (the pure verdict + markdown mutation live in knowledge_provenance.py).
+# This module is the ONLY Meta-touching half: it resolves the named metric out of the live rows
+# (`resolve_fresh_metric`) and orchestrates select → re-pull → classify → render/apply
+# (`run_vault_audit`). Both are pure given an injected `fetch_metrics`, so they unit-test with a
+# fake provider (no live Meta in tests).
+
+# Abbreviation aliases so a metric name's identifier token can match a fresh row's segment value or
+# entity name (e.g. `ig_roas` ↔ an `instagram` publisher_platform row).
+_SEGMENT_ALIASES: dict[str, str] = {
+    "ig": "instagram",
+    "fb": "facebook",
+    "an": "audience_network",
+}
+# Tokens in a metric NAME that describe the measure or the scope, not WHICH entity/segment it is —
+# dropped before matching so `engaged_adset_roas` reduces to the discriminating token {engaged}.
+_DROP_METRIC_TOKENS: frozenset[str] = frozenset(
+    {"roas", "aov", "cpp", "cpa", "cpm", "cpc", "ctr", "cvr", "spend", "value", "purchases", "cost",
+     "account", "campaign", "adset", "ad", "level", "blended"}
+)
+
+
+def _opt_float(value: object) -> float | None:
+    """A config threshold coerced to float, or None if absent/non-numeric (no fabricated default)."""
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _row_value(row: dict[str, object]) -> tuple[float | None, float | None, float | None]:
+    """``(roas, purchases, spend)`` from one fetched metrics row. ROAS stays ``None`` when value is
+    missing for the window (→ could_not_audit, never a fabricated 0 — see AGENTS.md / the ticket's
+    'Derived ROAS' edge case)."""
+    spend = row.get("spend")
+    purchases = row.get("purchases")
+    roas = row.get("roas")
+    value = row.get("purchase_value")
+    if roas is None and value is not None and isinstance(spend, (int, float)) and spend:
+        roas = round(value / spend, 2)
+    return (
+        roas if isinstance(roas, (int, float)) else None,
+        purchases if isinstance(purchases, (int, float)) else None,
+        spend if isinstance(spend, (int, float)) else None,
+    )
+
+
+def _aggregate_value(rows: list[dict[str, object]]) -> tuple[float | None, float | None, float | None]:
+    """Blended ``(roas, purchases, spend)`` over ``rows`` (the account-aggregate case). If every row
+    is missing purchase_value, or total spend is 0, the value is ``None`` (could_not_audit) rather
+    than a fabricated 0."""
+    spend = sum(float(r["spend"]) for r in rows if isinstance(r.get("spend"), (int, float)))
+    purchases = sum(float(r["purchases"]) for r in rows if isinstance(r.get("purchases"), (int, float)))
+    values = [r.get("purchase_value") for r in rows]
+    if not spend or all(v is None for v in values):
+        return None, (purchases or None), (spend or None)
+    total_value = sum(float(v) for v in values if isinstance(v, (int, float)))
+    return round(total_value / spend, 2), purchases, spend
+
+
+def _metric_identifier_tokens(metric_name: str | None) -> set[str]:
+    """Discriminating identity tokens of a metric name, alias-expanded — `ig_roas` → {instagram},
+    `engaged_adset_roas` → {engaged}. Measure/scope words are dropped (see `_DROP_METRIC_TOKENS`)."""
+    parts = [p for p in re.split(r"[_\s]+", (metric_name or "").lower()) if p]
+    return {_SEGMENT_ALIASES.get(p, p) for p in parts if p not in _DROP_METRIC_TOKENS}
+
+
+def _row_identifier_text(row: dict[str, object]) -> str:
+    """A fresh row's identity string: its breakdown segment values, else its entity name (lower)."""
+    seg = row.get("segment")
+    if isinstance(seg, dict):
+        return " ".join(str(v) for v in seg.values()).lower()
+    return str(row.get("name") or "").lower()
+
+
+def resolve_fresh_metric(
+    rows: list[dict[str, object]],
+    *,
+    level: str,
+    breakdowns: list[str],
+    metric_name: str | None,
+) -> tuple[float | None, float | None, float | None]:
+    """Resolve the named metric's fresh ``(value, purchases, spend)`` out of the fetched rows.
+
+    Two cases:
+
+    - **Account aggregate** (``level == account`` with no breakdown): the metric is the blended
+      account ROAS — :func:`_aggregate_value` over the (single) row(s).
+    - **Segment / entity scoped** (a breakdown, or a campaign/adset/ad level): the metric names a
+      *specific* row (e.g. ``ig_roas`` → the ``instagram`` segment). The row is matched by token
+      overlap between the metric name and the row's segment/entity identity. **Exactly one** match
+      resolves; zero or several → ``(None, None, None)`` so the verdict is ``could_not_audit`` and
+      the claim is never silently confirmed (AGENTS.md: don't collapse missing into zeros).
+    """
+    if not rows:
+        return None, None, None
+    if not breakdowns and level == "account":
+        return _aggregate_value(rows)
+    tokens = _metric_identifier_tokens(metric_name)
+    if not tokens:
+        return None, None, None
+    matches = [r for r in rows if any(tok in _row_identifier_text(r) for tok in tokens)]
+    if len(matches) != 1:
+        return None, None, None
+    return _row_value(matches[0])
+
+
+def _window_length_days(date_from: str | None, date_to: str | None, *, default: int = 30) -> int:
+    """Inclusive day-span of a stored ``--date-from``/``--date-to`` window; ``default`` (30) when
+    either bound is absent or unparseable."""
+    if not (date_from and date_to):
+        return default
+    try:
+        span = (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days + 1
+    except ValueError:
+        return default
+    return span if span > 0 else default
+
+
+def _fresh_verify_cmd(
+    account_slug: str, level: str, breakdowns: list[str], date_from: str, date_to: str
+) -> str:
+    """The ``account_metrics …`` command that reproduces the FRESH value, for the logged ``➖``."""
+    cmd = (
+        f"account_metrics --account {account_slug} --level {level} "
+        f"--date-from {date_from} --date-to {date_to}"
+    )
+    if breakdowns:
+        cmd += f" --breakdown {','.join(breakdowns)}"
+    return cmd
+
+
+def run_vault_audit(
+    *,
+    text: str,
+    account_slug: str,
+    as_of: date,
+    target_roas: float | None,
+    pause_roas_floor: float | None,
+    fetch_metrics,
+    apply: bool,
+) -> tuple[str, str | None, dict[str, int]]:
+    """Orchestrate one audit pass over ``learnings.md`` text and return
+    ``(report, new_text_or_None, counts)``.
+
+    Pure given ``fetch_metrics`` — a callable ``(level, breakdowns, date_from, date_to) -> rows`` —
+    so it is testable with a fake provider. For each auditable, account-scoped ``metric:`` claim it
+    re-pulls a FRESH trailing window of the stored length ending ``as_of`` (current reality, NOT the
+    historical window), resolves the metric, and classifies drift. ``new_text`` is ``None`` unless
+    ``apply`` (report-only ⇒ zero file changes); when ``apply`` it is the surgically-edited markdown.
+    """
+    from .knowledge_provenance import (
+        FreshSample,
+        apply_entry_edits,
+        audit_claim,
+        parse_learnings,
+        parse_verify_query,
+        plan_edits,
+        render_audit_report,
+        select_auditable,
+    )
+    from .sync_api import resolve_date_window
+
+    entries = parse_learnings(text)
+    pairs = select_auditable(entries, account_slug=account_slug)
+
+    outcomes = []
+    fresh_verify_for: dict[int, str] = {}
+    for entry, ev in pairs:
+        pq = parse_verify_query(ev.verify_query)
+        level = pq["level"] or "account"
+        breakdowns = pq["breakdowns"]
+        window_len = _window_length_days(pq["date_from"], pq["date_to"])
+        date_from, date_to = resolve_date_window(as_of, lookback_days=window_len)
+        rows = fetch_metrics(level, breakdowns, date_from, date_to)
+        value, purchases, spend = resolve_fresh_metric(
+            rows, level=level, breakdowns=breakdowns, metric_name=ev.metric_name
+        )
+        fresh = FreshSample(
+            value=value, purchases=purchases, spend=spend, window=f"{date_from}..{date_to}"
+        )
+        outcomes.append(
+            audit_claim(
+                entry,
+                ev,
+                fresh,
+                target_roas=target_roas,
+                pause_roas_floor=pause_roas_floor,
+            )
+        )
+        fresh_verify_for[ev.lineno] = _fresh_verify_cmd(
+            account_slug, level, breakdowns, date_from, date_to
+        )
+
+    report, counts = render_audit_report(
+        outcomes, account_slug=account_slug, as_of=as_of.isoformat(), apply_mode=apply
+    )
+    new_text: str | None = None
+    if apply:
+        edits = plan_edits(
+            outcomes,
+            as_of=as_of.isoformat(),
+            account_slug=account_slug,
+            fresh_verify_for=fresh_verify_for,
+        )
+        new_text = apply_entry_edits(text, edits)
+    return report, new_text, counts
+
+
+def audit_vault_main() -> None:
+    """Re-check the vault's data-backed ``metric:`` claims against fresh live data.
+
+    Read-only against Meta; report-only by default. With ``--apply`` it edits ``learnings.md`` ONLY:
+    a drifted claim gets a dated ``➖`` and its band lowered one level (refuted → 🔴 ``(contested)``);
+    a confirmed claim just gets ``Verified:`` refreshed (this is how a ``lint-vault ⏳ re-verify``
+    flag clears). It NEVER edits claim text and NEVER deletes an entry — a human decides deletion.
+    """
+    from .config import PROJECT_ROOT
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description="Re-check the knowledge vault's metric: claims against fresh live data; surface "
+        "drift loudly, lower confidence, and log it — never silently overwrite or delete."
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument(
+        "--as-of", help="Anchor date YYYY-MM-DD for the fresh trailing window. Defaults to today."
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write band/Verified/➖ edits to learnings.md. Without it, report-only (no file changes).",
+    )
+    parser.add_argument("--path", help="learnings.md to audit (default: knowledge/learnings.md).")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    as_of = date.fromisoformat(args.as_of) if args.as_of else date.today()
+    learnings_path = Path(args.path) if args.path else PROJECT_ROOT / "knowledge" / "learnings.md"
+    text = learnings_path.read_text(encoding="utf-8")
+
+    policy = resolve_account(account_slug).action_policy or {}
+    target_roas = _opt_float(policy.get("target_roas") or policy.get("scale_roas_floor"))
+    pause_roas_floor = _opt_float(policy.get("pause_roas_floor"))
+
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+
+    def fetch_metrics(level, breakdowns, date_from, date_to):
+        if breakdowns:
+            return fetch_breakdown_metrics(
+                client, ad_account_id, breakdown=",".join(breakdowns),
+                date_from=date_from, date_to=date_to, level=level,
+            )
+        return fetch_entity_metrics(
+            client, ad_account_id, level=level, date_from=date_from, date_to=date_to
+        )
+
+    report, new_text, _counts = run_vault_audit(
+        text=text,
+        account_slug=account_slug,
+        as_of=as_of,
+        target_roas=target_roas,
+        pause_roas_floor=pause_roas_floor,
+        fetch_metrics=fetch_metrics,
+        apply=args.apply,
+    )
+    print(report)
+    if args.apply:
+        if new_text is not None and new_text != text:
+            learnings_path.write_text(new_text, encoding="utf-8")
+            print(f"\naudit-vault: wrote updates to {learnings_path}")
+        else:
+            print("\naudit-vault: no drift to apply — file unchanged.")
+
+
 def estimate_main() -> None:
     from .meta_api import client_from_env
 
@@ -1644,6 +1979,14 @@ def operator_brief_main() -> None:
         action="store_true",
         help="Skip comparison against the previous report run.",
     )
+    parser.add_argument(
+        "--no-review",
+        action="store_true",
+        help=(
+            "Skip the adversarial review gate (escape hatch). By default the gate corrects or drops "
+            "recommendations that cannot survive a second-opinion challenge before they reach the brief."
+        ),
+    )
     args = parser.parse_args()
 
     account_slug = _resolve_account_slug(args.account)
@@ -1681,6 +2024,7 @@ def operator_brief_main() -> None:
         report=load_report(report_path),
         previous_plan=previous_plan,
         previous_report=previous_report,
+        review_enabled=not args.no_review,
     )
     markdown_path = Path(args.output_path) if args.output_path else default_operator_brief_path(
         account_slug,

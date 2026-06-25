@@ -288,6 +288,8 @@ This writes:
 
 The brief summarizes the account goal, what changed from the previous run, what is ready for approval, what is already approved to execute, what still needs human judgment, and any Meta AI / Advantage follow-ups.
 
+Before the brief is built, an adversarial **review gate** re-checks each recommendation from its own cited evidence and claimed confidence band (sample size, window length, correlation-vs-cause, whether the band is actually earned, and whether the action agrees with its own number). Calls that fail are corrected (band downgraded) or dropped from their normal section and surfaced — never silently deleted — under a "Refuted / Downgraded By Review" heading, with the failing input and reason shown. The gate can only ever demote a call, never promote one. Pass `--no-review` to skip the gate and reproduce the pre-gate brief.
+
 ## What The Report Covers
 
 - Executive summary

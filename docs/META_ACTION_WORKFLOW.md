@@ -49,6 +49,15 @@ Actions are generated with `status: "proposed"`.
 
 Only executable actions with `status: "approved"` are sent to the Meta Graph API. Non-executable actions remain operator tasks, even if their status is changed.
 
+## Evidence and Confidence
+
+Each recommendation-bearing action (`pause_ad`, `increase_adset_budget`, `consider_scale_budget`, `refresh_creative`) carries two structured blocks:
+
+- `evidence`: the deterministic facts behind the call — the metric the decision rests on (ROAS for ROAS-goal accounts, cost-per-install for install-goal accounts), the window, the sample (purchases / spend), the entity, and a `regenerating_query` that reproduces the metric.
+- `confidence`: a computed band (`high` / `medium` / `low` / `abstain`) from the shared confidence engine. The band is never free-typed; it is derived from sample size, recency, and how causal the evidence is. Grounding caps data strength, so a large-sample correlational call can never read `high`.
+
+For the executable pause/budget paths, a sample below the significance floor (too few conversions and too little spend) does **not** become a confident pause or scale. The action is flipped to a non-executable `verdict: "insufficient_data"` recommendation — "promising test, keep running and re-check as more data accrues" — with `executable: false` and `approval_required: false`, so thin data can never be approved into a write.
+
 ## Account Goals
 
 Account-specific action policy lives in `config/meta_ads_accounts.json`.
@@ -125,6 +134,28 @@ The operator brief turns the generated `action_plan.json` into:
 - what is approved to execute,
 - what still needs human judgment,
 - and which account goal each action supports.
+
+Under every recommendation the brief also surfaces the action's `evidence` and `confidence`
+(carried through from the action plan, not recomputed): a compact `Evidence:` line (the number,
+window, sample, and entity), a `Confidence:` band line in the shared 🟢/🟡/🔴/⚪ vocabulary, a
+`Re-check:` line with the exact `account_metrics` command that reproduces the number, and what
+would raise or lower the band. Abstain actions read as "Insufficient data — keep running" (never a
+percentage), and a correlational causal claim shows the "confirm via A/B" caveat plus the offer to
+file an experiment via `experiment define`.
+
+Before the brief is assembled, an adversarial **review gate** (`review.py`) re-derives each
+recommendation's confidence from its own cited evidence + claimed band — deliberately not trusting
+the producing rationale's conclusion — and tries to refute it: sample below the significance floor
+(→ insufficient/keep running), a window shorter than `REVIEW_MIN_WINDOW_DAYS` (→ downgrade), a
+causal claim from non-experimental data, a band that exceeds what the rubric recomputes, external
+evidence read above `low`, and an action whose direction contradicts its own cited metric versus the
+account goal (→ refuted). The gate can only ever **demote** (lower a band, flip
+executable→non-executable, demote out of `approved`) — it never raises a band or promotes a status,
+so it sits upstream of the guarded-write approval and cannot weaken it. Refuted/insufficient calls
+appear in their own `Refuted / Downgraded By Review` section (surfaced, never silently dropped); a
+downgrade that keeps its section gets a compact `↓ Review:` line. Pass `--no-review` to
+`operator-brief` to skip the gate. (Semantic refutations — KB-narrative contradiction, cherry-picked
+windows — are the companion `adversarial-review-protocol` doc procedure, not this code gate.)
 
 It writes:
 

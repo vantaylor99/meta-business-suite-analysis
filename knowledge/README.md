@@ -71,7 +71,14 @@ account). This is the path toward the multi-account specialist template.
 - **experiments.md** tracks hypotheses with: hypothesis, change made, status, what we're
   waiting on, success signal, and (when done) the conclusion. Move concluded learnings into
   `learnings.md` so they become permanent.
-- **learnings.md** holds generalized, durable facts — date-stamp each so staleness is visible.
+- **learnings.md** holds generalized, durable facts — date-stamp each so staleness is visible, and
+  give every entry a **provenance tag + `Rot:`/`Verified:` header** in the format below. Run
+  `python -m meta_ads_analysis lint-vault` after editing it; the checker fails on missing/invalid
+  provenance and flags stale `fast` facts for re-verification. To actually *re-verify* a flagged
+  fact (or spot one that has quietly gone stale), run
+  `python -m meta_ads_analysis audit-vault --account <slug>`: it re-pulls each `metric:` claim
+  against fresh live data and surfaces drift (see "Re-verifying with `audit-vault`" below). A new
+  account/specialist inherits this file as a template, so keep the discipline.
 - Convert relative dates to absolute. Cite ad set / ad names and IDs so entries are actionable cold.
 - Keep entries concise and skimmable. This base should stay readable in a few minutes.
 - **Update this base at the end of any session** that changed an account or taught us something.
@@ -112,14 +119,178 @@ observation or inference. Always flag when evidence is confounded.
 - When an experiment in `experiments.md` concludes, fold its result into the relevant learning
   as a new dated ➕/➖ evidence line and adjust the level.
 
-**Entry template:**
+**This same rubric is now computed in code.** `src/meta_ads_analysis/confidence.py` scores live
+operator-facing recommendations with the **identical 🟢/🟡/🔴 vocabulary** (plus a fourth band, ⚪
+**Insufficient data — abstain**, for live calls below the significance floor — where we abstain
+rather than report a low percentage). It is deliberately one language: the human rubric here and the
+code rubric there must never drift into two scales. The code computes a band from *deterministic
+inputs* — sample size, recency, evidence tier, significance — never a number the model free-types,
+and it caps a causal claim that lacks an A/B test exactly the way the "evidence strength" ladder
+above does. The full prose rules for **grounding tiers** and **external evidence** are in the two
+subsections that follow.
+
+**Every live recommendation is re-checked by a two-layer adversarial review before it reaches the
+operator.** Producing a band is not the last word — a fresh-eyes pass then tries to *refute* each
+pause/scale/budget call from its cited basis alone, and downgrades or drops the ones that can't
+survive:
+
+- **Deterministic layer — `src/meta_ads_analysis/review.py`.** Re-derives the band from the cited
+  evidence via `confidence.assess` and runs the *arithmetic / structural* refutations (sample-floor,
+  window-length, causal-cap, band-earned, scale/pause direction, external-cap). It is demote-only and
+  sits upstream of the guarded-write approval — it can lower a call, never raise or approve one.
+- **Semantic layer — the agent rule in [`AGENTS.md`](../AGENTS.md) ("Adversarial-review rule").** The
+  refutations code can't make: does the call contradict a learning here or a `decision-log.md` entry,
+  is the window cherry-picked over a relearning period (the reviewer may re-pull the *same* metric to
+  check, never invent one), is a prose call grounded, is web evidence being treated as confirmation
+  instead of a hypothesis.
+
+Both layers speak the **same 🟢/🟡/🔴/⚪ vocabulary** and the same verdicts (**stands / downgrade /
+refuted / insufficient**) — one confidence language, never two.
+
+**Entry template** (every field below is **required and machine-checked** by `lint-vault` — see
+"Provenance format" just below):
 
 ```
 ### <one-line claim>
 **Confidence:** 🟡 Medium ↑  ·  **Domain:** platform | strategy | measurement
-- ➕ YYYY-MM-DD — <supporting evidence> _(evidence type; account/source)_
-- ➖ YYYY-MM-DD — <contradicting evidence>
+**Rot:** fast | evergreen  ·  **Verified:** YYYY-MM-DD
+- ➕ YYYY-MM-DD — <supporting evidence> `verify: account_metrics --account <slug> --level <lvl> --date-from <f> --date-to <t>` _(src: direct_observation · acct: divine_designs · metric: blended_roas=3.74)_
+- ➖ YYYY-MM-DD — <contradicting evidence> _(src: correlational · acct: divine_designs)_
 **Apply:** <how to act on it>
 **Would raise / lower:** <evidence that would move confidence>
 ```
+
+### Provenance format (what each tag means, and what `lint-vault` enforces)
+
+Every `➕`/`➖` evidence line ends with a structured `_( … )_` tag, and every entry carries a rot
+class + last-verified date. This makes provenance **regex-checkable** so a wrong guess can't quietly
+harden into a "fact" — it is the knowledge-base counterpart to the live `confidence.py` engine, and
+the two speak **ONE** vocabulary (the `src` tiers below ARE `confidence.EvidenceTier`, not a second
+scale).
+
+**Evidence-line tag fields:**
+
+- `src: <tier>` — **required on every evidence line.** One of the five `confidence.EvidenceTier`
+  names (lowest→highest grounding): `model_inference`, `external`, `correlational`,
+  `direct_observation`, `ab_experiment` (see the "Grounding tiers" table below for each tier's
+  ceiling band). The conceptual *observed / inferred / external* axis maps onto these: observed =
+  {`direct_observation`, `ab_experiment`}, inferred = {`correlational`, `model_inference`}, external
+  = `external`. Use the tier names, never a parallel three-word set.
+- `acct: <slug|—>` — the account the evidence came from, or `—` for an account-agnostic fact
+  (a platform mechanic, a methodological principle).
+- `metric: <name>=<value>` — **required when the evidence cites a live-account number** (e.g.
+  `metric: blended_roas=3.74`). Its presence marks the line *auditable*: the dependent `audit-vault`
+  pass re-runs it. A line carrying `metric:` **MUST** also carry an inline
+  `` `verify: account_metrics …` `` command (auditable ⇒ reproducible).
+- A `src: external` line **MUST** carry a URL (and per "External evidence" below, a date + verbatim
+  quote) — `lint-vault` fails an external line with no link.
+
+**Entry-level fields:**
+
+- `**Rot:** fast | evergreen` — volatility class.
+  - `fast` = depends on *this account's current numbers* or *current platform UI/policy state* (e.g.
+    "Engaged Audience holds ~3.7 ROAS", "IG > FB on this account"). Subject to staleness: a `fast`
+    entry whose `Verified` date is older than `KNOWLEDGE_REVERIFY_DAYS` (≈6 weeks) is flagged
+    `⏳ re-verify`.
+  - `evergreen` = a platform/API mechanic that only changes if Meta changes the API (the
+    dev-mode-app blocker, `validate_only` honored, AA blocks audience edits) **or** a durable
+    strategy principle ("lead with a hook"). **Never** auto-flagged on age.
+- `**Verified:** YYYY-MM-DD` — the date the claim was last confirmed (initially its first evidence
+  date; `audit-vault --apply` refreshes it when it re-runs the claim).
+
+`lint-vault` (`python -m meta_ads_analysis lint-vault`, or the `lint_vault` console script) reads
+`learnings.md` and reports **errors** (missing/invalid `src`, missing `Rot`/`Verified`, a `metric:`
+line with no `verify:`, a `src: external` line with no URL, an untagged evidence line — these exit
+nonzero, CI-usable) and **warnings** (`⏳ re-verify` for stale `fast` facts; `--strict` makes those
+fail too). It also age-checks the one `**Rot:**`/`**Verified:**` header on `profile.md`'s
+Performance-baseline section. Time is passed in (`--today`), never read from the clock, so runs are
+deterministic. The **`audit-vault`** pass (below) reuses this parser to re-pull each `metric:`
+line's `verify:` query against fresh data and flag drift.
+
+### Re-verifying with `audit-vault` (does the stored number still hold?)
+
+`lint-vault` checks *format* and *age*; **`audit-vault` checks the number against reality.** Run
+`python -m meta_ads_analysis audit-vault --account <slug>` (or the `audit_vault` console script).
+For every account-scoped, data-backed `metric:` claim it re-pulls that metric over a **fresh
+trailing window of the stored length, ending `--as-of` (default today)** — i.e. *current* data, not
+the original historical window (so a date mismatch in the logged `➖` is expected, not a bug) — and
+diffs fresh vs stored:
+
+- **Confirmed** (fresh ≈ stored): with `--apply`, only the entry's `**Verified:**` date is refreshed
+  — *this is how a `lint-vault ⏳ re-verify` flag clears.* The band is **not** raised (re-confirming
+  the same kind of window is not independent corroboration).
+- **Contradicted** (relative change ≥ `KNOWLEDGE_DRIFT_PCT`, 25%) or **refuted** (the fresh value
+  crosses a policy threshold — `target_roas` / `pause_roas_floor` — the stored value sat on the other
+  side of): the contradiction is surfaced **loudly (⚠️)**, and with `--apply` a dated `➖` evidence
+  line is appended and the **band is lowered one level** (🟢→🟡→🔴; a refute drops to 🔴 Low and marks
+  the claim `(contested)`). **The claim text is never edited and the entry is never deleted — a human
+  decides deletion.**
+- **Insufficient fresh data / could-not-audit:** a fresh sample below the significance floor (a quiet
+  week) or a vanished entity / missing value is reported but **abstains** — it never refutes a real
+  fact and never moves the band.
+
+It is **read-only against Meta** (only ever reads metrics) and **report-only by default** — without
+`--apply` it makes zero changes to `learnings.md`. The verdict math reuses the live
+`confidence.py` engine (the band ladder and the `data_strength` floor), so the audit and the
+recommendation engine speak one vocabulary.
+
+## Grounding tiers (how causal is the evidence?)
+
+Confidence has **two axes, and the weaker one governs** (this is `combine_bands = min(...)` in
+`confidence.py`):
+
+1. **Data strength** — is there enough recent, significant data to trust the number? (sample size,
+   recency, statistical significance) — the "Evidence strength" ladder above.
+2. **Grounding tier** — how *causal* is the evidence? An A/B experiment grounds a causal claim; a
+   cross-sectional correlation does not, no matter how large the sample.
+
+The grounding tier is the code's `EvidenceTier` (lowest → highest), and each tier has a **ceiling**
+band it can reach (`_TIER_CEILING` in `confidence.py`) — data strength can land lower, never higher:
+
+| Grounding tier (`EvidenceTier`) | What it is | Ceiling band |
+| --- | --- | --- |
+| `ab_experiment` | a completed A/B with the one variable isolated | 🟢 High |
+| `direct_observation` | a directly observed platform behavior / clean before-after on the same entity | 🟢 High |
+| `correlational` | a cross-sectional comparison of different entities (confounded) | 🟡 Medium |
+| `external` | the web / practitioner advice — about advertising in general, not this account | 🔴 Low |
+| `model_inference` | the model's own inference with no first-party data behind it | 🔴 Low |
+
+Because the **weaker axis caps the combined band**, a huge-but-correlational sample cannot read High,
+and a web-only claim cannot exceed 🔴 Low. The **causal-language guard** is part of this axis: a
+recommendation that asserts *cause* ("X drives ROAS", "because", "leads to") from any
+non-`ab_experiment` tier is labeled **"correlational — confirm via A/B"** and downgraded one band.
+
+## External evidence (the web) is a hypothesis source, never a confirmation
+
+The web is enormously useful for ideas and dangerous as proof. The dividing line:
+
+- **Account data answers "is this true for THIS account?"; external evidence answers "what's worth
+  trying?"** The hard rule: **external findings feed the hypothesis / experiment queue, never the
+  confidence score of a live recommendation.** "Square video wins in Reels" → `experiment define` an
+  A/B, **not** "+confidence on this ad." A code path or prose that treats a web finding as
+  *confirmation* about this account — that lets it raise a live recommendation's band — is a **defect**;
+  route it to `experiment define` instead.
+- **Grounding tier, capped.** `external` sits **below every first-party source and above only
+  `model_inference`** (see the table above). Because the weaker axis caps the band, a web-only
+  recommendation reads **at most 🔴 Low** (`_TIER_CEILING[external] = low`) — usually phrased
+  "🔴 Low (hypothesis — confirm via A/B)." It can never, on its own, reach Medium or High.
+- **Cite the source; quote, don't paraphrase.** An external claim needs a **link + a date + a
+  verbatim quote** of the key claim. **An external claim with no citable source is not usable** —
+  drop it. (The model summarizing the web is itself a hallucination surface; quoting the source
+  blocks an invented "everyone agrees" consensus that no page actually says.)
+- **Recency-weighted, NOT upvote-weighted.** Upvotes measure gameable popularity — never a confidence
+  multiplier, at most a weak tie-breaker. For Meta, **recency dominates**: an old high-upvote post
+  about a **platform tactic** (a placement trick, a setting, a current-UI workflow) is a *trap* —
+  Meta changes monthly. Distinguish fast-rotting **platform tactics** from slow-rotting **evergreen
+  principles** (hook fast, test creative, don't over-narrow) and weight accordingly: a 2019 tactic is
+  near-worthless; a 2019 principle may still hold.
+- **Source-quality tiers.** Meta's own docs, or a **named practitioner who shows their methodology**,
+  rank above an anonymous "this worked for me." But even Meta's docs describe *general* platform
+  behavior, **not this account** — so the `external` cap still applies; first-party data always wins
+  the moment it exists.
+- **Cold-start exception (where external earns its keep).** When the account has **no data** on
+  something new — a new creative direction, ad type, or audience — a clearly **labeled `external`**
+  prior may inform the *initial* call (still capped 🔴 Low). The instant first-party data exists,
+  **account data dominates** and the confidence is recomputed from it via `assess(...)`; the external
+  prior drops to a footnote.
 

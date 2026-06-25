@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -12,13 +13,59 @@ from meta_ads_analysis.actions import (
     build_action_plan,
     build_api_operation,
     enrich_action_plan_with_live_state,
+    evaluate_action_confidence,
 )
 from meta_ads_analysis.account_registry import load_account_registry, resolve_account
 from meta_ads_analysis.analyze import build_report_payload
 from meta_ads_analysis.briefs import build_operator_brief, render_operator_brief
 from meta_ads_analysis.cli import build_meta_report_main, ingest_meta_exports_main, sync_meta_api_main
+from meta_ads_analysis.config import CONFIDENCE_RECENCY_STALE_DAYS
+from meta_ads_analysis.confidence import (
+    BAND_PRESENTATION,
+    Band,
+    Evidence,
+    EvidenceTier,
+    abstain_confidence,
+    assess,
+    build_regenerating_query,
+    combine_bands,
+    confidence_from_dict,
+    confidence_to_dict,
+    data_strength,
+    detect_causal_language,
+    evidence_from_dict,
+    evidence_to_dict,
+    grounding_strength,
+    render_confidence_line,
+    render_evidence_line,
+)
+from meta_ads_analysis.knowledge_provenance import (
+    AUDIT_CONFIRMED,
+    AUDIT_CONTRADICTED,
+    AUDIT_COULD_NOT,
+    AUDIT_INSUFFICIENT,
+    AUDIT_REFUTED,
+    BAND_EMOJIS,
+    FreshSample,
+    TIER_NAMES,
+    apply_entry_edits,
+    audit_claim,
+    classify_drift,
+    lint,
+    lint_profile_baseline,
+    lower_band_emoji,
+    parse_learnings,
+    plan_edits,
+    render_report,
+    select_auditable,
+)
 from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
+from meta_ads_analysis.review import (
+    ReviewResult,
+    review_action_plan,
+    review_recommendation,
+)
 from meta_ads_analysis.reporting import render_markdown_report
 from meta_ads_analysis.storage import connect, fetch_run_rows, replace_run_rows
 from meta_ads_analysis.sync_api import resolve_date_window
@@ -1083,6 +1130,916 @@ def test_operator_brief_moves_failed_live_lookup_to_do_not_touch() -> None:
     assert brief["ready_for_review"] == []
     assert brief["do_not_touch_yet"][0]["action_id"] == "pause_ad_1"
     assert brief["needs_human_judgment"][0]["action_id"] == "refresh_creative_1"
+
+
+def _evidence_for_brief(*, purchases: float | None, spend: float | None) -> Evidence:
+    """A populated, recent Evidence for a divine_designs ad — drives a reproducible re-check line."""
+    return Evidence(
+        metric_name="blended_roas",
+        metric_value=1.20,
+        metric_display="ROAS 1.20",
+        window="2026-06-10..2026-06-24",
+        sample_purchases=purchases,
+        sample_spend=spend,
+        entity_level="ad",
+        entity_id="123",
+        entity_name="Cody - Copy",
+        regenerating_query=build_regenerating_query("divine_designs", "ad", "2026-06-10", "2026-06-24"),
+    )
+
+
+def _action_with_confidence(
+    *,
+    action_id: str,
+    status: str,
+    executable: bool,
+    rationale: str,
+    evidence: Evidence,
+    confidence,
+) -> dict:
+    return {
+        "action_id": action_id,
+        "action_type": "pause_ad",
+        "status": status,
+        "executable": executable,
+        "target": {"type": "ad", "id": "123", "name": "Cody - Copy"},
+        "params": {"status": "paused"},
+        "rationale": rationale,
+        "evidence": evidence_to_dict(evidence),
+        "confidence": confidence_to_dict(confidence),
+    }
+
+
+def test_operator_brief_renders_high_confidence_evidence_and_recheck_line() -> None:
+    # Parent use case: an auditor can re-run the named query to confirm the number. A high-confidence
+    # pause must surface the band, the four evidence facts, and the exact account_metrics command.
+    evidence = _evidence_for_brief(purchases=120.0, spend=2400.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert confidence_to_dict(confidence)["band"] == "high"  # precondition
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="pause_ad_123",
+                status="approved",
+                executable=True,
+                rationale="High waste risk: ROAS well below the account floor.",
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    brief = build_operator_brief(plan=plan)
+    markdown = render_operator_brief(brief)
+
+    # Evidence + confidence carried through to the JSON (additive).
+    carried = brief["approved_to_execute"][0]
+    assert carried["confidence"]["band"] == "high"
+    assert carried["evidence"]["metric_display"] == "ROAS 1.20"
+
+    # Band (one vocabulary), the four evidence facts, and the re-check command all render.
+    assert "🟢 High (~80–100%)" in markdown
+    assert "ROAS 1.20" in markdown                       # the number
+    assert "2026-06-10..2026-06-24" in markdown          # the time window
+    assert "120 purchases" in markdown                   # the sample size
+    assert "ad:123 'Cody - Copy'" in markdown            # which ad
+    assert (
+        "Re-check: account_metrics --account divine_designs --level ad "
+        "--date-from 2026-06-10 --date-to 2026-06-24"
+    ) in markdown
+    assert "Would raise:" in markdown and "Would lower:" in markdown
+
+
+def test_operator_brief_abstain_action_reads_as_keep_running_not_a_percentage() -> None:
+    # An abstain must read as a promising test ("keep running"), be visually distinct (⚪, not 🔴),
+    # and never show a percentage.
+    evidence = _evidence_for_brief(purchases=2.0, spend=40.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert confidence_to_dict(confidence)["band"] == "abstain"  # precondition
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="pause_ad_thin",
+                status="proposed",
+                executable=False,
+                rationale="Treat as a promising test: keep running and re-check.",
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "⚪ Insufficient data — keep running" in markdown
+    assert "🔴 Low" not in markdown
+    # No band percentage at all for an abstain (no range token, no precise score).
+    assert "%" not in markdown
+
+
+def test_operator_brief_causal_flag_action_offers_an_ab_experiment() -> None:
+    # A correlational claim that asserts cause must carry the visible caveat and the offer to file an
+    # experiment to confirm it (the brief surfaces the offer in text; it does not auto-file).
+    evidence = _evidence_for_brief(purchases=120.0, spend=2400.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+        causal_text="ROAS is low because this creative drives wasted spend.",
+    )
+    assert confidence_to_dict(confidence)["causal_flag"] is True  # precondition
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="refresh_creative_123",
+                status="proposed",
+                executable=True,
+                rationale="Creative appears to drive waste.",
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "correlational — confirm via A/B" in markdown
+    assert "experiment define" in markdown
+
+
+def test_operator_brief_never_prints_false_precision_or_none() -> None:
+    # The band range "~80–100%" is allowed, but no two-significant-figure precise score (e.g. 82.4%).
+    evidence = _evidence_for_brief(purchases=120.0, spend=2400.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="pause_ad_123",
+                status="approved",
+                executable=True,
+                rationale="High waste risk.",
+                evidence=evidence,
+                confidence=confidence,
+            ),
+            # An action carrying no evidence/confidence must render gracefully (no block, no "None").
+            {
+                "action_id": "measurement_review_0",
+                "action_type": "measurement_review",
+                "status": "proposed",
+                "executable": False,
+                "target": {"type": "account", "id": "acct"},
+                "params": {},
+                "rationale": "Tracking looks off; verify the pixel.",
+                "evidence": {},
+            },
+        ],
+    }
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "~80–100%" in markdown                          # the range is fine
+    assert re.search(r"\d{1,3}\.\d+%", markdown) is None    # but no precise percent score
+    # The no-evidence action renders its bullet with no block — never "Evidence/Confidence: None".
+    assert "measurement_review_0" in markdown
+    assert "Evidence: None" not in markdown and "Confidence: None" not in markdown
+
+
+def test_operator_brief_evidence_without_regen_omits_recheck_line() -> None:
+    # The re-check command can be absent (build_regenerating_query returns None when the account /
+    # level / window cannot be determined). The Evidence facts must still render, with no orphan
+    # "Re-check:" line.
+    evidence = Evidence(
+        metric_name="blended_roas",
+        metric_value=1.20,
+        metric_display="ROAS 1.20",
+        window="2026-06-10..2026-06-24",
+        sample_purchases=120.0,
+        sample_spend=2400.0,
+        entity_level="ad",
+        entity_id="123",
+        entity_name="Cody - Copy",
+        regenerating_query=None,
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="pause_ad_123",
+                status="approved",
+                executable=True,
+                rationale="High waste risk.",
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "ROAS 1.20" in markdown          # facts still render
+    assert "🟢 High" in markdown            # band still renders
+    assert "Re-check:" not in markdown      # no orphan re-check line when no query exists
+
+
+def test_operator_brief_confidence_without_evidence_renders_band_only() -> None:
+    # A confidence block can arrive without an evidence block; the band line must still render (no
+    # Evidence / Re-check lines, no "None").
+    evidence = _evidence_for_brief(purchases=120.0, spend=2400.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    action = _action_with_confidence(
+        action_id="pause_ad_123",
+        status="approved",
+        executable=True,
+        rationale="High waste risk.",
+        evidence=evidence,
+        confidence=confidence,
+    )
+    action["evidence"] = {}  # confidence present, evidence absent
+    plan = {"account_slug": "divine_designs", "run_date": "2026-06-24", "actions": [action]}
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "🟢 High" in markdown
+    assert "Evidence:" not in markdown
+    assert "Re-check:" not in markdown
+    assert "Evidence: None" not in markdown
+
+
+# ---------------------------------------------------------------------------
+# Adversarial review gate (review.py)
+# ---------------------------------------------------------------------------
+
+
+def _review_evidence(
+    *,
+    window: str,
+    purchases: float | None,
+    spend: float | None,
+    metric_value: float | None = 2.0,
+    metric_name: str = "blended_roas",
+) -> Evidence:
+    return Evidence(
+        metric_name=metric_name,
+        metric_value=metric_value,
+        metric_display=f"ROAS {metric_value:.2f}" if metric_value is not None else "ROAS n/a",
+        window=window,
+        sample_purchases=purchases,
+        sample_spend=spend,
+        entity_level="ad",
+        entity_id="123",
+        entity_name="Cody - Copy",
+        regenerating_query=None,
+    )
+
+
+def test_review_below_floor_returns_insufficient() -> None:
+    # Parent use case: the "9-purchase winner" must never reach the brief as a confident call.
+    evidence = _review_evidence(window="2026-06-19..2026-06-24", purchases=9.0, spend=40.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "consider_scale_budget"},
+        policy={},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "insufficient"
+    assert "sample_floor" in result.failed_inputs
+    assert any("floor" in reason for reason in result.reasons)
+
+
+def test_review_short_window_downgrades() -> None:
+    # ROAS 1.1 over a 3-day window: the sample clears the floor but the window may be unrepresentative.
+    evidence = _review_evidence(
+        window="2026-06-21..2026-06-24", purchases=30.0, spend=200.0, metric_value=1.1
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert "window_length" in result.failed_inputs
+    assert Band[result.revised_band] < Band[result.original_band]
+    assert any("unrepresentative" in reason for reason in result.reasons)
+
+
+def test_review_causal_correlational_downgrades() -> None:
+    # A causal claim from correlational data whose band was (hand-)inflated above the causal cap.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=4.0
+    )
+    confidence = {
+        "band": "high",
+        "data_band": "high",
+        "grounding_band": "medium",
+        "grounding_tier": "correlational",
+        "factors": [],
+        "would_raise": "",
+        "would_lower": "",
+        "causal_flag": True,
+    }
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "consider_scale_budget"},
+        policy={},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert "causal" in result.failed_inputs
+    assert Band[result.revised_band] < Band.high
+    assert any("A/B" in reason for reason in result.reasons)
+
+
+def test_review_band_earned_downgrades() -> None:
+    # The claimed band is stronger than confidence.assess recomputes from the same evidence.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=30.0, spend=200.0, metric_value=1.0
+    )
+    confidence = confidence_to_dict(
+        assess(
+            evidence=evidence,
+            tier=EvidenceTier.direct_observation,
+            spend_floor=100.0,
+            conversions_floor=25.0,
+            recency_days=1,
+        )
+    )
+    assert confidence["band"] == "medium"  # precondition: the rubric supports medium
+    confidence["band"] = "high"  # ...but the stored band drifted up to high
+
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert "band_earned" in result.failed_inputs
+    assert result.revised_band == "medium"
+    assert Band[result.revised_band] < Band.high
+
+
+def test_review_external_caps_at_low() -> None:
+    # External evidence is a hypothesis: a live call grounded in it cannot read above low.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=3.0
+    )
+    confidence = {
+        "band": "medium",
+        "data_band": "medium",
+        "grounding_band": "low",
+        "grounding_tier": "external",
+        "factors": [],
+        "would_raise": "",
+        "would_lower": "",
+        "causal_flag": False,
+    }
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "consider_scale_budget"},
+        policy={},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert "external" in result.failed_inputs
+    assert result.revised_band == "low"
+    assert any("experiment define" in reason for reason in result.reasons)
+
+
+def test_review_direction_contradiction_refutes() -> None:
+    # Pausing an ad whose cited ROAS is well above the account target contradicts its own number.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=6.0
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "pause_ad"},
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert result.revised_band is None  # refuted carries no corrected band
+
+
+def test_review_clean_call_stands() -> None:
+    # A pause with a large sample, a long recent window, and a direct-observation tier survives.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=1.0
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert isinstance(result, ReviewResult)
+    assert result.verdict == "stands"
+    assert result.failed_inputs == []
+    assert result.revised_band is None
+    assert result.original_band == confidence_to_dict(confidence)["band"]
+
+
+def test_review_causal_ab_experiment_is_never_downgraded() -> None:
+    # An A/B experiment IS the causal evidence — a causal claim grounded in it must NOT be downgraded
+    # by the causal guard (the exemption the producer's grounding_strength encodes). Locks the
+    # tier != ab_experiment guard in check 3.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=4.0
+    )
+    confidence = {
+        "band": "high",
+        "data_band": "high",
+        "grounding_band": "high",
+        "grounding_tier": "ab_experiment",
+        "factors": [],
+        "would_raise": "",
+        "would_lower": "",
+        "causal_flag": True,
+    }
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "consider_scale_budget"},
+        policy={},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "stands"
+    assert "causal" not in result.failed_inputs
+
+
+def test_review_scale_below_target_refutes() -> None:
+    # The mirror of the pause-a-winner case: scaling an entity whose cited ROAS is below the account
+    # target contradicts its own number.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=1.5
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "increase_adset_budget"},
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert any("below the 3 target" in reason for reason in result.reasons)
+
+
+def test_review_no_claimed_band_is_defensive_noop() -> None:
+    # A confidence block with no recognizable band has nothing to refute → stands (never crashes,
+    # never fabricates a verdict).
+    evidence = _review_evidence(window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0)
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence={"band": None},
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "stands"
+    assert result.failed_inputs == []
+
+
+def test_review_accumulates_multiple_downgrades_most_conservative_wins() -> None:
+    # A short window (one-band downgrade) AND external evidence (cap at low) both fire on one call;
+    # the most-conservative revised band wins and BOTH failing inputs are named.
+    evidence = _review_evidence(
+        window="2026-06-21..2026-06-24", purchases=120.0, spend=2400.0, metric_value=2.0
+    )
+    confidence = {
+        "band": "medium",
+        "data_band": "medium",
+        "grounding_band": "low",
+        "grounding_tier": "external",
+        "factors": [],
+        "would_raise": "",
+        "would_lower": "",
+        "causal_flag": False,
+    }
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert {"window_length", "external"} <= set(result.failed_inputs)
+    # external caps at low, which is more conservative than the one-band window downgrade (→ low).
+    assert result.revised_band == "low"
+
+
+def _confidence_action(
+    *,
+    action_id: str,
+    action_type: str,
+    status: str,
+    executable: bool,
+    evidence: Evidence,
+    confidence,
+    rationale: str = "Cited rationale.",
+) -> dict:
+    return {
+        "action_id": action_id,
+        "action_type": action_type,
+        "status": status,
+        "executable": executable,
+        "target": {"type": "ad", "id": "123", "name": "Cody - Copy"},
+        "params": {"status": "paused"} if action_type == "pause_ad" else {},
+        "rationale": rationale,
+        "evidence": evidence_to_dict(evidence),
+        "confidence": confidence_to_dict(confidence),
+    }
+
+
+def test_review_action_plan_below_floor_flips_to_keep_running() -> None:
+    evidence = _review_evidence(window="2026-06-19..2026-06-24", purchases=9.0, spend=40.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _confidence_action(
+                action_id="consider_scale_budget_123",
+                action_type="consider_scale_budget",
+                status="proposed",
+                executable=False,
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    reviewed = review_action_plan(plan)
+    action = reviewed["actions"][0]
+
+    assert action["review"]["verdict"] == "insufficient"
+    assert action["executable"] is False
+    assert action["verdict"] == "insufficient_data"
+    assert action["confidence"]["band"] == "abstain"
+    assert any("floor" in reason for reason in action["review"]["reasons"])
+    # The input plan was not mutated.
+    assert "review" not in plan["actions"][0]
+
+
+def test_review_action_plan_skips_non_recommendation_actions() -> None:
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            {
+                "action_id": "measurement_review_1",
+                "action_type": "measurement_review",
+                "status": "proposed",
+                "executable": False,
+                "target": {"type": "account", "id": "acct"},
+                "params": {},
+                "rationale": "Verify the pixel.",
+                "evidence": {},
+            }
+        ],
+    }
+
+    reviewed = review_action_plan(plan)
+    action = reviewed["actions"][0]
+
+    assert "review" not in action  # no confidence block → never reviewed
+    assert action == plan["actions"][0]  # passed through untouched
+
+
+def test_review_gate_only_ever_demotes() -> None:
+    clean_evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=1.0
+    )
+    clean_conf = assess(
+        evidence=clean_evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    winner_evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=6.0
+    )
+    winner_conf = assess(
+        evidence=winner_evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "account_action_policy": {"primary_goal": "roas", "target_roas": 3.0},
+        "actions": [
+            _confidence_action(
+                action_id="pause_ad_clean",
+                action_type="pause_ad",
+                status="proposed",
+                executable=True,
+                evidence=clean_evidence,
+                confidence=clean_conf,
+            ),
+            _confidence_action(
+                action_id="pause_ad_winner",
+                action_type="pause_ad",
+                status="approved",
+                executable=True,
+                evidence=winner_evidence,
+                confidence=winner_conf,
+            ),
+        ],
+    }
+
+    reviewed = review_action_plan(plan)
+
+    for before, after in zip(plan["actions"], reviewed["actions"]):
+        # executable is never raised
+        assert not (after["executable"] and not before["executable"])
+        # status is never promoted to approved
+        assert not (after.get("status") == "approved" and before.get("status") != "approved")
+        # the band is never raised
+        assert Band[after["confidence"]["band"]] <= Band[before["confidence"]["band"]]
+
+    # the winner was actually demoted (refuted), proving the gate fired
+    winner = reviewed["actions"][1]
+    assert winner["review"]["verdict"] == "refuted"
+    assert winner["executable"] is False
+    assert winner["status"] == "proposed"
+
+
+def test_review_action_plan_is_idempotent() -> None:
+    short_window_evidence = _review_evidence(
+        window="2026-06-21..2026-06-24", purchases=30.0, spend=200.0, metric_value=1.1
+    )
+    short_window_conf = assess(
+        evidence=short_window_evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    clean_evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=1.0
+    )
+    clean_conf = assess(
+        evidence=clean_evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _confidence_action(
+                action_id="pause_ad_short",
+                action_type="pause_ad",
+                status="approved",
+                executable=True,
+                evidence=short_window_evidence,
+                confidence=short_window_conf,
+            ),
+            _confidence_action(
+                action_id="pause_ad_clean",
+                action_type="pause_ad",
+                status="proposed",
+                executable=True,
+                evidence=clean_evidence,
+                confidence=clean_conf,
+            ),
+        ],
+    }
+
+    once = review_action_plan(plan)
+    twice = review_action_plan(once)
+
+    assert once["actions"][0]["review"]["verdict"] == "downgrade"  # precondition: a real correction
+    assert twice == once
+
+
+def test_operator_brief_review_refuted_direction_surfaced_not_approved() -> None:
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=6.0
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "account_action_policy": {"primary_goal": "roas", "target_roas": 3.0},
+        "actions": [
+            _confidence_action(
+                action_id="pause_ad_winner",
+                action_type="pause_ad",
+                status="approved",
+                executable=True,
+                evidence=evidence,
+                confidence=confidence,
+                rationale="High waste risk.",
+            )
+        ],
+    }
+
+    brief = build_operator_brief(plan=plan)
+
+    assert brief["approved_to_execute"] == []
+    assert [a["action_id"] for a in brief["refuted_or_downgraded_by_review"]] == ["pause_ad_winner"]
+    assert brief["summary"]["reviewed_out_count"] == 1
+
+    markdown = render_operator_brief(brief)
+    approved_section = markdown.split("## Approved To Execute", 1)[1].split("## ", 1)[0]
+    assert "pause_ad_winner" not in approved_section
+    review_section = markdown.split("## Refuted / Downgraded By Review", 1)[1]
+    assert "pause_ad_winner" in review_section
+    assert "direction" in review_section
+
+
+def test_operator_brief_no_review_reproduces_pre_gate_behavior() -> None:
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=6.0
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "account_action_policy": {"primary_goal": "roas", "target_roas": 3.0},
+        "actions": [
+            _confidence_action(
+                action_id="pause_ad_winner",
+                action_type="pause_ad",
+                status="approved",
+                executable=True,
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    brief = build_operator_brief(plan=plan, review_enabled=False)
+
+    # With the gate off the contradictory call is NOT filtered (escape hatch reproduces old behavior).
+    assert [a["action_id"] for a in brief["approved_to_execute"]] == ["pause_ad_winner"]
+    assert brief["refuted_or_downgraded_by_review"] == []
 
 
 def test_api_operation_only_allows_explicit_pause_without_meta_ai_params() -> None:
@@ -2441,6 +3398,82 @@ def test_build_watch_report_protects_young_flags_mature() -> None:
     assert report["watchlist"]["ads"]["m1"]["times_flagged"] == 1
 
 
+def test_classify_ad_below_min_spend_confidence_abstains_not_low() -> None:
+    # An ad below the significance floor abstains (⚪ "insufficient data"), it is NOT scored low.
+    v = classify_ad(spend=50, roas=0.5, results=0, days_since_change=30, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "insufficient"
+    assert v["confidence"]["band"] == "abstain"
+    assert v["confidence"]["band"] != "low"
+
+
+def test_classify_ad_young_ad_stays_watch_confidence_abstains_never_urgent() -> None:
+    # A young ad below the ROAS floor stays `watch` (grace wins) and its confidence reflects
+    # "too young to judge" — abstain, never a high-confidence pause.
+    v = classify_ad(spend=300, roas=0.5, results=0, days_since_change=2, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "watch"            # grace beats pause
+    assert v["classification"] != "urgent"
+    assert v["confidence"]["band"] == "abstain"      # not "low", not "high"
+    assert v["confidence"]["causal_flag"] is False
+
+
+def test_classify_ad_urgent_confidence_is_direct_observation_non_causal() -> None:
+    # A mature below-floor ad gets a direct-observation data band; descriptive reasons are not
+    # causal language, so causal_flag stays False (asserted, per the ticket).
+    v = classify_ad(spend=300, roas=0.5, results=3, days_since_change=30, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "urgent"
+    assert v["confidence"]["grounding_tier"] == "direct_observation"
+    assert v["confidence"]["causal_flag"] is False
+    # 3 purchases is below the 25 conversion floor (spend cleared) → thin-on-conversions → low.
+    assert v["confidence"]["band"] == "low"
+
+
+def test_classify_ad_young_ad_with_large_sample_still_abstains() -> None:
+    # The grace abstention is NOT a below-floor sample: a young ad can be heavily funded with many
+    # conversions, yet we still decline to judge it. This is exactly why grace routes through the
+    # abstain factory rather than the sample-size rubric in assess.
+    v = classify_ad(spend=5000, roas=0.5, results=400, days_since_change=2, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "watch"
+    assert v["confidence"]["band"] == "abstain"        # not high, despite 400 purchases / $5k spend
+    assert v["confidence"]["data_band"] == "abstain"
+
+
+def test_classify_ad_underperforming_carries_direct_observation_confidence() -> None:
+    # floor < roas < target on a mature ad with enough conversions → a real (non-abstain) data band.
+    v = classify_ad(spend=300, roas=2.0, results=30, days_since_change=30, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "underperforming"
+    assert v["confidence"]["grounding_tier"] == "direct_observation"
+    assert v["confidence"]["band"] == "medium"         # 30 purchases ≥ 25 floor, < 100 high-knee
+    assert v["confidence"]["causal_flag"] is False
+
+
+def test_build_watch_report_rows_carry_confidence_and_reproducible_evidence() -> None:
+    insights = [
+        {"ad_id": "m1", "ad_name": "Mature Loser", "spend": "300",
+         "action_values": [{"action_type": "purchase", "value": "150"}], "actions": [{"action_type": "purchase", "value": "3"}]},
+    ]
+    ads_meta = [
+        {"id": "m1", "name": "Mature Loser", "effective_status": "ACTIVE", "adset_id": "as1", "updated_time": "2026-06-01T00:00:00+0000"},
+    ]
+    report = build_watch_report(_WatchFakeClient(insights, ads_meta), "act_1", account_slug="demo",
+                                as_of=_d(2026, 6, 24), roas_floor=1.5, roas_target=3.0, min_spend=100, grace_days=5)
+    row = {r["ad_id"]: r for r in report["rows"]}["m1"]
+    assert row["classification"] == "urgent"
+    assert row["confidence"]["grounding_tier"] == "direct_observation"
+    assert row["confidence"]["causal_flag"] is False
+    ev = row["evidence"]
+    assert ev["entity_level"] == "ad" and ev["entity_id"] == "m1"
+    assert ev["window"] == "2026-06-18..2026-06-24"
+    # A flagged ad traces back to a reproducible account_metrics command.
+    assert ev["regenerating_query"] == (
+        "account_metrics --account demo --level ad --date-from 2026-06-18 --date-to 2026-06-24"
+    )
+
+
 # --- A/B experiment harness ----------------------------------------------------
 
 from datetime import date as _date_e
@@ -2539,6 +3572,63 @@ def test_read_experiment_calls_significant_winner() -> None:
     assert r["variant"]["roas"] == 6.0 and r["control"]["roas"] == 2.0
 
 
+def test_read_experiment_significant_reads_high_confidence_ab_experiment() -> None:
+    # A clean, well-powered, significant A/B reads 🟢 High — the experiment is the TOP grounding tier,
+    # so it is NOT capped the way a correlational claim is. (The same claim read Medium as a
+    # correlational action in the actions ticket; grounding improved, so confidence rises.)
+    insights = [
+        {"ad_id": "c1", "ad_name": "Control", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "2000"}],
+         "actions": [{"action_type": "purchase", "value": "100"}], "impressions": "100000"},
+        {"ad_id": "v1", "ad_name": "Variant", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "6000"}],
+         "actions": [{"action_type": "purchase", "value": "300"}], "impressions": "100000"},
+    ]
+    r = _exp.read_experiment(_ExpFakeClient(insights), "act_1", _exp_obj(), as_of=_date_e(2026, 6, 24),
+                             min_conversions=25)
+    assert r["confidence"]["band"] == "high"
+    assert r["confidence"]["grounding_tier"] == "ab_experiment"
+    assert r["confidence"]["causal_flag"] is False          # the A/B IS the causal instrument
+    ev = r["evidence"]
+    assert ev["entity_level"] == "ad" and ev["sample_purchases"] == 100   # weaker arm governs
+    assert ev["regenerating_query"] == (
+        "account_metrics --account demo --level ad --date-from 2026-06-01 --date-to 2026-06-24"
+    )
+
+
+def test_read_experiment_below_min_conversions_abstains_keeps_verdict_string() -> None:
+    insights = [
+        {"ad_id": "c1", "ad_name": "Control", "spend": "100",
+         "action_values": [{"action_type": "purchase", "value": "300"}],
+         "actions": [{"action_type": "purchase", "value": "5"}], "impressions": "1000"},
+        {"ad_id": "v1", "ad_name": "Variant", "spend": "100",
+         "action_values": [{"action_type": "purchase", "value": "400"}],
+         "actions": [{"action_type": "purchase", "value": "6"}], "impressions": "1000"},
+    ]
+    r = _exp.read_experiment(_ExpFakeClient(insights), "act_1", _exp_obj(), as_of=_date_e(2026, 6, 24))
+    assert r["confidence"]["band"] == "abstain"
+    assert "INSUFFICIENT DATA" in r["verdict"]   # existing human verdict string preserved
+
+
+def test_read_experiment_no_significant_difference_caps_confidence_at_medium() -> None:
+    # Enough data per arm, but identical conversion rates (p>=0.05) → no proven effect → the data band
+    # is capped at medium even though the sample is large. Verdict string is unchanged.
+    insights = [
+        {"ad_id": "c1", "ad_name": "Control", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "2000"}],
+         "actions": [{"action_type": "purchase", "value": "100"}], "impressions": "100000"},
+        {"ad_id": "v1", "ad_name": "Variant", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "2000"}],
+         "actions": [{"action_type": "purchase", "value": "100"}], "impressions": "100000"},
+    ]
+    r = _exp.read_experiment(_ExpFakeClient(insights), "act_1", _exp_obj(), as_of=_date_e(2026, 6, 24),
+                             min_conversions=25)
+    assert r["conversion_rate_pvalue"] is not None and r["conversion_rate_pvalue"] >= 0.05
+    assert r["confidence"]["grounding_tier"] == "ab_experiment"
+    assert r["confidence"]["band"] == "medium"   # NOT high — no proven difference yet
+    assert "NO significant difference" in r["verdict"]
+
+
 def test_readout_json_output_path(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(_exp, "EXPERIMENTS_ROOT", tmp_path)
     insights = [
@@ -2623,3 +3713,1200 @@ def test_experiment_readout_cli_no_json_path_writes_nothing(tmp_path, monkeypatc
     assert "Wrote readout JSON" not in captured        # no file confirmation
     # only the experiment-definition JSON exists; no readout file was written
     assert not any(p.name == "readout.json" for p in tmp_path.rglob("*.json"))
+
+
+# ---------------------------------------------------------------------------
+# Confidence engine (src/meta_ads_analysis/confidence.py)
+# ---------------------------------------------------------------------------
+
+
+def _recent_evidence(*, purchases: float | None, spend: float | None) -> Evidence:
+    """A reusable, fully-populated Evidence with a recent window for confidence tests."""
+    return Evidence(
+        metric_name="blended_roas",
+        metric_value=1.20,
+        metric_display="ROAS 1.20",
+        window="2026-06-10..2026-06-24",
+        sample_purchases=purchases,
+        sample_spend=spend,
+        entity_level="ad",
+        entity_id="123",
+        entity_name="Scale Winner",
+        regenerating_query=build_regenerating_query("divine_designs", "ad", "2026-06-10", "2026-06-24"),
+    )
+
+
+def test_combine_bands_returns_the_weaker_axis() -> None:
+    assert combine_bands(Band.high, Band.medium) == Band.medium
+    assert combine_bands(Band.high, Band.low) == Band.low
+    assert combine_bands(Band.abstain, Band.high) == Band.abstain
+    assert combine_bands(Band.high, Band.abstain) == Band.abstain
+    assert combine_bands(Band.high, Band.high) == Band.high
+
+
+def test_grounding_caps_a_large_correlational_causal_sample_at_low() -> None:
+    # Big, recent, well-converted sample — strong on the DATA axis...
+    evidence = _recent_evidence(purchases=500.0, spend=50_000.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+        causal_text="scaled because the new audience converts",
+    )
+    # ...but the grounding cap (correlational ceiling medium, downgraded one for the causal claim)
+    # governs: the combined band can be at most low. Sample size must NOT average the cap away.
+    assert conf.data_band == Band.high
+    assert conf.grounding_band == Band.low
+    assert conf.band == Band.low
+    assert conf.causal_flag is True
+    assert "correlational — confirm via A/B" in conf.factors
+
+
+def test_ab_experiment_with_significance_reads_high_despite_causal_language() -> None:
+    evidence = _recent_evidence(purchases=500.0, spend=50_000.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.ab_experiment,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+        pvalue=0.01,
+        causal_text="the new audience drives ROAS",
+    )
+    # Experiment IS the causal evidence: grounding no longer caps and the causal guard does not
+    # downgrade an experiment-backed claim.
+    assert conf.data_band == Band.high
+    assert conf.grounding_band == Band.high
+    assert conf.band == Band.high
+    assert conf.causal_flag is True
+
+
+def test_below_floor_inputs_abstain_not_low() -> None:
+    evidence = _recent_evidence(purchases=3.0, spend=40.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert conf.data_band == Band.abstain
+    assert conf.band == Band.abstain  # NOT low — abstain is a first-class verdict
+    assert any("floor" in factor for factor in conf.factors)
+
+
+def test_clearing_only_spend_floor_is_thin_on_conversions() -> None:
+    # Spend cleared ($500 > $100) but conversions did not (2 < 25): weak data on the outcome → low.
+    band, factors = data_strength(
+        sample_purchases=2.0,
+        sample_spend=500.0,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert band == Band.low
+    assert any("thin on conversions" in factor for factor in factors)
+
+
+def test_missing_sample_drives_abstain_no_model_typed_score() -> None:
+    # A caller that cannot supply sample data passes None — which drives abstain, never a guess.
+    evidence = _recent_evidence(purchases=None, spend=None)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.ab_experiment,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert conf.band == Band.abstain
+
+
+def test_assess_exposes_no_pre_baked_band_parameter() -> None:
+    import inspect
+
+    params = set(inspect.signature(assess).parameters)
+    # The ONLY path to a band is through deterministic inputs; no caller-set band/score knob.
+    assert not (params & {"band", "score", "confidence", "data_band", "grounding_band"})
+
+
+def test_abstain_confidence_factory_pins_data_axis_and_keeps_grounding_ceiling() -> None:
+    # A caller whose own domain gate refuses to score (e.g. a well-funded but too-young ad whose
+    # sample WOULD clear the floor) gets abstain via the sanctioned factory — the data axis is pinned
+    # to the floor, NOT a number, while grounding still reports the tier's honest ceiling.
+    conf = abstain_confidence(
+        tier=EvidenceTier.direct_observation,
+        factors=["too young to judge — abstain, keep running"],
+        would_raise="a matured (post-learning) window",
+    )
+    assert conf.data_band is Band.abstain
+    assert conf.grounding_band is Band.high          # direct_observation ceiling, honestly reported
+    assert conf.band is Band.abstain                 # weaker axis governs
+    assert conf.grounding_tier == "direct_observation"
+    assert conf.causal_flag is False
+    # Round-trips through the shared serializer like any other verdict.
+    assert confidence_to_dict(conf)["band"] == "abstain"
+
+
+def test_abstain_confidence_factory_exposes_no_band_knob() -> None:
+    import inspect
+
+    # The factory is an explicit *refusal* to score, not a back door to a caller-chosen band.
+    params = set(inspect.signature(abstain_confidence).parameters)
+    assert not (params & {"band", "score", "data_band", "grounding_band", "confidence"})
+
+
+def test_detect_causal_language() -> None:
+    assert detect_causal_language("scaled because the new audience converts") is True
+    assert detect_causal_language("the new creative drives ROAS") is True
+    assert detect_causal_language("paused due to fatigue") is True
+    assert detect_causal_language("the change leads to more purchases") is True
+    # Descriptive, no causal verb:
+    assert detect_causal_language("ROAS is 1.2 over 14 days") is False
+    assert detect_causal_language("") is False
+    assert detect_causal_language(None) is False
+
+
+def test_build_regenerating_query_exact_string_and_none_on_missing() -> None:
+    assert build_regenerating_query("divine_designs", "ad", "2026-06-10", "2026-06-24") == (
+        "account_metrics --account divine_designs --level ad "
+        "--date-from 2026-06-10 --date-to 2026-06-24"
+    )
+    assert build_regenerating_query("divine_designs", None, "2026-06-10", "2026-06-24") is None
+    assert build_regenerating_query("divine_designs", "ad", "2026-06-10", None) is None
+    assert build_regenerating_query(None, "ad", "2026-06-10", "2026-06-24") is None
+
+
+def test_stale_window_rounds_data_band_down_vs_recent() -> None:
+    kwargs = dict(
+        sample_purchases=500.0,
+        sample_spend=50_000.0,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+    )
+    recent_band, _ = data_strength(recency_days=1, **kwargs)
+    stale_band, stale_factors = data_strength(recency_days=CONFIDENCE_RECENCY_STALE_DAYS + 40, **kwargs)
+    assert recent_band == Band.high
+    assert stale_band == Band.medium  # rounded down exactly one level
+    assert stale_band < recent_band
+    assert any("stale window" in factor for factor in stale_factors)
+
+
+def test_unknown_recency_rounds_down() -> None:
+    band, factors = data_strength(
+        sample_purchases=500.0,
+        sample_spend=50_000.0,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=None,
+    )
+    assert band == Band.medium  # high base, rounded down because recency is unknown
+    assert any("recency unknown" in factor for factor in factors)
+
+
+def test_non_significant_pvalue_caps_data_at_medium() -> None:
+    band, factors = data_strength(
+        sample_purchases=500.0,
+        sample_spend=50_000.0,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+        pvalue=0.20,
+    )
+    assert band == Band.medium
+    assert any("not significant" in factor for factor in factors)
+
+
+def test_grounding_tier_ceilings_and_causal_guard() -> None:
+    assert grounding_strength(EvidenceTier.ab_experiment, causal_claim=False)[0] == Band.high
+    assert grounding_strength(EvidenceTier.direct_observation, causal_claim=False)[0] == Band.high
+    assert grounding_strength(EvidenceTier.correlational, causal_claim=False)[0] == Band.medium
+    assert grounding_strength(EvidenceTier.external, causal_claim=False)[0] == Band.low
+    assert grounding_strength(EvidenceTier.model_inference, causal_claim=False)[0] == Band.low
+    # Causal guard downgrades non-experimental claims one band (floored at low)...
+    assert grounding_strength(EvidenceTier.correlational, causal_claim=True)[0] == Band.low
+    assert grounding_strength(EvidenceTier.external, causal_claim=True)[0] == Band.low
+    # ...but never an A/B experiment (the experiment is the causal evidence).
+    assert grounding_strength(EvidenceTier.ab_experiment, causal_claim=True)[0] == Band.high
+    # Strings coerce to the same tiers.
+    assert grounding_strength("correlational", causal_claim=False)[0] == Band.medium
+
+
+def test_band_presentation_matches_knowledge_vocabulary_exactly() -> None:
+    # Pin the one vocabulary so knowledge/README.md and confidence.py cannot drift into two scales.
+    assert BAND_PRESENTATION[Band.high] == {"emoji": "🟢", "label": "High", "range": "~80–100%"}
+    assert BAND_PRESENTATION[Band.medium] == {"emoji": "🟡", "label": "Medium", "range": "~50–80%"}
+    assert BAND_PRESENTATION[Band.low] == {"emoji": "🔴", "label": "Low", "range": "<50%"}
+    assert BAND_PRESENTATION[Band.abstain] == {
+        "emoji": "⚪",
+        "label": "Insufficient data — abstain",
+        "range": "—",
+    }
+
+
+def test_band_vocabulary_actually_appears_in_knowledge_readme() -> None:
+    # The pin above guards the code constants; this one closes the loop the implement handoff
+    # claimed but did not enforce — that the SAME emoji+label live in knowledge/README.md, so the
+    # human rubric and the computed rubric genuinely cannot drift into two scales. If someone edits
+    # the README's emoji/label (or the code's), one of these assertions fails.
+    from meta_ads_analysis.config import PROJECT_ROOT
+
+    readme = (PROJECT_ROOT / "knowledge" / "README.md").read_text(encoding="utf-8")
+    for band in (Band.high, Band.medium, Band.low, Band.abstain):
+        pres = BAND_PRESENTATION[band]
+        assert pres["emoji"] in readme, f"{band.name} emoji {pres['emoji']!r} missing from README"
+        assert pres["label"] in readme, f"{band.name} label {pres['label']!r} missing from README"
+
+
+def test_grounding_tier_ceilings_match_knowledge_readme() -> None:
+    # Sibling to the band-vocabulary pin: the README "Grounding tiers" table documents each
+    # EvidenceTier's ceiling band, and that mapping IS the code's _TIER_CEILING. Without this pin the
+    # table could silently drift (e.g. someone raises external to Medium in prose but not in code, or
+    # vice versa). Assert that the row naming each tier carries that tier's true ceiling emoji+label.
+    from meta_ads_analysis.config import PROJECT_ROOT
+    from meta_ads_analysis.confidence import _TIER_CEILING
+
+    readme = (PROJECT_ROOT / "knowledge" / "README.md").read_text(encoding="utf-8")
+    lines = readme.splitlines()
+    for tier, ceiling in _TIER_CEILING.items():
+        pres = BAND_PRESENTATION[ceiling]
+        # The table wraps each tier name in backticks; find the row that names it.
+        rows = [ln for ln in lines if f"`{tier.name}`" in ln]
+        assert rows, f"EvidenceTier {tier.name!r} missing from README grounding-tier table"
+        assert any(pres["emoji"] in ln and pres["label"] in ln for ln in rows), (
+            f"{tier.name} should document ceiling {pres['emoji']} {pres['label']} in its README row"
+        )
+
+
+def test_review_verdict_taxonomy_appears_in_docs() -> None:
+    # Sibling to the vocabulary/tier pins above. The AGENTS.md "Adversarial-review rule" and the
+    # knowledge/README.md two-layer-review subsection both name the four verdicts that review.py
+    # emits. Pin the SOURCE-OF-TRUTH verdict strings (review.py's VERDICT_* constants) to both docs
+    # so a rename in code (or a drifted doc) fails here instead of silently desyncing the prose from
+    # the gate. (The six per-check names are intentionally NOT pinned — the docs spell them as prose,
+    # e.g. "causal-cap"/"external-cap", which deliberately differ from the code's failed_input
+    # identifiers "causal"/"external", so a verbatim pin would be fragile in both directions.)
+    from meta_ads_analysis.config import PROJECT_ROOT
+    from meta_ads_analysis.review import (
+        VERDICT_DOWNGRADE,
+        VERDICT_INSUFFICIENT,
+        VERDICT_REFUTED,
+        VERDICT_STANDS,
+    )
+
+    verdicts = (VERDICT_STANDS, VERDICT_DOWNGRADE, VERDICT_REFUTED, VERDICT_INSUFFICIENT)
+    for rel in ("AGENTS.md", "knowledge/README.md"):
+        doc = (PROJECT_ROOT / rel).read_text(encoding="utf-8")
+        for verdict in verdicts:
+            assert verdict in doc, f"verdict {verdict!r} missing from {rel}"
+
+
+def test_render_helpers_produce_compact_lines() -> None:
+    evidence = _recent_evidence(purchases=42.0, spend=1250.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    conf_line = render_confidence_line(conf)
+    assert BAND_PRESENTATION[conf.band]["emoji"] in conf_line
+    assert BAND_PRESENTATION[conf.band]["label"] in conf_line
+
+    ev_line = render_evidence_line(evidence)
+    assert "ROAS 1.20" in ev_line
+    assert "2026-06-10..2026-06-24" in ev_line
+    assert "42 purchases" in ev_line
+    assert "account_metrics --account divine_designs" in ev_line
+
+
+def test_band_ordering_is_abstain_low_medium_high() -> None:
+    assert Band.abstain < Band.low < Band.medium < Band.high
+
+
+def test_evidence_and_confidence_dicts_round_trip() -> None:
+    evidence = _recent_evidence(purchases=120.0, spend=2400.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    # to_dict stores bands as their lowercase NAME, never a number.
+    conf_dict = confidence_to_dict(conf)
+    assert conf_dict["band"] == "high"
+    assert conf_dict["grounding_tier"] == "direct_observation"
+    assert evidence_to_dict(evidence)["regenerating_query"].startswith("account_metrics --account")
+    # Round-trip is lossless for the fields the downstream brief renderer needs.
+    assert confidence_from_dict(conf_dict).band is Band.high
+    rebuilt = evidence_from_dict(evidence_to_dict(evidence))
+    assert rebuilt.metric_display == "ROAS 1.20"
+    assert rebuilt.sample_purchases == 120.0
+
+
+# ---------------------------------------------------------------------------
+# Action plan: evidence + confidence + abstention (confidence-actions-analyze)
+# ---------------------------------------------------------------------------
+
+
+def _use_account_policy(tmp_path: Path, monkeypatch, slug: str, policy: dict[str, Any]) -> None:
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": slug,
+                        "account_name": slug.replace("_", " ").title(),
+                        "ad_account_id": "act_test",
+                        "action_policy": policy,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path
+    )
+
+
+def _pause_ad_payload(*, ad_overrides: dict[str, Any], run_date: str = "2026-06-24") -> dict[str, Any]:
+    ad = {
+        "ad_id": "123",
+        "ad_name": "Cody - Copy",
+        "campaign_name": "Campaign",
+        "adset_name": "Ad Set",
+        "total_results": 0.0,
+        "total_app_installs": 0.0,
+        "waste_score": 90.0,
+        "waste_status": "high",
+        "waste_reasons": ["spent without proportional value"],
+        "tracking_confidence": "high",
+    }
+    ad.update(ad_overrides)
+    return {
+        "account_slug": "divine_designs",
+        "run_date": run_date,
+        "budget_waste": [ad],
+        "fatigue_findings": [],
+        "scaling_candidates": [],
+        "tracking_concerns": [],
+    }
+
+
+def test_action_plan_pause_carries_high_confidence_and_direct_observation(tmp_path, monkeypatch) -> None:
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={
+            "blended_roas": 1.2,
+            "total_purchase_count": 120.0,
+            "total_spend": 2400.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        }
+    )
+
+    plan = build_action_plan(payload)
+
+    pause = next(action for action in plan["actions"] if action["action_type"] == "pause_ad")
+    # The headline use case: a well-sampled, recent, directly-observed pause reads High.
+    assert pause["confidence"]["band"] == "high"
+    assert pause["confidence"]["grounding_tier"] == "direct_observation"
+    assert pause["confidence"]["causal_flag"] is False
+    # Still a confident, executable pause — the evidence/confidence shape is additive.
+    assert pause["executable"] is True
+    assert pause["status"] == "proposed"
+    assert "verdict" not in pause
+    # Evidence carries the four facts + a real (non-null) regenerating query.
+    evidence = pause["evidence"]
+    assert evidence["metric_name"] == "blended_roas"
+    assert evidence["metric_display"] == "ROAS 1.20"
+    assert evidence["window"] == "2026-06-10..2026-06-24"
+    assert evidence["sample_purchases"] == 120.0
+    assert evidence["sample_spend"] == 2400.0
+    assert evidence["entity_level"] == "ad"
+    assert evidence["entity_id"] == "123"
+    assert evidence["entity_name"] == "Cody - Copy"
+    assert evidence["regenerating_query"] == (
+        "account_metrics --account divine_designs --level ad "
+        "--date-from 2026-06-10 --date-to 2026-06-24"
+    )
+
+
+def test_action_plan_pause_with_43_purchases_reads_medium_under_calibrated_knee(
+    tmp_path, monkeypatch
+) -> None:
+    # NOTE: the ticket's headline example calls 43 purchases "🟢 High ~85%", but the SHIPPED
+    # confidence-core rubric only reaches `high` at >= 4x the conversions floor (>= 100 purchases);
+    # 43 clears the floor but lands at `medium`. This test pins the real computed band so the
+    # discrepancy is visible (confidence-core was reviewed/accepted and is out of scope here).
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={
+            "blended_roas": 1.2,
+            "total_purchase_count": 43.0,
+            "total_spend": 880.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        }
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["confidence"]["band"] == "medium"
+    assert pause["confidence"]["grounding_tier"] == "direct_observation"
+    assert pause["executable"] is True
+    assert pause["evidence"]["sample_purchases"] == 43.0
+    assert pause["evidence"]["regenerating_query"] is not None
+
+
+def test_action_plan_pause_below_floor_abstains_as_keep_running(tmp_path, monkeypatch) -> None:
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={
+            "blended_roas": 1.2,
+            "total_purchase_count": 3.0,
+            "total_spend": 40.0,
+            "first_seen": "2026-06-20",
+            "last_seen": "2026-06-23",
+        }
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    # Below the significance floor: a non-executable "insufficient data — keep running" rec, NOT a
+    # confident pause. Cannot be approved into a write (approval_required is False).
+    assert pause["confidence"]["band"] == "abstain"
+    assert pause["verdict"] == "insufficient_data"
+    assert pause["executable"] is False
+    assert pause["approval_required"] is False
+    assert pause["status"] == "proposed"
+    rationale = pause["rationale"].lower()
+    assert "keep running" in rationale
+    assert "winner" not in rationale
+    assert "loser" not in rationale
+
+
+def test_action_plan_zero_sample_ad_abstains_never_fabricates_pause(tmp_path, monkeypatch) -> None:
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={"total_purchase_count": 0.0, "total_spend": 0.0}
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["confidence"]["band"] == "abstain"
+    assert pause["verdict"] == "insufficient_data"
+    assert pause["executable"] is False
+    assert pause["approval_required"] is False
+
+
+def test_evaluate_action_confidence_flags_causal_correlational_and_caps_band() -> None:
+    ad = {
+        "ad_id": "scale-1",
+        "ad_name": "New Audience",
+        "blended_roas": 4.0,
+        "total_purchase_count": 300.0,
+        "total_spend": 9000.0,
+        "first_seen": "2026-06-10",
+        "last_seen": "2026-06-24",
+    }
+    _evidence, confidence = evaluate_action_confidence(
+        ad,
+        action_type="consider_scale_budget",
+        policy={"primary_goal": "roas"},
+        account_slug="divine_designs",
+        run_date="2026-06-24",
+        rationale="Scale because the new audience converts",
+    )
+    # Trajectory/scale-candidate calls lean on a cross-sectional comparison → correlational.
+    assert confidence["grounding_tier"] == "correlational"
+    assert confidence["causal_flag"] is True
+    # Grounding caps the large, recent sample: correlational ceiling medium, downgraded one for the
+    # causal claim → low. Sample size must NOT average the cap away.
+    assert confidence["data_band"] == "high"
+    assert confidence["band"] == "low"
+
+
+def test_action_plan_pause_keeps_rationale_and_params_backward_compatible() -> None:
+    # The executable pause path's behavior is unchanged; confidence/evidence are purely additive.
+    payload = {
+        "account_slug": "pollen_sense",
+        "run_date": "2026-05-04",
+        "budget_waste": [
+            {
+                "ad_id": "123",
+                "ad_name": "Waste Ad",
+                "total_spend": 250.0,
+                "total_results": 0.0,
+                "total_app_installs": 1.0,
+                "waste_score": 82.0,
+                "waste_status": "high",
+                "waste_reasons": ["spent without results"],
+                "tracking_confidence": "medium_roas_unavailable",
+            }
+        ],
+        "fatigue_findings": [],
+        "scaling_candidates": [],
+        "tracking_concerns": [],
+    }
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["executable"] is True
+    assert pause["approval_required"] is True
+    assert pause["params"] == {"status": "paused"}
+    assert pause["rationale"].startswith("High waste risk")
+    assert "confidence" in pause
+    assert pause["evidence"]["entity_id"] == "123"
+
+
+def test_recommendations_prose_carries_metric_window_sample_facts() -> None:
+    rows = [
+        {
+            "report_date": date(2026, 6, 1) + timedelta(days=offset),
+            "campaign_id": "campaign-1",
+            "campaign_name": "Waste Campaign",
+            "adset_id": "adset-1",
+            "adset_name": "Waste Set",
+            "ad_id": "waste-ad",
+            "ad_name": "Waste Ad",
+            "creative_type": "Image",
+            "spend": 60.0,
+            "purchase_value": 72.0,
+            "purchase_count": 3.0,
+            "results": 3.0,
+            "result_label": "Website purchases",
+            "app_installs": 0.0,
+            "impressions": 5000,
+            "outbound_clicks": 50,
+            "frequency": 2.0,
+            "video_3s_plays": 0,
+            "thruplays": 0,
+            "has_video_metrics": False,
+            "tracking_confidence": "high",
+        }
+        for offset in range(6)
+    ]
+
+    report = build_report_payload(rows, "2026-06-16")
+    waste_line = next(
+        (line for line in report["next_7_day_actions"] if line.startswith("Reduce or pause budget")),
+        None,
+    )
+    assert waste_line is not None
+    # Metric, window, sample, and spend facts are inline so the prose is grounded.
+    assert "ROAS" in waste_line
+    assert "purchases" in waste_line
+    assert "spend" in waste_line
+    assert "over" in waste_line and "d," in waste_line
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-vault provenance format + lint-vault
+# (src/meta_ads_analysis/knowledge_provenance.py)
+# ---------------------------------------------------------------------------
+
+_CLEAN_VAULT = """# Durable learnings
+
+Intro prose that is not an entry and must be ignored.
+
+## Meta platform & API behavior
+
+### Dev-mode app blocker is a platform mechanic
+**Confidence:** 🟢 High →  ·  **Domain:** platform
+**Rot:** evergreen  ·  **Verified:** 2026-01-01
+- ➕ 2026-01-01 — validate-only POST rejected on all 3 ad sets; matches documented behavior.
+  This evidence wraps across **two** physical lines and the tag closes here. _(src: direct_observation · acct: divine_designs)_
+- ➖ 2026-01-02 — one counter-observation that lowers nothing yet. _(src: correlational · acct: divine_designs)_
+**Apply:** check issues_info first.
+**Would raise / lower:** a second account reproducing it.
+
+### Engaged audience holds higher ROAS
+**Confidence:** 🔴 Low ↑  ·  **Domain:** strategy
+**Rot:** fast  ·  **Verified:** 2026-01-10
+- ➕ 2026-01-10 — engaged ad set 3.74 ROAS vs low-value 2.04, confounded by creative mix.
+  `verify: account_metrics --account divine_designs --level adset --date-from 2025-12-11 --date-to 2026-01-10`
+  _(src: correlational · acct: divine_designs · metric: engaged_roas=3.74)_
+**Apply:** treat as a hunch only.
+
+## Tooling capabilities (factual reference — not a probabilistic claim)
+
+- `sync-api` — a plain tooling bullet that is NOT an entry and must be ignored.
+"""
+
+
+def _entry(*body_lines: str, header: str = "X claim", confidence: str = "🟢 High →",
+           rot: str = "evergreen", verified: str = "2026-01-01") -> str:
+    head = [f"### {header}", f"**Confidence:** {confidence}  ·  **Domain:** platform"]
+    if rot is not None and verified is not None:
+        head.append(f"**Rot:** {rot}  ·  **Verified:** {verified}")
+    elif rot is not None:
+        head.append(f"**Rot:** {rot}")
+    elif verified is not None:
+        head.append(f"**Verified:** {verified}")
+    return "\n".join(["## Section", "", *head, *body_lines, ""])
+
+
+def _codes(findings, severity=None) -> set:
+    return {f.code for f in findings if severity is None or f.severity == severity}
+
+
+def test_parse_learnings_extracts_structured_fields() -> None:
+    entries = parse_learnings(_CLEAN_VAULT)
+    # Two `###` entries; the intro prose and the tooling bullet are ignored.
+    assert len(entries) == 2
+
+    dev = entries[0]
+    assert dev.claim == "Dev-mode app blocker is a platform mechanic"
+    assert dev.band_emoji == "🟢"
+    assert dev.domain == "platform"
+    assert dev.rot == "evergreen"
+    assert dev.verified == "2026-01-01"
+    # lineno points at the `### ` header line (1-indexed).
+    assert _CLEAN_VAULT.splitlines()[dev.lineno - 1].startswith("### ")
+    assert len(dev.evidence) == 2
+
+    ev0 = dev.evidence[0]
+    assert ev0.sign == "+" and ev0.date == "2026-01-01"
+    assert ev0.tier == "direct_observation" and ev0.account == "divine_designs"
+    assert ev0.metric_name is None and ev0.metric_value is None
+    assert ev0.verify_query is None and ev0.url is None and ev0.has_tag is True
+    # The multi-physical-line evidence was rejoined: text from both lines is present, tag stripped.
+    assert "validate-only POST" in ev0.text
+    assert "wraps across" in ev0.text
+    assert "src:" not in ev0.text
+
+    assert dev.evidence[1].sign == "-" and dev.evidence[1].tier == "correlational"
+
+    eng = entries[1]
+    assert eng.rot == "fast" and eng.verified == "2026-01-10"
+    ev = eng.evidence[0]
+    assert ev.tier == "correlational" and ev.account == "divine_designs"
+    assert ev.metric_name == "engaged_roas" and ev.metric_value == 3.74
+    assert ev.verify_query is not None and ev.verify_query.startswith("account_metrics --account divine_designs")
+
+
+def test_lint_clean_vault_has_no_findings() -> None:
+    entries = parse_learnings(_CLEAN_VAULT)
+    findings = lint(entries, today=date(2026, 1, 15))  # 5d after the fast entry's Verified
+    assert findings == []
+
+
+def test_lint_errors_untagged_evidence_line() -> None:
+    text = _entry("- ➕ 2026-01-01 — an evidence line with no provenance tag at all.")
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "missing_tag" in _codes(findings, "error")
+
+
+def test_tag_on_field_label_continuation_fails_loudly_not_silently() -> None:
+    # Documented parser-boundary tradeoff: a bold *field label* (`**Note:**`) at the start of a
+    # continuation line ends the evidence block, so a `_( … )_` tag stranded on such a line does NOT
+    # join. The point of this guard is the FAILURE DIRECTION — the orphaned-tag evidence must surface
+    # a loud `missing_tag` error, never silently pass as tagged. (Inline emphasis like `**not**` —
+    # no colon — does NOT end a block; that path is exercised by _CLEAN_VAULT's wrapped evidence.)
+    text = _entry(
+        "- ➕ 2026-01-01 — first physical line of the evidence",
+        "  **Note:** continuation that mistakenly carries the tag "
+        "_(src: direct_observation · acct: divine_designs)_",
+    )
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "missing_tag" in _codes(findings, "error")
+
+
+def test_lint_errors_invalid_src_tier() -> None:
+    text = _entry("- ➕ 2026-01-01 — bad tier. _(src: bogus_tier · acct: divine_designs)_")
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "invalid_src" in _codes(findings, "error")
+
+
+def test_lint_errors_missing_rot_and_verified() -> None:
+    text = _entry(
+        "- ➕ 2026-01-01 — fine evidence. _(src: direct_observation · acct: divine_designs)_",
+        rot=None,
+        verified=None,
+    )
+    codes = _codes(lint(parse_learnings(text), today=date(2026, 1, 2)), "error")
+    assert "missing_rot" in codes and "missing_verified" in codes
+
+
+def test_lint_errors_metric_without_verify_command() -> None:
+    text = _entry(
+        "- ➕ 2026-01-01 — cites a number. _(src: correlational · acct: divine_designs · metric: roas=3.0)_"
+    )
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "metric_without_verify" in _codes(findings, "error")
+
+
+def test_lint_errors_external_without_url() -> None:
+    text = _entry("- ➕ 2026-01-01 — practitioner says X. _(src: external · acct: —)_")
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "external_without_url" in _codes(findings, "error")
+    # A URL anywhere on the line satisfies the rule.
+    ok = _entry(
+        "- ➕ 2026-01-01 — practitioner says X, see https://example.com/post . _(src: external · acct: —)_"
+    )
+    assert "external_without_url" not in _codes(lint(parse_learnings(ok), today=date(2026, 1, 2)), "error")
+
+
+def test_lint_staleness_flags_fast_but_never_evergreen() -> None:
+    text = (
+        _entry(
+            "- ➕ 2026-01-01 — fast fact. _(src: correlational · acct: divine_designs)_",
+            header="fast claim",
+            rot="fast",
+            verified="2026-01-01",
+        )
+        + _entry(
+            "- ➕ 2025-06-01 — durable platform mechanic. _(src: direct_observation · acct: —)_",
+            header="evergreen claim",
+            rot="evergreen",
+            verified="2025-06-01",
+        )
+    )
+    entries = parse_learnings(text)
+    # today is 50d after the fast entry's Verified (> default 42) and ~264d after the evergreen one.
+    findings = lint(entries, today=date(2026, 2, 20))
+    warns = [f for f in findings if f.severity == "warn"]
+    assert len(warns) == 1
+    assert warns[0].code == "reverify" and warns[0].claim == "fast claim"
+    # No errors, and the 200+ day-old evergreen entry is NOT age-flagged.
+    assert _codes(findings, "error") == set()
+    assert all(f.claim != "evergreen claim" for f in findings)
+
+
+def test_render_report_strict_turns_warnings_into_failure() -> None:
+    text = _entry(
+        "- ➕ 2026-01-01 — fast fact. _(src: correlational · acct: divine_designs)_",
+        rot="fast",
+        verified="2026-01-01",
+    )
+    findings = lint(parse_learnings(text), today=date(2026, 3, 1))  # well past 42 days
+    assert any(f.severity == "warn" for f in findings)
+    _, code_lenient = render_report(findings, entries_count=1, strict=False)
+    _, code_strict = render_report(findings, entries_count=1, strict=True)
+    assert code_lenient == 0  # warnings alone do not fail by default
+    assert code_strict == 1   # --strict makes them fail
+
+
+def _run_lint_vault_cli(tmp_path, monkeypatch, text, *, today="2026-01-15", strict=False) -> int:
+    import pytest
+
+    from meta_ads_analysis.cli import lint_vault_main
+
+    learnings = tmp_path / "learnings.md"
+    learnings.write_text(text, encoding="utf-8")
+    argv = [
+        "lint-vault",
+        "--path", str(learnings),
+        "--profile", str(tmp_path / "no-such-profile.md"),  # skipped (does not exist)
+        "--today", today,
+    ]
+    if strict:
+        argv.append("--strict")
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        lint_vault_main()
+    code = exc.value.code
+    return code if isinstance(code, int) else 1
+
+
+def test_lint_vault_main_exits_zero_when_clean(tmp_path, monkeypatch, capsys) -> None:
+    code = _run_lint_vault_cli(tmp_path, monkeypatch, _CLEAN_VAULT, today="2026-01-15")
+    assert code == 0
+    assert "0 error(s)" in capsys.readouterr().out
+
+
+def test_lint_vault_main_exits_nonzero_on_format_error(tmp_path, monkeypatch, capsys) -> None:
+    bad = _entry("- ➕ 2026-01-01 — bad. _(src: bogus_tier · acct: divine_designs)_")
+    code = _run_lint_vault_cli(tmp_path, monkeypatch, bad, today="2026-01-15")
+    assert code == 1
+    assert "ERROR" in capsys.readouterr().out
+
+
+def test_lint_vault_main_strict_fails_on_stale_fast(tmp_path, monkeypatch) -> None:
+    stale = _entry(
+        "- ➕ 2026-01-01 — fast fact. _(src: correlational · acct: divine_designs)_",
+        rot="fast",
+        verified="2026-01-01",
+    )
+    # Without --strict the stale warning does not fail; with --strict it does.
+    assert _run_lint_vault_cli(tmp_path, monkeypatch, stale, today="2026-06-01") == 0
+    assert _run_lint_vault_cli(tmp_path, monkeypatch, stale, today="2026-06-01", strict=True) == 1
+
+
+def test_provenance_tier_names_are_exactly_confidence_evidence_tier() -> None:
+    # ONE vocabulary: the provenance `src` tiers must equal confidence.EvidenceTier so the vault
+    # checker and the live engine cannot drift into two scales.
+    assert TIER_NAMES == frozenset(t.name for t in EvidenceTier)
+
+
+def test_provenance_band_emojis_match_confidence_presentation() -> None:
+    assert BAND_EMOJIS == frozenset(
+        BAND_PRESENTATION[b]["emoji"] for b in (Band.high, Band.medium, Band.low)
+    )
+
+
+def test_real_learnings_md_lints_with_zero_errors() -> None:
+    # Meta-test: the committed knowledge/learnings.md, after the provenance retrofit, must lint
+    # clean (errors). Deterministic because `today` is pinned. Warnings (re-verify) are allowed.
+    from meta_ads_analysis.config import PROJECT_ROOT
+
+    text = (PROJECT_ROOT / "knowledge" / "learnings.md").read_text(encoding="utf-8")
+    entries = parse_learnings(text)
+    assert entries, "expected the real learnings.md to contain entries"
+    findings = lint(entries, today=date(2026, 6, 25))
+    errors = [f for f in findings if f.severity == "error"]
+    assert errors == [], f"real learnings.md has lint errors: {[(f.code, f.message) for f in errors]}"
+    # Every entry has a rot class and a verified date after the retrofit.
+    assert all(e.rot in {"fast", "evergreen"} and e.verified for e in entries)
+
+
+def test_real_profile_baseline_header_is_present_and_fresh() -> None:
+    from meta_ads_analysis.config import PROJECT_ROOT
+
+    text = (PROJECT_ROOT / "knowledge" / "accounts" / "divine_designs" / "profile.md").read_text(
+        encoding="utf-8"
+    )
+    # Fresh relative to the baseline date → no warning; far in the future → ⏳ re-verify warning.
+    assert lint_profile_baseline(text, today=date(2026, 6, 25)) == []
+    stale = lint_profile_baseline(text, today=date(2027, 1, 1))
+    assert len(stale) == 1 and stale[0].code == "reverify"
+
+
+# ---------------------------------------------------------------------------
+# audit-vault — drift re-check (pure verdict + markdown mutation in
+# knowledge_provenance.py; the Meta-touching orchestration in cli.py is exercised
+# with a FAKE metrics provider — never live Meta).
+# ---------------------------------------------------------------------------
+
+# A single account-level, data-backed `fast` claim — the clean case `resolve_fresh_metric` can
+# aggregate without segment matching. Stored window is 30 days (2025-12-12..2026-01-10).
+_AUDIT_VAULT = """# Durable learnings
+
+## Strategy
+
+### Divine Designs blended ROAS sits comfortably above target
+**Confidence:** 🟢 High →  ·  **Domain:** strategy
+**Rot:** fast  ·  **Verified:** 2026-01-10
+- ➕ 2026-01-10 — 30-day blended ROAS 3.74 on a healthy sample.
+  `verify: account_metrics --account divine_designs --level account --date-from 2025-12-12 --date-to 2026-01-10`
+  _(src: direct_observation · acct: divine_designs · metric: blended_roas=3.74)_
+**Apply:** keep scaling.
+"""
+
+
+def _account_rows(*, roas: float | None, spend: float = 2000.0, purchases: float = 60.0):
+    """One account-level metrics row. ``purchase_value`` is derived so the aggregate ROAS resolves to
+    ``roas``; a ``None`` roas models a window with spend but no resolvable value."""
+    value = round(roas * spend, 2) if roas is not None else None
+    return [{"id": "act", "name": "account", "spend": spend, "purchase_value": value,
+             "roas": roas, "purchases": purchases}]
+
+
+def _fixed_fetch(rows):
+    def fetch(level, breakdowns, date_from, date_to):
+        return rows
+    return fetch
+
+
+def _audit(text, fetch, *, apply, as_of=date(2026, 6, 25)):
+    from meta_ads_analysis.cli import run_vault_audit
+
+    return run_vault_audit(
+        text=text,
+        account_slug="divine_designs",
+        as_of=as_of,
+        target_roas=3.0,
+        pause_roas_floor=1.5,
+        fetch_metrics=fetch,
+        apply=apply,
+    )
+
+
+# --- pure verdict logic (classify_drift) -----------------------------------
+
+
+def test_classify_drift_confirmed_when_fresh_matches_stored() -> None:
+    # Stored 3.74, fresh 3.70 (≈1% drift, both above target) → confirmed.
+    verdict, crossed, _ = classify_drift(
+        stored_value=3.74, fresh=FreshSample(3.70, 60, 2000, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_CONFIRMED and crossed is None
+
+
+def test_classify_drift_refuted_on_policy_threshold_cross() -> None:
+    # Stored 3.74 (above target 3.0), fresh 2.10 (below) → decision flip → refuted, regardless of %.
+    verdict, crossed, _ = classify_drift(
+        stored_value=3.74, fresh=FreshSample(2.10, 60, 2000, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_REFUTED and crossed == "target_roas"
+
+
+def test_classify_drift_contradicted_on_magnitude_without_threshold_cross() -> None:
+    # Stored 10.0, fresh 6.0 (40% drift) but BOTH above target → contradicted, not refuted.
+    verdict, crossed, _ = classify_drift(
+        stored_value=10.0, fresh=FreshSample(6.0, 60, 4000, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_CONTRADICTED and crossed is None
+
+
+def test_classify_drift_insufficient_fresh_data_abstains() -> None:
+    # A noisy fresh window (2 purchases / $30) is below the significance floor → abstain, NOT a
+    # refutation — even though 2.5 < target 3.0 would otherwise flip the decision.
+    verdict, crossed, _ = classify_drift(
+        stored_value=3.74, fresh=FreshSample(2.5, 2, 30, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_INSUFFICIENT and crossed is None
+
+
+def test_classify_drift_could_not_audit_when_fresh_value_unresolved() -> None:
+    # Entity vanished / value missing for the window → could_not_audit, never scored as 0 ROAS.
+    verdict, _, _ = classify_drift(
+        stored_value=3.74, fresh=FreshSample(None, None, None, "w"),
+        target_roas=3.0, pause_roas_floor=1.5,
+    )
+    assert verdict == AUDIT_COULD_NOT
+
+
+def test_lower_band_emoji_walks_confidence_band_ordering() -> None:
+    # The decrement uses confidence.Band ordering (not a local emoji ladder), floored at Low.
+    assert lower_band_emoji(BAND_PRESENTATION[Band.high]["emoji"]) == BAND_PRESENTATION[Band.medium]["emoji"]
+    assert lower_band_emoji(BAND_PRESENTATION[Band.medium]["emoji"]) == BAND_PRESENTATION[Band.low]["emoji"]
+    assert lower_band_emoji(BAND_PRESENTATION[Band.low]["emoji"]) == BAND_PRESENTATION[Band.low]["emoji"]
+    assert lower_band_emoji(None) is None
+
+
+# --- selection -------------------------------------------------------------
+
+
+def test_select_auditable_skips_evergreen_no_metric_and_other_accounts() -> None:
+    text = (
+        # evergreen + metric: skipped (platform mechanics don't rot on numbers)
+        _entry(
+            "- ➕ 2026-01-01 — x. `verify: account_metrics --account divine_designs --level account` "
+            "_(src: direct_observation · acct: divine_designs · metric: roas=2.0)_",
+            header="evergreen with metric", rot="evergreen", verified="2026-01-01",
+        )
+        # fast, no metric: skipped (nothing to re-pull)
+        + _entry(
+            "- ➕ 2026-01-01 — qualitative. _(src: direct_observation · acct: divine_designs)_",
+            header="fast no metric", rot="fast", verified="2026-01-01",
+        )
+        # fast + metric for ANOTHER account: skipped for divine_designs
+        + _entry(
+            "- ➕ 2026-01-01 — y. `verify: account_metrics --account pollen_sense --level account` "
+            "_(src: direct_observation · acct: pollen_sense · metric: roas=2.0)_",
+            header="other account", rot="fast", verified="2026-01-01",
+        )
+        # fast + metric + divine_designs: the ONLY selectable claim
+        + _entry(
+            "- ➕ 2026-01-01 — z. `verify: account_metrics --account divine_designs --level account` "
+            "_(src: direct_observation · acct: divine_designs · metric: blended_roas=3.0)_",
+            header="auditable target", rot="fast", verified="2026-01-01",
+        )
+    )
+    pairs = select_auditable(parse_learnings(text), account_slug="divine_designs")
+    assert [e.claim for e, _ in pairs] == ["auditable target"]
+
+
+# --- metric resolution out of fresh rows (resolve_fresh_metric) ------------
+
+
+def test_resolve_fresh_metric_aggregates_account_level() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = _account_rows(roas=3.21, spend=1000, purchases=40)
+    value, purchases, spend = resolve_fresh_metric(rows, level="account", breakdowns=[], metric_name="blended_roas")
+    assert value == 3.21 and purchases == 40 and spend == 1000
+
+
+def test_resolve_fresh_metric_matches_a_breakdown_segment_by_name() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = [
+        {"segment": {"publisher_platform": "facebook"}, "spend": 500, "purchase_value": 970, "roas": 1.94, "purchases": 20},
+        {"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232, "roas": 2.79, "purchases": 50},
+    ]
+    # `ig_roas` → identifier token {instagram} → the instagram row.
+    value, _, _ = resolve_fresh_metric(rows, level="account", breakdowns=["publisher_platform"], metric_name="ig_roas")
+    assert value == 2.79
+
+
+def test_resolve_fresh_metric_returns_none_when_segment_is_ambiguous() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = [
+        {"segment": {"publisher_platform": "facebook"}, "spend": 500, "purchase_value": 970, "roas": 1.94, "purchases": 20},
+        {"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232, "roas": 2.79, "purchases": 50},
+    ]
+    # A metric name with no token matching any segment → unresolved (→ could_not_audit, never a guess).
+    assert resolve_fresh_metric(rows, level="account", breakdowns=["publisher_platform"], metric_name="tiktok_roas") == (None, None, None)
+
+
+def test_resolve_fresh_metric_value_missing_is_unresolved_not_zero() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # Spend but no purchase_value for the window → ROAS unresolved, NOT a fabricated 0 ROAS.
+    rows = _account_rows(roas=None, spend=300, purchases=0)
+    value, _, spend = resolve_fresh_metric(rows, level="account", breakdowns=[], metric_name="blended_roas")
+    assert value is None and spend == 300
+
+
+# --- end-to-end orchestration with a fake metrics provider -----------------
+
+
+def test_audit_confirmed_refreshes_verified_only_band_unchanged() -> None:
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=3.70)), apply=True)
+    assert counts[AUDIT_CONFIRMED] == 1
+    assert new_text is not None
+    assert "🟢 High" in new_text  # band untouched (re-confirming the same window is not corroboration)
+    assert "**Verified:** 2026-06-25" in new_text  # refreshed → clears a lint-vault ⏳ re-verify flag
+    assert "➖" not in new_text  # no contradiction logged
+
+
+def test_audit_refuted_lowers_band_logs_dated_minus_and_keeps_claim() -> None:
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=2.10)), apply=True)
+    assert counts[AUDIT_REFUTED] == 1
+    assert new_text is not None
+    # Refute → 🔴 Low + (contested); never edits the claim text; never deletes the entry.
+    assert "🔴 Low (contested)" in new_text
+    assert "Divine Designs blended ROAS sits comfortably above target" in new_text
+    # A dated ➖ carrying the fresh metric and a reproduce-the-fresh-value verify command.
+    assert "➖ 2026-06-25 — vault audit: blended_roas now 2.10 vs stored 3.74" in new_text
+    assert "verify: account_metrics --account divine_designs --level account" in new_text
+    assert "metric: blended_roas=2.10" in new_text
+    assert "**Verified:** 2026-06-25" in new_text
+    # The contradiction is called out loudly in the always-printed report.
+    assert "⚠️" in report and "CONTRADICTION" in report
+
+
+def test_audit_insufficient_fresh_data_changes_nothing() -> None:
+    # A below-floor fresh pull must not refute a real fact: no band change, no ➖, Verified unmoved.
+    report, new_text, counts = _audit(
+        _AUDIT_VAULT, _fixed_fetch(_account_rows(roas=2.5, spend=30, purchases=2)), apply=True
+    )
+    assert counts[AUDIT_INSUFFICIENT] == 1
+    assert new_text == _AUDIT_VAULT
+
+
+def test_audit_could_not_audit_when_entity_vanished() -> None:
+    # Empty fresh rows → could_not_audit; reported, never silently counted as confirmed, no edits.
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch([]), apply=True)
+    assert counts[AUDIT_COULD_NOT] == 1
+    assert new_text == _AUDIT_VAULT
+
+
+def test_audit_apply_is_idempotent_on_same_as_of() -> None:
+    fetch = _fixed_fetch(_account_rows(roas=2.10))
+    _, t1, _ = _audit(_AUDIT_VAULT, fetch, apply=True)
+    _, t2, _ = _audit(t1, fetch, apply=True)
+    assert t2 == t1  # second --apply on the same --as-of is a no-op
+    assert t1.count("➖ 2026-06-25") == 1  # exactly one drift line, not two
+
+
+def test_audit_report_only_makes_no_text_changes() -> None:
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=2.10)), apply=False)
+    assert new_text is None  # report-only ⇒ nothing to write
+    assert counts[AUDIT_REFUTED] == 1  # …but drift is still detected and reported
+
+
+# --- CLI: file I/O path (report-only never writes; --apply writes) ---------
+
+
+def _run_audit_cli(tmp_path, monkeypatch, text, rows, *, apply: bool, as_of="2026-06-25"):
+    from meta_ads_analysis import cli
+    import meta_ads_analysis.meta_api as meta_api
+
+    learnings = tmp_path / "learnings.md"
+    learnings.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(cli, "resolve_ad_account_id", lambda slug: "act_test")
+    monkeypatch.setattr(cli, "fetch_entity_metrics", lambda *a, **k: rows)
+    monkeypatch.setattr(cli, "fetch_breakdown_metrics", lambda *a, **k: rows)
+    monkeypatch.setattr(meta_api, "client_from_env", lambda version=None: Mock())
+    argv = ["audit-vault", "--account", "divine_designs", "--as-of", as_of, "--path", str(learnings)]
+    if apply:
+        argv.append("--apply")
+    monkeypatch.setattr(sys, "argv", argv)
+    cli.audit_vault_main()
+    return learnings.read_text(encoding="utf-8")
+
+
+def test_audit_vault_cli_report_only_leaves_file_byte_for_byte(tmp_path, monkeypatch, capsys) -> None:
+    out = _run_audit_cli(tmp_path, monkeypatch, _AUDIT_VAULT, _account_rows(roas=2.10), apply=False)
+    assert out == _AUDIT_VAULT  # zero file changes in report-only mode
+    printed = capsys.readouterr().out
+    assert "CONTRADICTION" in printed  # contradiction surfaced loudly even without --apply
+
+
+def test_audit_vault_cli_apply_writes_drift_to_file(tmp_path, monkeypatch) -> None:
+    out = _run_audit_cli(tmp_path, monkeypatch, _AUDIT_VAULT, _account_rows(roas=2.10), apply=True)
+    assert "🔴 Low (contested)" in out
+    assert "➖ 2026-06-25 — vault audit: blended_roas now 2.10 vs stored 3.74" in out
+    assert "**Verified:** 2026-06-25" in out
+
+
+# --- review additions: gaps the implementer's tests left uncovered ---------
+
+
+def test_audit_contradicted_lowers_band_one_level_in_text() -> None:
+    # Magnitude drift (3.74 → 5.00 ≈ 34%) with NO policy-threshold cross (both above target 3.0):
+    # contradicted, NOT refuted. On --apply the band drops exactly one level (🟢 High → 🟡 Medium),
+    # is NOT marked (contested) (that is refute-only), and a dated ➖ is logged.
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=5.00)), apply=True)
+    assert counts[AUDIT_CONTRADICTED] == 1 and counts[AUDIT_REFUTED] == 0
+    assert new_text is not None
+    assert "🟡 Medium" in new_text and "🟢 High" not in new_text
+    assert "(contested)" not in new_text  # one-level drop, not a refute
+    assert "➖ 2026-06-25 — vault audit: blended_roas now 5.00 vs stored 3.74" in new_text
+    assert "**Verified:** 2026-06-25" in new_text
+
+
+def test_resolve_fresh_metric_matches_entity_name_at_adset_level() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # `engaged_adset_roas` → identifier token {engaged} → the one ad set whose NAME contains it.
+    rows = [
+        {"id": "1", "name": "Engaged - 365d", "spend": 1200, "purchase_value": 4488, "roas": 3.74, "purchases": 90},
+        {"id": "2", "name": "Broad prospecting", "spend": 900, "purchase_value": 1800, "roas": 2.0, "purchases": 30},
+    ]
+    value, _, spend = resolve_fresh_metric(rows, level="adset", breakdowns=[], metric_name="engaged_adset_roas")
+    assert value == 3.74 and spend == 1200
+
+
+# Two data-backed metric: lines in ONE entry (mirrors the real divine_designs Instagram entry,
+# which carries two `ig_roas` claims). Both must be audited, both ➖ logged, and a re-run must stay
+# byte-identical even though the two share the same metric NAME.
+_AUDIT_TWO_METRICS = """# Durable learnings
+
+## Strategy
+
+### Two windows back the same Instagram-wins claim
+**Confidence:** 🟢 High →  ·  **Domain:** strategy
+**Rot:** fast  ·  **Verified:** 2026-01-10
+- ➕ 2026-01-10 — 30d split. `verify: account_metrics --account divine_designs --level account --date-from 2025-12-12 --date-to 2026-01-10 --breakdown publisher_platform` _(src: correlational · acct: divine_designs · metric: ig_roas=2.79)_
+- ➕ 2026-01-10 — 30d split, different cut. `verify: account_metrics --account divine_designs --level account --date-from 2025-12-12 --date-to 2026-01-10 --breakdown publisher_platform` _(src: correlational · acct: divine_designs · metric: fb_roas=1.94)_
+**Apply:** lean Instagram.
+"""
+
+
+def test_audit_logs_each_drifted_metric_in_a_multi_metric_entry_and_is_idempotent() -> None:
+    # ig_roas → instagram segment 1.50 (drifts from 2.79, AND crosses pause_roas_floor 1.5? no — 1.5
+    # is not < 1.5; use a clear refute). fb_roas → facebook segment 1.00 (drifts from 1.94, crosses
+    # pause_roas_floor 1.5 → refuted). Both segments resolvable in one breakdown pull.
+    rows = [
+        {"segment": {"publisher_platform": "instagram"}, "spend": 1000, "purchase_value": 1200, "roas": 1.20, "purchases": 50},
+        {"segment": {"publisher_platform": "facebook"}, "spend": 1000, "purchase_value": 1000, "roas": 1.00, "purchases": 40},
+    ]
+    _, t1, counts = _audit(_AUDIT_TWO_METRICS, _fixed_fetch(rows), apply=True)
+    # Both metrics drifted; each gets its own dated ➖ even though they live in one entry.
+    assert t1.count("➖ 2026-06-25 — vault audit:") == 2
+    assert "vault audit: ig_roas now 1.20" in t1
+    assert "vault audit: fb_roas now 1.00" in t1
+    # A second --apply on the same --as-of adds nothing (idempotent across both metric names).
+    _, t2, _ = _audit(t1, _fixed_fetch(rows), apply=True)
+    assert t2 == t1

@@ -754,6 +754,45 @@ def _build_tracking_concerns(ad_summaries: list[dict[str, Any]]) -> list[str]:
     return concerns
 
 
+def _recommendation_facts(ad: dict[str, Any]) -> str:
+    """Inline metric/window/sample facts for a prose recommendation, pulled from the ad summary
+    already in scope. Grounds the narrative line (section-4 rule: no advice without the number, its
+    window, the sample, and the entity) without computing a confidence band — the band lives on the
+    structured action."""
+    parts: list[str] = []
+    roas = ad.get("blended_roas")
+    cost_per_result = ad.get("cost_per_result")
+    cost_per_install = ad.get("cost_per_app_install")
+    if roas is not None:
+        parts.append(f"ROAS {roas:.2f}")
+    elif cost_per_result is not None:
+        parts.append(f"cost/result ${cost_per_result:.2f}")
+    elif cost_per_install is not None:
+        parts.append(f"cost/install ${cost_per_install:.2f}")
+    days_active = ad.get("days_active")
+    if days_active:
+        parts.append(f"over {int(days_active)}d")
+    purchases = ad.get("total_purchase_count")
+    if purchases is not None:
+        parts.append(f"{purchases:g} purchases")
+    spend = ad.get("total_spend")
+    if spend is not None:
+        parts.append(f"${spend:,.0f} spend")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _trajectory_facts(item: dict[str, Any]) -> str:
+    """Inline metric/window facts for a trajectory-driven prose recommendation."""
+    parts: list[str] = []
+    metric = item.get("metric")
+    if metric:
+        parts.append(str(metric).replace("_", " "))
+    pct = item.get("percent_change")
+    if pct is not None:
+        parts.append(f"{pct * 100:+.0f}% recent vs prior window")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _build_recommendations(
     waste_ads: list[dict[str, Any]],
     fatigued_ads: list[dict[str, Any]],
@@ -765,27 +804,27 @@ def _build_recommendations(
     if waste_ads:
         top = waste_ads[0]
         actions.append(
-            f"Reduce or pause budget on {top['ad_name']} first because it combines meaningful spend with weak value output."
+            f"Reduce or pause budget on {top['ad_name']}{_recommendation_facts(top)} first because it combines meaningful spend with weak value output."
         )
     if fatigued_ads:
         top = fatigued_ads[0]
         actions.append(
-            f"Refresh or rotate {top['ad_name']} because recent delivery patterns suggest fatigue rather than simple volatility."
+            f"Refresh or rotate {top['ad_name']}{_recommendation_facts(top)} because recent delivery patterns suggest fatigue rather than simple volatility."
         )
     if scaling_candidates:
         top = scaling_candidates[0]
         actions.append(
-            f"Consider carefully scaling {top['ad_name']} because it pairs stronger efficiency with manageable fatigue risk."
+            f"Consider carefully scaling {top['ad_name']}{_recommendation_facts(top)} because it pairs stronger efficiency with manageable fatigue risk."
         )
     degrading = next((item for item in trajectory_highlights if item["status"] == "degrading"), None)
     improving = next((item for item in trajectory_highlights if item["status"] == "improving"), None)
     if degrading:
         actions.append(
-            f"Review recent delivery on {degrading['ad_name']} because short-window efficiency is degrading versus the longer view."
+            f"Review recent delivery on {degrading['ad_name']}{_trajectory_facts(degrading)} because short-window efficiency is degrading versus the longer view."
         )
     elif improving:
         actions.append(
-            f"Hold {improving['ad_name']} for a controlled read because recent efficiency is improving, but avoid scaling from short-window data alone."
+            f"Hold {improving['ad_name']}{_trajectory_facts(improving)} for a controlled read because recent efficiency is improving, but avoid scaling from short-window data alone."
         )
     if tracking_concerns:
         actions.append(

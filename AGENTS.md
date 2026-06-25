@@ -33,7 +33,10 @@ Use these sources in this order:
 4. `data/normalized/meta_ads/<account_slug>/<run_date>/creative_lookup.csv`
 5. raw files in `data/raw/meta_ads/<account_slug>/<run_date>/` only when a detail needs to be verified
 
-Do not infer confidence that is not supported by the exported data.
+Do not infer confidence that is not supported by the exported data — every recommendation states a
+band (🟢 High / 🟡 Medium / 🔴 Low, or ⚪ *Insufficient data — abstain*) computed from sample size,
+recency, and grounding tier per the **Grounding rule** under Interpretation Rules. Below the
+significance floor, abstain — do not guess a low percentage.
 
 ## Output Structure
 
@@ -68,6 +71,98 @@ Every written analysis should use this structure:
 - If an ad has rising frequency and falling efficiency over enough history, call out fatigue even if it still produces results.
 - If export coverage is incomplete, say so plainly.
 
+**Grounding rule (applies to EVERY operator-facing recommendation — including free-text prose, where
+no code enforces it).** State four facts and a confidence band, or abstain:
+
+- **Cite four facts:** the **metric**, the **time window**, the **sample size** (purchases/spend, or
+  installs for install-goal accounts), and the **entity** (which ad / ad set / campaign). A
+  recommendation with no entity and no sample is not a recommendation — it is a guess.
+- **Carry a confidence band** in the shared vocabulary — 🟢 High / 🟡 Medium / 🔴 Low, or ⚪
+  *Insufficient data — abstain* — **with its rationale**. The rationale rests on two axes:
+  **data strength** (sample size, statistical significance, recency) and **grounding tier**
+  (`ab_experiment` > `direct_observation` > `correlational` > `external` > `model_inference`).
+  **The weaker axis caps the band** — a huge but correlational sample cannot read High, and a perfect
+  A/B on three conversions cannot either.
+- **When the data floor isn't cleared, abstain.** Below the significance floor in `confidence.py`
+  (25 conversions / $100 spend), say "insufficient data — keep running." **Never invent a
+  winner or a loser to avoid abstaining** — abstention is a blessed, correct output, not a failure.
+- **Causal-language guard:** a recommendation that asserts a *cause* ("X drives ROAS", "the lift is
+  *because* of Y", "Z *leads to* purchases") from non-experimental data must be labeled
+  **"correlational — confirm via A/B"** and downgraded one band. Only a completed A/B experiment
+  grounds a causal claim at full strength.
+
+This is the human-/agent-facing mirror of what the code now enforces structurally. The **canonical
+computation** is [`src/meta_ads_analysis/confidence.py`](src/meta_ads_analysis/confidence.py); the
+**shared vocabulary** is the "Confidence & evidence" rubric in
+[`knowledge/README.md`](knowledge/README.md). There is **one** confidence language across prose,
+README, and code — never introduce a second scale.
+
+**Adversarial-review rule (every pause / scale / budget recommendation must survive a fresh-context
+refutation pass before it reaches the operator).** A recommendation that drives an account action —
+a pause, a budget scale, a creative refresh — is not finalized until a second reviewer, working from
+*only* the recommendation and its cited basis (the **metric / window / sample / entity** and the
+claimed **band**) and **NOT** the reasoning that produced it, tries to **refute** it. The reviewer is
+conservative: **when uncertain it downgrades or refutes — it never passes.** Every verdict must name
+the specific input that fails; a vague "looks fine" is not a verdict. The four verdicts (the same
+taxonomy [`src/meta_ads_analysis/review.py`](src/meta_ads_analysis/review.py) emits):
+
+- **stands** — survives the challenge; reaches the operator unchanged.
+- **downgrade** — earned a lower band; corrected to the **new band** (named) before the operator sees it.
+- **refuted** — the call contradicts its own evidence; dropped (surfaced in the brief's "Refuted /
+  Downgraded By Review" section, never silently deleted).
+- **insufficient (abstain)** — cited basis is below the significance floor; becomes ⚪ "insufficient
+  data — keep running," never a 🔴 Low call.
+
+**The deterministic half of this pass is already enforced by code.** `review.py` re-derives the band
+from the cited evidence via `confidence.assess` and runs the *arithmetic / structural* refutations —
+sample-floor, window-length, causal-cap, band-earned, scale/pause direction, external-cap — returning
+the most-conservative verdict. The agent's job in this pass is the **semantic** refutations code
+cannot make (below). This pass only **filters and downgrades** what gets proposed: it **never approves
+an action, never flips an action executable, and never touches PAUSED-by-default** — it sits *upstream*
+of the guarded-write approval and cannot weaken it. **Abstention is a blessed output** — "insufficient
+data to recommend — keep running" is correct, and there is no pressure to pass a call.
+
+**What the fresh-context reviewer checks (the semantic refutations — each must name the failing
+input):**
+
+- **Contradicts the knowledge base.** Does the call conflict with a learning in
+  [`knowledge/learnings.md`](knowledge/learnings.md) or a decision in
+  `knowledge/accounts/<slug>/decision-log.md` — e.g. recommending a tactic a logged experiment
+  already refuted? → **refute or downgrade**, citing the conflicting entry.
+- **Cherry-picked window.** Is the cited window unusually short, or positioned over a *known
+  relearning / recently-changed period* (cross-check `decision-log.md` and the ~5-day watch grace
+  window)? The reviewer **may re-pull the same metric over a longer / standard window** — run the
+  `account_metrics …` command already attached to the evidence as its `regenerating_query` — to see
+  whether the call flips. Re-reading the same source is allowed; **inventing a contradicting number is
+  not.** → **downgrade** with "window may be unrepresentative; widen the window." (The code gate is
+  read-only and never re-pulls; this re-pull is the agent's job alone.)
+- **Prose recommendations.** The narrative `next_7_day_actions` lines and any free-text analysis get
+  the **same treatment as structured actions** — no schema enforces grounding on prose. If a prose
+  call lacks the four facts, or its implied confidence isn't earned, **downgrade or refute** it.
+- **External-as-confirmation.** If any web / external evidence is being treated as *confirmation* of a
+  live call rather than a *hypothesis*, **refute** it and route it to `experiment define` — this
+  enforces the external-evidence rule (above, and in `knowledge/README.md`) at review time.
+- **Confidence earned.** Independently sanity-check that the stated band is justified by the rubric
+  inputs. The code gate does this arithmetically; the reviewer catches the cases that hinge on
+  judgment the rubric can't encode.
+
+**Anti-rubber-stamp structure (the reviewer is itself an AI and could just agree — these mitigations
+are mandatory, not optional).** Mirror the TESS adversarial-reviewer discipline:
+
+- **Fresh context** — give the reviewer only the recommendation + its cited basis, never the producing
+  conversation or reasoning.
+- **Refute-by-default / downgrade-when-uncertain** — the burden is on the call to survive; ties go to
+  the more conservative verdict.
+- **Name the specific failing input** — a verdict without a named input (metric / window / sample /
+  entity / band) is not acceptable.
+- **No fabricated data** — reason over the cited basis; re-pull the *same* metric to check, but never
+  invent a contradicting number.
+
+**Materiality and audit trail.** Review the calls that drive a **pause / scale / budget** action — not
+trivial informational lines; the code gate already encodes this threshold (it reviews only
+confidence-bearing actions and passes informational ones through untouched). This pass may be run as a
+**TESS-style review stage** so it leaves an audit trail of what was filtered and why.
+
 ## Severity Heuristics
 
 - High waste risk:
@@ -95,7 +190,21 @@ Every written analysis should use this structure:
 
 ## Guardrails
 
-- Do not claim causal certainty from export data alone.
+- Do not claim causal certainty from export data alone — export data is correlational. Apply the
+  **causal-language guard** (see the Grounding rule under Interpretation Rules): label any
+  cause-claim "correlational — confirm via A/B" and downgrade its band. Only a completed A/B
+  experiment (`experiment define` → `experiment readout`) grounds a causal claim at full strength.
+- Do not present a recommendation without its four facts (metric / window / sample / entity) and a
+  confidence band; when the sample is below the significance floor, abstain ("insufficient data —
+  keep running") rather than manufacture a confident call.
+- Do not let external/web evidence raise the confidence of a live recommendation. External findings
+  are hypotheses for the experiment queue, capped at the `external` grounding tier — see "External
+  evidence" in [`knowledge/README.md`](knowledge/README.md).
+- Do not finalize a pause/scale/budget recommendation — structured *or* prose — until it survives the
+  **fresh-context adversarial-review pass** (see the **Adversarial-review rule** under Interpretation
+  Rules). The reviewer refutes by default and names the failing input; that pass only filters and
+  downgrades proposals upstream of approval — it never approves an action, enables a write, or alters
+  PAUSED-by-default.
 - Do not assume the pixel or Conversions API is healthy just because Meta reports purchases.
 - Do not assume revenue is healthy just because Meta reports results or app installs.
 - Do not recommend scaling solely off hook rate without downstream conversion evidence.
