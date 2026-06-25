@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-25T21:31:11.164Z (agent: claude)
+  Log file: /Users/vantaylor99/Developer/projects/meta-business-suite-analysis/tickets/.logs/8-vault-audit.implement.2026-06-25T21-31-11-164Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Add a command that re-checks the knowledge vault against fresh live data — when a stored number (like "Engaged Audience holds 3.7 ROAS") no longer matches reality, it surfaces the conflict loudly, lowers that fact's confidence, and logs the disagreement, but never silently overwrites or deletes it. A human still decides what to remove.
 prereq: vault-provenance-format
 files: src/meta_ads_analysis/knowledge_provenance.py, src/meta_ads_analysis/cli.py, src/meta_ads_analysis/config.py, pyproject.toml, knowledge/README.md, tests/test_meta_ads_analysis.py

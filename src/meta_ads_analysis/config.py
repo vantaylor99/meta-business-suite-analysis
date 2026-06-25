@@ -44,6 +44,16 @@ CONFIDENCE_CONVERSIONS_FLOOR = 25
 # `evergreen` learnings (platform/API mechanics, durable principles) are NEVER age-flagged.
 KNOWLEDGE_REVERIFY_DAYS = 42
 
+# Knowledge-vault drift (see the `audit-vault` re-check). When `audit-vault` re-pulls a stored
+# `metric:` over a fresh trailing window, a relative change of at least this fraction
+# (|fresh − stored| / stored) counts as drift and contradicts the stored belief. 0.25 (25%)
+# deliberately absorbs second-decimal ROAS noise (see "ROAS is partly derived" in learnings.md) so a
+# quiet week can't refute a real fact; a *policy-threshold crossing* (target_roas / pause_roas_floor)
+# refutes regardless of magnitude because it flips a scale/pause decision. A contradiction never
+# deletes a fact — it lowers the confidence band one level and logs a dated `➖`; a human decides
+# deletion.
+KNOWLEDGE_DRIFT_PCT = 0.25
+
 # Adversarial-review gate (see review.py). The minimum representative window span for the
 # ``window_length`` refutation check: a recommendation resting on a window shorter than this many
 # days is downgraded ("window may be unrepresentative; recommend a wider window"). This is the ONLY

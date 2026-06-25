@@ -5,8 +5,16 @@ provenance of every learning **machine-checkable** so a wrong guess can't quietl
 "fact" that future sessions trust:
 
 - ``parse_learnings(text)`` turns the markdown into structured :class:`LearningEntry` /
-  :class:`EvidenceLine` records (also consumed by the dependent ``vault-audit`` drift pass).
+  :class:`EvidenceLine` records (also consumed by the ``audit-vault`` drift pass below).
 - ``lint(entries, today=..., reverify_days=...)`` enforces the format and ages out *fast* facts.
+- The **audit engine** (``select_auditable`` → ``audit_claim`` → ``plan_edits`` →
+  ``apply_entry_edits``) re-checks a stored ``metric:`` against a *fresh* live value and, when reality
+  has drifted, **surfaces the contradiction loudly, lowers the band one level, and logs a dated
+  ``➖``** — it never silently keeps a stale belief and **never deletes an entry** (a human decides
+  deletion). This is the pure half; the Meta pull that feeds it ``FreshSample`` values lives in
+  :mod:`cli` (the only module that touches the API). It is deliberately the same vocabulary as the
+  live engine: drift verdicts decrement :class:`confidence.Band` (not a local emoji list) and the
+  data floor that protects a true fact from a noisy week is :func:`confidence.data_strength`.
 
 This is the knowledge-base counterpart to the live :mod:`confidence` engine, and the two speak
 **ONE** vocabulary — the provenance ``src`` tiers ARE ``confidence.EvidenceTier`` (re-exported here,
@@ -25,8 +33,13 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
-from .config import KNOWLEDGE_REVERIFY_DAYS
-from .confidence import BAND_PRESENTATION, Band, EvidenceTier
+from .config import (
+    CONFIDENCE_CONVERSIONS_FLOOR,
+    KNOWLEDGE_DRIFT_PCT,
+    KNOWLEDGE_REVERIFY_DAYS,
+    MIN_WASTE_SPEND,
+)
+from .confidence import BAND_PRESENTATION, Band, EvidenceTier, data_strength
 
 # ONE vocabulary — the provenance `src` tiers are exactly confidence.EvidenceTier. Do NOT fork a
 # second list; a test pins this equality so the two modules can't drift into two scales.
@@ -443,3 +456,485 @@ def render_report(
     )
     exit_code = 1 if (errors or (strict and warns)) else 0
     return "\n".join(out), exit_code
+
+
+# --- audit (drift re-check) -------------------------------------------------------------------
+#
+# `lint-vault` enforces the *format* and ages out fast facts. `audit-vault` closes the loop: it
+# re-pulls each `metric:` line's value over a FRESH trailing window and, when reality has drifted,
+# lowers the band + logs a dated `➖`. The diff/verdict and the markdown mutation below are PURE
+# (no Meta, no clock) so they unit-test with a fake metrics provider; cli.py owns the live pull.
+
+# The verdict an audited claim earns. `refuted` is the strong form of `contradicted` (a policy
+# threshold the claim sat on the other side of was crossed); both append a `➖` and lower the band,
+# `refuted` drops to 🔴 Low + `(contested)`. The two abstain verdicts never touch the band — a noisy
+# fresh window (`insufficient_fresh_data`) or a vanished entity/metric (`could_not_audit`) must not
+# refute a real fact (AGENTS.md: "don't collapse missing into zeros").
+AUDIT_CONFIRMED = "confirmed"
+AUDIT_CONTRADICTED = "contradicted"
+AUDIT_REFUTED = "refuted"
+AUDIT_INSUFFICIENT = "insufficient_fresh_data"
+AUDIT_COULD_NOT = "could_not_audit"
+
+# A contradiction event lowers the band; the two abstain verdicts leave it untouched.
+_AUDIT_DRIFTED: frozenset[str] = frozenset({AUDIT_CONTRADICTED, AUDIT_REFUTED})
+
+# Reverse of BAND_PRESENTATION for the three written-down bands — emoji → Band. Derived from the
+# single source so the audit's band decrement stays ONE vocabulary with the live engine.
+_EMOJI_TO_BAND: dict[str, Band] = {
+    BAND_PRESENTATION[b]["emoji"]: b for b in (Band.high, Band.medium, Band.low)
+}
+
+# The dated `➖` audit bullets all open with this marker; selection skips them (an audit line must
+# not itself become an audit target) and idempotency keys off it.
+_AUDIT_MARKER = "vault audit:"
+
+# In-line band token on a `**Confidence:**` header, e.g. "🟢 High" — rewritten as a pair so the
+# emoji and label never disagree (never "🟡 High").
+_BAND_INLINE_RE = re.compile(r"(🟢|🟡|🔴)\s*(High|Medium|Low)")
+_VERIFIED_LINE_RE = re.compile(r"(\*\*Verified:\*\*\s*)\d{4}-\d{2}-\d{2}")
+
+# Pull the level / breakdown / window out of a stored `account_metrics …` verify command.
+_VQ_LEVEL_RE = re.compile(r"--level\s+(?P<level>account|campaign|adset|ad)")
+_VQ_BREAKDOWN_RE = re.compile(r"--breakdown\s+(?P<breakdown>[A-Za-z0-9_,]+)")
+_VQ_FROM_RE = re.compile(r"--date-from\s+(?P<d>\d{4}-\d{2}-\d{2})")
+_VQ_TO_RE = re.compile(r"--date-to\s+(?P<d>\d{4}-\d{2}-\d{2})")
+
+
+@dataclass(slots=True)
+class FreshSample:
+    """The fresh live numbers a stored claim is re-checked against. Produced by cli.py's metrics
+    provider (the only Meta-touching code) and consumed by the pure :func:`audit_claim`.
+
+    ``value`` is the resolved fresh metric (e.g. ROAS) or ``None`` when it could not be resolved
+    (entity vanished from the rows, named metric absent, or value missing for the window → audit
+    abstains rather than scoring a fabricated 0). ``purchases``/``spend`` size the fresh window so
+    :func:`confidence.data_strength` can decide whether the pull even clears the significance floor.
+    ``window`` is the fresh trailing window actually pulled (``YYYY-MM-DD..YYYY-MM-DD``), surfaced in
+    the report and the logged ``➖``."""
+
+    value: float | None
+    purchases: float | None
+    spend: float | None
+    window: str
+
+
+@dataclass(slots=True)
+class AuditOutcome:
+    """One audited claim's verdict + the inputs behind it (so a reader can reproduce the call)."""
+
+    entry: LearningEntry
+    evidence: EvidenceLine
+    verdict: str
+    stored_value: float | None
+    fresh: FreshSample
+    crossed_threshold: str | None  # "target_roas"/"pause_roas_floor" when a boundary cross refuted
+    new_band_emoji: str | None  # the band this entry would move to (None = unchanged)
+    contested: bool  # refuted → mark the band (contested)
+    factors: list[str]  # human-readable "why this verdict"
+
+
+@dataclass(slots=True)
+class EntryEdit:
+    """A surgical, idempotent edit to ONE entry, keyed off its ``### header`` line number. The
+    mutation only ever touches this entry's band emoji + ``Verified:`` line and inserts bullets into
+    its evidence log — never the claim text, never another entry, never the whole file."""
+
+    entry_lineno: int
+    new_band_emoji: str | None
+    contested: bool
+    set_verified: str | None
+    insert_bullets: list[str]
+
+
+def is_audit_line(ev: EvidenceLine) -> bool:
+    """True if ``ev`` is a ``➖`` line this audit wrote (opens with the ``vault audit:`` marker).
+    Such lines carry their own ``metric:``+``verify:`` but must never be re-audited."""
+    return ev.text.lstrip().lower().startswith(_AUDIT_MARKER)
+
+
+def select_auditable(
+    entries: list[LearningEntry], *, account_slug: str
+) -> list[tuple[LearningEntry, EvidenceLine]]:
+    """The (entry, evidence) pairs worth auditing for ``account_slug``: a data-backed, account-scoped
+    claim. Skips ``evergreen`` entries (platform mechanics don't rot on numbers), lines with no
+    ``metric:``/``verify:``, lines for other accounts, and this audit's own ``➖`` lines."""
+    needle = f"--account {account_slug}"
+    out: list[tuple[LearningEntry, EvidenceLine]] = []
+    for entry in entries:
+        if entry.rot == ROT_EVERGREEN:
+            continue
+        for ev in entry.evidence:
+            if ev.metric_name is None or ev.metric_value is None or not ev.verify_query:
+                continue
+            if is_audit_line(ev):
+                continue
+            if needle not in ev.verify_query:
+                continue
+            out.append((entry, ev))
+    return out
+
+
+def parse_verify_query(cmd: str | None) -> dict[str, object]:
+    """Extract ``level`` / ``breakdowns`` / ``date_from`` / ``date_to`` from a stored
+    ``account_metrics …`` verify command (pure string parsing — no Meta). Missing parts come back
+    ``None`` / ``[]`` so the caller can fall back to defaults."""
+    cmd = cmd or ""
+    level_m = _VQ_LEVEL_RE.search(cmd)
+    bd_m = _VQ_BREAKDOWN_RE.search(cmd)
+    from_m = _VQ_FROM_RE.search(cmd)
+    to_m = _VQ_TO_RE.search(cmd)
+    breakdowns = (
+        [b for b in bd_m.group("breakdown").split(",") if b] if bd_m else []
+    )
+    return {
+        "level": level_m.group("level") if level_m else None,
+        "breakdowns": breakdowns,
+        "date_from": from_m.group("d") if from_m else None,
+        "date_to": to_m.group("d") if to_m else None,
+    }
+
+
+def _crosses(stored: float, fresh: float, threshold: float) -> bool:
+    """True if ``stored`` and ``fresh`` sit on opposite sides of ``threshold`` (a decision flip)."""
+    return (stored >= threshold) != (fresh >= threshold)
+
+
+def classify_drift(
+    *,
+    stored_value: float | None,
+    fresh: FreshSample,
+    target_roas: float | None,
+    pause_roas_floor: float | None,
+    spend_floor: float = MIN_WASTE_SPEND,
+    conversions_floor: float = CONFIDENCE_CONVERSIONS_FLOOR,
+    drift_pct: float = KNOWLEDGE_DRIFT_PCT,
+) -> tuple[str, str | None, list[str]]:
+    """The pure verdict: compare a stored value to a fresh sample. Returns
+    ``(verdict, crossed_threshold, factors)``.
+
+    Order of guards (each protects a true fact from a false refutation):
+    1. ``could_not_audit`` — the fresh value couldn't be resolved (``None``) or the stored value is
+       absent/zero (no relative change is computable).
+    2. ``insufficient_fresh_data`` — the fresh sample is below the significance floor
+       (:func:`confidence.data_strength` abstains): a noisy week must not refute a real fact.
+    3. ``refuted`` — the fresh value crossed ``target_roas`` or ``pause_roas_floor`` (a decision
+       flip) — strong contradiction regardless of magnitude.
+    4. ``contradicted`` — relative change ≥ ``drift_pct`` (the 25% band absorbs ROAS noise).
+    5. ``confirmed`` — fresh ≈ stored.
+    """
+    if stored_value is None or stored_value == 0 or fresh.value is None:
+        why = "fresh value could not be resolved" if (fresh.value is None) else (
+            "stored value missing or zero — relative drift not computable"
+        )
+        return AUDIT_COULD_NOT, None, [why]
+
+    data_band, data_factors = data_strength(
+        sample_purchases=fresh.purchases,
+        sample_spend=fresh.spend,
+        spend_floor=spend_floor,
+        conversions_floor=conversions_floor,
+        recency_days=0,  # a fresh trailing window ends at --as-of by construction
+    )
+    if data_band == Band.abstain:
+        return AUDIT_INSUFFICIENT, None, list(data_factors)
+
+    for name, threshold in (("target_roas", target_roas), ("pause_roas_floor", pause_roas_floor)):
+        if threshold is not None and _crosses(stored_value, fresh.value, threshold):
+            return (
+                AUDIT_REFUTED,
+                name,
+                [
+                    f"fresh {fresh.value:.2f} crossed {name} ({threshold:g}) from stored "
+                    f"{stored_value:.2f} — decision flip, refuted"
+                ],
+            )
+
+    rel = abs(fresh.value - stored_value) / abs(stored_value)
+    if rel >= drift_pct:
+        return (
+            AUDIT_CONTRADICTED,
+            None,
+            [f"fresh {fresh.value:.2f} vs stored {stored_value:.2f} — {rel:.0%} drift ≥ {drift_pct:.0%}"],
+        )
+    return (
+        AUDIT_CONFIRMED,
+        None,
+        [f"fresh {fresh.value:.2f} ≈ stored {stored_value:.2f} — {rel:.0%} drift < {drift_pct:.0%}"],
+    )
+
+
+def lower_band_emoji(emoji: str | None) -> str | None:
+    """One band step down (🟢→🟡→🔴, floored at 🔴) via :class:`confidence.Band` ordering — never a
+    local emoji ladder. ``None`` / unrecognized emoji → ``None`` (leave the header alone)."""
+    band = _EMOJI_TO_BAND.get(emoji or "")
+    if band is None:
+        return None
+    lowered = Band(max(Band.low, Band(band - 1)))
+    return BAND_PRESENTATION[lowered]["emoji"]
+
+
+def audit_claim(
+    entry: LearningEntry,
+    evidence: EvidenceLine,
+    fresh: FreshSample,
+    *,
+    target_roas: float | None,
+    pause_roas_floor: float | None,
+    spend_floor: float = MIN_WASTE_SPEND,
+    conversions_floor: float = CONFIDENCE_CONVERSIONS_FLOOR,
+    drift_pct: float = KNOWLEDGE_DRIFT_PCT,
+) -> AuditOutcome:
+    """Run :func:`classify_drift` for one claim and resolve the band move it implies. ``refuted`` →
+    🔴 Low + ``(contested)``; ``contradicted`` → one level down; everything else leaves the band."""
+    verdict, crossed, factors = classify_drift(
+        stored_value=evidence.metric_value,
+        fresh=fresh,
+        target_roas=target_roas,
+        pause_roas_floor=pause_roas_floor,
+        spend_floor=spend_floor,
+        conversions_floor=conversions_floor,
+        drift_pct=drift_pct,
+    )
+    new_band_emoji: str | None = None
+    contested = False
+    if verdict == AUDIT_REFUTED:
+        new_band_emoji = BAND_PRESENTATION[Band.low]["emoji"]
+        contested = True
+    elif verdict == AUDIT_CONTRADICTED:
+        new_band_emoji = lower_band_emoji(entry.band_emoji)
+    return AuditOutcome(
+        entry=entry,
+        evidence=evidence,
+        verdict=verdict,
+        stored_value=evidence.metric_value,
+        fresh=fresh,
+        crossed_threshold=crossed,
+        new_band_emoji=new_band_emoji,
+        contested=contested,
+        factors=factors,
+    )
+
+
+def build_audit_bullet(
+    outcome: AuditOutcome,
+    *,
+    as_of: str,
+    account_slug: str,
+    verify_query: str,
+) -> str:
+    """The dated ``➖`` evidence line to append for a drifted claim. It carries its own
+    ``metric:``+``verify:`` (so it survives ``lint-vault``) and opens with the ``vault audit:`` marker
+    (so it is never itself re-audited). ``verify_query`` should reproduce the *fresh* value."""
+    metric = outcome.evidence.metric_name
+    fresh = outcome.fresh.value
+    stored = outcome.stored_value
+    return (
+        f"- ➖ {as_of} — {_AUDIT_MARKER} {metric} now {fresh:.2f} vs stored "
+        f"{stored:.2f} over {outcome.fresh.window} `verify: {verify_query}` "
+        f"_(src: {EvidenceTier.direct_observation.name} · acct: {account_slug} · "
+        f"metric: {metric}={fresh:.2f})_"
+    )
+
+
+def plan_edits(
+    outcomes: list[AuditOutcome],
+    *,
+    as_of: str,
+    account_slug: str,
+    fresh_verify_for: dict[int, str] | None = None,
+) -> list[EntryEdit]:
+    """Turn audit outcomes into per-entry surgical edits, idempotently.
+
+    One :class:`EntryEdit` per entry (outcomes are grouped by ``entry.lineno``). For each entry:
+
+    - **Idempotency:** an outcome whose dated ``vault audit:`` line for this ``as_of`` + ``metric``
+      already exists in the entry is treated as already-applied — it contributes no new bullet and no
+      band decrement, so re-running ``--apply`` on the same ``--as-of`` is a no-op.
+    - **Band:** at most ONE step per run. A *new* refutation pins to 🔴 ``(contested)``; otherwise a
+      *new* contradiction lowers one level. Abstain verdicts never move the band.
+    - **Verified:** refreshed to ``as_of`` whenever the claim was actually checked (confirmed /
+      contradicted / refuted) — this is how a ``lint-vault ⏳ re-verify`` flag clears. An abstain
+      (insufficient / could-not-audit) does NOT refresh it (nothing was confirmed).
+
+    ``fresh_verify_for`` maps an evidence ``lineno`` to the reproduce-the-fresh-value command for its
+    ``➖`` bullet; a missing entry falls back to the stored ``verify_query``.
+    """
+    fresh_verify_for = fresh_verify_for or {}
+    by_entry: dict[int, list[AuditOutcome]] = {}
+    for o in outcomes:
+        by_entry.setdefault(o.entry.lineno, []).append(o)
+
+    edits: list[EntryEdit] = []
+    for lineno, group in by_entry.items():
+        entry = group[0].entry
+        already: set[str] = {
+            f"{e.date}|{e.metric_name}"
+            for e in entry.evidence
+            if is_audit_line(e) and e.metric_name is not None
+        }
+
+        new_band_emoji: str | None = None
+        contested = False
+        bullets: list[str] = []
+        checked = False  # any non-abstain verdict → Verified is fair to refresh
+
+        for o in group:
+            if o.verdict in (AUDIT_CONFIRMED, *_AUDIT_DRIFTED):
+                checked = True
+            if o.verdict not in _AUDIT_DRIFTED:
+                continue
+            key = f"{as_of}|{o.evidence.metric_name}"
+            if key in already:
+                continue  # this exact audit already logged — don't double-count
+            verify_query = fresh_verify_for.get(o.evidence.lineno) or (o.evidence.verify_query or "")
+            bullets.append(
+                build_audit_bullet(
+                    o, as_of=as_of, account_slug=account_slug, verify_query=verify_query
+                )
+            )
+            if o.verdict == AUDIT_REFUTED:
+                new_band_emoji = BAND_PRESENTATION[Band.low]["emoji"]
+                contested = True
+            elif new_band_emoji is None and not contested:
+                lowered = lower_band_emoji(entry.band_emoji)
+                if lowered is not None:
+                    new_band_emoji = lowered
+
+        set_verified = as_of if checked else None
+        if new_band_emoji is None and not contested and not bullets and set_verified is None:
+            continue
+        edits.append(
+            EntryEdit(
+                entry_lineno=lineno,
+                new_band_emoji=new_band_emoji,
+                contested=contested,
+                set_verified=set_verified,
+                insert_bullets=bullets,
+            )
+        )
+    return edits
+
+
+def _entry_span(lines: list[str], header_idx: int) -> int:
+    """End (exclusive, 0-indexed) of the entry whose ``### header`` is at ``header_idx``: the next
+    ``### ``/``## `` line, or EOF."""
+    i = header_idx + 1
+    n = len(lines)
+    while i < n:
+        if lines[i].startswith("### ") or lines[i].startswith("## "):
+            break
+        i += 1
+    return i
+
+
+def _apply_one_edit(lines: list[str], edit: EntryEdit) -> None:
+    """Apply a single :class:`EntryEdit` to ``lines`` in place. Re-locates the band / Verified /
+    evidence lines by scanning the entry's CURRENT span (never byte offsets) so concurrent edits
+    elsewhere in the file aren't clobbered."""
+    start = edit.entry_lineno - 1  # entry_lineno is 1-indexed at the `### header`
+    if start < 0 or start >= len(lines) or not lines[start].startswith("### "):
+        return  # entry moved/vanished under us — skip rather than corrupt
+    end = _entry_span(lines, start)
+
+    # Band emoji (+ optional contested marker) on the **Confidence:** line.
+    if edit.new_band_emoji is not None or edit.contested:
+        for i in range(start, end):
+            if "**Confidence:**" not in lines[i]:
+                continue
+            line = lines[i]
+            if edit.new_band_emoji is not None:
+                band = _EMOJI_TO_BAND[edit.new_band_emoji]
+                label = BAND_PRESENTATION[band]["label"]
+                line = _BAND_INLINE_RE.sub(f"{edit.new_band_emoji} {label}", line, count=1)
+            if edit.contested and "(contested)" not in line:
+                line = _BAND_INLINE_RE.sub(r"\g<0> (contested)", line, count=1)
+            lines[i] = line
+            break
+
+    # Verified date.
+    if edit.set_verified is not None:
+        for i in range(start, end):
+            if "**Verified:**" in lines[i]:
+                lines[i] = _VERIFIED_LINE_RE.sub(rf"\g<1>{edit.set_verified}", lines[i], count=1)
+                break
+
+    # Insert bullets after the last evidence block (before **Apply:** etc.).
+    if edit.insert_bullets:
+        last_ev = None
+        for i in range(start, end):
+            if _EVIDENCE_START_RE.match(lines[i]):
+                last_ev = i
+        if last_ev is None:
+            insert_at = end  # no evidence log yet — append at the entry's end
+        else:
+            insert_at = last_ev + 1
+            while insert_at < end and _is_continuation(lines[insert_at]):
+                insert_at += 1
+        lines[insert_at:insert_at] = edit.insert_bullets
+
+
+def apply_entry_edits(text: str, edits: list[EntryEdit]) -> str:
+    """Apply ``edits`` to ``text`` and return the new text. Edits run bottom-up (descending
+    ``entry_lineno``) so an insertion never shifts the line numbers of a not-yet-edited entry above
+    it. With no edits the input is returned byte-for-byte (report-only ⇒ zero file changes)."""
+    if not edits:
+        return text
+    lines = text.splitlines()
+    had_final_newline = text.endswith("\n")
+
+    for edit in sorted(edits, key=lambda e: e.entry_lineno, reverse=True):
+        _apply_one_edit(lines, edit)
+
+    out = "\n".join(lines)
+    if had_final_newline:
+        out += "\n"
+    return out
+
+
+# Icons for the report. Drift is loud (⚠️); abstains are quiet; confirmed is a check.
+_VERDICT_ICON = {
+    AUDIT_CONFIRMED: "✅",
+    AUDIT_CONTRADICTED: "⚠️",
+    AUDIT_REFUTED: "⚠️",
+    AUDIT_INSUFFICIENT: "•",
+    AUDIT_COULD_NOT: "•",
+}
+
+
+def render_audit_report(
+    outcomes: list[AuditOutcome], *, account_slug: str, as_of: str, apply_mode: bool
+) -> tuple[str, dict[str, int]]:
+    """Render the always-printed audit report and return ``(text, counts)``. Contradictions/
+    refutations are called out loudly (⚠️); the summary line tallies every verdict."""
+    counts = {
+        AUDIT_CONFIRMED: 0,
+        AUDIT_CONTRADICTED: 0,
+        AUDIT_REFUTED: 0,
+        AUDIT_INSUFFICIENT: 0,
+        AUDIT_COULD_NOT: 0,
+    }
+    mode = "apply" if apply_mode else "report-only"
+    out = [f"audit-vault {account_slug} — {len(outcomes)} auditable claim(s) as of {as_of} [{mode}]"]
+    for o in outcomes:
+        counts[o.verdict] = counts.get(o.verdict, 0) + 1
+        icon = _VERDICT_ICON.get(o.verdict, "•")
+        stored = "n/a" if o.stored_value is None else f"{o.stored_value:.2f}"
+        fresh = "n/a" if o.fresh.value is None else f"{o.fresh.value:.2f}"
+        loud = "  ⚠️ CONTRADICTION" if o.verdict in _AUDIT_DRIFTED else ""
+        out.append(
+            f"{icon} [{o.verdict}] {o.entry.claim}{loud}\n"
+            f"      {o.evidence.metric_name}: stored {stored} vs fresh {fresh} "
+            f"over {o.fresh.window or 'n/a'}"
+        )
+        for factor in o.factors:
+            out.append(f"        - {factor}")
+    out.append(
+        "audit-vault: "
+        f"{counts[AUDIT_CONFIRMED]} confirmed · "
+        f"{counts[AUDIT_CONTRADICTED] + counts[AUDIT_REFUTED]} contradicted "
+        f"({counts[AUDIT_REFUTED]} refuted) · "
+        f"{counts[AUDIT_INSUFFICIENT]} insufficient-fresh-data · "
+        f"{counts[AUDIT_COULD_NOT]} could-not-audit"
+    )
+    return "\n".join(out), counts
