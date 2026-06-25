@@ -3959,6 +3959,29 @@ def test_grounding_tier_ceilings_match_knowledge_readme() -> None:
         )
 
 
+def test_review_verdict_taxonomy_appears_in_docs() -> None:
+    # Sibling to the vocabulary/tier pins above. The AGENTS.md "Adversarial-review rule" and the
+    # knowledge/README.md two-layer-review subsection both name the four verdicts that review.py
+    # emits. Pin the SOURCE-OF-TRUTH verdict strings (review.py's VERDICT_* constants) to both docs
+    # so a rename in code (or a drifted doc) fails here instead of silently desyncing the prose from
+    # the gate. (The six per-check names are intentionally NOT pinned — the docs spell them as prose,
+    # e.g. "causal-cap"/"external-cap", which deliberately differ from the code's failed_input
+    # identifiers "causal"/"external", so a verbatim pin would be fragile in both directions.)
+    from meta_ads_analysis.config import PROJECT_ROOT
+    from meta_ads_analysis.review import (
+        VERDICT_DOWNGRADE,
+        VERDICT_INSUFFICIENT,
+        VERDICT_REFUTED,
+        VERDICT_STANDS,
+    )
+
+    verdicts = (VERDICT_STANDS, VERDICT_DOWNGRADE, VERDICT_REFUTED, VERDICT_INSUFFICIENT)
+    for rel in ("AGENTS.md", "knowledge/README.md"):
+        doc = (PROJECT_ROOT / rel).read_text(encoding="utf-8")
+        for verdict in verdicts:
+            assert verdict in doc, f"verdict {verdict!r} missing from {rel}"
+
+
 def test_render_helpers_produce_compact_lines() -> None:
     evidence = _recent_evidence(purchases=42.0, spend=1250.0)
     conf = assess(
