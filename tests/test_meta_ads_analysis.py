@@ -4848,3 +4848,65 @@ def test_audit_vault_cli_apply_writes_drift_to_file(tmp_path, monkeypatch) -> No
     assert "🔴 Low (contested)" in out
     assert "➖ 2026-06-25 — vault audit: blended_roas now 2.10 vs stored 3.74" in out
     assert "**Verified:** 2026-06-25" in out
+
+
+# --- review additions: gaps the implementer's tests left uncovered ---------
+
+
+def test_audit_contradicted_lowers_band_one_level_in_text() -> None:
+    # Magnitude drift (3.74 → 5.00 ≈ 34%) with NO policy-threshold cross (both above target 3.0):
+    # contradicted, NOT refuted. On --apply the band drops exactly one level (🟢 High → 🟡 Medium),
+    # is NOT marked (contested) (that is refute-only), and a dated ➖ is logged.
+    report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=5.00)), apply=True)
+    assert counts[AUDIT_CONTRADICTED] == 1 and counts[AUDIT_REFUTED] == 0
+    assert new_text is not None
+    assert "🟡 Medium" in new_text and "🟢 High" not in new_text
+    assert "(contested)" not in new_text  # one-level drop, not a refute
+    assert "➖ 2026-06-25 — vault audit: blended_roas now 5.00 vs stored 3.74" in new_text
+    assert "**Verified:** 2026-06-25" in new_text
+
+
+def test_resolve_fresh_metric_matches_entity_name_at_adset_level() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # `engaged_adset_roas` → identifier token {engaged} → the one ad set whose NAME contains it.
+    rows = [
+        {"id": "1", "name": "Engaged - 365d", "spend": 1200, "purchase_value": 4488, "roas": 3.74, "purchases": 90},
+        {"id": "2", "name": "Broad prospecting", "spend": 900, "purchase_value": 1800, "roas": 2.0, "purchases": 30},
+    ]
+    value, _, spend = resolve_fresh_metric(rows, level="adset", breakdowns=[], metric_name="engaged_adset_roas")
+    assert value == 3.74 and spend == 1200
+
+
+# Two data-backed metric: lines in ONE entry (mirrors the real divine_designs Instagram entry,
+# which carries two `ig_roas` claims). Both must be audited, both ➖ logged, and a re-run must stay
+# byte-identical even though the two share the same metric NAME.
+_AUDIT_TWO_METRICS = """# Durable learnings
+
+## Strategy
+
+### Two windows back the same Instagram-wins claim
+**Confidence:** 🟢 High →  ·  **Domain:** strategy
+**Rot:** fast  ·  **Verified:** 2026-01-10
+- ➕ 2026-01-10 — 30d split. `verify: account_metrics --account divine_designs --level account --date-from 2025-12-12 --date-to 2026-01-10 --breakdown publisher_platform` _(src: correlational · acct: divine_designs · metric: ig_roas=2.79)_
+- ➕ 2026-01-10 — 30d split, different cut. `verify: account_metrics --account divine_designs --level account --date-from 2025-12-12 --date-to 2026-01-10 --breakdown publisher_platform` _(src: correlational · acct: divine_designs · metric: fb_roas=1.94)_
+**Apply:** lean Instagram.
+"""
+
+
+def test_audit_logs_each_drifted_metric_in_a_multi_metric_entry_and_is_idempotent() -> None:
+    # ig_roas → instagram segment 1.50 (drifts from 2.79, AND crosses pause_roas_floor 1.5? no — 1.5
+    # is not < 1.5; use a clear refute). fb_roas → facebook segment 1.00 (drifts from 1.94, crosses
+    # pause_roas_floor 1.5 → refuted). Both segments resolvable in one breakdown pull.
+    rows = [
+        {"segment": {"publisher_platform": "instagram"}, "spend": 1000, "purchase_value": 1200, "roas": 1.20, "purchases": 50},
+        {"segment": {"publisher_platform": "facebook"}, "spend": 1000, "purchase_value": 1000, "roas": 1.00, "purchases": 40},
+    ]
+    _, t1, counts = _audit(_AUDIT_TWO_METRICS, _fixed_fetch(rows), apply=True)
+    # Both metrics drifted; each gets its own dated ➖ even though they live in one entry.
+    assert t1.count("➖ 2026-06-25 — vault audit:") == 2
+    assert "vault audit: ig_roas now 1.20" in t1
+    assert "vault audit: fb_roas now 1.00" in t1
+    # A second --apply on the same --as-of adds nothing (idempotent across both metric names).
+    _, t2, _ = _audit(t1, _fixed_fetch(rows), apply=True)
+    assert t2 == t1
