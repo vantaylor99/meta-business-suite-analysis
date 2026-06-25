@@ -39,6 +39,15 @@ from meta_ads_analysis.confidence import (
     render_confidence_line,
     render_evidence_line,
 )
+from meta_ads_analysis.knowledge_provenance import (
+    BAND_EMOJIS,
+    TIER_NAMES,
+    Finding,
+    lint,
+    lint_profile_baseline,
+    parse_learnings,
+    render_report,
+)
 from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
 from meta_ads_analysis.review import (
@@ -4280,3 +4289,260 @@ def test_recommendations_prose_carries_metric_window_sample_facts() -> None:
     assert "purchases" in waste_line
     assert "spend" in waste_line
     assert "over" in waste_line and "d," in waste_line
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-vault provenance format + lint-vault
+# (src/meta_ads_analysis/knowledge_provenance.py)
+# ---------------------------------------------------------------------------
+
+_CLEAN_VAULT = """# Durable learnings
+
+Intro prose that is not an entry and must be ignored.
+
+## Meta platform & API behavior
+
+### Dev-mode app blocker is a platform mechanic
+**Confidence:** 🟢 High →  ·  **Domain:** platform
+**Rot:** evergreen  ·  **Verified:** 2026-01-01
+- ➕ 2026-01-01 — validate-only POST rejected on all 3 ad sets; matches documented behavior.
+  This evidence wraps across **two** physical lines and the tag closes here. _(src: direct_observation · acct: divine_designs)_
+- ➖ 2026-01-02 — one counter-observation that lowers nothing yet. _(src: correlational · acct: divine_designs)_
+**Apply:** check issues_info first.
+**Would raise / lower:** a second account reproducing it.
+
+### Engaged audience holds higher ROAS
+**Confidence:** 🔴 Low ↑  ·  **Domain:** strategy
+**Rot:** fast  ·  **Verified:** 2026-01-10
+- ➕ 2026-01-10 — engaged ad set 3.74 ROAS vs low-value 2.04, confounded by creative mix.
+  `verify: account_metrics --account divine_designs --level adset --date-from 2025-12-11 --date-to 2026-01-10`
+  _(src: correlational · acct: divine_designs · metric: engaged_roas=3.74)_
+**Apply:** treat as a hunch only.
+
+## Tooling capabilities (factual reference — not a probabilistic claim)
+
+- `sync-api` — a plain tooling bullet that is NOT an entry and must be ignored.
+"""
+
+
+def _entry(*body_lines: str, header: str = "X claim", confidence: str = "🟢 High →",
+           rot: str = "evergreen", verified: str = "2026-01-01") -> str:
+    head = [f"### {header}", f"**Confidence:** {confidence}  ·  **Domain:** platform"]
+    if rot is not None and verified is not None:
+        head.append(f"**Rot:** {rot}  ·  **Verified:** {verified}")
+    elif rot is not None:
+        head.append(f"**Rot:** {rot}")
+    elif verified is not None:
+        head.append(f"**Verified:** {verified}")
+    return "\n".join(["## Section", "", *head, *body_lines, ""])
+
+
+def _codes(findings, severity=None) -> set:
+    return {f.code for f in findings if severity is None or f.severity == severity}
+
+
+def test_parse_learnings_extracts_structured_fields() -> None:
+    entries = parse_learnings(_CLEAN_VAULT)
+    # Two `###` entries; the intro prose and the tooling bullet are ignored.
+    assert len(entries) == 2
+
+    dev = entries[0]
+    assert dev.claim == "Dev-mode app blocker is a platform mechanic"
+    assert dev.band_emoji == "🟢"
+    assert dev.domain == "platform"
+    assert dev.rot == "evergreen"
+    assert dev.verified == "2026-01-01"
+    # lineno points at the `### ` header line (1-indexed).
+    assert _CLEAN_VAULT.splitlines()[dev.lineno - 1].startswith("### ")
+    assert len(dev.evidence) == 2
+
+    ev0 = dev.evidence[0]
+    assert ev0.sign == "+" and ev0.date == "2026-01-01"
+    assert ev0.tier == "direct_observation" and ev0.account == "divine_designs"
+    assert ev0.metric_name is None and ev0.metric_value is None
+    assert ev0.verify_query is None and ev0.url is None and ev0.has_tag is True
+    # The multi-physical-line evidence was rejoined: text from both lines is present, tag stripped.
+    assert "validate-only POST" in ev0.text
+    assert "wraps across" in ev0.text
+    assert "src:" not in ev0.text
+
+    assert dev.evidence[1].sign == "-" and dev.evidence[1].tier == "correlational"
+
+    eng = entries[1]
+    assert eng.rot == "fast" and eng.verified == "2026-01-10"
+    ev = eng.evidence[0]
+    assert ev.tier == "correlational" and ev.account == "divine_designs"
+    assert ev.metric_name == "engaged_roas" and ev.metric_value == 3.74
+    assert ev.verify_query is not None and ev.verify_query.startswith("account_metrics --account divine_designs")
+
+
+def test_lint_clean_vault_has_no_findings() -> None:
+    entries = parse_learnings(_CLEAN_VAULT)
+    findings = lint(entries, today=date(2026, 1, 15))  # 5d after the fast entry's Verified
+    assert findings == []
+
+
+def test_lint_errors_untagged_evidence_line() -> None:
+    text = _entry("- ➕ 2026-01-01 — an evidence line with no provenance tag at all.")
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "missing_tag" in _codes(findings, "error")
+
+
+def test_lint_errors_invalid_src_tier() -> None:
+    text = _entry("- ➕ 2026-01-01 — bad tier. _(src: bogus_tier · acct: divine_designs)_")
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "invalid_src" in _codes(findings, "error")
+
+
+def test_lint_errors_missing_rot_and_verified() -> None:
+    text = _entry(
+        "- ➕ 2026-01-01 — fine evidence. _(src: direct_observation · acct: divine_designs)_",
+        rot=None,
+        verified=None,
+    )
+    codes = _codes(lint(parse_learnings(text), today=date(2026, 1, 2)), "error")
+    assert "missing_rot" in codes and "missing_verified" in codes
+
+
+def test_lint_errors_metric_without_verify_command() -> None:
+    text = _entry(
+        "- ➕ 2026-01-01 — cites a number. _(src: correlational · acct: divine_designs · metric: roas=3.0)_"
+    )
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "metric_without_verify" in _codes(findings, "error")
+
+
+def test_lint_errors_external_without_url() -> None:
+    text = _entry("- ➕ 2026-01-01 — practitioner says X. _(src: external · acct: —)_")
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    assert "external_without_url" in _codes(findings, "error")
+    # A URL anywhere on the line satisfies the rule.
+    ok = _entry(
+        "- ➕ 2026-01-01 — practitioner says X, see https://example.com/post . _(src: external · acct: —)_"
+    )
+    assert "external_without_url" not in _codes(lint(parse_learnings(ok), today=date(2026, 1, 2)), "error")
+
+
+def test_lint_staleness_flags_fast_but_never_evergreen() -> None:
+    text = (
+        _entry(
+            "- ➕ 2026-01-01 — fast fact. _(src: correlational · acct: divine_designs)_",
+            header="fast claim",
+            rot="fast",
+            verified="2026-01-01",
+        )
+        + _entry(
+            "- ➕ 2025-06-01 — durable platform mechanic. _(src: direct_observation · acct: —)_",
+            header="evergreen claim",
+            rot="evergreen",
+            verified="2025-06-01",
+        )
+    )
+    entries = parse_learnings(text)
+    # today is 50d after the fast entry's Verified (> default 42) and ~264d after the evergreen one.
+    findings = lint(entries, today=date(2026, 2, 20))
+    warns = [f for f in findings if f.severity == "warn"]
+    assert len(warns) == 1
+    assert warns[0].code == "reverify" and warns[0].claim == "fast claim"
+    # No errors, and the 200+ day-old evergreen entry is NOT age-flagged.
+    assert _codes(findings, "error") == set()
+    assert all(f.claim != "evergreen claim" for f in findings)
+
+
+def test_render_report_strict_turns_warnings_into_failure() -> None:
+    text = _entry(
+        "- ➕ 2026-01-01 — fast fact. _(src: correlational · acct: divine_designs)_",
+        rot="fast",
+        verified="2026-01-01",
+    )
+    findings = lint(parse_learnings(text), today=date(2026, 3, 1))  # well past 42 days
+    assert any(f.severity == "warn" for f in findings)
+    _, code_lenient = render_report(findings, entries_count=1, strict=False)
+    _, code_strict = render_report(findings, entries_count=1, strict=True)
+    assert code_lenient == 0  # warnings alone do not fail by default
+    assert code_strict == 1   # --strict makes them fail
+
+
+def _run_lint_vault_cli(tmp_path, monkeypatch, text, *, today="2026-01-15", strict=False) -> int:
+    import pytest
+
+    from meta_ads_analysis.cli import lint_vault_main
+
+    learnings = tmp_path / "learnings.md"
+    learnings.write_text(text, encoding="utf-8")
+    argv = [
+        "lint-vault",
+        "--path", str(learnings),
+        "--profile", str(tmp_path / "no-such-profile.md"),  # skipped (does not exist)
+        "--today", today,
+    ]
+    if strict:
+        argv.append("--strict")
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        lint_vault_main()
+    code = exc.value.code
+    return code if isinstance(code, int) else 1
+
+
+def test_lint_vault_main_exits_zero_when_clean(tmp_path, monkeypatch, capsys) -> None:
+    code = _run_lint_vault_cli(tmp_path, monkeypatch, _CLEAN_VAULT, today="2026-01-15")
+    assert code == 0
+    assert "0 error(s)" in capsys.readouterr().out
+
+
+def test_lint_vault_main_exits_nonzero_on_format_error(tmp_path, monkeypatch, capsys) -> None:
+    bad = _entry("- ➕ 2026-01-01 — bad. _(src: bogus_tier · acct: divine_designs)_")
+    code = _run_lint_vault_cli(tmp_path, monkeypatch, bad, today="2026-01-15")
+    assert code == 1
+    assert "ERROR" in capsys.readouterr().out
+
+
+def test_lint_vault_main_strict_fails_on_stale_fast(tmp_path, monkeypatch) -> None:
+    stale = _entry(
+        "- ➕ 2026-01-01 — fast fact. _(src: correlational · acct: divine_designs)_",
+        rot="fast",
+        verified="2026-01-01",
+    )
+    # Without --strict the stale warning does not fail; with --strict it does.
+    assert _run_lint_vault_cli(tmp_path, monkeypatch, stale, today="2026-06-01") == 0
+    assert _run_lint_vault_cli(tmp_path, monkeypatch, stale, today="2026-06-01", strict=True) == 1
+
+
+def test_provenance_tier_names_are_exactly_confidence_evidence_tier() -> None:
+    # ONE vocabulary: the provenance `src` tiers must equal confidence.EvidenceTier so the vault
+    # checker and the live engine cannot drift into two scales.
+    assert TIER_NAMES == frozenset(t.name for t in EvidenceTier)
+
+
+def test_provenance_band_emojis_match_confidence_presentation() -> None:
+    assert BAND_EMOJIS == frozenset(
+        BAND_PRESENTATION[b]["emoji"] for b in (Band.high, Band.medium, Band.low)
+    )
+
+
+def test_real_learnings_md_lints_with_zero_errors() -> None:
+    # Meta-test: the committed knowledge/learnings.md, after the provenance retrofit, must lint
+    # clean (errors). Deterministic because `today` is pinned. Warnings (re-verify) are allowed.
+    from meta_ads_analysis.config import PROJECT_ROOT
+
+    text = (PROJECT_ROOT / "knowledge" / "learnings.md").read_text(encoding="utf-8")
+    entries = parse_learnings(text)
+    assert entries, "expected the real learnings.md to contain entries"
+    findings = lint(entries, today=date(2026, 6, 25))
+    errors = [f for f in findings if f.severity == "error"]
+    assert errors == [], f"real learnings.md has lint errors: {[(f.code, f.message) for f in errors]}"
+    # Every entry has a rot class and a verified date after the retrofit.
+    assert all(e.rot in {"fast", "evergreen"} and e.verified for e in entries)
+
+
+def test_real_profile_baseline_header_is_present_and_fresh() -> None:
+    from meta_ads_analysis.config import PROJECT_ROOT
+
+    text = (PROJECT_ROOT / "knowledge" / "accounts" / "divine_designs" / "profile.md").read_text(
+        encoding="utf-8"
+    )
+    # Fresh relative to the baseline date → no warning; far in the future → ⏳ re-verify warning.
+    assert lint_profile_baseline(text, today=date(2026, 6, 25)) == []
+    stale = lint_profile_baseline(text, today=date(2027, 1, 1))
+    assert len(stale) == 1 and stale[0].code == "reverify"

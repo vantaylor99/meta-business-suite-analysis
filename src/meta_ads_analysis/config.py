@@ -36,6 +36,14 @@ CONFIDENCE_RECENCY_STALE_DAYS = 14
 # ("insufficient data") instead of being scored as a confident pause/scale.
 CONFIDENCE_CONVERSIONS_FLOOR = 25
 
+# Knowledge-vault staleness (see knowledge_provenance.py / the `lint-vault` checker). A `fast`
+# learning whose **Verified:** date is older than this many days before `today` is flagged
+# "⏳ re-verify" (a warning, not a fatal error). Deliberately LONGER than
+# CONFIDENCE_RECENCY_STALE_DAYS (14) — that governs *live-recommendation* recency, this governs how
+# long a written-down account fact may sit un-reconfirmed before the vault nags. ≈6 weeks.
+# `evergreen` learnings (platform/API mechanics, durable principles) are NEVER age-flagged.
+KNOWLEDGE_REVERIFY_DAYS = 42
+
 # Adversarial-review gate (see review.py). The minimum representative window span for the
 # ``window_length`` refutation check: a recommendation resting on a window shorter than this many
 # days is downgraded ("window may be unrepresentative; recommend a wider window"). This is the ONLY

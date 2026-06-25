@@ -875,6 +875,62 @@ def metrics_main() -> None:
     print(f"\nMetrics JSON: {output_path}")
 
 
+def lint_vault_main() -> None:
+    """Lint the knowledge vault: enforce provenance tags on every learning and age out stale facts.
+
+    Scans ``knowledge/learnings.md`` (full enforcement) and, if present, the divine_designs
+    ``profile.md`` baseline header (staleness only). CI-usable: exits 1 on any error.
+    """
+    from .config import KNOWLEDGE_REVERIFY_DAYS, PROJECT_ROOT
+    from .knowledge_provenance import (
+        lint,
+        lint_profile_baseline,
+        parse_learnings,
+        render_report,
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Lint the knowledge vault: require provenance tags + flag stale (fast) facts."
+    )
+    parser.add_argument("--path", help="learnings.md to lint (default: knowledge/learnings.md).")
+    parser.add_argument(
+        "--profile",
+        help="profile.md to scan for baseline staleness "
+        "(default: knowledge/accounts/divine_designs/profile.md; skipped if missing).",
+    )
+    parser.add_argument("--today", help="Override today (YYYY-MM-DD) for staleness math.")
+    parser.add_argument(
+        "--reverify-days",
+        type=int,
+        default=KNOWLEDGE_REVERIFY_DAYS,
+        help=f"Age (days) after which a fast fact is flagged re-verify (default {KNOWLEDGE_REVERIFY_DAYS}).",
+    )
+    parser.add_argument("--strict", action="store_true", help="Treat ⏳ warnings as failures too.")
+    args = parser.parse_args()
+
+    today = date.fromisoformat(args.today) if args.today else date.today()
+    learnings_path = Path(args.path) if args.path else PROJECT_ROOT / "knowledge" / "learnings.md"
+    entries = parse_learnings(learnings_path.read_text(encoding="utf-8"))
+    findings = lint(entries, today=today, reverify_days=args.reverify_days)
+
+    profile_path = (
+        Path(args.profile)
+        if args.profile
+        else PROJECT_ROOT / "knowledge" / "accounts" / "divine_designs" / "profile.md"
+    )
+    if profile_path.exists():
+        findings += lint_profile_baseline(
+            profile_path.read_text(encoding="utf-8"),
+            today=today,
+            reverify_days=args.reverify_days,
+            label=profile_path.name,
+        )
+
+    report, exit_code = render_report(findings, entries_count=len(entries), strict=args.strict)
+    print(report)
+    raise SystemExit(exit_code)
+
+
 def estimate_main() -> None:
     from .meta_api import client_from_env
 

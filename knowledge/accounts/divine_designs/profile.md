@@ -41,6 +41,10 @@ other two audiences and their lookalikes). Advantage Audience is now **off** on 
 
 ## Performance baseline — 30 days ending 2026-06-22
 
+**Rot:** fast · **Verified:** 2026-06-22  _(these are live-account numbers — `lint-vault` flags them
+for re-verification once they age past `KNOWLEDGE_REVERIFY_DAYS`; refresh with `account_metrics` and
+bump the date when reconfirmed)_
+
 - Spend **$18,478** → purchase value **$44,865** → **blended ROAS 2.43** (target 3.0).
 - 843 purchases, ~$53 AOV, cost/result $21.92. (Report: `reports/divine_designs/2026-06-22/`.)
 - **ROAS by band:** ≥3.0 = 27% of spend @ 3.69 · 1.5–3.0 = **63% of spend @ 2.08** (the core

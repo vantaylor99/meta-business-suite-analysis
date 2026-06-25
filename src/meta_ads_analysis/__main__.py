@@ -21,6 +21,7 @@ from .cli import (
     ingest_meta_exports_main,
     inspect_main,
     intake_video_main,
+    lint_vault_main,
     list_audiences_main,
     list_pixels_main,
     metrics_main,
@@ -45,7 +46,7 @@ from .cli import (
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
-            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|metrics|diagnose|"
+            "Usage: python -m meta_ads_analysis <ingest|report|sync-api|inspect|metrics|lint-vault|diagnose|"
             "list-audiences|account-info|estimate|search-interests|list-pixels|copy-library|watch|experiment|followups|propose-actions|"
             "apply-actions|propose-rotation|apply-rotation|propose-disable-advantage|"
             "apply-disable-advantage|propose-renames|apply-renames|propose-enable-ads|propose-pause-ads|"
@@ -84,6 +85,9 @@ def main() -> None:
         return
     if command in {"metrics", "performance"}:
         metrics_main()
+        return
+    if command in {"lint_vault", "lint"}:
+        lint_vault_main()
         return
     if command in {"diagnose", "scan_issues"}:
         diagnose_main()
@@ -163,6 +167,7 @@ def main() -> None:
 
     raise SystemExit(
         f"Unknown command: {command}. Use `ingest`, `report`, `sync-api`, `inspect`, `metrics`, "
+        "`lint-vault`, "
         "`diagnose`, `list-audiences`, `account-info`, `estimate`, `search-interests`, `list-pixels`, "
         "`copy-library`, `watch`, `experiment`, `followups`, "
         "`propose-actions`, `apply-actions`, `propose-rotation`, `apply-rotation`, "

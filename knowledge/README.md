@@ -71,7 +71,11 @@ account). This is the path toward the multi-account specialist template.
 - **experiments.md** tracks hypotheses with: hypothesis, change made, status, what we're
   waiting on, success signal, and (when done) the conclusion. Move concluded learnings into
   `learnings.md` so they become permanent.
-- **learnings.md** holds generalized, durable facts — date-stamp each so staleness is visible.
+- **learnings.md** holds generalized, durable facts — date-stamp each so staleness is visible, and
+  give every entry a **provenance tag + `Rot:`/`Verified:` header** in the format below. Run
+  `python -m meta_ads_analysis lint-vault` after editing it; the checker fails on missing/invalid
+  provenance and flags stale `fast` facts for re-verification (forthcoming `audit-vault` re-pulls the
+  numbers). A new account/specialist inherits this file as a template, so keep the discipline.
 - Convert relative dates to absolute. Cite ad set / ad names and IDs so entries are actionable cold.
 - Keep entries concise and skimmable. This base should stay readable in a few minutes.
 - **Update this base at the end of any session** that changed an account or taught us something.
@@ -140,16 +144,65 @@ survive:
 Both layers speak the **same 🟢/🟡/🔴/⚪ vocabulary** and the same verdicts (**stands / downgrade /
 refuted / insufficient**) — one confidence language, never two.
 
-**Entry template:**
+**Entry template** (every field below is **required and machine-checked** by `lint-vault` — see
+"Provenance format" just below):
 
 ```
 ### <one-line claim>
 **Confidence:** 🟡 Medium ↑  ·  **Domain:** platform | strategy | measurement
-- ➕ YYYY-MM-DD — <supporting evidence> _(evidence type; account/source)_
-- ➖ YYYY-MM-DD — <contradicting evidence>
+**Rot:** fast | evergreen  ·  **Verified:** YYYY-MM-DD
+- ➕ YYYY-MM-DD — <supporting evidence> `verify: account_metrics --account <slug> --level <lvl> --date-from <f> --date-to <t>` _(src: direct_observation · acct: divine_designs · metric: blended_roas=3.74)_
+- ➖ YYYY-MM-DD — <contradicting evidence> _(src: correlational · acct: divine_designs)_
 **Apply:** <how to act on it>
 **Would raise / lower:** <evidence that would move confidence>
 ```
+
+### Provenance format (what each tag means, and what `lint-vault` enforces)
+
+Every `➕`/`➖` evidence line ends with a structured `_( … )_` tag, and every entry carries a rot
+class + last-verified date. This makes provenance **regex-checkable** so a wrong guess can't quietly
+harden into a "fact" — it is the knowledge-base counterpart to the live `confidence.py` engine, and
+the two speak **ONE** vocabulary (the `src` tiers below ARE `confidence.EvidenceTier`, not a second
+scale).
+
+**Evidence-line tag fields:**
+
+- `src: <tier>` — **required on every evidence line.** One of the five `confidence.EvidenceTier`
+  names (lowest→highest grounding): `model_inference`, `external`, `correlational`,
+  `direct_observation`, `ab_experiment` (see the "Grounding tiers" table below for each tier's
+  ceiling band). The conceptual *observed / inferred / external* axis maps onto these: observed =
+  {`direct_observation`, `ab_experiment`}, inferred = {`correlational`, `model_inference`}, external
+  = `external`. Use the tier names, never a parallel three-word set.
+- `acct: <slug|—>` — the account the evidence came from, or `—` for an account-agnostic fact
+  (a platform mechanic, a methodological principle).
+- `metric: <name>=<value>` — **required when the evidence cites a live-account number** (e.g.
+  `metric: blended_roas=3.74`). Its presence marks the line *auditable*: the dependent `audit-vault`
+  pass re-runs it. A line carrying `metric:` **MUST** also carry an inline
+  `` `verify: account_metrics …` `` command (auditable ⇒ reproducible).
+- A `src: external` line **MUST** carry a URL (and per "External evidence" below, a date + verbatim
+  quote) — `lint-vault` fails an external line with no link.
+
+**Entry-level fields:**
+
+- `**Rot:** fast | evergreen` — volatility class.
+  - `fast` = depends on *this account's current numbers* or *current platform UI/policy state* (e.g.
+    "Engaged Audience holds ~3.7 ROAS", "IG > FB on this account"). Subject to staleness: a `fast`
+    entry whose `Verified` date is older than `KNOWLEDGE_REVERIFY_DAYS` (≈6 weeks) is flagged
+    `⏳ re-verify`.
+  - `evergreen` = a platform/API mechanic that only changes if Meta changes the API (the
+    dev-mode-app blocker, `validate_only` honored, AA blocks audience edits) **or** a durable
+    strategy principle ("lead with a hook"). **Never** auto-flagged on age.
+- `**Verified:** YYYY-MM-DD` — the date the claim was last confirmed (initially its first evidence
+  date; `audit-vault --apply` refreshes it when it re-runs the claim).
+
+`lint-vault` (`python -m meta_ads_analysis lint-vault`, or the `lint_vault` console script) reads
+`learnings.md` and reports **errors** (missing/invalid `src`, missing `Rot`/`Verified`, a `metric:`
+line with no `verify:`, a `src: external` line with no URL, an untagged evidence line — these exit
+nonzero, CI-usable) and **warnings** (`⏳ re-verify` for stale `fast` facts; `--strict` makes those
+fail too). It also age-checks the one `**Rot:**`/`**Verified:**` header on `profile.md`'s
+Performance-baseline section. Time is passed in (`--today`), never read from the clock, so runs are
+deterministic. The forthcoming **`audit-vault`** pass reuses this parser to re-pull each `metric:`
+line's `verify:` query against fresh data and flag drift.
 
 ## Grounding tiers (how causal is the evidence?)
 
