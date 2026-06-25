@@ -12,6 +12,7 @@ from meta_ads_analysis.actions import (
     build_action_plan,
     build_api_operation,
     enrich_action_plan_with_live_state,
+    evaluate_action_confidence,
 )
 from meta_ads_analysis.account_registry import load_account_registry, resolve_account
 from meta_ads_analysis.analyze import build_report_payload
@@ -26,8 +27,12 @@ from meta_ads_analysis.confidence import (
     assess,
     build_regenerating_query,
     combine_bands,
+    confidence_from_dict,
+    confidence_to_dict,
     data_strength,
     detect_causal_language,
+    evidence_from_dict,
+    evidence_to_dict,
     grounding_strength,
     render_confidence_line,
     render_evidence_line,
@@ -2880,3 +2885,279 @@ def test_render_helpers_produce_compact_lines() -> None:
 
 def test_band_ordering_is_abstain_low_medium_high() -> None:
     assert Band.abstain < Band.low < Band.medium < Band.high
+
+
+def test_evidence_and_confidence_dicts_round_trip() -> None:
+    evidence = _recent_evidence(purchases=120.0, spend=2400.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    # to_dict stores bands as their lowercase NAME, never a number.
+    conf_dict = confidence_to_dict(conf)
+    assert conf_dict["band"] == "high"
+    assert conf_dict["grounding_tier"] == "direct_observation"
+    assert evidence_to_dict(evidence)["regenerating_query"].startswith("account_metrics --account")
+    # Round-trip is lossless for the fields the downstream brief renderer needs.
+    assert confidence_from_dict(conf_dict).band is Band.high
+    rebuilt = evidence_from_dict(evidence_to_dict(evidence))
+    assert rebuilt.metric_display == "ROAS 1.20"
+    assert rebuilt.sample_purchases == 120.0
+
+
+# ---------------------------------------------------------------------------
+# Action plan: evidence + confidence + abstention (confidence-actions-analyze)
+# ---------------------------------------------------------------------------
+
+
+def _use_account_policy(tmp_path: Path, monkeypatch, slug: str, policy: dict[str, Any]) -> None:
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": slug,
+                        "account_name": slug.replace("_", " ").title(),
+                        "ad_account_id": "act_test",
+                        "action_policy": policy,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path
+    )
+
+
+def _pause_ad_payload(*, ad_overrides: dict[str, Any], run_date: str = "2026-06-24") -> dict[str, Any]:
+    ad = {
+        "ad_id": "123",
+        "ad_name": "Cody - Copy",
+        "campaign_name": "Campaign",
+        "adset_name": "Ad Set",
+        "total_results": 0.0,
+        "total_app_installs": 0.0,
+        "waste_score": 90.0,
+        "waste_status": "high",
+        "waste_reasons": ["spent without proportional value"],
+        "tracking_confidence": "high",
+    }
+    ad.update(ad_overrides)
+    return {
+        "account_slug": "divine_designs",
+        "run_date": run_date,
+        "budget_waste": [ad],
+        "fatigue_findings": [],
+        "scaling_candidates": [],
+        "tracking_concerns": [],
+    }
+
+
+def test_action_plan_pause_carries_high_confidence_and_direct_observation(tmp_path, monkeypatch) -> None:
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={
+            "blended_roas": 1.2,
+            "total_purchase_count": 120.0,
+            "total_spend": 2400.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        }
+    )
+
+    plan = build_action_plan(payload)
+
+    pause = next(action for action in plan["actions"] if action["action_type"] == "pause_ad")
+    # The headline use case: a well-sampled, recent, directly-observed pause reads High.
+    assert pause["confidence"]["band"] == "high"
+    assert pause["confidence"]["grounding_tier"] == "direct_observation"
+    assert pause["confidence"]["causal_flag"] is False
+    # Still a confident, executable pause — the evidence/confidence shape is additive.
+    assert pause["executable"] is True
+    assert pause["status"] == "proposed"
+    assert "verdict" not in pause
+    # Evidence carries the four facts + a real (non-null) regenerating query.
+    evidence = pause["evidence"]
+    assert evidence["metric_name"] == "blended_roas"
+    assert evidence["metric_display"] == "ROAS 1.20"
+    assert evidence["window"] == "2026-06-10..2026-06-24"
+    assert evidence["sample_purchases"] == 120.0
+    assert evidence["sample_spend"] == 2400.0
+    assert evidence["entity_level"] == "ad"
+    assert evidence["entity_id"] == "123"
+    assert evidence["entity_name"] == "Cody - Copy"
+    assert evidence["regenerating_query"] == (
+        "account_metrics --account divine_designs --level ad "
+        "--date-from 2026-06-10 --date-to 2026-06-24"
+    )
+
+
+def test_action_plan_pause_with_43_purchases_reads_medium_under_calibrated_knee(
+    tmp_path, monkeypatch
+) -> None:
+    # NOTE: the ticket's headline example calls 43 purchases "🟢 High ~85%", but the SHIPPED
+    # confidence-core rubric only reaches `high` at >= 4x the conversions floor (>= 100 purchases);
+    # 43 clears the floor but lands at `medium`. This test pins the real computed band so the
+    # discrepancy is visible (confidence-core was reviewed/accepted and is out of scope here).
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={
+            "blended_roas": 1.2,
+            "total_purchase_count": 43.0,
+            "total_spend": 880.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        }
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["confidence"]["band"] == "medium"
+    assert pause["confidence"]["grounding_tier"] == "direct_observation"
+    assert pause["executable"] is True
+    assert pause["evidence"]["sample_purchases"] == 43.0
+    assert pause["evidence"]["regenerating_query"] is not None
+
+
+def test_action_plan_pause_below_floor_abstains_as_keep_running(tmp_path, monkeypatch) -> None:
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={
+            "blended_roas": 1.2,
+            "total_purchase_count": 3.0,
+            "total_spend": 40.0,
+            "first_seen": "2026-06-20",
+            "last_seen": "2026-06-23",
+        }
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    # Below the significance floor: a non-executable "insufficient data — keep running" rec, NOT a
+    # confident pause. Cannot be approved into a write (approval_required is False).
+    assert pause["confidence"]["band"] == "abstain"
+    assert pause["verdict"] == "insufficient_data"
+    assert pause["executable"] is False
+    assert pause["approval_required"] is False
+    assert pause["status"] == "proposed"
+    rationale = pause["rationale"].lower()
+    assert "keep running" in rationale
+    assert "winner" not in rationale
+    assert "loser" not in rationale
+
+
+def test_action_plan_zero_sample_ad_abstains_never_fabricates_pause(tmp_path, monkeypatch) -> None:
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={"total_purchase_count": 0.0, "total_spend": 0.0}
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["confidence"]["band"] == "abstain"
+    assert pause["verdict"] == "insufficient_data"
+    assert pause["executable"] is False
+    assert pause["approval_required"] is False
+
+
+def test_evaluate_action_confidence_flags_causal_correlational_and_caps_band() -> None:
+    ad = {
+        "ad_id": "scale-1",
+        "ad_name": "New Audience",
+        "blended_roas": 4.0,
+        "total_purchase_count": 300.0,
+        "total_spend": 9000.0,
+        "first_seen": "2026-06-10",
+        "last_seen": "2026-06-24",
+    }
+    _evidence, confidence = evaluate_action_confidence(
+        ad,
+        action_type="consider_scale_budget",
+        policy={"primary_goal": "roas"},
+        account_slug="divine_designs",
+        run_date="2026-06-24",
+        rationale="Scale because the new audience converts",
+    )
+    # Trajectory/scale-candidate calls lean on a cross-sectional comparison → correlational.
+    assert confidence["grounding_tier"] == "correlational"
+    assert confidence["causal_flag"] is True
+    # Grounding caps the large, recent sample: correlational ceiling medium, downgraded one for the
+    # causal claim → low. Sample size must NOT average the cap away.
+    assert confidence["data_band"] == "high"
+    assert confidence["band"] == "low"
+
+
+def test_action_plan_pause_keeps_rationale_and_params_backward_compatible() -> None:
+    # The executable pause path's behavior is unchanged; confidence/evidence are purely additive.
+    payload = {
+        "account_slug": "pollen_sense",
+        "run_date": "2026-05-04",
+        "budget_waste": [
+            {
+                "ad_id": "123",
+                "ad_name": "Waste Ad",
+                "total_spend": 250.0,
+                "total_results": 0.0,
+                "total_app_installs": 1.0,
+                "waste_score": 82.0,
+                "waste_status": "high",
+                "waste_reasons": ["spent without results"],
+                "tracking_confidence": "medium_roas_unavailable",
+            }
+        ],
+        "fatigue_findings": [],
+        "scaling_candidates": [],
+        "tracking_concerns": [],
+    }
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["executable"] is True
+    assert pause["approval_required"] is True
+    assert pause["params"] == {"status": "paused"}
+    assert pause["rationale"].startswith("High waste risk")
+    assert "confidence" in pause
+    assert pause["evidence"]["entity_id"] == "123"
+
+
+def test_recommendations_prose_carries_metric_window_sample_facts() -> None:
+    rows = [
+        {
+            "report_date": date(2026, 6, 1) + timedelta(days=offset),
+            "campaign_id": "campaign-1",
+            "campaign_name": "Waste Campaign",
+            "adset_id": "adset-1",
+            "adset_name": "Waste Set",
+            "ad_id": "waste-ad",
+            "ad_name": "Waste Ad",
+            "creative_type": "Image",
+            "spend": 60.0,
+            "purchase_value": 72.0,
+            "purchase_count": 3.0,
+            "results": 3.0,
+            "result_label": "Website purchases",
+            "app_installs": 0.0,
+            "impressions": 5000,
+            "outbound_clicks": 50,
+            "frequency": 2.0,
+            "video_3s_plays": 0,
+            "thruplays": 0,
+            "has_video_metrics": False,
+            "tracking_confidence": "high",
+        }
+        for offset in range(6)
+    ]
+
+    report = build_report_payload(rows, "2026-06-16")
+    waste_line = next(
+        (line for line in report["next_7_day_actions"] if line.startswith("Reduce or pause budget")),
+        None,
+    )
+    assert waste_line is not None
+    # Metric, window, sample, and spend facts are inline so the prose is grounded.
+    assert "ROAS" in waste_line
+    assert "purchases" in waste_line
+    assert "spend" in waste_line
+    assert "over" in waste_line and "d," in waste_line

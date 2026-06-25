@@ -31,3 +31,7 @@ MIN_TRAJECTORY_SHORT_SPEND = 100.0
 # CONFIDENCE_RECENCY_STALE_DAYS is the recency knee: a window whose end is older than this many
 # days is "stale" and rounds the data band down one level.
 CONFIDENCE_RECENCY_STALE_DAYS = 14
+# Conversions significance floor for the confidence engine — mirrors experiment.py's
+# ``min_conversions`` default (25). A sample below BOTH this and the relevant spend floor abstains
+# ("insufficient data") instead of being scored as a confident pause/scale.
+CONFIDENCE_CONVERSIONS_FLOOR = 25

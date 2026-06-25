@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Any
 
 from .config import CONFIDENCE_RECENCY_STALE_DAYS
 
@@ -309,6 +310,69 @@ def render_confidence_line(conf: Confidence, *, max_factors: int = 3) -> str:
     if conf.factors:
         head += " — " + "; ".join(conf.factors[:max_factors])
     return head
+
+
+def evidence_to_dict(evidence: Evidence) -> dict[str, Any]:
+    """Serialize :class:`Evidence` to the JSON shape stored on an action (e.g. action_plan.json)."""
+    return {
+        "metric_name": evidence.metric_name,
+        "metric_value": evidence.metric_value,
+        "metric_display": evidence.metric_display,
+        "window": evidence.window,
+        "sample_purchases": evidence.sample_purchases,
+        "sample_spend": evidence.sample_spend,
+        "entity_level": evidence.entity_level,
+        "entity_id": evidence.entity_id,
+        "entity_name": evidence.entity_name,
+        "regenerating_query": evidence.regenerating_query,
+    }
+
+
+def confidence_to_dict(conf: Confidence) -> dict[str, Any]:
+    """Serialize :class:`Confidence` to JSON. Bands are stored as their lowercase name
+    (``"high"``/``"medium"``/``"low"``/``"abstain"``), never as a number."""
+    return {
+        "band": conf.band.name,
+        "data_band": conf.data_band.name,
+        "grounding_band": conf.grounding_band.name,
+        "grounding_tier": conf.grounding_tier,
+        "factors": list(conf.factors),
+        "would_raise": conf.would_raise,
+        "would_lower": conf.would_lower,
+        "causal_flag": conf.causal_flag,
+    }
+
+
+def evidence_from_dict(data: dict[str, Any]) -> Evidence:
+    """Rebuild :class:`Evidence` from :func:`evidence_to_dict` output (for downstream renderers)."""
+    return Evidence(
+        metric_name=data.get("metric_name", ""),
+        metric_value=data.get("metric_value"),
+        metric_display=data.get("metric_display", ""),
+        window=data.get("window", ""),
+        sample_purchases=data.get("sample_purchases"),
+        sample_spend=data.get("sample_spend"),
+        entity_level=data.get("entity_level", ""),
+        entity_id=data.get("entity_id"),
+        entity_name=data.get("entity_name"),
+        regenerating_query=data.get("regenerating_query"),
+    )
+
+
+def confidence_from_dict(data: dict[str, Any]) -> Confidence:
+    """Rebuild :class:`Confidence` from :func:`confidence_to_dict` output for rendering ONLY. This is
+    a deserializer for an already-computed verdict, not a scoring path — :func:`assess` remains the
+    only way to *compute* a band from data."""
+    return Confidence(
+        band=Band[data["band"]],
+        data_band=Band[data["data_band"]],
+        grounding_band=Band[data["grounding_band"]],
+        grounding_tier=data.get("grounding_tier", ""),
+        factors=list(data.get("factors") or []),
+        would_raise=data.get("would_raise", ""),
+        would_lower=data.get("would_lower", ""),
+        causal_flag=bool(data.get("causal_flag")),
+    )
 
 
 def render_evidence_line(evidence: Evidence) -> str:
