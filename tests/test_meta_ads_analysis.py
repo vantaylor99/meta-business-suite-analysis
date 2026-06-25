@@ -1307,6 +1307,81 @@ def test_operator_brief_never_prints_false_precision_or_none() -> None:
     assert "Evidence: None" not in markdown and "Confidence: None" not in markdown
 
 
+def test_operator_brief_evidence_without_regen_omits_recheck_line() -> None:
+    # The re-check command can be absent (build_regenerating_query returns None when the account /
+    # level / window cannot be determined). The Evidence facts must still render, with no orphan
+    # "Re-check:" line.
+    evidence = Evidence(
+        metric_name="blended_roas",
+        metric_value=1.20,
+        metric_display="ROAS 1.20",
+        window="2026-06-10..2026-06-24",
+        sample_purchases=120.0,
+        sample_spend=2400.0,
+        entity_level="ad",
+        entity_id="123",
+        entity_name="Cody - Copy",
+        regenerating_query=None,
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="pause_ad_123",
+                status="approved",
+                executable=True,
+                rationale="High waste risk.",
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "ROAS 1.20" in markdown          # facts still render
+    assert "🟢 High" in markdown            # band still renders
+    assert "Re-check:" not in markdown      # no orphan re-check line when no query exists
+
+
+def test_operator_brief_confidence_without_evidence_renders_band_only() -> None:
+    # A confidence block can arrive without an evidence block; the band line must still render (no
+    # Evidence / Re-check lines, no "None").
+    evidence = _evidence_for_brief(purchases=120.0, spend=2400.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    action = _action_with_confidence(
+        action_id="pause_ad_123",
+        status="approved",
+        executable=True,
+        rationale="High waste risk.",
+        evidence=evidence,
+        confidence=confidence,
+    )
+    action["evidence"] = {}  # confidence present, evidence absent
+    plan = {"account_slug": "divine_designs", "run_date": "2026-06-24", "actions": [action]}
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "🟢 High" in markdown
+    assert "Evidence:" not in markdown
+    assert "Re-check:" not in markdown
+    assert "Evidence: None" not in markdown
+
+
 def test_api_operation_only_allows_explicit_pause_without_meta_ai_params() -> None:
     action = {
         "action_type": "pause_ad",

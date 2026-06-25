@@ -135,6 +135,14 @@ The operator brief turns the generated `action_plan.json` into:
 - what still needs human judgment,
 - and which account goal each action supports.
 
+Under every recommendation the brief also surfaces the action's `evidence` and `confidence`
+(carried through from the action plan, not recomputed): a compact `Evidence:` line (the number,
+window, sample, and entity), a `Confidence:` band line in the shared 🟢/🟡/🔴/⚪ vocabulary, a
+`Re-check:` line with the exact `account_metrics` command that reproduces the number, and what
+would raise or lower the band. Abstain actions read as "Insufficient data — keep running" (never a
+percentage), and a correlational causal claim shows the "confirm via A/B" caveat plus the offer to
+file an experiment via `experiment define`.
+
 It writes:
 
 ```text
