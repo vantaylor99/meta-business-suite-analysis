@@ -1632,6 +1632,123 @@ def test_review_clean_call_stands() -> None:
     assert result.original_band == confidence_to_dict(confidence)["band"]
 
 
+def test_review_causal_ab_experiment_is_never_downgraded() -> None:
+    # An A/B experiment IS the causal evidence — a causal claim grounded in it must NOT be downgraded
+    # by the causal guard (the exemption the producer's grounding_strength encodes). Locks the
+    # tier != ab_experiment guard in check 3.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=4.0
+    )
+    confidence = {
+        "band": "high",
+        "data_band": "high",
+        "grounding_band": "high",
+        "grounding_tier": "ab_experiment",
+        "factors": [],
+        "would_raise": "",
+        "would_lower": "",
+        "causal_flag": True,
+    }
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "consider_scale_budget"},
+        policy={},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "stands"
+    assert "causal" not in result.failed_inputs
+
+
+def test_review_scale_below_target_refutes() -> None:
+    # The mirror of the pause-a-winner case: scaling an entity whose cited ROAS is below the account
+    # target contradicts its own number.
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0, metric_value=1.5
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": "increase_adset_budget"},
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert any("below the 3 target" in reason for reason in result.reasons)
+
+
+def test_review_no_claimed_band_is_defensive_noop() -> None:
+    # A confidence block with no recognizable band has nothing to refute → stands (never crashes,
+    # never fabricates a verdict).
+    evidence = _review_evidence(window="2026-06-10..2026-06-24", purchases=120.0, spend=2400.0)
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence={"band": None},
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "stands"
+    assert result.failed_inputs == []
+
+
+def test_review_accumulates_multiple_downgrades_most_conservative_wins() -> None:
+    # A short window (one-band downgrade) AND external evidence (cap at low) both fire on one call;
+    # the most-conservative revised band wins and BOTH failing inputs are named.
+    evidence = _review_evidence(
+        window="2026-06-21..2026-06-24", purchases=120.0, spend=2400.0, metric_value=2.0
+    )
+    confidence = {
+        "band": "medium",
+        "data_band": "medium",
+        "grounding_band": "low",
+        "grounding_tier": "external",
+        "factors": [],
+        "would_raise": "",
+        "would_lower": "",
+        "causal_flag": False,
+    }
+    result = review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence,
+        action={"action_type": "pause_ad"},
+        policy={},
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+    assert result.verdict == "downgrade"
+    assert {"window_length", "external"} <= set(result.failed_inputs)
+    # external caps at low, which is more conservative than the one-band window downgrade (→ low).
+    assert result.revised_band == "low"
+
+
 def _confidence_action(
     *,
     action_id: str,

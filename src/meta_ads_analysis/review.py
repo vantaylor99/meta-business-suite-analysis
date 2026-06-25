@@ -524,8 +524,9 @@ def _min_band_name(existing: Any, revised: str) -> str:
 
 
 def _deepcopy_plan(plan: dict[str, Any]) -> dict[str, Any]:
-    """Shallow-copy the plan but deep-copy each action (and its nested dicts we mutate), so the input
-    plan is never mutated. Plans are JSON, so a recursive copy is sufficient and clock-free."""
+    """Deep-copy the whole plan so the caller's input is never mutated when we adjust an action's
+    nested ``confidence``/``review`` dicts. Plans are JSON, so a recursive copy is sufficient and
+    clock-free."""
     import copy
 
     return copy.deepcopy(plan)
