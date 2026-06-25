@@ -119,8 +119,8 @@ rather than report a low percentage). It is deliberately one language: the human
 code rubric there must never drift into two scales. The code computes a band from *deterministic
 inputs* — sample size, recency, evidence tier, significance — never a number the model free-types,
 and it caps a causal claim that lacks an A/B test exactly the way the "evidence strength" ladder
-above does. The full prose rules for grounding tiers and external evidence land in the
-`grounding-rules-and-external-evidence` ticket.
+above does. The full prose rules for **grounding tiers** and **external evidence** are in the two
+subsections that follow.
 
 **Entry template:**
 
@@ -132,4 +132,64 @@ above does. The full prose rules for grounding tiers and external evidence land 
 **Apply:** <how to act on it>
 **Would raise / lower:** <evidence that would move confidence>
 ```
+
+## Grounding tiers (how causal is the evidence?)
+
+Confidence has **two axes, and the weaker one governs** (this is `combine_bands = min(...)` in
+`confidence.py`):
+
+1. **Data strength** — is there enough recent, significant data to trust the number? (sample size,
+   recency, statistical significance) — the "Evidence strength" ladder above.
+2. **Grounding tier** — how *causal* is the evidence? An A/B experiment grounds a causal claim; a
+   cross-sectional correlation does not, no matter how large the sample.
+
+The grounding tier is the code's `EvidenceTier` (lowest → highest), and each tier has a **ceiling**
+band it can reach (`_TIER_CEILING` in `confidence.py`) — data strength can land lower, never higher:
+
+| Grounding tier (`EvidenceTier`) | What it is | Ceiling band |
+| --- | --- | --- |
+| `ab_experiment` | a completed A/B with the one variable isolated | 🟢 High |
+| `direct_observation` | a directly observed platform behavior / clean before-after on the same entity | 🟢 High |
+| `correlational` | a cross-sectional comparison of different entities (confounded) | 🟡 Medium |
+| `external` | the web / practitioner advice — about advertising in general, not this account | 🔴 Low |
+| `model_inference` | the model's own inference with no first-party data behind it | 🔴 Low |
+
+Because the **weaker axis caps the combined band**, a huge-but-correlational sample cannot read High,
+and a web-only claim cannot exceed 🔴 Low. The **causal-language guard** is part of this axis: a
+recommendation that asserts *cause* ("X drives ROAS", "because", "leads to") from any
+non-`ab_experiment` tier is labeled **"correlational — confirm via A/B"** and downgraded one band.
+
+## External evidence (the web) is a hypothesis source, never a confirmation
+
+The web is enormously useful for ideas and dangerous as proof. The dividing line:
+
+- **Account data answers "is this true for THIS account?"; external evidence answers "what's worth
+  trying?"** The hard rule: **external findings feed the hypothesis / experiment queue, never the
+  confidence score of a live recommendation.** "Square video wins in Reels" → `experiment define` an
+  A/B, **not** "+confidence on this ad." A code path or prose that treats a web finding as
+  *confirmation* about this account — that lets it raise a live recommendation's band — is a **defect**;
+  route it to `experiment define` instead.
+- **Grounding tier, capped.** `external` sits **below every first-party source and above only
+  `model_inference`** (see the table above). Because the weaker axis caps the band, a web-only
+  recommendation reads **at most 🔴 Low** (`_TIER_CEILING[external] = low`) — usually phrased
+  "🔴 Low (hypothesis — confirm via A/B)." It can never, on its own, reach Medium or High.
+- **Cite the source; quote, don't paraphrase.** An external claim needs a **link + a date + a
+  verbatim quote** of the key claim. **An external claim with no citable source is not usable** —
+  drop it. (The model summarizing the web is itself a hallucination surface; quoting the source
+  blocks an invented "everyone agrees" consensus that no page actually says.)
+- **Recency-weighted, NOT upvote-weighted.** Upvotes measure gameable popularity — never a confidence
+  multiplier, at most a weak tie-breaker. For Meta, **recency dominates**: an old high-upvote post
+  about a **platform tactic** (a placement trick, a setting, a current-UI workflow) is a *trap* —
+  Meta changes monthly. Distinguish fast-rotting **platform tactics** from slow-rotting **evergreen
+  principles** (hook fast, test creative, don't over-narrow) and weight accordingly: a 2019 tactic is
+  near-worthless; a 2019 principle may still hold.
+- **Source-quality tiers.** Meta's own docs, or a **named practitioner who shows their methodology**,
+  rank above an anonymous "this worked for me." But even Meta's docs describe *general* platform
+  behavior, **not this account** — so the `external` cap still applies; first-party data always wins
+  the moment it exists.
+- **Cold-start exception (where external earns its keep).** When the account has **no data** on
+  something new — a new creative direction, ad type, or audience — a clearly **labeled `external`**
+  prior may inform the *initial* call (still capped 🔴 Low). The instant first-party data exists,
+  **account data dominates** and the confidence is recomputed from it via `assess(...)`; the external
+  prior drops to a footnote.
 

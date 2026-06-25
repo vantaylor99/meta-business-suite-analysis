@@ -78,6 +78,11 @@ validate-only call that actually changes state.
   ~4% lower cost/result for standard enhancements); **turn OFF copy-rewriting "Text Improvements"**
   (it moves/rewrites your primary text/headline and can truncate, breaking tested copy) and be
   cautious with video touch-ups if the creative is intentional.
+  _(**external** evidence — grounding tier `external`, **capped 🔴 Low**: a hypothesis worth testing,
+  **not** account truth. It does not raise this entry's band — the 🟡 Medium rests on the first-party
+  own-account reads above. Per the "External evidence" rule in `README.md` it should carry a dated
+  link + verbatim quote to be fully citable, and the keep-additive / kill-Text-Improvements claim is
+  to **confirm via A/B** on this account before being trusted as more than a prior.)_
 
 - ➕ 2026-06-24 — correlational join (30 ads, ≥$100 spend, 120d, spend-weighted ROAS): the
   additive/essential cohort trends positive — `enhance_cta` 3.98 vs 2.96 without, brightness 5.90

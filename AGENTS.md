@@ -33,7 +33,10 @@ Use these sources in this order:
 4. `data/normalized/meta_ads/<account_slug>/<run_date>/creative_lookup.csv`
 5. raw files in `data/raw/meta_ads/<account_slug>/<run_date>/` only when a detail needs to be verified
 
-Do not infer confidence that is not supported by the exported data.
+Do not infer confidence that is not supported by the exported data — every recommendation states a
+band (🟢 High / 🟡 Medium / 🔴 Low, or ⚪ *Insufficient data — abstain*) computed from sample size,
+recency, and grounding tier per the **Grounding rule** under Interpretation Rules. Below the
+significance floor, abstain — do not guess a low percentage.
 
 ## Output Structure
 
@@ -68,6 +71,32 @@ Every written analysis should use this structure:
 - If an ad has rising frequency and falling efficiency over enough history, call out fatigue even if it still produces results.
 - If export coverage is incomplete, say so plainly.
 
+**Grounding rule (applies to EVERY operator-facing recommendation — including free-text prose, where
+no code enforces it).** State four facts and a confidence band, or abstain:
+
+- **Cite four facts:** the **metric**, the **time window**, the **sample size** (purchases/spend, or
+  installs for install-goal accounts), and the **entity** (which ad / ad set / campaign). A
+  recommendation with no entity and no sample is not a recommendation — it is a guess.
+- **Carry a confidence band** in the shared vocabulary — 🟢 High / 🟡 Medium / 🔴 Low, or ⚪
+  *Insufficient data — abstain* — **with its rationale**. The rationale rests on two axes:
+  **data strength** (sample size, statistical significance, recency) and **grounding tier**
+  (`ab_experiment` > `direct_observation` > `correlational` > `external` > `model_inference`).
+  **The weaker axis caps the band** — a huge but correlational sample cannot read High, and a perfect
+  A/B on three conversions cannot either.
+- **When the data floor isn't cleared, abstain.** Below the significance floor in `confidence.py`
+  (25 conversions / $100 spend), say "insufficient data — keep running." **Never invent a
+  winner or a loser to avoid abstaining** — abstention is a blessed, correct output, not a failure.
+- **Causal-language guard:** a recommendation that asserts a *cause* ("X drives ROAS", "the lift is
+  *because* of Y", "Z *leads to* purchases") from non-experimental data must be labeled
+  **"correlational — confirm via A/B"** and downgraded one band. Only a completed A/B experiment
+  grounds a causal claim at full strength.
+
+This is the human-/agent-facing mirror of what the code now enforces structurally. The **canonical
+computation** is [`src/meta_ads_analysis/confidence.py`](src/meta_ads_analysis/confidence.py); the
+**shared vocabulary** is the "Confidence & evidence" rubric in
+[`knowledge/README.md`](knowledge/README.md). There is **one** confidence language across prose,
+README, and code — never introduce a second scale.
+
 ## Severity Heuristics
 
 - High waste risk:
@@ -95,7 +124,16 @@ Every written analysis should use this structure:
 
 ## Guardrails
 
-- Do not claim causal certainty from export data alone.
+- Do not claim causal certainty from export data alone — export data is correlational. Apply the
+  **causal-language guard** (see the Grounding rule under Interpretation Rules): label any
+  cause-claim "correlational — confirm via A/B" and downgrade its band. Only a completed A/B
+  experiment (`experiment define` → `experiment readout`) grounds a causal claim at full strength.
+- Do not present a recommendation without its four facts (metric / window / sample / entity) and a
+  confidence band; when the sample is below the significance floor, abstain ("insufficient data —
+  keep running") rather than manufacture a confident call.
+- Do not let external/web evidence raise the confidence of a live recommendation. External findings
+  are hypotheses for the experiment queue, capped at the `external` grounding tier — see "External
+  evidence" in [`knowledge/README.md`](knowledge/README.md).
 - Do not assume the pixel or Conversions API is healthy just because Meta reports purchases.
 - Do not assume revenue is healthy just because Meta reports results or app installs.
 - Do not recommend scaling solely off hook rate without downstream conversion evidence.
