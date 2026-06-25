@@ -3299,6 +3299,26 @@ def test_band_vocabulary_actually_appears_in_knowledge_readme() -> None:
         assert pres["label"] in readme, f"{band.name} label {pres['label']!r} missing from README"
 
 
+def test_grounding_tier_ceilings_match_knowledge_readme() -> None:
+    # Sibling to the band-vocabulary pin: the README "Grounding tiers" table documents each
+    # EvidenceTier's ceiling band, and that mapping IS the code's _TIER_CEILING. Without this pin the
+    # table could silently drift (e.g. someone raises external to Medium in prose but not in code, or
+    # vice versa). Assert that the row naming each tier carries that tier's true ceiling emoji+label.
+    from meta_ads_analysis.config import PROJECT_ROOT
+    from meta_ads_analysis.confidence import _TIER_CEILING
+
+    readme = (PROJECT_ROOT / "knowledge" / "README.md").read_text(encoding="utf-8")
+    lines = readme.splitlines()
+    for tier, ceiling in _TIER_CEILING.items():
+        pres = BAND_PRESENTATION[ceiling]
+        # The table wraps each tier name in backticks; find the row that names it.
+        rows = [ln for ln in lines if f"`{tier.name}`" in ln]
+        assert rows, f"EvidenceTier {tier.name!r} missing from README grounding-tier table"
+        assert any(pres["emoji"] in ln and pres["label"] in ln for ln in rows), (
+            f"{tier.name} should document ceiling {pres['emoji']} {pres['label']} in its README row"
+        )
+
+
 def test_render_helpers_produce_compact_lines() -> None:
     evidence = _recent_evidence(purchases=42.0, spend=1250.0)
     conf = assess(
