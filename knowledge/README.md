@@ -112,6 +112,16 @@ observation or inference. Always flag when evidence is confounded.
 - When an experiment in `experiments.md` concludes, fold its result into the relevant learning
   as a new dated ➕/➖ evidence line and adjust the level.
 
+**This same rubric is now computed in code.** `src/meta_ads_analysis/confidence.py` scores live
+operator-facing recommendations with the **identical 🟢/🟡/🔴 vocabulary** (plus a fourth band, ⚪
+**Insufficient data — abstain**, for live calls below the significance floor — where we abstain
+rather than report a low percentage). It is deliberately one language: the human rubric here and the
+code rubric there must never drift into two scales. The code computes a band from *deterministic
+inputs* — sample size, recency, evidence tier, significance — never a number the model free-types,
+and it caps a causal claim that lacks an A/B test exactly the way the "evidence strength" ladder
+above does. The full prose rules for grounding tiers and external evidence land in the
+`grounding-rules-and-external-evidence` ticket.
+
 **Entry template:**
 
 ```

@@ -24,3 +24,10 @@ PERFORMANCE_WINDOWS_DAYS = (30, 7, 3)
 MIN_TRAJECTORY_BASE_SPEND = 75.0
 MIN_TRAJECTORY_RECENT_SPEND = 50.0
 MIN_TRAJECTORY_SHORT_SPEND = 100.0
+
+# Confidence engine (see confidence.py). The data-strength floors are NOT new constants:
+# callers pass the existing gates — spend uses MIN_WASTE_SPEND (100.0) / MIN_SCALING_SPEND (75.0)
+# / monitor's min_spend (100.0); conversions uses experiment.py's min_conversions default (25).
+# CONFIDENCE_RECENCY_STALE_DAYS is the recency knee: a window whose end is older than this many
+# days is "stale" and rounds the data band down one level.
+CONFIDENCE_RECENCY_STALE_DAYS = 14

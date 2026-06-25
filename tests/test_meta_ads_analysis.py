@@ -17,6 +17,21 @@ from meta_ads_analysis.account_registry import load_account_registry, resolve_ac
 from meta_ads_analysis.analyze import build_report_payload
 from meta_ads_analysis.briefs import build_operator_brief, render_operator_brief
 from meta_ads_analysis.cli import build_meta_report_main, ingest_meta_exports_main, sync_meta_api_main
+from meta_ads_analysis.config import CONFIDENCE_RECENCY_STALE_DAYS
+from meta_ads_analysis.confidence import (
+    BAND_PRESENTATION,
+    Band,
+    Evidence,
+    EvidenceTier,
+    assess,
+    build_regenerating_query,
+    combine_bands,
+    data_strength,
+    detect_causal_language,
+    grounding_strength,
+    render_confidence_line,
+    render_evidence_line,
+)
 from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
 from meta_ads_analysis.reporting import render_markdown_report
@@ -2623,3 +2638,231 @@ def test_experiment_readout_cli_no_json_path_writes_nothing(tmp_path, monkeypatc
     assert "Wrote readout JSON" not in captured        # no file confirmation
     # only the experiment-definition JSON exists; no readout file was written
     assert not any(p.name == "readout.json" for p in tmp_path.rglob("*.json"))
+
+
+# ---------------------------------------------------------------------------
+# Confidence engine (src/meta_ads_analysis/confidence.py)
+# ---------------------------------------------------------------------------
+
+
+def _recent_evidence(*, purchases: float | None, spend: float | None) -> Evidence:
+    """A reusable, fully-populated Evidence with a recent window for confidence tests."""
+    return Evidence(
+        metric_name="blended_roas",
+        metric_value=1.20,
+        metric_display="ROAS 1.20",
+        window="2026-06-10..2026-06-24",
+        sample_purchases=purchases,
+        sample_spend=spend,
+        entity_level="ad",
+        entity_id="123",
+        entity_name="Scale Winner",
+        regenerating_query=build_regenerating_query("divine_designs", "ad", "2026-06-10", "2026-06-24"),
+    )
+
+
+def test_combine_bands_returns_the_weaker_axis() -> None:
+    assert combine_bands(Band.high, Band.medium) == Band.medium
+    assert combine_bands(Band.high, Band.low) == Band.low
+    assert combine_bands(Band.abstain, Band.high) == Band.abstain
+    assert combine_bands(Band.high, Band.abstain) == Band.abstain
+    assert combine_bands(Band.high, Band.high) == Band.high
+
+
+def test_grounding_caps_a_large_correlational_causal_sample_at_low() -> None:
+    # Big, recent, well-converted sample — strong on the DATA axis...
+    evidence = _recent_evidence(purchases=500.0, spend=50_000.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+        causal_text="scaled because the new audience converts",
+    )
+    # ...but the grounding cap (correlational ceiling medium, downgraded one for the causal claim)
+    # governs: the combined band can be at most low. Sample size must NOT average the cap away.
+    assert conf.data_band == Band.high
+    assert conf.grounding_band == Band.low
+    assert conf.band == Band.low
+    assert conf.causal_flag is True
+    assert "correlational — confirm via A/B" in conf.factors
+
+
+def test_ab_experiment_with_significance_reads_high_despite_causal_language() -> None:
+    evidence = _recent_evidence(purchases=500.0, spend=50_000.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.ab_experiment,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+        pvalue=0.01,
+        causal_text="the new audience drives ROAS",
+    )
+    # Experiment IS the causal evidence: grounding no longer caps and the causal guard does not
+    # downgrade an experiment-backed claim.
+    assert conf.data_band == Band.high
+    assert conf.grounding_band == Band.high
+    assert conf.band == Band.high
+    assert conf.causal_flag is True
+
+
+def test_below_floor_inputs_abstain_not_low() -> None:
+    evidence = _recent_evidence(purchases=3.0, spend=40.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert conf.data_band == Band.abstain
+    assert conf.band == Band.abstain  # NOT low — abstain is a first-class verdict
+    assert any("floor" in factor for factor in conf.factors)
+
+
+def test_clearing_only_spend_floor_is_thin_on_conversions() -> None:
+    # Spend cleared ($500 > $100) but conversions did not (2 < 25): weak data on the outcome → low.
+    band, factors = data_strength(
+        sample_purchases=2.0,
+        sample_spend=500.0,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert band == Band.low
+    assert any("thin on conversions" in factor for factor in factors)
+
+
+def test_missing_sample_drives_abstain_no_model_typed_score() -> None:
+    # A caller that cannot supply sample data passes None — which drives abstain, never a guess.
+    evidence = _recent_evidence(purchases=None, spend=None)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.ab_experiment,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert conf.band == Band.abstain
+
+
+def test_assess_exposes_no_pre_baked_band_parameter() -> None:
+    import inspect
+
+    params = set(inspect.signature(assess).parameters)
+    # The ONLY path to a band is through deterministic inputs; no caller-set band/score knob.
+    assert not (params & {"band", "score", "confidence", "data_band", "grounding_band"})
+
+
+def test_detect_causal_language() -> None:
+    assert detect_causal_language("scaled because the new audience converts") is True
+    assert detect_causal_language("the new creative drives ROAS") is True
+    assert detect_causal_language("paused due to fatigue") is True
+    assert detect_causal_language("the change leads to more purchases") is True
+    # Descriptive, no causal verb:
+    assert detect_causal_language("ROAS is 1.2 over 14 days") is False
+    assert detect_causal_language("") is False
+    assert detect_causal_language(None) is False
+
+
+def test_build_regenerating_query_exact_string_and_none_on_missing() -> None:
+    assert build_regenerating_query("divine_designs", "ad", "2026-06-10", "2026-06-24") == (
+        "account_metrics --account divine_designs --level ad "
+        "--date-from 2026-06-10 --date-to 2026-06-24"
+    )
+    assert build_regenerating_query("divine_designs", None, "2026-06-10", "2026-06-24") is None
+    assert build_regenerating_query("divine_designs", "ad", "2026-06-10", None) is None
+    assert build_regenerating_query(None, "ad", "2026-06-10", "2026-06-24") is None
+
+
+def test_stale_window_rounds_data_band_down_vs_recent() -> None:
+    kwargs = dict(
+        sample_purchases=500.0,
+        sample_spend=50_000.0,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+    )
+    recent_band, _ = data_strength(recency_days=1, **kwargs)
+    stale_band, stale_factors = data_strength(recency_days=CONFIDENCE_RECENCY_STALE_DAYS + 40, **kwargs)
+    assert recent_band == Band.high
+    assert stale_band == Band.medium  # rounded down exactly one level
+    assert stale_band < recent_band
+    assert any("stale window" in factor for factor in stale_factors)
+
+
+def test_unknown_recency_rounds_down() -> None:
+    band, factors = data_strength(
+        sample_purchases=500.0,
+        sample_spend=50_000.0,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=None,
+    )
+    assert band == Band.medium  # high base, rounded down because recency is unknown
+    assert any("recency unknown" in factor for factor in factors)
+
+
+def test_non_significant_pvalue_caps_data_at_medium() -> None:
+    band, factors = data_strength(
+        sample_purchases=500.0,
+        sample_spend=50_000.0,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+        pvalue=0.20,
+    )
+    assert band == Band.medium
+    assert any("not significant" in factor for factor in factors)
+
+
+def test_grounding_tier_ceilings_and_causal_guard() -> None:
+    assert grounding_strength(EvidenceTier.ab_experiment, causal_claim=False)[0] == Band.high
+    assert grounding_strength(EvidenceTier.direct_observation, causal_claim=False)[0] == Band.high
+    assert grounding_strength(EvidenceTier.correlational, causal_claim=False)[0] == Band.medium
+    assert grounding_strength(EvidenceTier.external, causal_claim=False)[0] == Band.low
+    assert grounding_strength(EvidenceTier.model_inference, causal_claim=False)[0] == Band.low
+    # Causal guard downgrades non-experimental claims one band (floored at low)...
+    assert grounding_strength(EvidenceTier.correlational, causal_claim=True)[0] == Band.low
+    assert grounding_strength(EvidenceTier.external, causal_claim=True)[0] == Band.low
+    # ...but never an A/B experiment (the experiment is the causal evidence).
+    assert grounding_strength(EvidenceTier.ab_experiment, causal_claim=True)[0] == Band.high
+    # Strings coerce to the same tiers.
+    assert grounding_strength("correlational", causal_claim=False)[0] == Band.medium
+
+
+def test_band_presentation_matches_knowledge_vocabulary_exactly() -> None:
+    # Pin the one vocabulary so knowledge/README.md and confidence.py cannot drift into two scales.
+    assert BAND_PRESENTATION[Band.high] == {"emoji": "🟢", "label": "High", "range": "~80–100%"}
+    assert BAND_PRESENTATION[Band.medium] == {"emoji": "🟡", "label": "Medium", "range": "~50–80%"}
+    assert BAND_PRESENTATION[Band.low] == {"emoji": "🔴", "label": "Low", "range": "<50%"}
+    assert BAND_PRESENTATION[Band.abstain] == {
+        "emoji": "⚪",
+        "label": "Insufficient data — abstain",
+        "range": "—",
+    }
+
+
+def test_render_helpers_produce_compact_lines() -> None:
+    evidence = _recent_evidence(purchases=42.0, spend=1250.0)
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    conf_line = render_confidence_line(conf)
+    assert BAND_PRESENTATION[conf.band]["emoji"] in conf_line
+    assert BAND_PRESENTATION[conf.band]["label"] in conf_line
+
+    ev_line = render_evidence_line(evidence)
+    assert "ROAS 1.20" in ev_line
+    assert "2026-06-10..2026-06-24" in ev_line
+    assert "42 purchases" in ev_line
+    assert "account_metrics --account divine_designs" in ev_line
+
+
+def test_band_ordering_is_abstain_low_medium_high() -> None:
+    assert Band.abstain < Band.low < Band.medium < Band.high
