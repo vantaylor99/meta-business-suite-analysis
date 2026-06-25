@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -1104,6 +1105,206 @@ def test_operator_brief_moves_failed_live_lookup_to_do_not_touch() -> None:
     assert brief["ready_for_review"] == []
     assert brief["do_not_touch_yet"][0]["action_id"] == "pause_ad_1"
     assert brief["needs_human_judgment"][0]["action_id"] == "refresh_creative_1"
+
+
+def _evidence_for_brief(*, purchases: float | None, spend: float | None) -> Evidence:
+    """A populated, recent Evidence for a divine_designs ad — drives a reproducible re-check line."""
+    return Evidence(
+        metric_name="blended_roas",
+        metric_value=1.20,
+        metric_display="ROAS 1.20",
+        window="2026-06-10..2026-06-24",
+        sample_purchases=purchases,
+        sample_spend=spend,
+        entity_level="ad",
+        entity_id="123",
+        entity_name="Cody - Copy",
+        regenerating_query=build_regenerating_query("divine_designs", "ad", "2026-06-10", "2026-06-24"),
+    )
+
+
+def _action_with_confidence(
+    *,
+    action_id: str,
+    status: str,
+    executable: bool,
+    rationale: str,
+    evidence: Evidence,
+    confidence,
+) -> dict:
+    return {
+        "action_id": action_id,
+        "action_type": "pause_ad",
+        "status": status,
+        "executable": executable,
+        "target": {"type": "ad", "id": "123", "name": "Cody - Copy"},
+        "params": {"status": "paused"},
+        "rationale": rationale,
+        "evidence": evidence_to_dict(evidence),
+        "confidence": confidence_to_dict(confidence),
+    }
+
+
+def test_operator_brief_renders_high_confidence_evidence_and_recheck_line() -> None:
+    # Parent use case: an auditor can re-run the named query to confirm the number. A high-confidence
+    # pause must surface the band, the four evidence facts, and the exact account_metrics command.
+    evidence = _evidence_for_brief(purchases=120.0, spend=2400.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert confidence_to_dict(confidence)["band"] == "high"  # precondition
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="pause_ad_123",
+                status="approved",
+                executable=True,
+                rationale="High waste risk: ROAS well below the account floor.",
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    brief = build_operator_brief(plan=plan)
+    markdown = render_operator_brief(brief)
+
+    # Evidence + confidence carried through to the JSON (additive).
+    carried = brief["approved_to_execute"][0]
+    assert carried["confidence"]["band"] == "high"
+    assert carried["evidence"]["metric_display"] == "ROAS 1.20"
+
+    # Band (one vocabulary), the four evidence facts, and the re-check command all render.
+    assert "🟢 High (~80–100%)" in markdown
+    assert "ROAS 1.20" in markdown                       # the number
+    assert "2026-06-10..2026-06-24" in markdown          # the time window
+    assert "120 purchases" in markdown                   # the sample size
+    assert "ad:123 'Cody - Copy'" in markdown            # which ad
+    assert (
+        "Re-check: account_metrics --account divine_designs --level ad "
+        "--date-from 2026-06-10 --date-to 2026-06-24"
+    ) in markdown
+    assert "Would raise:" in markdown and "Would lower:" in markdown
+
+
+def test_operator_brief_abstain_action_reads_as_keep_running_not_a_percentage() -> None:
+    # An abstain must read as a promising test ("keep running"), be visually distinct (⚪, not 🔴),
+    # and never show a percentage.
+    evidence = _evidence_for_brief(purchases=2.0, spend=40.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    assert confidence_to_dict(confidence)["band"] == "abstain"  # precondition
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="pause_ad_thin",
+                status="proposed",
+                executable=False,
+                rationale="Treat as a promising test: keep running and re-check.",
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "⚪ Insufficient data — keep running" in markdown
+    assert "🔴 Low" not in markdown
+    # No band percentage at all for an abstain (no range token, no precise score).
+    assert "%" not in markdown
+
+
+def test_operator_brief_causal_flag_action_offers_an_ab_experiment() -> None:
+    # A correlational claim that asserts cause must carry the visible caveat and the offer to file an
+    # experiment to confirm it (the brief surfaces the offer in text; it does not auto-file).
+    evidence = _evidence_for_brief(purchases=120.0, spend=2400.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.correlational,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+        causal_text="ROAS is low because this creative drives wasted spend.",
+    )
+    assert confidence_to_dict(confidence)["causal_flag"] is True  # precondition
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="refresh_creative_123",
+                status="proposed",
+                executable=True,
+                rationale="Creative appears to drive waste.",
+                evidence=evidence,
+                confidence=confidence,
+            )
+        ],
+    }
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "correlational — confirm via A/B" in markdown
+    assert "experiment define" in markdown
+
+
+def test_operator_brief_never_prints_false_precision_or_none() -> None:
+    # The band range "~80–100%" is allowed, but no two-significant-figure precise score (e.g. 82.4%).
+    evidence = _evidence_for_brief(purchases=120.0, spend=2400.0)
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=100.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    plan = {
+        "account_slug": "divine_designs",
+        "run_date": "2026-06-24",
+        "actions": [
+            _action_with_confidence(
+                action_id="pause_ad_123",
+                status="approved",
+                executable=True,
+                rationale="High waste risk.",
+                evidence=evidence,
+                confidence=confidence,
+            ),
+            # An action carrying no evidence/confidence must render gracefully (no block, no "None").
+            {
+                "action_id": "measurement_review_0",
+                "action_type": "measurement_review",
+                "status": "proposed",
+                "executable": False,
+                "target": {"type": "account", "id": "acct"},
+                "params": {},
+                "rationale": "Tracking looks off; verify the pixel.",
+                "evidence": {},
+            },
+        ],
+    }
+
+    markdown = render_operator_brief(build_operator_brief(plan=plan))
+
+    assert "~80–100%" in markdown                          # the range is fine
+    assert re.search(r"\d{1,3}\.\d+%", markdown) is None    # but no precise percent score
+    # The no-evidence action renders its bullet with no block — never "Evidence/Confidence: None".
+    assert "measurement_review_0" in markdown
+    assert "Evidence: None" not in markdown and "Confidence: None" not in markdown
 
 
 def test_api_operation_only_allows_explicit_pause_without_meta_ai_params() -> None:

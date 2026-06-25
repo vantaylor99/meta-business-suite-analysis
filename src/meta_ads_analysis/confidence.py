@@ -406,8 +406,12 @@ def confidence_from_dict(data: dict[str, Any]) -> Confidence:
     )
 
 
-def render_evidence_line(evidence: Evidence) -> str:
-    """Compact one-line evidence renderer (metric · window · sample · entity · regen query)."""
+def render_evidence_line(evidence: Evidence, *, include_regen: bool = True) -> str:
+    """Compact one-line evidence renderer (metric · window · sample · entity · regen query).
+
+    Pass ``include_regen=False`` to drop the trailing ``regen:`` query — for callers (e.g. the
+    operator brief) that surface the reproduce-it command on its own clearly-labeled line and would
+    otherwise print it twice."""
     parts = [evidence.metric_display or evidence.metric_name, f"window {evidence.window}"]
     parts.append(
         f"n={_fmt_purchases(evidence.sample_purchases)} purchases / "
@@ -418,6 +422,6 @@ def render_evidence_line(evidence: Evidence) -> str:
         if evidence.entity_name:
             label += f" '{evidence.entity_name}'"
         parts.append(label)
-    if evidence.regenerating_query:
+    if include_regen and evidence.regenerating_query:
         parts.append(f"regen: {evidence.regenerating_query}")
     return " · ".join(parts)

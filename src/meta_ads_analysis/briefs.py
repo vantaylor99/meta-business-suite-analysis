@@ -9,6 +9,15 @@ from pathlib import Path
 from typing import Any
 
 from .config import DEFAULT_REPORTS_ROOT
+from .confidence import (
+    BAND_PRESENTATION,
+    Band,
+    Confidence,
+    confidence_from_dict,
+    evidence_from_dict,
+    render_confidence_line,
+    render_evidence_line,
+)
 from .utils import ensure_dir, write_json
 
 
@@ -171,6 +180,7 @@ def render_operator_brief(brief: dict[str, Any]) -> str:
         ("Do Not Touch Yet", brief.get("do_not_touch_yet") or []),
         ("Meta AI Follow-Ups", brief.get("meta_ai_followups") or []),
     ]
+    account_slug = brief.get("account_slug")
     for title, actions in sections:
         lines.extend(["", f"## {title}"])
         if not actions:
@@ -183,7 +193,80 @@ def render_operator_brief(brief: dict[str, Any]) -> str:
                 f"targeting {action.get('target_name') or action.get('target_id') or 'unknown target'}: "
                 f"{action.get('rationale') or 'No rationale supplied.'}"
             )
+            lines.extend(_render_action_evidence(action, account_slug=account_slug))
     return "\n".join(lines).rstrip() + "\n"
+
+
+# Markdown indent for the evidence/confidence sub-lines beneath each action bullet.
+_BLOCK_INDENT = "    "
+
+
+def _render_action_evidence(action: dict[str, Any], *, account_slug: Any) -> list[str]:
+    """Render the compact evidence + confidence block beneath one action bullet.
+
+    Additive and skimmable: a labeled line each for the facts, the confidence band, (when the claim
+    is causal) the correlational caveat + offer to file an A/B, the exact re-check command, and what
+    would move the band. Renders nothing when the action carries no evidence/confidence (e.g.
+    measurement_review actions) — never prints ``None``. The band/emoji vocabulary comes straight
+    from ``confidence.py`` so the brief speaks the one confidence language."""
+    evidence_block = action.get("evidence") if isinstance(action.get("evidence"), dict) else {}
+    confidence_block = action.get("confidence") if isinstance(action.get("confidence"), dict) else {}
+    if not evidence_block and not confidence_block:
+        return []
+
+    lines: list[str] = []
+    if evidence_block:
+        evidence = evidence_from_dict(evidence_block)
+        # Drop the inline regen query — it gets its own labeled "Re-check:" line below.
+        lines.append(f"{_BLOCK_INDENT}Evidence: {render_evidence_line(evidence, include_regen=False)}")
+
+    confidence: Confidence | None = None
+    if confidence_block:
+        confidence = confidence_from_dict(confidence_block)
+        lines.append(f"{_BLOCK_INDENT}Confidence: {_render_brief_confidence(confidence)}")
+        if confidence.causal_flag:
+            lines.append(f"{_BLOCK_INDENT}{_render_causal_offer(account_slug)}")
+
+    regen = evidence_block.get("regenerating_query")
+    if regen:
+        lines.append(f"{_BLOCK_INDENT}Re-check: {regen}")
+
+    if confidence is not None:
+        raise_lower = _render_raise_lower(confidence)
+        if raise_lower:
+            lines.append(f"{_BLOCK_INDENT}{raise_lower}")
+
+    return lines
+
+
+def _render_brief_confidence(conf: Confidence) -> str:
+    """One-line confidence for the brief. Defers to ``confidence.render_confidence_line`` for scored
+    bands; an ``abstain`` reads as a promising test ("Insufficient data — keep running"), distinct
+    from a 🔴 Low verdict and never a percentage."""
+    if conf.band is Band.abstain:
+        head = f"{BAND_PRESENTATION[Band.abstain]['emoji']} Insufficient data — keep running"
+        if conf.factors:
+            head += " — " + "; ".join(conf.factors[:3])
+        return head
+    return render_confidence_line(conf)
+
+
+def _render_causal_offer(account_slug: Any) -> str:
+    """Surface the correlational caveat and the offer to confirm it with an A/B. The brief only
+    surfaces the text — it does not auto-file the experiment."""
+    command = "experiment define"
+    if account_slug:
+        command += f" --account {account_slug}"
+    return f"⚠️ correlational — confirm via A/B — file one to confirm: {command} …"
+
+
+def _render_raise_lower(conf: Confidence) -> str | None:
+    parts = []
+    if conf.would_raise:
+        parts.append(f"Would raise: {conf.would_raise}")
+    if conf.would_lower:
+        parts.append(f"Would lower: {conf.would_lower}")
+    return " · ".join(parts) if parts else None
 
 
 def write_operator_brief(
@@ -212,6 +295,11 @@ def _brief_action(action: dict[str, Any]) -> dict[str, Any]:
         "adset_name": target.get("adset_name"),
         "params": action.get("params") if isinstance(action.get("params"), dict) else {},
         "rationale": action.get("rationale"),
+        # Carry the structured evidence + computed confidence straight through (computed once, in the
+        # action plan — never recomputed here). Empty dict when the action carries none, so the
+        # renderer can omit the block gracefully.
+        "evidence": action.get("evidence") if isinstance(action.get("evidence"), dict) else {},
+        "confidence": action.get("confidence") if isinstance(action.get("confidence"), dict) else {},
     }
 
 
