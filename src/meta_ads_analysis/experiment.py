@@ -25,6 +25,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import PROJECT_ROOT
+from .confidence import (
+    Evidence,
+    EvidenceTier,
+    assess,
+    build_regenerating_query,
+    confidence_to_dict,
+    evidence_to_dict,
+)
 from .control import fetch_entity_metrics
 from .meta_api import MetaMarketingApiClient
 from .utils import ensure_dir, slugify_name
@@ -155,12 +163,40 @@ def read_experiment(
     else:
         verdict = (f"NO significant difference yet (p={p_value}); ROAS variant {variant['roas']} "
                    f"vs control {control['roas']}. Keep running or call it a tie.")
+
+    # Confidence in the shared vocabulary. The A/B is the top grounding tier (``ab_experiment``), so a
+    # significant, well-powered readout can reach 🟢 High — it is NOT capped the way a correlational
+    # claim is. Significance rests on conversions, so the data band is driven by per-arm purchases
+    # (the weaker arm governs) + the p-value; spend is kept off the data axis. Below the
+    # ``min_conversions`` gate the sample is below the conversion floor → ⚪ abstain, while the human
+    # ``verdict`` string (INSUFFICIENT DATA) is preserved unchanged.
+    sample_purchases = min(control["purchases"], variant["purchases"])
+    evidence = Evidence(
+        metric_name="roas_lift_pct", metric_value=roas_lift,
+        metric_display=f"ROAS lift {roas_lift:+.1f}%" if roas_lift is not None else "ROAS lift n/a",
+        window=f"{exp.start_date}..{as_of.isoformat()}",
+        sample_purchases=sample_purchases,
+        sample_spend=None,  # the A/B's significance rests on conversions, not spend
+        entity_level=exp.level,
+        entity_id=",".join(exp.control_ids + exp.variant_ids) or None, entity_name=exp.id,
+        regenerating_query=build_regenerating_query(exp.account, exp.level, exp.start_date, as_of.isoformat()),
+    )
+    confidence = assess(
+        evidence=evidence, tier=EvidenceTier.ab_experiment,
+        # spend is not the experiment's significance axis; sample_spend=None + a positive floor keeps
+        # it off the data band, so the conversion floor (min_conversions) alone governs abstention.
+        spend_floor=1.0, conversions_floor=float(min_conversions),
+        recency_days=0,  # window ends at as_of (deterministic, clock-free)
+        pvalue=p_value if enough else None,
+        causal_text=None,  # the A/B IS the causal instrument — not an unsupported causal claim to flag
+    )
     return {
         "experiment_id": exp.id, "hypothesis": exp.hypothesis, "variable": exp.variable,
         "window": f"{exp.start_date}..{as_of.isoformat()}", "level": exp.level,
         "control": control, "variant": variant,
         "roas_lift_pct": roas_lift, "conversion_rate_pvalue": p_value, "min_conversions": min_conversions,
         "verdict": verdict,
+        "confidence": confidence_to_dict(confidence), "evidence": evidence_to_dict(evidence),
         "caveat": ("Significance is on conversion-rate (purchases/impressions); ROAS also depends on "
                    "value variance. If both arms share an ad set they compete (overlap) — cleanest is "
                    "matched separate ad sets or Meta's native split test."),

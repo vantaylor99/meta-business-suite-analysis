@@ -2461,6 +2461,61 @@ def test_build_watch_report_protects_young_flags_mature() -> None:
     assert report["watchlist"]["ads"]["m1"]["times_flagged"] == 1
 
 
+def test_classify_ad_below_min_spend_confidence_abstains_not_low() -> None:
+    # An ad below the significance floor abstains (⚪ "insufficient data"), it is NOT scored low.
+    v = classify_ad(spend=50, roas=0.5, results=0, days_since_change=30, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "insufficient"
+    assert v["confidence"]["band"] == "abstain"
+    assert v["confidence"]["band"] != "low"
+
+
+def test_classify_ad_young_ad_stays_watch_confidence_abstains_never_urgent() -> None:
+    # A young ad below the ROAS floor stays `watch` (grace wins) and its confidence reflects
+    # "too young to judge" — abstain, never a high-confidence pause.
+    v = classify_ad(spend=300, roas=0.5, results=0, days_since_change=2, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "watch"            # grace beats pause
+    assert v["classification"] != "urgent"
+    assert v["confidence"]["band"] == "abstain"      # not "low", not "high"
+    assert v["confidence"]["causal_flag"] is False
+
+
+def test_classify_ad_urgent_confidence_is_direct_observation_non_causal() -> None:
+    # A mature below-floor ad gets a direct-observation data band; descriptive reasons are not
+    # causal language, so causal_flag stays False (asserted, per the ticket).
+    v = classify_ad(spend=300, roas=0.5, results=3, days_since_change=30, accelerating=False,
+                    min_spend=100, grace_days=5, roas_floor=1.5, roas_target=3.0)
+    assert v["classification"] == "urgent"
+    assert v["confidence"]["grounding_tier"] == "direct_observation"
+    assert v["confidence"]["causal_flag"] is False
+    # 3 purchases is below the 25 conversion floor (spend cleared) → thin-on-conversions → low.
+    assert v["confidence"]["band"] == "low"
+
+
+def test_build_watch_report_rows_carry_confidence_and_reproducible_evidence() -> None:
+    insights = [
+        {"ad_id": "m1", "ad_name": "Mature Loser", "spend": "300",
+         "action_values": [{"action_type": "purchase", "value": "150"}], "actions": [{"action_type": "purchase", "value": "3"}]},
+    ]
+    ads_meta = [
+        {"id": "m1", "name": "Mature Loser", "effective_status": "ACTIVE", "adset_id": "as1", "updated_time": "2026-06-01T00:00:00+0000"},
+    ]
+    report = build_watch_report(_WatchFakeClient(insights, ads_meta), "act_1", account_slug="demo",
+                                as_of=_d(2026, 6, 24), roas_floor=1.5, roas_target=3.0, min_spend=100, grace_days=5)
+    row = {r["ad_id"]: r for r in report["rows"]}["m1"]
+    assert row["classification"] == "urgent"
+    assert row["confidence"]["grounding_tier"] == "direct_observation"
+    assert row["confidence"]["causal_flag"] is False
+    ev = row["evidence"]
+    assert ev["entity_level"] == "ad" and ev["entity_id"] == "m1"
+    assert ev["window"] == "2026-06-18..2026-06-24"
+    # A flagged ad traces back to a reproducible account_metrics command.
+    assert ev["regenerating_query"] == (
+        "account_metrics --account demo --level ad --date-from 2026-06-18 --date-to 2026-06-24"
+    )
+
+
 # --- A/B experiment harness ----------------------------------------------------
 
 from datetime import date as _date_e
@@ -2557,6 +2612,63 @@ def test_read_experiment_calls_significant_winner() -> None:
     assert r["conversion_rate_pvalue"] is not None and r["conversion_rate_pvalue"] < 0.05
     assert "SIGNIFICANT" in r["verdict"] and "variant" in r["verdict"]
     assert r["variant"]["roas"] == 6.0 and r["control"]["roas"] == 2.0
+
+
+def test_read_experiment_significant_reads_high_confidence_ab_experiment() -> None:
+    # A clean, well-powered, significant A/B reads 🟢 High — the experiment is the TOP grounding tier,
+    # so it is NOT capped the way a correlational claim is. (The same claim read Medium as a
+    # correlational action in the actions ticket; grounding improved, so confidence rises.)
+    insights = [
+        {"ad_id": "c1", "ad_name": "Control", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "2000"}],
+         "actions": [{"action_type": "purchase", "value": "100"}], "impressions": "100000"},
+        {"ad_id": "v1", "ad_name": "Variant", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "6000"}],
+         "actions": [{"action_type": "purchase", "value": "300"}], "impressions": "100000"},
+    ]
+    r = _exp.read_experiment(_ExpFakeClient(insights), "act_1", _exp_obj(), as_of=_date_e(2026, 6, 24),
+                             min_conversions=25)
+    assert r["confidence"]["band"] == "high"
+    assert r["confidence"]["grounding_tier"] == "ab_experiment"
+    assert r["confidence"]["causal_flag"] is False          # the A/B IS the causal instrument
+    ev = r["evidence"]
+    assert ev["entity_level"] == "ad" and ev["sample_purchases"] == 100   # weaker arm governs
+    assert ev["regenerating_query"] == (
+        "account_metrics --account demo --level ad --date-from 2026-06-01 --date-to 2026-06-24"
+    )
+
+
+def test_read_experiment_below_min_conversions_abstains_keeps_verdict_string() -> None:
+    insights = [
+        {"ad_id": "c1", "ad_name": "Control", "spend": "100",
+         "action_values": [{"action_type": "purchase", "value": "300"}],
+         "actions": [{"action_type": "purchase", "value": "5"}], "impressions": "1000"},
+        {"ad_id": "v1", "ad_name": "Variant", "spend": "100",
+         "action_values": [{"action_type": "purchase", "value": "400"}],
+         "actions": [{"action_type": "purchase", "value": "6"}], "impressions": "1000"},
+    ]
+    r = _exp.read_experiment(_ExpFakeClient(insights), "act_1", _exp_obj(), as_of=_date_e(2026, 6, 24))
+    assert r["confidence"]["band"] == "abstain"
+    assert "INSUFFICIENT DATA" in r["verdict"]   # existing human verdict string preserved
+
+
+def test_read_experiment_no_significant_difference_caps_confidence_at_medium() -> None:
+    # Enough data per arm, but identical conversion rates (p>=0.05) → no proven effect → the data band
+    # is capped at medium even though the sample is large. Verdict string is unchanged.
+    insights = [
+        {"ad_id": "c1", "ad_name": "Control", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "2000"}],
+         "actions": [{"action_type": "purchase", "value": "100"}], "impressions": "100000"},
+        {"ad_id": "v1", "ad_name": "Variant", "spend": "1000",
+         "action_values": [{"action_type": "purchase", "value": "2000"}],
+         "actions": [{"action_type": "purchase", "value": "100"}], "impressions": "100000"},
+    ]
+    r = _exp.read_experiment(_ExpFakeClient(insights), "act_1", _exp_obj(), as_of=_date_e(2026, 6, 24),
+                             min_conversions=25)
+    assert r["conversion_rate_pvalue"] is not None and r["conversion_rate_pvalue"] >= 0.05
+    assert r["confidence"]["grounding_tier"] == "ab_experiment"
+    assert r["confidence"]["band"] == "medium"   # NOT high — no proven difference yet
+    assert "NO significant difference" in r["verdict"]
 
 
 def test_readout_json_output_path(tmp_path, monkeypatch) -> None:

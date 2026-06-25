@@ -23,7 +23,19 @@ from pathlib import Path
 from typing import Any
 
 from . import account_registry
-from .config import DEFAULT_REPORTS_ROOT
+from .config import CONFIDENCE_CONVERSIONS_FLOOR, DEFAULT_REPORTS_ROOT
+from .confidence import (
+    Band,
+    Confidence,
+    Evidence,
+    EvidenceTier,
+    assess,
+    build_regenerating_query,
+    combine_bands,
+    confidence_to_dict,
+    evidence_to_dict,
+    grounding_strength,
+)
 from .control import fetch_entity_metrics
 from .meta_api import MetaMarketingApiClient
 from .utils import ensure_dir, write_json
@@ -41,6 +53,25 @@ def _as_date(value: Any) -> date | None:
         return None
 
 
+def _abstain_confidence(factors: list[str]) -> Confidence:
+    """The monitor's explicit "too thin / too young to judge" abstention, in the shared confidence
+    vocabulary. ``abstain`` is the deliberate refusal to score data the significance floor (too little
+    spend) or the grace window (a still-learning ad) deems untrustworthy — NOT a fabricated number.
+    Grounding is ``direct_observation`` (live metrics), but the data axis abstains, so the combined
+    verdict abstains (the weaker axis governs, identical to :func:`confidence.combine_bands`)."""
+    grounding, _ = grounding_strength(EvidenceTier.direct_observation, causal_claim=False)
+    return Confidence(
+        band=combine_bands(Band.abstain, grounding),
+        data_band=Band.abstain,
+        grounding_band=grounding,
+        grounding_tier=EvidenceTier.direct_observation.name,
+        factors=list(factors),
+        would_raise="more spend past the significance floor / a matured (post-learning) window",
+        would_lower="",
+        causal_flag=False,
+    )
+
+
 def classify_ad(
     *,
     spend: float,
@@ -52,31 +83,61 @@ def classify_ad(
     grace_days: int,
     roas_floor: float,
     roas_target: float,
+    recency_days: int | None = 0,
 ) -> dict[str, Any]:
-    """Pure classification of one ad. Returns classification + reasons + $ at risk."""
+    """Pure classification of one ad. Returns classification + reasons + $ at risk + a ``confidence``
+    block in the shared :mod:`confidence` vocabulary.
+
+    ``recency_days`` is the staleness of the *data window* (days since its end), passed in so this
+    stays clock-free; it is 0 for a watch scan whose window ends at ``as_of``. The significance floor
+    (``insufficient``) and the protective grace window both map to ``abstain`` — the same
+    "insufficient data" verdict the action plan uses — while ``urgent``/``underperforming`` rows get
+    a ``direct_observation`` data band computed from spend/purchases/recency.
+    """
+    metric_display = f"ROAS {roas:.2f}" if roas is not None else "ROAS n/a"
+    evidence = Evidence(
+        metric_name="roas", metric_value=roas, metric_display=metric_display,
+        window="n/a", sample_purchases=results, sample_spend=spend,
+        entity_level="ad", entity_id=None, entity_name=None, regenerating_query=None,
+    )
+
     if spend < min_spend:
-        return {"classification": "insufficient", "dollars_at_risk": 0.0,
-                "reasons": [f"only ${spend:.0f} spent (< ${min_spend:.0f} significance floor) — too early to judge"]}
+        reasons = [f"only ${spend:.0f} spent (< ${min_spend:.0f} significance floor) — too early to judge"]
+        return {"classification": "insufficient", "dollars_at_risk": 0.0, "reasons": reasons,
+                "confidence": confidence_to_dict(_abstain_confidence(reasons))}
+
     r = roas if roas is not None else 0.0
     dollars_at_risk = round(spend * max(0.0, 1.0 - (r / roas_target)), 2)
-    reasons: list[str] = []
+    reasons = []
     protected = days_since_change is not None and days_since_change < grace_days
     if protected:
         reasons.append(f"created/changed {days_since_change}d ago (< {grace_days}d) — learning, protected from kill")
         if r < roas_floor:
             reasons.append(f"ROAS {r:.2f} is below floor {roas_floor} but it's too young to judge")
-        return {"classification": "watch", "dollars_at_risk": dollars_at_risk, "reasons": reasons}
+        conf = _abstain_confidence(reasons + ["too young to judge — abstain, keep running"])
+        return {"classification": "watch", "dollars_at_risk": dollars_at_risk, "reasons": reasons,
+                "confidence": confidence_to_dict(conf)}
+
     if r < roas_floor:
         reasons.append(f"ROAS {r:.2f} < pause floor {roas_floor} on ${spend:.0f}")
         if not results:
             reasons.append("~0 results")
         if accelerating:
             reasons.append("spend accelerating vs its recent average")
-        return {"classification": "urgent", "dollars_at_risk": dollars_at_risk, "reasons": reasons}
-    if r < roas_target:
+        cls = "urgent"
+    elif r < roas_target:
         reasons.append(f"ROAS {r:.2f} below target {roas_target} (above floor {roas_floor})")
-        return {"classification": "underperforming", "dollars_at_risk": dollars_at_risk, "reasons": reasons}
-    return {"classification": "ok", "dollars_at_risk": dollars_at_risk, "reasons": []}
+        cls = "underperforming"
+    else:
+        cls = "ok"
+
+    conf = assess(
+        evidence=evidence, tier=EvidenceTier.direct_observation,
+        spend_floor=min_spend, conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=recency_days, causal_text="; ".join(reasons) or None,
+    )
+    return {"classification": cls, "dollars_at_risk": dollars_at_risk, "reasons": reasons,
+            "confidence": confidence_to_dict(conf)}
 
 
 def _policy_floors(account_slug: str) -> tuple[float, float]:
@@ -135,6 +196,7 @@ def build_watch_report(
             spend=spend, roas=m.get("roas"), results=m.get("purchases"),
             days_since_change=days_since_change, accelerating=accelerating,
             min_spend=min_spend, grace_days=grace_days, roas_floor=roas_floor, roas_target=roas_target,
+            recency_days=0,  # window ends at as_of, so the data is maximally fresh (deterministic)
         )
         cls = verdict["classification"]
         if cls in ("insufficient", "ok"):
@@ -142,12 +204,21 @@ def build_watch_report(
         flaggable = cls in ("urgent", "underperforming")
         prior_entry = prior.get(ad_id, {})
         times = (prior_entry.get("times_flagged", 0) + 1) if flaggable else prior_entry.get("times_flagged", 0)
+        roas_val = m.get("roas")
+        evidence = Evidence(
+            metric_name="roas", metric_value=roas_val,
+            metric_display=f"ROAS {roas_val:.2f}" if roas_val is not None else "ROAS n/a",
+            window=f"{win_from}..{to}", sample_purchases=m.get("purchases"), sample_spend=round(spend, 2),
+            entity_level="ad", entity_id=ad_id, entity_name=info.get("name"),
+            regenerating_query=build_regenerating_query(account_slug, "ad", win_from, to),
+        )
         row = {
             "ad_id": ad_id, "ad_name": info.get("name"), "adset_id": info.get("adset_id"),
             "classification": cls, "spend": round(spend, 2), "roas": m.get("roas"),
             "purchases": m.get("purchases"), "dollars_at_risk": verdict["dollars_at_risk"],
             "days_since_change": days_since_change, "accelerating": accelerating,
             "times_flagged": times, "reasons": verdict["reasons"],
+            "confidence": verdict["confidence"], "evidence": evidence_to_dict(evidence),
         }
         rows.append(row)
         if flaggable:
