@@ -954,8 +954,8 @@ def fetch_entity_metrics(
     """Live per-entity performance over a window (one aggregated row per entity).
 
     Read-only (insights via ``reader``). Returns dicts with id, name, spend, purchase_value,
-    roas, purchases, impressions, cost_per_purchase — sorted by spend desc. ``level`` is
-    account/campaign/adset/ad.
+    roas, purchases, app_installs, cost_per_app_install, impressions, cost_per_purchase — sorted by
+    spend desc. ``level`` is account/campaign/adset/ad.
     """
     if level not in _LEVEL_KEYS:
         raise ValueError(f"level must be one of {sorted(_LEVEL_KEYS)}")

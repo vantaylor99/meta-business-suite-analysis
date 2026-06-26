@@ -3225,6 +3225,25 @@ def test_enable_ads_thin_new_ad_abstains_so_go_live_is_a_reviewed_step() -> None
     assert op["review_verdict"] == "insufficient"
 
 
+def test_enable_ads_install_goal_grounds_on_cost_per_install() -> None:
+    # An install-goal account grounds the enable on cost-per-install (the goal metric), mirroring
+    # actions._select_action_metric. The conversion sample is still purchases, so a spend-cleared but
+    # purchase-thin install ad reads `low` (never high) and stands — it is allowed, but never an
+    # over-confident enable.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "actions": [{"action_type": "mobile_app_install", "value": "40"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "maximize_in_app_subscriptions"}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["metric_value"] == 12.5  # $500 / 40 installs
+    assert op["confidence"]["band"] == "low"  # spend cleared the floor, but purchases are thin
+    assert op["review"]["verdict"] == "stands"
+
+
 def test_review_ops_plan_demotes_overclaimed_enable() -> None:
     from meta_ads_analysis.review import review_ops_plan
 
