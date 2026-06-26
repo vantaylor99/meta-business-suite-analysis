@@ -1785,6 +1785,109 @@ def test_review_scale_below_target_refutes() -> None:
     assert any("below the 3 target" in reason for reason in result.reasons)
 
 
+def _install_direction_result(
+    action_type: str, cost: float, *, target: float | None = 3.0
+):
+    # Run one install-goal recommendation through the gate on a clean, above-floor sample so only the
+    # cost-polarity `direction` check can fire. The policy carries the install target unless `target`
+    # is None (the missing-target guard case).
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24",
+        purchases=120.0,
+        spend=2400.0,
+        metric_value=cost,
+        metric_name="cost_per_app_install",
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    policy = {"primary_goal": "maximize_in_app_subscriptions"}
+    if target is not None:
+        policy["secondary_cost_per_app_install_target"] = target
+    return review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": action_type},
+        policy=policy,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+
+def test_review_install_scale_above_target_refutes() -> None:
+    # Install goal (cost-per-install, lower-is-better): scaling an entity whose cited cost/install
+    # ($5) sits above the $3 target is scaling a loser — the polarity mirror of a ROAS scale below
+    # target. Refuted (a warning, not a band-cap).
+    result = _install_direction_result("consider_scale_budget", 5.0)
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert any("above the $3 target" in reason for reason in result.reasons)
+    assert any("scaling" in reason for reason in result.reasons)
+    assert result.revised_band is None  # refuted carries no corrected band
+
+
+def test_review_install_pause_below_target_refutes() -> None:
+    # Pausing an entity whose cost/install ($1.50) is comfortably below the $3 target (<= 3/1.5 = $2)
+    # is killing a winner — the mirror of pausing a ROAS winner.
+    result = _install_direction_result("pause_ad", 1.5)
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert any("comfortably below the $3 target" in reason for reason in result.reasons)
+
+
+def test_review_install_budget_cut_below_target_refutes_at_margin_boundary() -> None:
+    # Boundary pin: cost/install ($2.00) sits EXACTLY at the inverted margin (3 / 1.5 = 2.0). The
+    # check uses an inclusive `<=`, so a cut at the boundary IS refuted — guards against a future
+    # `<` slip silently letting it stand.
+    result = _install_direction_result("decrease_adset_budget", 2.0)
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert any("cutting the budget" in reason for reason in result.reasons)
+
+
+def test_review_install_scale_agreeing_with_target_stands() -> None:
+    # A genuine winner: cost/install ($2) below the $3 target — scaling it agrees with the goal, so
+    # the direction check does not fire.
+    result = _install_direction_result("consider_scale_budget", 2.0)
+    assert result.verdict == "stands"
+    assert "direction" not in result.failed_inputs
+
+
+def test_review_install_pause_agreeing_with_target_stands() -> None:
+    # A loser worth pausing: cost/install ($5) above target — pausing it agrees with the goal, so the
+    # direction check does not fire.
+    result = _install_direction_result("pause_ad", 5.0)
+    assert result.verdict == "stands"
+    assert "direction" not in result.failed_inputs
+
+
+def test_review_install_scale_at_target_stands() -> None:
+    # Boundary pin: cost/install ($3.00) sits EXACTLY at the $3 target. The scale branch uses a strict
+    # `>`, so an at-target scale is NOT refuted (mirrors the ROAS scale branch's strict `<`).
+    result = _install_direction_result("increase_adset_budget", 3.0)
+    assert result.verdict == "stands"
+    assert "direction" not in result.failed_inputs
+
+
+def test_review_install_missing_target_does_not_fire() -> None:
+    # Conservative guard: with an install goal but NO secondary_cost_per_app_install_target configured,
+    # the cost-polarity direction check cannot fire — a would-be pause-a-winner stands. Pins the guard
+    # that keeps install-goal accounts without a cost target out of the gate.
+    pause = _install_direction_result("pause_ad", 1.5, target=None)
+    scale = _install_direction_result("consider_scale_budget", 5.0, target=None)
+    assert pause.verdict == "stands"
+    assert "direction" not in pause.failed_inputs
+    assert scale.verdict == "stands"
+    assert "direction" not in scale.failed_inputs
+
+
 def test_review_no_claimed_band_is_defensive_noop() -> None:
     # A confidence block with no recognizable band has nothing to refute → stands (never crashes,
     # never fabricates a verdict).
@@ -3350,11 +3453,12 @@ def test_enable_ads_roas_goal_without_target_does_not_refute() -> None:
     assert op["review"]["verdict"] == "stands"
 
 
-def test_enable_ads_install_goal_not_direction_refuted() -> None:
-    # The enable direction rule is ROAS-ONLY. An install-goal enable carries action_type == "enable_ad"
-    # but is judged on cost-per-install, not ROAS vs target — so even with a target_roas in the policy it
-    # is never direction-refuted; it stays low/stands (the conversion sample is purchases, not installs,
-    # so it already caps at low). The install-goal direction polarity is deferred to a follow-up.
+def test_enable_ads_install_goal_no_cost_target_not_direction_refuted() -> None:
+    # Guard pin (NOT a blanket "ROAS-only" deferral): an install-goal enable is judged on
+    # cost-per-install, but this policy carries only a target_roas — no
+    # secondary_cost_per_app_install_target — so the cost-polarity direction check has no target to fire
+    # against and the enable stands (it already caps at low: the conversion sample is purchases, not
+    # installs). The companion test below pins the refute path when a cost target IS configured.
     insights = [{
         "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
         "actions": [{"action_type": "mobile_app_install", "value": "40"}],
@@ -3369,6 +3473,34 @@ def test_enable_ads_install_goal_not_direction_refuted() -> None:
     assert op["review"]["verdict"] != "refuted"
     assert op["review"]["verdict"] == "stands"
     assert op["confidence"]["band"] == "low"
+
+
+def test_enable_ads_install_goal_above_cost_target_is_refuted() -> None:
+    # The install-goal enable-op path with a cost target configured: re-enabling an ad whose computed
+    # cost/install ($12.50 = $500 / 40 installs) sits ABOVE the $3 target is turning a known loser back
+    # on (the cost-polarity mirror of a below-target ROAS re-enable). The gate REFUTES it with an
+    # "enabling" reason. Refuted is a warning, not a band-cap — the computed band (low) is left intact.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "actions": [{"action_type": "mobile_app_install", "value": "40"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1",
+        policy={
+            "primary_goal": "maximize_in_app_subscriptions",
+            "secondary_cost_per_app_install_target": 3.0,
+        },
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["metric_value"] == 12.5  # $500 / 40 installs
+    assert op["review"]["verdict"] == "refuted"
+    assert "direction" in op["review"]["failed_inputs"]
+    reason = " ".join(op["review"]["reasons"])
+    assert "enabling" in reason and "12.50" in reason and "$3 target" in reason
+    assert op["review_verdict"] == "refuted"
+    assert op["confidence"]["band"] == "low"  # refuted is a warning, not a band-cap
 
 
 def test_enable_ads_cold_ad_with_target_stays_insufficient_not_refuted() -> None:

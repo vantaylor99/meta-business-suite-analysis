@@ -133,8 +133,8 @@ Shared scaffolding lets each of these carry grounding uniformly:
   they may lower a band and demote an op's `status` from `approved` back to `proposed`, but never raise
   a band, promote a status, or touch PAUSED-by-default. They use the op's own vocabulary
   (`status` + a `review_verdict` marker) rather than the action plan's `executable`/`rationale` keys.
-  Because an op carries no `action_type`, the gate's `direction` check (scale-vs-ROAS-target) cannot
-  fire here — op-level direction-contradiction is the per-capability ticket's job, since it knows the
+  Because an op carries no `action_type`, the gate's `direction` check (scale/pause-vs-goal-target)
+  cannot fire here — op-level direction-contradiction is the per-capability ticket's job, since it knows the
   op's semantic. Rotation plans use `plan["rotations"]` / `plan["items"]` / `plan["renames"]` rather
   than `plan["ops"]`, so they have their own key-aware wrapper, `review.review_rotation_plan`, **not**
   `review_ops_plan` (routing a rotation plan through the `ops` iterator would silently review nothing).
@@ -202,8 +202,12 @@ This complements the band protection above (which caps over-confidence): the ban
 the claim is, the direction check guards *which way* it points. The refutation is a loud, evidence-named
 warning, **not** a hard block — `apply_ops_plan`'s gate keys on grounding, not on `review_verdict`, so an
 operator who genuinely wants the retest can still set the op to `approved` and execute it. The check is
-ROAS-only for now: an install-goal enable is judged on cost-per-install and already caps at `low`, so it
-is not direction-judged here (deferred to a follow-up). Enabling a campaign or ad set toggles only
+goal-aware and runs in both polarities: on a ROAS-goal account it keys on `target_roas` (higher is
+better); on an install-goal account it keys on `secondary_cost_per_app_install_target` and inverts —
+turning ON an ad whose cited cost-per-install sits *above* target is refuted as enabling a loser (and,
+on the action/budget surfaces, pausing or cutting an entity whose cost-per-install is comfortably
+*below* target is refuted as killing a winner). Each branch fires only with a numeric goal target and
+the matching cited metric, so an account with no configured target is never direction-judged. Enabling a campaign or ad set toggles only
 that node — it does **not** un-pause PAUSED children — so evidence is attached at the level being
 toggled. The ad list is read once at propose time, so live `effective_status` may drift before execute;
 re-applying `ACTIVE` to an ad that is already ACTIVE is idempotent on Meta's side (and `--validate-only`
@@ -365,8 +369,11 @@ the window, with sample + `regenerating_query`) and a computed `confidence` band
 sample abstains into a non-executable "keep running" recommendation (the "9 purchases over 5 days"
 guard). Budget ops set an `action_type` (`increase_adset_budget` / `increase_campaign_budget` /
 `decrease_adset_budget` / `decrease_campaign_budget`) so the review gate's `direction` check fires on an
-op: it **refutes** scaling up an entity whose cited ROAS is below the account target, and **refutes**
-cutting the budget of a clear winner (ROAS comfortably above target).
+op: on a ROAS-goal account it **refutes** scaling up an entity whose cited ROAS is below the account
+target, and **refutes** cutting the budget of a clear winner (ROAS comfortably above target). On an
+install-goal account the same check runs inverted against `secondary_cost_per_app_install_target`:
+scaling up an entity whose cost-per-install is above target, or cutting one whose cost-per-install is
+comfortably below it, is refuted.
 
 ## Meta AI / Advantage+ Policy
 
