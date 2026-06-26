@@ -7686,6 +7686,30 @@ def test_watch_early_life_pause_candidate_carries_evidence_no_write() -> None:
     assert [a for a in report["followup_actions"] if a["ad_id"] == "T"] == []
 
 
+def test_watch_early_life_install_goal_keep_watch_is_goal_aware() -> None:
+    # Install-goal account: a brand-new struggling ad (zero installs on non-trivial spend) graded
+    # against comparable new install ads that later booked cheap installs → keep on probation. Proves
+    # the policy threads through so the analog grading uses cost-per-install, NOT ROAS (the ad has no
+    # purchases at all, so a ROAS-only path would mis-judge it).
+    triaged = _install_ad("T", days=2, start=date(2026, 6, 25))  # first_seen 6/25 -> age 1, $10, 0 installs
+    analogs = [_install_ad(f"R{i}", days=10, recover_from=2) for i in range(3)]  # 3 recovered (cheap installs)
+    report = _run_watch(
+        insights=[_watch_insight("T", spend=30)],
+        meta=[_watch_meta("T")],
+        histories=[triaged] + analogs,
+        policy=_INSTALL_POLICY,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "T")
+    assert row["early_life"] is True
+    assert row["verdict"] == "keep_watch"
+    assert row["classification"] == "watch"
+    assert row["analog_basis"]["analogs"] == 3 and row["analog_basis"]["recovered"] == 3
+    # Goal-aware: the engine's evidence cites the install metric, not ROAS.
+    assert row["evidence"]["metric_name"] == "cost_per_app_install"
+    files = [a for a in report["followup_actions"] if a["action"] == "file" and a["ad_id"] == "T"]
+    assert len(files) == 1
+
+
 def test_watch_age_from_first_seen_not_updated_time() -> None:
     # An ad edited yesterday (updated_time) but launched two weeks ago (first_seen) is NOT early-life:
     # age must come from first_seen. It falls through to the normal grace-protected path.
