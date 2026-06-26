@@ -2,6 +2,42 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-25 (action) — paused Sisters First Test - Copy; diagnosed Mission Call bait failure; scaling deferred
+
+**Account changes executed (Graph API):**
+- **Paused `Sisters First Test - Copy`** (ad 120243000099550733, May Lower Spend / Low Value
+  Customers). Ran proposed → approved → validate → execute; Meta returned `{"success": true}`,
+  confirmed `status=PAUSED`.
+  - *Why:* $128.59 spend, **0 results**, ROAS 0.00 over its run — clean waste, below the 1.50
+    pause floor. The one fully-grounded executable pause in the action plan.
+
+**Diagnosed (no new action — already paused):**
+- **`Mission Call Opening - He Lives` confirmed PAUSED** (it was ACTIVE on 06-24; retired since).
+  Diagnosed *why* it failed beyond the creative: it pulled **CTR 3.39% / outbound 2.16%
+  (~2.4–2.5× the account median) at a cheap $0.83 CPC**, but converted only **0.4% of link
+  clicks (533 clicks → 2 purchases)** on $443.92 spend. CPM only mildly elevated ($18.01 vs
+  $15.79 median), so Meta had not heavily penalized it yet. Signature of a
+  **curiosity/outrage-bait creative**: magnetic at the top of funnel, but the clicks are
+  low-intent (curiosity/irritation) and don't convert — amplified by serving to the warm
+  Engaged Audience. The "make people mad" risk would surface later as rising CPM.
+  - *Caveat:* conversion sample is thin (2 purchases); the click-side signal is conclusive.
+    **Confirm via A/B** (bait vs. straight creative, measured on purchases, not clicks).
+
+**Deferred (deliberately — no writes):**
+- **Scaling the seasonal winners — NOT done.** BYU Football / Easter / Easter Video 3 carry
+  strong *historical* ROAS (11.79 / 5.42 / 6.50), but their campaigns (Byu, Younger Audience,
+  Easter Campaign) are all **PAUSED with 0 active ads** (seasonal). Raising budget on a paused
+  campaign is a no-op. Also: these use **CBO (campaign-level budgets)** — Byu $100/day, Younger
+  Audience $50/day, Easter Campaign $80/day — so the tool's ad-set-level `increase_adset_budget`
+  targets the wrong level here (logged as a tool gap to fix). Follow-up logged to scale +15% at
+  the **campaign** level on relaunch (due 2026-08-01), re-checking current ROAS first.
+- **Creative refreshes** for 5 fatigued ads (White BG V2 - Copy, BYU Ad (updated), New Black,
+  Still Black - Copy, Missionaries - Copy 3) need new creative assets, not an API toggle.
+  Follow-up logged (due 2026-07-09).
+
+**Data:** synced a 12-month window (data effectively starts 2025-11-14 → 156 active days).
+Blended ROAS **3.29** over $63.9K spend / $210K purchase value, 85 ads / 22 ad sets / 13 campaigns.
+
 ## 2026-06-24 (action) — placement policy applied to High Value Customers; Selfie Mom unblocked
 
 - **Verified at the ad-set level first** (120d, High Value Customers specifically, not account-wide):
