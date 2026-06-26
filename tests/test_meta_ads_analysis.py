@@ -6129,6 +6129,56 @@ def test_parse_learnings_extracts_structured_fields() -> None:
     assert ev.tier == "correlational" and ev.account == "divine_designs"
     assert ev.metric_name == "engaged_roas" and ev.metric_value == 3.74
     assert ev.verify_query is not None and ev.verify_query.startswith("account_metrics --account divine_designs")
+    assert ev.metric_selector is None  # no `select:` in the tag → None (token-heuristic fallback)
+
+
+def test_parse_evidence_selector_field() -> None:
+    # A `select:` field parses into a {key: value} dict alongside metric:/src:/acct:.
+    one = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account --breakdown publisher_platform` "
+        "_(src: correlational · acct: d · metric: ig_roas=3.63 · select: publisher_platform=instagram)_",
+        header="single-key select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert one.metric_selector == {"publisher_platform": "instagram"}
+
+    # Multi-key: comma-separated pairs; the commas inside the value don't collide with the `·`
+    # field separator, so both pairs survive.
+    multi = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · acct: d · metric: r=4.5 · select: publisher_platform=instagram,platform_position=stories)_",
+        header="multi-key select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert multi.metric_selector == {"publisher_platform": "instagram", "platform_position": "stories"}
+
+    # Malformed (a bare key with no `=`) → None → falls back to the token heuristic (no crash).
+    bad = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · acct: d · metric: r=4.5 · select: publisher_platform)_",
+        header="malformed select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert bad.metric_selector is None
+
+    # Absent → None.
+    none = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · acct: d · metric: r=4.5)_",
+        header="no select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert none.metric_selector is None
+
+
+def test_parse_evidence_selector_does_not_bleed_across_sibling_lines() -> None:
+    # Two evidence bullets in ONE entry parse independently — a `select:` on one must not leak onto
+    # the other (each is its own EvidenceLine).
+    evs = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — a. `verify: account_metrics --account d --level account --breakdown publisher_platform,platform_position` "
+        "_(src: correlational · acct: d · metric: ig_roas=3.63 · select: publisher_platform=instagram)_",
+        "- ➕ 2026-01-01 — b. `verify: account_metrics --account d --level account --breakdown publisher_platform` "
+        "_(src: correlational · acct: d · metric: fb_roas=2.55)_",
+        header="two bullets", rot="fast", verified="2026-01-01",
+    ))[0].evidence
+    assert evs[0].metric_selector == {"publisher_platform": "instagram"}
+    assert evs[1].metric_selector is None
 
 
 def test_lint_clean_vault_has_no_findings() -> None:
@@ -6191,6 +6241,42 @@ def test_lint_errors_external_without_url() -> None:
         "- ➕ 2026-01-01 — practitioner says X, see https://example.com/post . _(src: external · acct: —)_"
     )
     assert "external_without_url" not in _codes(lint(parse_learnings(ok), today=date(2026, 1, 2)), "error")
+
+
+def test_lint_warns_select_recommended_for_multi_breakdown_metric_without_selector() -> None:
+    # A metric sliced by ≥2 breakdowns with no `select:` is the exact class audit-vault's token
+    # heuristic can't resolve → one `select_recommended` WARN (never an error).
+    text = _entry(
+        "- ➕ 2026-01-01 — IG 3.63 vs FB. "
+        "`verify: account_metrics --account divine_designs --level account "
+        "--date-from 2026-02-23 --date-to 2026-06-23 --breakdown publisher_platform,platform_position` "
+        "_(src: correlational · acct: divine_designs · metric: ig_roas=3.63)_",
+        header="two-dim no selector", rot="fast", verified="2026-01-01",
+    )
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    warns = [f for f in findings if f.code == "select_recommended"]
+    assert len(warns) == 1 and warns[0].severity == "warn"
+    assert _codes(findings, "error") == set()  # warn-not-error keeps the entry lint-clean
+
+
+def test_lint_no_select_warn_when_selector_present_or_single_breakdown() -> None:
+    # With a selector the two-dim metric is resolvable → no nudge.
+    with_sel = _entry(
+        "- ➕ 2026-01-01 — IG 3.63. "
+        "`verify: account_metrics --account divine_designs --level account "
+        "--breakdown publisher_platform,platform_position` "
+        "_(src: correlational · acct: divine_designs · metric: ig_roas=3.63 · select: publisher_platform=instagram)_",
+        header="two-dim with selector", rot="fast", verified="2026-01-01",
+    )
+    assert "select_recommended" not in _codes(lint(parse_learnings(with_sel), today=date(2026, 1, 2)))
+    # A SINGLE-breakdown metric without a selector is fine (the token heuristic resolves it) → no nudge.
+    single = _entry(
+        "- ➕ 2026-01-01 — IG 2.79. "
+        "`verify: account_metrics --account divine_designs --level account --breakdown publisher_platform` "
+        "_(src: correlational · acct: divine_designs · metric: ig_roas=2.79)_",
+        header="single-dim no selector", rot="fast", verified="2026-01-01",
+    )
+    assert "select_recommended" not in _codes(lint(parse_learnings(single), today=date(2026, 1, 2)))
 
 
 def test_lint_staleness_flags_fast_but_never_evergreen() -> None:
@@ -6501,6 +6587,115 @@ def test_resolve_fresh_metric_value_missing_is_unresolved_not_zero() -> None:
     assert value is None and spend == 300
 
 
+# --- explicit `select:` slice resolution (resolve_fresh_metric) ------------
+# A two-dimension `publisher_platform,platform_position` breakdown: many IG cells share the
+# {instagram} name-token, so the token heuristic abstains (ambiguous). An explicit selector resolves
+# the slice exactly — blending several cells, or pinning one — and abstains only on zero matches.
+
+def _two_dim_ig_fb_rows():
+    """IG (feed/stories/reels) + FB (feed) cells. IG blends to 3.63 ROAS (8160/2250); IG Stories
+    alone is 4.50 (2250/500)."""
+    return [
+        {"segment": {"publisher_platform": "instagram", "platform_position": "feed"},
+         "spend": 1000, "purchase_value": 3250, "roas": 3.25, "purchases": 80},
+        {"segment": {"publisher_platform": "instagram", "platform_position": "stories"},
+         "spend": 500, "purchase_value": 2250, "roas": 4.50, "purchases": 40},
+        {"segment": {"publisher_platform": "instagram", "platform_position": "reels"},
+         "spend": 750, "purchase_value": 2660, "roas": 3.55, "purchases": 55},
+        {"segment": {"publisher_platform": "facebook", "platform_position": "feed"},
+         "spend": 900, "purchase_value": 2295, "roas": 2.55, "purchases": 35},
+    ]
+
+
+def test_resolve_fresh_metric_selector_blends_subset_under_finer_breakdown() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # `select: publisher_platform=instagram` under a two-dim breakdown → several IG cells → the
+    # author-specified platform-level blend (8160 value / 2250 spend = 3.63), NOT an abstain.
+    value, purchases, spend = resolve_fresh_metric(
+        _two_dim_ig_fb_rows(), level="account", breakdowns=["publisher_platform", "platform_position"],
+        metric_name="ig_roas", selector={"publisher_platform": "instagram"},
+    )
+    assert value == 3.63 and spend == 2250 and purchases == 175
+
+
+def test_resolve_fresh_metric_selector_pins_a_single_cell() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # A two-key selector names exactly one cell → that row via _row_value (single-cell ROAS 4.50).
+    value, _, spend = resolve_fresh_metric(
+        _two_dim_ig_fb_rows(), level="account", breakdowns=["publisher_platform", "platform_position"],
+        metric_name="ig_stories_roas",
+        selector={"publisher_platform": "instagram", "platform_position": "stories"},
+    )
+    assert value == 4.50 and spend == 500
+
+
+def test_resolve_fresh_metric_selector_zero_match_abstains() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # A vanished/renamed segment value → zero matches → (None, None, None) → could_not_audit.
+    assert resolve_fresh_metric(
+        _two_dim_ig_fb_rows(), level="account", breakdowns=["publisher_platform", "platform_position"],
+        metric_name="threads_roas", selector={"publisher_platform": "threads"},
+    ) == (None, None, None)
+
+
+def test_resolve_fresh_metric_selector_is_case_insensitive_full_value_only() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = [
+        {"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232, "roas": 2.79, "purchases": 50},
+        {"segment": {"publisher_platform": "facebook"}, "spend": 500, "purchase_value": 970, "roas": 1.94, "purchases": 20},
+    ]
+    # Case-insensitive full-value match: `Instagram` selector resolves the `instagram` row.
+    value, _, _ = resolve_fresh_metric(
+        rows, level="account", breakdowns=["publisher_platform"],
+        metric_name="ig_roas", selector={"publisher_platform": "Instagram"},
+    )
+    assert value == 2.79
+    # …but a substring must NOT match (full value only, unlike the token path) → abstain.
+    assert resolve_fresh_metric(
+        rows, level="account", breakdowns=["publisher_platform"],
+        metric_name="ig_roas", selector={"publisher_platform": "insta"},
+    ) == (None, None, None)
+
+
+def test_resolve_fresh_metric_selector_missing_key_does_not_match() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # A selector key absent from the row's segment dict → no match (no crash, no partial match).
+    rows = [{"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232,
+             "roas": 2.79, "purchases": 50}]
+    assert resolve_fresh_metric(
+        rows, level="account", breakdowns=["publisher_platform"],
+        metric_name="ig_roas", selector={"platform_position": "stories"},
+    ) == (None, None, None)
+
+
+def test_resolve_fresh_metric_none_selector_uses_token_heuristic_unchanged() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = [
+        {"segment": {"publisher_platform": "facebook"}, "spend": 500, "purchase_value": 970, "roas": 1.94, "purchases": 20},
+        {"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232, "roas": 2.79, "purchases": 50},
+    ]
+    # selector=None (the default) falls through to the name-token path: ig_roas → {instagram} → 2.79.
+    assert resolve_fresh_metric(
+        rows, level="account", breakdowns=["publisher_platform"], metric_name="ig_roas",
+    )[0] == 2.79
+
+
+def test_resolve_fresh_metric_account_level_rows_have_no_segment_so_selector_abstains() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # Account-level rows carry no `segment` dict → _row_matches_selector is False for all → abstain.
+    assert resolve_fresh_metric(
+        _account_rows(roas=3.21), level="account", breakdowns=[], metric_name="blended_roas",
+        selector={"publisher_platform": "instagram"},
+    ) == (None, None, None)
+
+
 # --- end-to-end orchestration with a fake metrics provider -----------------
 
 
@@ -6557,6 +6752,63 @@ def test_audit_report_only_makes_no_text_changes() -> None:
     report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=2.10)), apply=False)
     assert new_text is None  # report-only ⇒ nothing to write
     assert counts[AUDIT_REFUTED] == 1  # …but drift is still detected and reported
+
+
+# A two-dimension `publisher_platform,platform_position` claim with an explicit `select:` slice —
+# mirrors the real divine_designs `ig_roas=3.63` entry. The token heuristic alone would abstain
+# (every IG cell matches {instagram}); the selector blends the IG cells so the claim re-verifies.
+_AUDIT_SELECT_VAULT = """# Durable learnings
+
+## Strategy
+
+### Instagram outperforms Facebook across placements
+**Confidence:** 🟢 High →  ·  **Domain:** strategy
+**Rot:** fast  ·  **Verified:** 2026-01-10
+- ➕ 2026-01-10 — 120d split. `verify: account_metrics --account divine_designs --level account --date-from 2025-09-12 --date-to 2026-01-10 --breakdown publisher_platform,platform_position` _(src: correlational · acct: divine_designs · metric: ig_roas=3.63 · select: publisher_platform=instagram)_
+**Apply:** lean Instagram.
+"""
+
+
+def _two_dim_blend_rows(*, ig_roas: float):
+    """Two IG cells (feed+stories) + one FB cell. The IG cells blend to ``ig_roas`` so the selector
+    `publisher_platform=instagram` resolves to it; FB is a decoy the selector must exclude."""
+    half = round(ig_roas * 1000, 2)
+    return [
+        {"segment": {"publisher_platform": "instagram", "platform_position": "feed"},
+         "spend": 1000, "purchase_value": half, "roas": ig_roas, "purchases": 80},
+        {"segment": {"publisher_platform": "instagram", "platform_position": "stories"},
+         "spend": 1000, "purchase_value": half, "roas": ig_roas, "purchases": 80},
+        {"segment": {"publisher_platform": "facebook", "platform_position": "feed"},
+         "spend": 1000, "purchase_value": 2000, "roas": 2.0, "purchases": 40},
+    ]
+
+
+def test_audit_selector_resolves_two_dim_claim_end_to_end_and_is_idempotent() -> None:
+    # Fresh IG blend 5.00 drifts 38% from stored 3.63 (both above target 3.0 → no policy cross →
+    # contradicted, not refuted). The selector blends only the IG cells; without it the audit would
+    # abstain (could_not_audit). Band drops one level 🟢→🟡, a dated ➖ is logged.
+    fetch = _fixed_fetch(_two_dim_blend_rows(ig_roas=5.00))
+    _, t1, counts = _audit(_AUDIT_SELECT_VAULT, fetch, apply=True)
+    assert counts[AUDIT_CONTRADICTED] == 1 and counts[AUDIT_COULD_NOT] == 0
+    assert "🟡 Medium" in t1 and "(contested)" not in t1
+    assert "➖ 2026-06-25 — vault audit: ig_roas now 5.00 vs stored 3.63" in t1
+    assert "**Verified:** 2026-06-25" in t1
+    # The logged ➖ carries metric: but no select: — and is_audit_line skips it, so a second --apply
+    # on the same --as-of stays byte-identical even for a selector-resolved claim.
+    _, t2, _ = _audit(t1, fetch, apply=True)
+    assert t2 == t1
+
+
+def test_audit_selector_abstains_when_segment_vanished_band_unchanged() -> None:
+    # The IG cells are gone from the fresh pull (only FB remains) → selector matches zero rows →
+    # could_not_audit. The safe-direction invariant: band untouched, no ➖, Verified unmoved.
+    fetch = _fixed_fetch([
+        {"segment": {"publisher_platform": "facebook", "platform_position": "feed"},
+         "spend": 1000, "purchase_value": 2000, "roas": 2.0, "purchases": 40},
+    ])
+    _, new_text, counts = _audit(_AUDIT_SELECT_VAULT, fetch, apply=True)
+    assert counts[AUDIT_COULD_NOT] == 1
+    assert new_text == _AUDIT_SELECT_VAULT  # zero file changes — a vanished segment must not refute
 
 
 # --- CLI: file I/O path (report-only never writes; --apply writes) ---------

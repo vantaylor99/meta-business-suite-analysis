@@ -84,6 +84,12 @@ _SRC_RE = re.compile(r"\bsrc:\s*(?P<src>[A-Za-z_]+)")
 _ACCT_RE = re.compile(r"\bacct:\s*(?P<acct>[^·;,)\s]+)")
 _METRIC_RE = re.compile(r"\bmetric:\s*(?P<name>[A-Za-z0-9_.]+)\s*=\s*(?P<value>[-+]?\d*\.?\d+)")
 
+# A `select:` slice — comma-separated key=value pairs naming the exact breakdown cells this metric
+# summarizes (so a two-dimension breakdown row resolves exactly instead of by name-token overlap).
+# Value chars are [A-Za-z0-9_=,.] so it stops at whitespace / the `·` field separator, not at the
+# commas *inside* the selector.
+_SELECT_RE = re.compile(r"\bselect:\s*(?P<select>[A-Za-z0-9_=,.]+)")
+
 # The inline reproduce-it command (`verify: account_metrics …`) and any URL, anywhere on the line.
 _VERIFY_RE = re.compile(r"`?verify:\s*(?P<cmd>account_metrics[^`\n]*)`?")
 _URL_RE = re.compile(r"https?://\S+")
@@ -104,6 +110,9 @@ class EvidenceLine:
     url: str | None
     lineno: int  # start line in the file
     has_tag: bool  # did the line carry a trailing `_( … )_` tag at all?
+    # The breakdown slice this metric summarizes (`select: publisher_platform=instagram` → its
+    # cells). None = no selector → audit-vault falls back to the name-token heuristic.
+    metric_selector: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -170,6 +179,7 @@ def _parse_evidence(joined: str, lineno: int) -> EvidenceLine:
 
     tier = account = metric_name = None
     metric_value: float | None = None
+    metric_selector: dict[str, str] | None = None
     if tag:
         if sm := _SRC_RE.search(tag):
             tier = sm.group("src")
@@ -181,6 +191,14 @@ def _parse_evidence(joined: str, lineno: int) -> EvidenceLine:
                 metric_value = float(mm.group("value"))
             except ValueError:
                 metric_value = None
+        if selm := _SELECT_RE.search(tag):
+            pairs: dict[str, str] = {}
+            for piece in selm.group("select").split(","):
+                if "=" in piece:
+                    k, v = piece.split("=", 1)
+                    if k and v:
+                        pairs[k] = v
+            metric_selector = pairs or None  # malformed / empty → None → token-heuristic fallback
 
     verify_query = vm.group("cmd").strip() if (vm := _VERIFY_RE.search(rest)) else None
     url = um.group(0).rstrip(".,);") if (um := _URL_RE.search(rest)) else None
@@ -197,6 +215,7 @@ def _parse_evidence(joined: str, lineno: int) -> EvidenceLine:
         url=url,
         lineno=lineno,
         has_tag=has_tag,
+        metric_selector=metric_selector,
     )
 
 
@@ -326,6 +345,23 @@ def _lint_evidence(ev: EvidenceLine, entry: LearningEntry, findings: list[Findin
                 entry.claim,
             )
         )
+
+    # A metric sliced by ≥2 breakdowns with no `select:` is the exact class the audit's name-token
+    # heuristic can't resolve (every IG cell matches `{instagram}` → ambiguous → could_not_audit).
+    # Nudge (warn, never error — keeps pre-existing entries lint-clean); skip our own ➖ audit lines.
+    if ev.metric_name and ev.metric_selector is None and not is_audit_line(ev):
+        breakdowns = parse_verify_query(ev.verify_query)["breakdowns"]
+        if len(breakdowns) >= 2:
+            findings.append(
+                Finding(
+                    "warn",
+                    "select_recommended",
+                    f"metric: {ev.metric_name} is sliced by {len(breakdowns)} breakdowns "
+                    "but carries no `select:` field; audit-vault cannot resolve it without one",
+                    ev.lineno,
+                    entry.claim,
+                )
+            )
 
     if ev.tier == EvidenceTier.external.name and not ev.url:
         findings.append(

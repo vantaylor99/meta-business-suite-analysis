@@ -182,6 +182,13 @@ scale).
   `metric: blended_roas=3.74`). Its presence marks the line *auditable*: the dependent `audit-vault`
   pass re-runs it. A line carrying `metric:` **MUST** also carry an inline
   `` `verify: account_metrics …` `` command (auditable ⇒ reproducible).
+- `select: <key=value,…>` — *optional;* names the exact breakdown slice a `metric:` summarizes so a
+  multi-dimension metric re-verifies automatically (e.g. `select: publisher_platform=instagram`
+  under a `publisher_platform,platform_position` breakdown). Without it, `audit-vault` matches the
+  metric *name* to a row by token overlap — which is ambiguous when several rows share a token
+  (every IG cell matches `ig_roas`), so a ≥2-breakdown metric with no `select:` draws a `lint-vault`
+  ⏳ warning. A selector matching **several** rows is intentional: those cells are blended into the
+  platform-level value; matching **one** row resolves that cell; matching **none** abstains.
 - A `src: external` line **MUST** carry a URL (and per "External evidence" below, a date + verbatim
   quote) — `lint-vault` fails an external line with no link.
 

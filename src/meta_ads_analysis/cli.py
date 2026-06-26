@@ -1035,27 +1035,58 @@ def _row_identifier_text(row: dict[str, object]) -> str:
     return str(row.get("name") or "").lower()
 
 
+def _row_matches_selector(row: dict[str, object], selector: dict[str, str]) -> bool:
+    """True if EVERY selector key/value is present in the row's ``segment`` dict (full-value,
+    case-insensitive — NOT token/substring overlap). A missing key, or a row with no ``segment``
+    dict (e.g. an account-level pull), → no match — the safe-abstain direction."""
+    seg = row.get("segment")
+    if not isinstance(seg, dict):
+        return False
+    return all(str(seg.get(k, "")).lower() == v.lower() for k, v in selector.items())
+
+
 def resolve_fresh_metric(
     rows: list[dict[str, object]],
     *,
     level: str,
     breakdowns: list[str],
     metric_name: str | None,
+    selector: dict[str, str] | None = None,
 ) -> tuple[float | None, float | None, float | None]:
     """Resolve the named metric's fresh ``(value, purchases, spend)`` out of the fetched rows.
 
-    Two cases:
+    Resolution order:
 
-    - **Account aggregate** (``level == account`` with no breakdown): the metric is the blended
-      account ROAS — :func:`_aggregate_value` over the (single) row(s).
-    - **Segment / entity scoped** (a breakdown, or a campaign/adset/ad level): the metric names a
-      *specific* row (e.g. ``ig_roas`` → the ``instagram`` segment). The row is matched by token
+    - **Explicit ``selector``** (a parsed ``select: key=value,…`` tag) — the author named the exact
+      breakdown slice this metric summarizes, so resolve against it *first*, by full-value
+      (case-insensitive) match on each row's ``segment`` dict, never name-token overlap:
+
+      - **zero** matches → ``(None, None, None)`` → ``could_not_audit`` (a renamed/vanished segment;
+        the safe-abstain direction is preserved).
+      - **exactly one** match → that row via :func:`_row_value` (keeps the roas-or-derived path).
+      - **several** matches → :func:`_aggregate_value` over them — the **intentional, author-
+        specified blend** (e.g. ``select: publisher_platform=instagram`` under a
+        ``publisher_platform,platform_position`` breakdown blends all IG cells → the platform-level
+        number). With an explicit selector, "several" is the author's coarser slice, NOT ambiguity.
+
+    - **Account aggregate** (no selector, ``level == account``, no breakdown): the blended account
+      ROAS — :func:`_aggregate_value` over the (single) row(s).
+    - **Segment / entity scoped** (no selector; a breakdown, or a campaign/adset/ad level): the
+      metric names a *specific* row (e.g. ``ig_roas`` → the ``instagram`` segment), matched by token
       overlap between the metric name and the row's segment/entity identity. **Exactly one** match
       resolves; zero or several → ``(None, None, None)`` so the verdict is ``could_not_audit`` and
-      the claim is never silently confirmed (AGENTS.md: don't collapse missing into zeros).
+      the claim is never silently confirmed (AGENTS.md: don't collapse missing into zeros). This
+      "several → abstain" heuristic applies ONLY on the no-selector path.
     """
     if not rows:
         return None, None, None
+    if selector:
+        matches = [r for r in rows if _row_matches_selector(r, selector)]
+        if not matches:
+            return None, None, None  # vanished/renamed segment → could_not_audit
+        if len(matches) == 1:
+            return _row_value(matches[0])  # single cell — keep roas-or-derived path
+        return _aggregate_value(matches)  # author-specified slice — blend the subset
     if not breakdowns and level == "account":
         return _aggregate_value(rows)
     tokens = _metric_identifier_tokens(metric_name)
@@ -1136,7 +1167,11 @@ def run_vault_audit(
         date_from, date_to = resolve_date_window(as_of, lookback_days=window_len)
         rows = fetch_metrics(level, breakdowns, date_from, date_to)
         value, purchases, spend = resolve_fresh_metric(
-            rows, level=level, breakdowns=breakdowns, metric_name=ev.metric_name
+            rows,
+            level=level,
+            breakdowns=breakdowns,
+            metric_name=ev.metric_name,
+            selector=ev.metric_selector,
         )
         fresh = FreshSample(
             value=value, purchases=purchases, spend=spend, window=f"{date_from}..{date_to}"

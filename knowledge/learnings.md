@@ -191,7 +191,7 @@ rotation (same creatives, swapped audience).  **Would lower:** it flips once cre
   Messenger / Threads were ~0 spend and 0 conversions. Only notable non-core placement: FB
   in-stream video (2.62 ROAS, ~$1.3k/120d). 120d, account-wide; auto-placement-influenced.
   `verify: account_metrics --account divine_designs --level account --date-from 2026-02-23 --date-to 2026-06-23 --breakdown publisher_platform,platform_position`
-  _(src: correlational · acct: divine_designs · metric: ig_roas=3.63)_
+  _(src: correlational · acct: divine_designs · metric: ig_roas=3.63 · select: publisher_platform=instagram)_
 
 **Apply:** Lean Instagram-heavy and vertical-first (Stories/Reels) for new ad sets/creative.
 **Adopted default placement set for this account: Facebook/Instagram Feed + Reels + Stories,
