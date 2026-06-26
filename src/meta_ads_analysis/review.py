@@ -542,10 +542,11 @@ def review_ops_plan(
     Same contract as :func:`review_action_plan`, over the op key: returns a NEW plan (the input is
     never mutated), reviews only ops carrying a ``confidence`` block (informational / structural ops
     with no band pass through untouched), and is idempotent (an op already carrying a ``review`` block
-    is left as-is). Op dicts have no ``action_type``, so the ``direction`` check cannot fire here — see
-    the module note in ``docs/META_ACTION_WORKFLOW.md``; op-level direction-contradiction is the
-    per-capability ticket's job (it knows the op semantics). The gate stays **demote-only**: it may
-    lower a band and demote ``status`` approved→proposed, never raise a band or promote a status.
+    is left as-is). Most op dicts carry no ``action_type``, so the ``direction`` check no-ops for them;
+    the exception is budget ops, which set one (``increase_*``/``decrease_*_budget`` — see
+    ``control._budget_op``) so the direction-contradiction check fires on them (refuting a scale-up
+    below target / a budget cut of a clear winner). The gate stays **demote-only**: it may lower a band
+    and demote ``status`` approved→proposed, never raise a band or promote a status.
     """
     return _review_plan_ops(
         plan,
@@ -607,7 +608,7 @@ def _review_plan_ops(
         result = review_recommendation(
             evidence=evidence,
             confidence=confidence,
-            action=op,  # ops carry no action_type → the direction check no-ops (documented)
+            action=op,  # most ops carry no action_type (direction no-ops); budget ops set one and do fire
             policy=policy,
             spend_floor=spend_floor,
             conversions_floor=conversions_floor,

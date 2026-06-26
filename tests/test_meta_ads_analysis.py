@@ -3860,6 +3860,30 @@ def test_apply_ops_campaign_lifetime_budget_blocked() -> None:
     assert client.updates == []
 
 
+def test_apply_ops_campaign_daily_budget_executes() -> None:
+    # The CBO-redirect deliverable's WRITE path: an approved campaign-level daily-budget op (the op
+    # build_budget_plan emits for a CBO ad set) executes through to update_campaign. Covers both an
+    # increase (within the 20% cap over the 5000-cent campaign budget) and a decrease (within the 50%
+    # decrease cap and above the 100-cent floor).
+    inc = _cbo_client()  # campaign c1 daily 5000, ad set as1 no budget
+    inc_res = apply_ops_plan(
+        {"ops": [{"op_id": "up", "op": "set_daily_budget", "level": "campaign", "id": "c1",
+                  "params": {"daily_budget_cents": 5500}, "status": "approved"}]},
+        inc, execute=True,
+    )[0]
+    assert inc_res.status == "executed"
+    assert ("campaign", "c1", {"daily_budget": "5500"}, False) in inc.updates
+
+    dec = _cbo_client()
+    dec_res = apply_ops_plan(
+        {"ops": [{"op_id": "down", "op": "set_daily_budget", "level": "campaign", "id": "c1",
+                  "params": {"daily_budget_cents": 4000}, "status": "approved"}]},
+        dec, execute=True,
+    )[0]
+    assert dec_res.status == "executed"
+    assert ("campaign", "c1", {"daily_budget": "4000"}, False) in dec.updates
+
+
 def test_apply_ops_budget_decrease_paths_and_caps() -> None:
     client = _adset_level_client()  # ad set as1 has a $100/day (10000-cent) budget
     plan = {"ops": [
