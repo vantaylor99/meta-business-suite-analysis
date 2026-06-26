@@ -70,13 +70,21 @@ _VERDICT_RANK: dict[str, int] = {
 _ACTION_SPEND_FLOOR: dict[str, float] = {
     "pause_ad": MIN_WASTE_SPEND,
     "increase_adset_budget": MIN_SCALING_SPEND,
+    "increase_campaign_budget": MIN_SCALING_SPEND,
+    "decrease_adset_budget": MIN_SCALING_SPEND,
+    "decrease_campaign_budget": MIN_SCALING_SPEND,
     "consider_scale_budget": MIN_SCALING_SPEND,
     "refresh_creative": MIN_WASTE_SPEND,
 }
 
 # Action types whose *direction* is a scale-up. For a ROAS-goal account, scaling an entity whose cited
-# ROAS is below the goal target contradicts its own number.
-_SCALE_ACTIONS = {"increase_adset_budget", "consider_scale_budget"}
+# ROAS is below the goal target contradicts its own number. (Budget ops set ``action_type`` so this
+# check can fire on them — see ``control._budget_op``.)
+_SCALE_ACTIONS = {"increase_adset_budget", "increase_campaign_budget", "consider_scale_budget"}
+
+# Action types whose *direction* is a budget scale-DOWN. Cutting the budget of a clear winner (cited
+# ROAS comfortably above target) contradicts the account goal, the mirror of pausing a winner.
+_SCALE_DOWN_BUDGET_ACTIONS = {"decrease_adset_budget", "decrease_campaign_budget"}
 
 # How far above target a paused ad's cited ROAS must sit before pausing it reads as "pausing a winner"
 # (a clear self-contradiction). A generous margin keeps borderline pauses — which may be justified for
@@ -404,6 +412,11 @@ def _direction_contradiction(
         return (
             f"recommendation contradicts its cited metric vs the account goal: scaling an entity "
             f"whose ROAS {roas:.2f} is below the {target:g} target"
+        )
+    if action_type in _SCALE_DOWN_BUDGET_ACTIONS and roas >= target * _PAUSE_WINNER_MARGIN:
+        return (
+            f"recommendation contradicts its cited metric vs the account goal: cutting the budget of "
+            f"an entity whose ROAS {roas:.2f} is comfortably above the {target:g} target"
         )
     if action_type == "pause_ad" and roas >= target * _PAUSE_WINNER_MARGIN:
         return (

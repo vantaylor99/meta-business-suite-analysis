@@ -3744,6 +3744,264 @@ def _TMP_OPS_RESULTS():
     return Path(tempfile.mkdtemp()) / "ops_results.json"
 
 
+# --- CBO-aware budget +/- (control ops + actions parity) --------------------
+
+from meta_ads_analysis.control import (
+    BUDGET_ADSET_LEVEL,
+    BUDGET_BROKEN,
+    BUDGET_CBO_ACTIVE,
+    build_budget_plan,
+    classify_adset_budget,
+)
+
+
+def _bud_insights(*, purchases="120", spend="2400", value="9600", ids=True):
+    """One insights row carrying BOTH ad-set and campaign ids, so the same row serves an ad-set-level
+    and a campaign-level metric lookup. Default sample (120 purchases / $2400, value $9600) clears the
+    floor with ROAS 4.0. Override ``value`` to move ROAS (1200→0.5, 2400→1.0, 12000→5.0)."""
+    row = {"spend": spend,
+           "action_values": [{"action_type": "purchase", "value": value}],
+           "actions": [{"action_type": "purchase", "value": purchases}]}
+    if ids:
+        row.update({"adset_id": "as1", "adset_name": "Set 1", "campaign_id": "c1", "campaign_name": "Camp"})
+    return [row]
+
+
+def _adset_level_client(adset_budget="10000", insights=None):
+    campaigns = [{"id": "c1", "name": "Camp", "status": "ACTIVE", "effective_status": "ACTIVE"}]
+    adsets = [{"id": "as1", "name": "Set 1", "status": "ACTIVE", "effective_status": "ACTIVE",
+               "campaign_id": "c1", "daily_budget": adset_budget}]
+    return _ControlFakeClient(campaigns, adsets, [],
+                              insights=_bud_insights() if insights is None else insights)
+
+
+def _cbo_client(campaign_daily="5000", campaign_lifetime=None, insights=None):
+    """Ad set as1 has NO daily budget (CBO); the parent campaign c1 holds the budget."""
+    campaign = {"id": "c1", "name": "Camp", "status": "ACTIVE", "effective_status": "ACTIVE"}
+    if campaign_daily is not None:
+        campaign["daily_budget"] = campaign_daily
+    if campaign_lifetime is not None:
+        campaign["lifetime_budget"] = campaign_lifetime
+    adsets = [{"id": "as1", "name": "Set 1", "status": "ACTIVE", "effective_status": "ACTIVE",
+               "campaign_id": "c1"}]  # no daily_budget
+    return _ControlFakeClient([campaign], adsets, [],
+                              insights=_bud_insights() if insights is None else insights)
+
+
+def test_classify_adset_budget_levels() -> None:
+    adset = classify_adset_budget(_adset_level_client(), "as1")
+    assert adset["classification"] == BUDGET_ADSET_LEVEL
+    assert adset["adset_daily_budget"] == 10000.0
+
+    cbo_daily = classify_adset_budget(_cbo_client(), "as1")
+    assert cbo_daily["classification"] == BUDGET_CBO_ACTIVE
+    assert cbo_daily["campaign_id"] == "c1"
+    assert cbo_daily["campaign_daily_budget"] == 5000.0
+
+    cbo_lifetime = classify_adset_budget(_cbo_client(campaign_daily=None, campaign_lifetime="70000"), "as1")
+    assert cbo_lifetime["classification"] == BUDGET_CBO_ACTIVE  # lifetime ALSO means "budget at campaign"
+    assert cbo_lifetime["campaign_lifetime_budget"] == 70000.0
+
+    broken = classify_adset_budget(_cbo_client(campaign_daily=None, campaign_lifetime=None), "as1")
+    assert broken["classification"] == BUDGET_BROKEN
+
+
+def test_build_budget_plan_cbo_redirects_to_campaign_op() -> None:
+    # ROAS 4.0 (>= 3.0 target) so the scale-up is legit and the campaign op stands (isolates the
+    # redirect mechanics from the direction refutation, which other tests cover).
+    plan = build_budget_plan(
+        _cbo_client(insights=_bud_insights(value="9600")), "act_1", new_daily_budget_cents=6000,
+        adset_id="as1", policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    pointer = next(o for o in plan["ops"] if o["level"] == "adset")
+    campaign_op = next(o for o in plan["ops"] if o["level"] == "campaign")
+    # ad-set op is the non-executable pointer carrying the CBO classification
+    assert pointer["cbo_detected"] is True
+    assert pointer["status"] == "proposed"
+    assert "CBO active" in pointer["note"]
+    assert pointer["live_campaign_state"]["classification"] == "cbo_active"
+    # campaign op is actionable, carries its OWN campaign-level evidence (not a copy of the ad set's)
+    assert campaign_op["id"] == "c1"
+    assert campaign_op["evidence"]["entity_level"] == "campaign"
+    assert campaign_op["cbo_redirect_from_adset_id"] == "as1"
+    assert campaign_op["action_type"] == "increase_campaign_budget"  # 6000 > campaign 5000
+    assert campaign_op["review"]["verdict"] == "stands"
+
+
+def test_apply_ops_cbo_active_adset_blocked_at_execute() -> None:
+    # Re-read drift: an ad-set budget op that finds CBO at execute time is blocked, not mis-applied.
+    client = _cbo_client()
+    plan = {"ops": [{"op_id": "bump", "op": "set_daily_budget", "level": "adset", "id": "as1",
+                     "params": {"daily_budget_cents": 6000}, "status": "approved"}]}
+    res = apply_ops_plan(plan, client, execute=True)[0]
+    assert res.status == "blocked"
+    assert "CBO active" in res.reason
+    assert client.updates == []
+
+
+def test_apply_ops_budget_broken_blocked() -> None:
+    client = _cbo_client(campaign_daily=None, campaign_lifetime=None)
+    plan = {"ops": [{"op_id": "x", "op": "set_daily_budget", "level": "adset", "id": "as1",
+                     "params": {"daily_budget_cents": 6000}, "status": "approved"}]}
+    res = apply_ops_plan(plan, client, execute=True)[0]
+    assert res.status == "blocked"
+    assert "neither" in res.reason
+    assert client.updates == []
+
+
+def test_apply_ops_campaign_lifetime_budget_blocked() -> None:
+    client = _cbo_client(campaign_daily=None, campaign_lifetime="70000")
+    plan = {"ops": [{"op_id": "x", "op": "set_daily_budget", "level": "campaign", "id": "c1",
+                     "params": {"daily_budget_cents": 6000}, "status": "approved"}]}
+    res = apply_ops_plan(plan, client, execute=True)[0]
+    assert res.status == "blocked"
+    assert "lifetime" in res.reason
+    assert client.updates == []
+
+
+def test_apply_ops_budget_decrease_paths_and_caps() -> None:
+    client = _adset_level_client()  # ad set as1 has a $100/day (10000-cent) budget
+    plan = {"ops": [
+        # 20% decrease: within the 50% cap and above the 100-cent floor → ok
+        {"op_id": "dec_ok", "op": "set_daily_budget", "level": "adset", "id": "as1",
+         "params": {"daily_budget_cents": 8000}, "status": "approved"},
+        # 60% decrease: exceeds the default 50% decrease cap → blocked
+        {"op_id": "dec_overcap", "op": "set_daily_budget", "level": "adset", "id": "as1",
+         "params": {"daily_budget_cents": 4000}, "status": "approved"},
+        # below the absolute floor (cap lifted to 99.9% so the FLOOR is what blocks, isolating it)
+        {"op_id": "dec_floor", "op": "set_daily_budget", "level": "adset", "id": "as1",
+         "params": {"daily_budget_cents": 50, "max_decrease_percent": 99.9}, "status": "approved"},
+    ]}
+    by_id = {r.op_id: r for r in apply_ops_plan(plan, client, execute=True)}
+    assert by_id["dec_ok"].status == "executed"
+    assert by_id["dec_overcap"].status == "blocked" and "max decrease" in by_id["dec_overcap"].reason
+    assert by_id["dec_floor"].status == "blocked" and "floor" in by_id["dec_floor"].reason
+    assert ("adset", "as1", {"daily_budget": "8000"}, False) in client.updates
+
+
+def test_build_budget_plan_adset_level_increase_grounded() -> None:
+    plan = build_budget_plan(
+        _adset_level_client(insights=_bud_insights(value="9600")), "act_1",
+        new_daily_budget_cents=11000, adset_id="as1",
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    assert len(plan["ops"]) == 1  # ad-set level → no campaign redirect
+    op = plan["ops"][0]
+    assert op["level"] == "adset" and op["action_type"] == "increase_adset_budget"
+    assert op["evidence"]["entity_level"] == "adset"
+    assert op["confidence"]["band"] in {"high", "medium"}
+    assert op["review"]["verdict"] == "stands"
+
+
+def test_build_budget_plan_thin_sample_abstains_and_is_blocked() -> None:
+    thin = _bud_insights(purchases="9", spend="40", value="80")
+    plan = build_budget_plan(
+        _adset_level_client(insights=thin), "act_1", new_daily_budget_cents=11000, adset_id="as1",
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-19", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["confidence"]["band"] == "abstain"  # below floor — never a fabricated low
+    assert op["review"]["verdict"] == "insufficient"
+    # Approving it anyway is blocked at the apply-time grounding gate (cited sample + abstain).
+    op["status"] = "approved"
+    res = apply_ops_plan(plan, _adset_level_client(insights=thin), execute=True)[0]
+    assert res.status == "blocked"
+    assert "insufficient data" in res.reason
+
+
+def test_build_budget_plan_review_refutes_scale_up_below_target() -> None:
+    below = _bud_insights(value="2400")  # ROAS 1.0, sample 120/$2400 clears the floor
+    plan = build_budget_plan(
+        _adset_level_client(insights=below), "act_1", new_daily_budget_cents=11000, adset_id="as1",
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["review"]["verdict"] == "refuted"  # scaling up an entity below the ROAS target
+    assert op["review_verdict"] == "refuted"
+
+
+def test_build_budget_plan_review_refutes_cutting_a_clear_winner() -> None:
+    winner = _bud_insights(value="12000")  # ROAS 5.0 ≥ 3.0 * 1.5 winner margin
+    plan = build_budget_plan(
+        _adset_level_client(insights=winner), "act_1", new_daily_budget_cents=8000, adset_id="as1",
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["action_type"] == "decrease_adset_budget"  # 8000 < current 10000
+    assert op["review"]["verdict"] == "refuted"  # cutting the budget of a clear winner
+
+
+def test_actions_ops_cbo_classification_parity() -> None:
+    # The ops path (classify_adset_budget) and the action path
+    # (_populate_budget_params_from_live_state) must classify an identical fixture identically.
+    from meta_ads_analysis.actions import _populate_budget_params_from_live_state
+
+    def _reader():
+        return FakeMetaReader(
+            get_adset=lambda adset_id, *, fields: {"id": "as1", "campaign_id": "c1"},  # no daily_budget
+            get_campaign=lambda campaign_id, *, fields: {"id": "c1", "daily_budget": "5000"},
+        )
+
+    ops_state = classify_adset_budget(_reader(), "as1")
+    assert ops_state["classification"] == BUDGET_CBO_ACTIVE
+
+    action = {
+        "action_type": "increase_adset_budget",
+        "target": {"type": "adset", "id": "as1"},
+        "params": {},
+        "live_adset_state": {"adset_id": "as1", "campaign_id": "c1", "daily_budget": None},
+        "rationale": "scale candidate",
+    }
+    _populate_budget_params_from_live_state(action, _reader())
+    assert action["cbo_detected"] is True
+    assert action["executable"] is False
+    assert action["live_campaign_state"]["classification"] == ops_state["classification"]
+
+
+def test_build_budget_plan_direct_campaign_target() -> None:
+    plan = build_budget_plan(
+        _cbo_client(insights=_bud_insights(value="9600")), "act_1", new_daily_budget_cents=5500,
+        campaign_id="c1", policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    assert len(plan["ops"]) == 1
+    op = plan["ops"][0]
+    assert op["level"] == "campaign" and op["id"] == "c1"
+    assert op["action_type"] == "increase_campaign_budget"  # 5500 > campaign 5000
+    assert "cbo_redirect_from_adset_id" not in op  # direct target, not a redirect
+    assert op["evidence"]["entity_level"] == "campaign"
+
+
+def test_build_budget_plan_requires_exactly_one_target() -> None:
+    client = _adset_level_client()
+    for kwargs in ({}, {"adset_id": "as1", "campaign_id": "c1"}):
+        try:
+            build_budget_plan(client, "act_1", new_daily_budget_cents=11000, **kwargs)
+            raise AssertionError("expected ValueError for ambiguous/missing target")
+        except ValueError:
+            pass
+
+
+def test_actions_adset_level_budget_populates_current() -> None:
+    # Non-CBO ad set with its own budget: current is populated and no CBO redirect happens.
+    from meta_ads_analysis.actions import _populate_budget_params_from_live_state
+
+    action = {
+        "action_type": "increase_adset_budget",
+        "target": {"type": "adset", "id": "as1"},
+        "params": {},
+        "live_adset_state": {"adset_id": "as1", "campaign_id": "c1", "daily_budget": "10000"},
+    }
+    _populate_budget_params_from_live_state(action, FakeMetaReader())  # reader never consulted
+    assert action["params"]["current_daily_budget_cents"] == 10000
+    assert "cbo_detected" not in action
+
+
 # --- Runaway / outlier watch scanner ----------------------------------------
 
 from datetime import date as _d

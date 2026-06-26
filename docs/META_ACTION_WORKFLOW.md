@@ -165,21 +165,66 @@ The executor supports:
 
 - `pause_ad`: pauses a specific ad with high waste risk or account-policy waste risk.
 - `increase_adset_budget`: raises a daily ad set budget only when the proposed action includes the current daily budget, the proposed new daily budget, and the increase stays within the action's `max_increase_percent`.
+- `set_daily_budget` (ops, via `propose-budget` / `apply-ops`): a CBO-aware daily-budget change — an **increase OR a decrease**, at the ad set **or** campaign level. See "CBO-aware budget +/-" below.
 
-Budget increases are intentionally capped. The plan can identify the ad set to scale, but live-state enrichment must populate the current daily budget before the executor will build an operation.
+Budget increases are intentionally capped. The action-plan path can identify the ad set to scale, but live-state enrichment must populate the current daily budget before the executor will build an operation.
 
-Writes go through the Meta Graph API (`MetaMarketingApiClient.update_ad` / `update_adset`), so the action workflow runs natively on any platform with no CLI/WSL dependency. Executing actions requires `META_ACCESS_TOKEN` to carry the `ads_management` permission; dry runs and live-state reads only need `ads_read`.
+Writes go through the Meta Graph API (`MetaMarketingApiClient.update_ad` / `update_adset` / `update_campaign`), so the action workflow runs natively on any platform with no CLI/WSL dependency. Executing actions requires `META_ACCESS_TOKEN` to carry the `ads_management` permission; dry runs and live-state reads only need `ads_read`.
 
 The workflow intentionally does not execute:
 
-- budget decreases,
 - campaign creation,
 - ad set creation,
 - creative creation,
 - creative replacement,
 - broad automated rules.
 
-Those can be added later, but they need tighter account-specific controls because broad mutations are harder to unwind than pausing one clearly wasteful ad or applying a capped budget increase.
+Those can be added later, but they need tighter account-specific controls because broad mutations are harder to unwind than pausing one clearly wasteful ad or applying a capped budget change.
+
+### CBO-aware budget +/- (`control.set_daily_budget`)
+
+`control.build_budget_plan` (CLI: `propose-budget`) proposes a single grounded daily-budget move and
+runs it through `review.review_ops_plan`; `apply-ops` then validates/executes it under the same
+propose → approve → validate_only → execute gate.
+
+**CBO detection.** Under Meta's campaign-budget-optimization the **campaign** holds the budget and the
+ad sets inherit it. When a `set_daily_budget` op (or the action-plan `increase_adset_budget`) finds the
+ad set has no `daily_budget`, the code re-reads the **parent campaign** (`classify_adset_budget`) and
+classifies:
+
+- **CBO active** (campaign has a daily *or* lifetime budget, ad set has none) → the ad-set op is
+  **not** silently blocked. The proposer emits a non-executable ad-set *pointer* op (marked
+  `cbo_detected: true` with the `live_campaign_state`) **plus an actionable campaign-level op** carrying
+  its **own** campaign metric as evidence (never a copy of the ad set's). At apply time an ad-set op
+  that finds CBO is **blocked** ("change the campaign budget instead") — so a campaign that flipped CBO
+  state between propose and execute is caught, not mis-applied.
+- **Truly broken** (neither the ad set nor its campaign has a budget) → blocked with a clear error.
+- **Ad-set-level budget present** → proceed as before (capped increase, now also decrease).
+
+**Increase vs decrease — two separate caps, selected by sign of `(new − current)`:**
+
+- **Increase** uses the op-param `max_increase_percent` (default 20%). Source unchanged.
+- **Decrease** uses a separate symmetric guard: `MAX_BUDGET_DECREASE_PERCENT` (config default;
+  op-param `max_decrease_percent` overrides; a per-account `max_budget_decrease_percent` in
+  `action_policy` is folded into the op-param by the builder) **and** an absolute floor,
+  `MIN_DAILY_BUDGET_CENTS` (account minor units), so a reduction can never silently pause delivery.
+  Both must hold. Applying the wrong cap to the wrong direction can never happen — the cap is chosen by
+  the sign of the change.
+
+**Lifetime budgets.** A daily-budget op cannot edit a lifetime budget. A campaign carrying only a
+lifetime budget classifies as CBO-active (the budget *is* at the campaign), but the redirected campaign
+op is marked non-executable and **blocked at apply** with "lifetime budget — not adjustable via a
+daily-budget op." Budgets are account-currency **minor units** (integer cents); `MIN_DAILY_BUDGET_CENTS`
+is a conservative local floor and `--validate-only` surfaces Meta's real per-currency minimum as the
+final check.
+
+**Grounding + direction.** Every budget op carries `evidence` (the entity's ROAS / cost-per-result over
+the window, with sample + `regenerating_query`) and a computed `confidence` band, and a below-floor
+sample abstains into a non-executable "keep running" recommendation (the "9 purchases over 5 days"
+guard). Budget ops set an `action_type` (`increase_adset_budget` / `increase_campaign_budget` /
+`decrease_adset_budget` / `decrease_campaign_budget`) so the review gate's `direction` check fires on an
+op: it **refutes** scaling up an entity whose cited ROAS is below the account target, and **refutes**
+cutting the budget of a clear winner (ROAS comfortably above target).
 
 ## Meta AI / Advantage+ Policy
 

@@ -22,7 +22,14 @@ from typing import Any
 
 from . import account_registry, review
 from .confidence import Evidence, EvidenceTier, build_regenerating_query
-from .config import CONFIDENCE_CONVERSIONS_FLOOR, DEFAULT_REPORTS_ROOT, MIN_WASTE_SPEND
+from .config import (
+    CONFIDENCE_CONVERSIONS_FLOOR,
+    DEFAULT_REPORTS_ROOT,
+    MAX_BUDGET_DECREASE_PERCENT,
+    MIN_DAILY_BUDGET_CENTS,
+    MIN_SCALING_SPEND,
+    MIN_WASTE_SPEND,
+)
 from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
 from .reader_provider import MetaReaderProvider, as_reader
 from .rotation import _audience_refs, _ids, advantage_audience_enabled
@@ -336,22 +343,150 @@ def _build_request(op: dict[str, Any], reader: MetaReaderProvider) -> dict[str, 
         live = _get_entity(reader, "adset", str(op["id"]), ["id", "targeting"])
         return {"targeting": _apply_targeting_change(op_type, params, live.get("targeting"))}
     if op_type == "set_daily_budget":
-        new_cents = int(_num(params.get("daily_budget_cents")))
-        max_increase = _num(params.get("max_increase_percent"))
-        max_increase = 20.0 if max_increase is None else max_increase
-        live = _get_entity(reader, op["level"], str(op["id"]), ["id", "daily_budget"])
-        current = _num(live.get("daily_budget"))
-        if current is None or current <= 0:
-            raise ValueError(
-                "set_daily_budget needs an existing daily budget to cap against "
-                "(entity has none — likely lifetime/CBO budget); not changing it."
-            )
+        return _build_budget_request(op, reader)
+    raise ValueError(f"Unhandled op: {op_type}")
+
+
+# --- Budget ops: CBO detection + symmetric +/- caps -------------------------
+
+# Classification of a ``set_daily_budget`` target after a live re-read (recorded on the op/action as
+# ``live_campaign_state``; the caller derives ``cbo_detected`` from it).
+BUDGET_ADSET_LEVEL = "adset_level"  # the ad set carries its own daily budget — adjust it directly
+BUDGET_CBO_ACTIVE = "cbo_active"  # budget lives on the parent campaign (CBO) — redirect there
+BUDGET_BROKEN = "broken"  # neither the ad set nor its campaign has a budget — nothing to cap against
+
+CAMPAIGN_BUDGET_FIELDS = ["id", "daily_budget", "lifetime_budget"]
+ADSET_BUDGET_FIELDS = ["id", "daily_budget", "campaign_id"]
+
+
+def classify_adset_budget(reader: MetaReaderProvider | MetaMarketingApiClient, adset_id: str) -> dict[str, Any]:
+    """Re-read an ad set's live budget and classify WHERE its budget actually lives.
+
+    Shared by the ops path (:func:`_build_budget_request`, :func:`build_budget_plan`) and the action
+    path (``actions._populate_budget_params_from_live_state``) so both classify the same fixture
+    identically (the CBO parity contract). Read-only via the reader. Returns a JSON-serializable dict
+    suitable to store on an op/action as ``live_campaign_state``.
+
+    - **adset_level** — the ad set has a positive ``daily_budget``; adjust it directly.
+    - **cbo_active** — the ad set has no daily budget but the parent campaign has a daily OR lifetime
+      budget (campaign-budget-optimization); the budget must be changed at the campaign. EITHER
+      campaign budget type counts as CBO (a daily-budget op can't touch a lifetime budget, but the
+      *classification* is still "budget is at the campaign").
+    - **broken** — neither the ad set nor its campaign has a budget; nothing to cap against.
+    """
+    reader = as_reader(reader)
+    live = reader.get_adset(adset_id, fields=ADSET_BUDGET_FIELDS)
+    adset_daily = _num(live.get("daily_budget"))
+    campaign_id = _optional_str(live.get("campaign_id"))
+    if adset_daily is not None and adset_daily > 0:
+        return {
+            "classification": BUDGET_ADSET_LEVEL,
+            "adset_id": str(adset_id),
+            "adset_daily_budget": adset_daily,
+            "campaign_id": campaign_id,
+            "campaign_daily_budget": None,
+            "campaign_lifetime_budget": None,
+        }
+    campaign: dict[str, Any] = {}
+    if campaign_id:
+        campaign = reader.get_campaign(campaign_id, fields=CAMPAIGN_BUDGET_FIELDS)
+    campaign_daily = _num(campaign.get("daily_budget"))
+    campaign_lifetime = _num(campaign.get("lifetime_budget"))
+    cbo = (campaign_daily is not None and campaign_daily > 0) or (
+        campaign_lifetime is not None and campaign_lifetime > 0
+    )
+    return {
+        "classification": BUDGET_CBO_ACTIVE if cbo else BUDGET_BROKEN,
+        "adset_id": str(adset_id),
+        "adset_daily_budget": None,
+        "campaign_id": campaign_id,
+        "campaign_daily_budget": campaign_daily,
+        "campaign_lifetime_budget": campaign_lifetime,
+    }
+
+
+def _resolve_increase_cap(params: dict[str, Any]) -> float:
+    """The increase cap, op-param-driven (default 20%). Source intentionally UNCHANGED from the
+    original behavior — the decrease path gets its own separate cap, never this one."""
+    cap = _num(params.get("max_increase_percent"))
+    return 20.0 if cap is None else cap
+
+
+def _resolve_decrease_cap(params: dict[str, Any]) -> float:
+    """The decrease cap: op-param ``max_decrease_percent`` override, else the config default. The
+    per-account ``max_budget_decrease_percent`` (registry) is folded into the op-param by
+    :func:`build_budget_plan`, so by apply time it is already on the op."""
+    cap = _num(params.get("max_decrease_percent"))
+    return MAX_BUDGET_DECREASE_PERCENT if cap is None else cap
+
+
+def _capped_budget_request(new_cents: int, current: float, params: dict[str, Any]) -> dict[str, Any]:
+    """Validate a daily-budget change against the live current budget, choosing the cap by the SIGN of
+    ``(new - current)``: an increase uses the op-param increase cap; a decrease uses the symmetric
+    decrease cap AND the absolute ``MIN_DAILY_BUDGET_CENTS`` floor. Keeping the two caps separate and
+    sign-selected means applying the wrong cap can never wrongly block a valid move."""
+    if new_cents > current:
+        max_increase = _resolve_increase_cap(params)
         if new_cents > current * (1 + max_increase / 100):
             raise ValueError(
-                f"set_daily_budget {new_cents} exceeds max increase of {max_increase:.0f}% over current {int(current)}."
+                f"set_daily_budget {new_cents} exceeds max increase of {max_increase:.0f}% over "
+                f"current {int(current)}."
             )
-        return {"daily_budget": str(new_cents)}
-    raise ValueError(f"Unhandled op: {op_type}")
+    elif new_cents < current:
+        max_decrease = _resolve_decrease_cap(params)
+        if new_cents < current * (1 - max_decrease / 100):
+            raise ValueError(
+                f"set_daily_budget {new_cents} exceeds max decrease of {max_decrease:.0f}% under "
+                f"current {int(current)}."
+            )
+        if new_cents < MIN_DAILY_BUDGET_CENTS:
+            raise ValueError(
+                f"set_daily_budget {new_cents} is below the absolute floor of "
+                f"{MIN_DAILY_BUDGET_CENTS} cents — refusing to risk pausing delivery."
+            )
+    return {"daily_budget": str(new_cents)}
+
+
+def _build_budget_request(op: dict[str, Any], reader: MetaReaderProvider) -> dict[str, Any]:
+    """Translate a ``set_daily_budget`` op into the Graph params to POST, re-reading live budget at
+    execute time (read-only via the reader). Handles BOTH levels, re-detects CBO on an ad-set op (so a
+    campaign that flipped CBO state since propose is caught, not mis-applied), supports increase AND
+    decrease (cap selected by sign), and refuses a lifetime-budget campaign."""
+    params = op.get("params") or {}
+    new_cents = int(_num(params.get("daily_budget_cents")))
+    level = op["level"]
+    node_id = str(op["id"])
+
+    if level == "campaign":
+        live = _get_entity(reader, "campaign", node_id, CAMPAIGN_BUDGET_FIELDS)
+        current = _num(live.get("daily_budget"))
+        if current is not None and current > 0:
+            return _capped_budget_request(new_cents, current, params)
+        if (_num(live.get("lifetime_budget")) or 0) > 0:
+            raise ValueError(
+                "campaign carries a lifetime budget, not a daily budget — not adjustable via a "
+                "daily-budget op; edit the lifetime budget directly in Ads Manager."
+            )
+        raise ValueError(
+            "set_daily_budget needs an existing daily budget to cap against (campaign has none); "
+            "not changing it."
+        )
+
+    # ad-set level: re-detect CBO at execute time, not just at propose time.
+    state = classify_adset_budget(reader, node_id)
+    classification = state["classification"]
+    if classification == BUDGET_ADSET_LEVEL:
+        return _capped_budget_request(new_cents, float(state["adset_daily_budget"]), params)
+    if classification == BUDGET_CBO_ACTIVE:
+        raise ValueError(
+            "CBO active: this ad set's budget lives on its parent campaign "
+            f"({state.get('campaign_id')}) — change the campaign budget instead "
+            "(set_daily_budget at level=campaign), not the ad set."
+        )
+    raise ValueError(
+        "set_daily_budget needs an existing daily budget to cap against (neither the ad set nor its "
+        "campaign has one — likely a broken or lifetime-only setup); not changing it."
+    )
 
 
 def apply_ops_plan(
@@ -1127,6 +1262,292 @@ def build_pause_plan(
             "requires_explicit_approval": True,
             "requires_grounding": True,
             "statuses": sorted(ALLOWED_STATUSES),
+        },
+        "ops": ops,
+    }
+    return review.review_ops_plan(plan)
+
+
+# --- Convenience builder: CBO-aware budget +/- ------------------------------
+
+# Action-type tags for the four budget moves. Ops carry no ``action_type`` by default, so the review
+# gate's ``direction`` check (scale-up below target / scale-down of a clear winner) cannot fire on a
+# bare op. Budget ops set one of these so the gate's direction refutation works (see
+# ``review._SCALE_ACTIONS`` / ``review._SCALE_DOWN_BUDGET_ACTIONS``).
+def _budget_action_type(level: str, new_cents: int, current: float | None) -> str:
+    increasing = current is None or new_cents >= current
+    if level == "campaign":
+        return "increase_campaign_budget" if increasing else "decrease_campaign_budget"
+    return "increase_adset_budget" if increasing else "decrease_adset_budget"
+
+
+def _budget_op(
+    *,
+    level: str,
+    node_id: str,
+    new_cents: int,
+    current: float | None,
+    max_increase_percent: float | None,
+    max_decrease_percent: float | None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """A bare (un-grounded) ``set_daily_budget`` op. Caps flow through op-params so the apply-time
+    re-read in :func:`_build_budget_request` enforces them; ``current`` only decides the direction tag
+    (the real cap is checked against the live re-read, never this propose-time snapshot)."""
+    params: dict[str, Any] = {"daily_budget_cents": int(new_cents)}
+    if max_increase_percent is not None:
+        params["max_increase_percent"] = max_increase_percent
+    if max_decrease_percent is not None:
+        params["max_decrease_percent"] = max_decrease_percent
+    action_type = _budget_action_type(level, new_cents, current)
+    direction = "increase" if action_type.startswith("increase") else "decrease"
+    return {
+        "op_id": f"{action_type}_{node_id}",
+        "op": "set_daily_budget",
+        "level": level,
+        "id": node_id,
+        "action_type": action_type,
+        "params": params,
+        "status": PROPOSED_STATUS,
+        "note": note or f"{direction} daily budget to {new_cents} cents",
+    }
+
+
+def _attach_budget_grounding(
+    op: dict[str, Any],
+    reader: MetaReaderProvider,
+    ad_account_id: str,
+    *,
+    level: str,
+    entity_id: str,
+    goal: str | None,
+    account_slug: str | None,
+    date_from: str,
+    date_to: str,
+    recency_days: int | None,
+) -> None:
+    """Attach the budget move's grounding: the entity's OWN metric (ROAS / cost-per-install by goal)
+    over the window, as a cited sample, plus a computed band. An entity with no delivery in the window
+    cites a ZERO sample → abstain → the apply-time gate blocks the swing (no confident budget move on
+    thin/absent data — the '9 purchases over 5 days' guard). Each op grounds on its own level's metric,
+    so a CBO redirect's campaign op carries CAMPAIGN evidence, never a copy of the ad set's."""
+    rows = fetch_entity_metrics(reader, ad_account_id, level=level, date_from=date_from, date_to=date_to)
+    row = next((m for m in rows if str(m.get("id")) == str(entity_id)), None)
+    metric_name, metric_value, metric_display = _status_metric(row, goal)
+    window = f"{date_from}..{date_to}"
+    if row is None:
+        evidence = Evidence(
+            metric_name=metric_name, metric_value=None, metric_display=metric_display, window=window,
+            sample_purchases=0.0, sample_spend=0.0, entity_level=level,
+            entity_id=_optional_str(entity_id), entity_name=None,
+            regenerating_query=build_regenerating_query(account_slug, level, date_from, date_to),
+        )
+    else:
+        evidence = Evidence(
+            metric_name=metric_name, metric_value=metric_value, metric_display=metric_display,
+            window=window, sample_purchases=_num(row.get("purchases")),
+            sample_spend=_num(row.get("spend")) or 0.0, entity_level=level,
+            entity_id=_optional_str(entity_id), entity_name=row.get("name"),
+            regenerating_query=build_regenerating_query(account_slug, level, date_from, date_to),
+        )
+    attach_op_grounding(
+        op, evidence=evidence, tier=EvidenceTier.direct_observation,
+        spend_floor=MIN_SCALING_SPEND, conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=recency_days,
+    )
+
+
+def _build_campaign_budget_ops(
+    reader: MetaReaderProvider,
+    ad_account_id: str,
+    campaign_id: str,
+    new_cents: int,
+    *,
+    goal: str | None,
+    account_slug: str | None,
+    date_from: str,
+    date_to: str,
+    recency_days: int | None,
+    max_increase_percent: float | None,
+    max_decrease_percent: float | None,
+    cbo_origin_adset_id: str | None = None,
+) -> list[dict[str, Any]]:
+    live = reader.get_campaign(campaign_id, fields=CAMPAIGN_BUDGET_FIELDS)
+    campaign_daily = _num(live.get("daily_budget"))
+    campaign_lifetime = _num(live.get("lifetime_budget"))
+    note = None
+    if cbo_origin_adset_id:
+        note = f"Campaign budget op redirected from ad set {cbo_origin_adset_id} (CBO active)."
+    op = _budget_op(
+        level="campaign", node_id=str(campaign_id), new_cents=new_cents, current=campaign_daily,
+        max_increase_percent=max_increase_percent, max_decrease_percent=max_decrease_percent, note=note,
+    )
+    if cbo_origin_adset_id:
+        op["cbo_redirect_from_adset_id"] = str(cbo_origin_adset_id)
+    if (campaign_daily is None or campaign_daily <= 0) and (campaign_lifetime or 0) > 0:
+        # Lifetime-budget campaign: a daily-budget op can't touch it. Surface it; it is blocked at
+        # apply by _build_budget_request's lifetime guard.
+        op["budget_type"] = "lifetime"
+        op["note"] = (
+            (op.get("note") or "")
+            + " Campaign uses a LIFETIME budget — not adjustable via a daily-budget op; "
+            "non-executable (blocked at apply)."
+        ).strip()
+    _attach_budget_grounding(
+        op, reader, ad_account_id, level="campaign", entity_id=str(campaign_id), goal=goal,
+        account_slug=account_slug, date_from=date_from, date_to=date_to, recency_days=recency_days,
+    )
+    return [op]
+
+
+def _build_adset_budget_ops(
+    reader: MetaReaderProvider,
+    ad_account_id: str,
+    adset_id: str,
+    new_cents: int,
+    *,
+    goal: str | None,
+    account_slug: str | None,
+    date_from: str,
+    date_to: str,
+    recency_days: int | None,
+    max_increase_percent: float | None,
+    max_decrease_percent: float | None,
+) -> list[dict[str, Any]]:
+    state = classify_adset_budget(reader, adset_id)
+    classification = state["classification"]
+
+    if classification == BUDGET_ADSET_LEVEL:
+        op = _budget_op(
+            level="adset", node_id=str(adset_id), new_cents=new_cents,
+            current=state["adset_daily_budget"], max_increase_percent=max_increase_percent,
+            max_decrease_percent=max_decrease_percent,
+        )
+        _attach_budget_grounding(
+            op, reader, ad_account_id, level="adset", entity_id=str(adset_id), goal=goal,
+            account_slug=account_slug, date_from=date_from, date_to=date_to, recency_days=recency_days,
+        )
+        return [op]
+
+    if classification == BUDGET_CBO_ACTIVE:
+        # Non-executable ad-set pointer op + actionable campaign op. The pointer carries the CBO
+        # classification for the operator/audit log and is blocked at apply (_build_budget_request);
+        # the campaign op carries its OWN campaign-level evidence (never a copy of the ad set's).
+        pointer = _budget_op(
+            level="adset", node_id=str(adset_id), new_cents=new_cents, current=None,
+            max_increase_percent=max_increase_percent, max_decrease_percent=max_decrease_percent,
+            note=(
+                "CBO active: budget is at the campaign — increase/decrease the campaign budget "
+                "instead. This ad-set op is non-executable (blocked at apply); approve the campaign "
+                "op below."
+            ),
+        )
+        pointer["cbo_detected"] = True
+        pointer["live_campaign_state"] = state
+        _attach_budget_grounding(
+            pointer, reader, ad_account_id, level="adset", entity_id=str(adset_id), goal=goal,
+            account_slug=account_slug, date_from=date_from, date_to=date_to, recency_days=recency_days,
+        )
+        ops = [pointer]
+        campaign_id = state.get("campaign_id")
+        if campaign_id:
+            ops.extend(_build_campaign_budget_ops(
+                reader, ad_account_id, str(campaign_id), new_cents, goal=goal, account_slug=account_slug,
+                date_from=date_from, date_to=date_to, recency_days=recency_days,
+                max_increase_percent=max_increase_percent, max_decrease_percent=max_decrease_percent,
+                cbo_origin_adset_id=str(adset_id),
+            ))
+        return ops
+
+    # broken: neither the ad set nor its campaign has a budget. Surface a non-executable op (blocked
+    # at apply) so the operator sees the situation rather than a silent no-op.
+    op = _budget_op(
+        level="adset", node_id=str(adset_id), new_cents=new_cents, current=None,
+        max_increase_percent=max_increase_percent, max_decrease_percent=max_decrease_percent,
+        note=(
+            "No daily budget on the ad set or its campaign (broken or lifetime-only setup) — "
+            "non-executable; blocked at apply."
+        ),
+    )
+    op["live_campaign_state"] = state
+    _attach_budget_grounding(
+        op, reader, ad_account_id, level="adset", entity_id=str(adset_id), goal=goal,
+        account_slug=account_slug, date_from=date_from, date_to=date_to, recency_days=recency_days,
+    )
+    return [op]
+
+
+def build_budget_plan(
+    reader: MetaReaderProvider | MetaMarketingApiClient,
+    ad_account_id: str,
+    *,
+    new_daily_budget_cents: int,
+    adset_id: str | None = None,
+    campaign_id: str | None = None,
+    account_slug: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    run_date: str | None = None,
+    policy: dict[str, Any] | None = None,
+    max_increase_percent: float | None = None,
+    max_decrease_percent: float | None = None,
+) -> dict[str, Any]:
+    """Propose a grounded, CBO-aware ``set_daily_budget`` op for ONE entity (an ad set OR a campaign).
+
+    Read-only: reads live budget + the entity's metric through ``reader``; only proposes ops. The move
+    may be an increase OR a decrease — the direction is inferred from the live current budget, and the
+    apply-time gate picks the cap by sign (increase cap vs the symmetric decrease cap + absolute floor).
+
+    Targeting an **ad set** whose budget lives on its campaign (CBO) yields TWO ops: a non-executable
+    ad-set pointer (marked ``cbo_detected``) and an actionable campaign-level op carrying its own
+    campaign metric as evidence. Every op carries ``evidence`` + a computed ``confidence`` band and the
+    plan is run through :func:`review.review_ops_plan` before return, so a below-floor sample abstains
+    into a non-executable "keep running" recommendation and a scale-up below the ROAS target is refuted.
+    """
+    reader = as_reader(reader)
+    if bool(adset_id) == bool(campaign_id):
+        raise ValueError("build_budget_plan requires exactly one of adset_id or campaign_id.")
+    policy = policy if policy is not None else resolve_action_policy(account_slug)
+    goal = policy.get("primary_goal")
+    date_from, date_to, recency_days, run_date_iso = _resolve_grounding_window(date_from, date_to, run_date)
+    new_cents = int(new_daily_budget_cents)
+    # Fold the per-account decrease override into the op-param so the apply-time cap honors it without
+    # control._build_budget_request needing the registry.
+    if max_decrease_percent is None:
+        max_decrease_percent = _num(policy.get("max_budget_decrease_percent"))
+
+    common = {
+        "goal": goal, "account_slug": account_slug, "date_from": date_from, "date_to": date_to,
+        "recency_days": recency_days, "max_increase_percent": max_increase_percent,
+        "max_decrease_percent": max_decrease_percent,
+    }
+    if campaign_id:
+        ops = _build_campaign_budget_ops(reader, ad_account_id, str(campaign_id), new_cents, **common)
+    else:
+        ops = _build_adset_budget_ops(reader, ad_account_id, str(adset_id), new_cents, **common)
+
+    plan = {
+        "schema_version": 1,
+        "plan_type": "ops",
+        "intent": "set_budget",
+        "account_slug": account_slug,
+        "ad_account_id": ad_account_id,
+        "generated_at": _now_iso(),
+        "run_date": run_date_iso,
+        "account_action_policy": policy,
+        "selection": {
+            "date_from": date_from, "date_to": date_to, "new_daily_budget_cents": new_cents,
+            "adset_id": adset_id, "campaign_id": campaign_id,
+        },
+        "approval_instructions": (
+            "Review each op. To apply it, set its status to 'approved'. Only approved ops are sent to "
+            "Meta, and only with --execute (or tested with --validate-only). Under CBO, approve the "
+            "campaign op (the ad-set op is a non-executable pointer). A below-floor sample abstains "
+            "and is blocked until the data clears the significance floor."
+        ),
+        "guardrails": {
+            "requires_explicit_approval": True,
+            "requires_grounding": True,
         },
         "ops": ops,
     }

@@ -46,6 +46,7 @@ from .control import (
     account_info,
     apply_ops_plan,
     build_account_snapshot,
+    build_budget_plan,
     build_copy_library,
     build_enable_ads_plan,
     build_pause_plan,
@@ -1624,6 +1625,58 @@ def propose_pause_ads_main() -> None:
     print(f"Wrote pause-ads plan for {account_slug} ({len(plan['ops'])} ads): {output_path}")
     for op in plan["ops"]:
         print(f"  {op['name']} — {op['note']}")
+    print("Approve by setting an op's status to 'approved', then run apply-ops --validate-only / --execute.")
+
+
+def propose_budget_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Propose a CBO-aware daily-budget change (increase OR decrease) for one ad set or "
+            "campaign, grounded + reviewed (no writes). Under CBO, redirects to a campaign-level op."
+        )
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--adset-id", help="Ad set to set the daily budget on (redirects under CBO).")
+    target.add_argument("--campaign-id", help="Campaign to set the daily budget on (CBO budget level).")
+    parser.add_argument(
+        "--daily-budget-cents", type=int, required=True,
+        help="Target daily budget in account minor units (cents). May be above OR below the current.",
+    )
+    parser.add_argument("--max-increase-percent", type=float, help="Override the increase cap (default 20%%).")
+    parser.add_argument("--max-decrease-percent", type=float, help="Override the decrease cap (default config/per-account).")
+    parser.add_argument("--date-from", help="Evidence-window start. Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence-window end. Defaults to the run date / today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    parser.add_argument("--output-path", help="Override ops plan path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    plan = build_budget_plan(
+        client, ad_account_id, account_slug=account_slug,
+        adset_id=args.adset_id, campaign_id=args.campaign_id,
+        new_daily_budget_cents=args.daily_budget_cents,
+        max_increase_percent=args.max_increase_percent,
+        max_decrease_percent=args.max_decrease_percent,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
+    )
+    output_path = Path(args.output_path) if args.output_path else default_ops_plan_path(account_slug, run_date, Path(args.reports_root))
+    write_plan(plan, output_path)
+    print(f"Wrote budget plan for {account_slug} ({len(plan['ops'])} op(s)): {output_path}")
+    for op in plan["ops"]:
+        flags = " [CBO redirect]" if op.get("cbo_detected") else ""
+        band = (op.get("confidence") or {}).get("band", "?")
+        print(f"  {op['level']}:{op['id']} — {op.get('note')} (band: {band}){flags}")
     print("Approve by setting an op's status to 'approved', then run apply-ops --validate-only / --execute.")
 
 

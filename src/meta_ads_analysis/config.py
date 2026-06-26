@@ -61,3 +61,19 @@ KNOWLEDGE_DRIFT_PCT = 0.25
 # existing constants (MIN_WASTE_SPEND / MIN_SCALING_SPEND, CONFIDENCE_CONVERSIONS_FLOOR,
 # CONFIDENCE_RECENCY_STALE_DAYS) so the gate and the producer share one set of thresholds.
 REVIEW_MIN_WINDOW_DAYS = 7
+
+# Budget-decrease safety (wired by ``control`` set_daily_budget — see ``control._capped_budget_request``).
+# NOTE: the budget *increase* cap is op-param-driven (``control._build_budget_request`` reads
+# ``params["max_increase_percent"]``, default 20) and is deliberately left untouched — these two
+# numbers govern the DECREASE direction only, the separate symmetric guard:
+#   - MAX_BUDGET_DECREASE_PERCENT: a single set_daily_budget may not cut the live daily budget by more
+#     than this percent. An op-param ``max_decrease_percent`` overrides it; a per-account
+#     ``max_budget_decrease_percent`` in ``action_policy`` is folded into that op-param by the budget
+#     builder. Picked by SIGN of (new - current), so it can never block a valid increase.
+#   - MIN_DAILY_BUDGET_CENTS: an absolute floor (account minor units) a decrease may not cross, so a
+#     reduction can never silently pause delivery. Deliberately conservative — ``validate_only`` against
+#     Meta surfaces the real per-currency minimum as the final check; this is the local sanity floor.
+# (The ``write-config-registry-controls`` ticket also documents/tunes these and adds the per-account
+# registry field; if it lands after this ticket it should reconcile to these definitions, not duplicate.)
+MAX_BUDGET_DECREASE_PERCENT = 50.0
+MIN_DAILY_BUDGET_CENTS = 100

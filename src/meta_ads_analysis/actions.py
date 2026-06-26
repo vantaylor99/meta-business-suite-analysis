@@ -289,7 +289,7 @@ def enrich_action_plan_with_live_state(
                 action["rationale"] = f"{action.get('rationale', '').rstrip()} Live Meta state already shows this ad is paused."
         if target.get("type") == "adset" or live_state.get("adset_id"):
             _maybe_add_live_adset_state(action, live_state, checked_at, effective_reader)
-            _populate_budget_params_from_live_state(action)
+            _populate_budget_params_from_live_state(action, effective_reader)
     _append_meta_ai_remediation_actions(enriched, checked_at)
     enriched["live_state_enriched_at"] = checked_at
     return enriched
@@ -795,14 +795,55 @@ def _maybe_add_live_adset_state(
     action["live_adset_state"] = {"checked_at": checked_at, "lookup_status": "ok", **adset_state}
 
 
-def _populate_budget_params_from_live_state(action: dict[str, Any]) -> None:
+def _populate_budget_params_from_live_state(
+    action: dict[str, Any],
+    reader: MetaReaderProvider | None = None,
+) -> None:
+    """Populate the ad set's live current daily budget on a budget action, OR — when the ad set has no
+    daily budget — detect CBO and redirect (Option A: mark non-executable with a clear note) so the
+    action-plan path no longer silently blocks under campaign-budget-optimization.
+
+    Uses the SAME classifier as the ops path (``control.classify_adset_budget``), so
+    ``increase_adset_budget`` (actions) and ``set_daily_budget`` (ops) classify an identical fixture
+    identically (the CBO parity contract). ``broken`` is left non-populated (the executor already
+    refuses without a current budget); only CBO is surfaced explicitly."""
     if action.get("action_type") != "increase_adset_budget":
         return
     params = action.get("params") if isinstance(action.get("params"), dict) else {}
     adset_state = action.get("live_adset_state") if isinstance(action.get("live_adset_state"), dict) else {}
     daily_budget = _number(adset_state.get("daily_budget"))
-    if daily_budget is not None and params.get("current_daily_budget_cents") is None:
-        params["current_daily_budget_cents"] = int(daily_budget)
+    if daily_budget is not None and daily_budget > 0:
+        if params.get("current_daily_budget_cents") is None:
+            params["current_daily_budget_cents"] = int(daily_budget)
+        action["params"] = params
+        return
+
+    # No ad-set daily budget — classify via the shared control classifier (CBO vs broken).
+    adset_id = str(
+        adset_state.get("adset_id") or (action.get("target") or {}).get("id") or ""
+    ).strip()
+    if reader is None or not adset_id:
+        action["params"] = params
+        return
+    from .control import BUDGET_ADSET_LEVEL, BUDGET_CBO_ACTIVE, classify_adset_budget
+
+    state = classify_adset_budget(reader, adset_id)
+    action["live_campaign_state"] = state
+    if state["classification"] == BUDGET_CBO_ACTIVE:
+        action["cbo_detected"] = True
+        action["executable"] = False
+        action["approval_required"] = False
+        action["verdict"] = "cbo_redirect"
+        action["rationale"] = (
+            f"{str(action.get('rationale') or '').rstrip()} "
+            "CBO active: this ad set's budget lives on its parent campaign "
+            f"({state.get('campaign_id')}). Increase/decrease the CAMPAIGN budget instead — the "
+            "ad-set budget cannot be changed while campaign-budget-optimization is on."
+        ).strip()
+    elif state["classification"] == BUDGET_ADSET_LEVEL and state.get("adset_daily_budget"):
+        # Race: a budget appeared between the two reads — populate it.
+        if params.get("current_daily_budget_cents") is None:
+            params["current_daily_budget_cents"] = int(state["adset_daily_budget"])
     action["params"] = params
 
 
