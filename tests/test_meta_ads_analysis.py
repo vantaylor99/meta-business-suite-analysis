@@ -2652,6 +2652,164 @@ def test_apply_advantage_disable_preserves_audiences_and_turns_off_aa() -> None:
     assert t["excluded_custom_audiences"] == [{"id": "B"}, {"id": "C"}]
 
 
+# --- Rotation grounding (evidence + correlational-capped confidence + review) ----
+
+from meta_ads_analysis.review import review_rotation_plan
+
+_ROTATION_WINDOW = {"date_from": "2026-06-10", "date_to": "2026-06-24",
+                    "recency_days": 1, "run_date": "2026-06-25"}
+
+
+def _rotation_metric_row(adset_id, name, *, purchases, spend):
+    """One fetch_entity_metrics-shaped row for an ad set's window performance."""
+    roas = round(spend / spend, 2) if spend else None  # placeholder ROAS; band is sample-driven
+    return {"id": adset_id, "name": name, "spend": float(spend), "roas": roas,
+            "purchases": float(purchases), "cost_per_app_install": None}
+
+
+def test_rotation_fatigued_adset_carries_correlational_capped_confidence() -> None:
+    # A high-spend ad set proposed for rotation carries the band the rubric COMPUTES from its own
+    # window sample — and because fatigue is correlational, a strong sample caps at MEDIUM, never high.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["evidence"]["sample_purchases"] == 120.0
+    assert op["confidence"]["grounding_tier"] == "correlational"
+    # 120 purchases would read high on the data axis, but correlational grounding caps it at medium.
+    assert op["confidence"]["band"] == "medium"
+    assert op["review"]["verdict"] == "stands"
+
+
+def test_rotation_thin_sample_abstains_and_is_flagged_insufficient() -> None:
+    # A below-floor fatigue sample abstains (never a fabricated low) and review marks it insufficient
+    # — non-executable: rotating on no evidence of fatigue is exactly what grounding prevents.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=9, spend=40)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review_verdict"] == "insufficient"
+
+
+def test_rotation_review_iterates_rotations_not_ops() -> None:
+    # Pin against the #1 failure mode: review_rotation_plan must iterate plan["rotations"], not a
+    # missing plan["ops"]. Every rotation item actually receives a review block.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert len(plan["rotations"]) == 3
+    assert all(isinstance(r.get("review"), dict) and r["review"]["verdict"] for r in plan["rotations"])
+
+
+def test_rotation_review_demotes_overclaimed_band() -> None:
+    # A hand-inflated 'high' band over a sample the correlational rubric only supports at 'medium'.
+    plan = {
+        "plan_type": "audience_rotation", "run_date": "2026-06-25",
+        "rotations": [{
+            "adset_id": "as1", "adset_name": "Set 1", "status": "approved",
+            "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
+                         "window": "2026-06-10..2026-06-24", "sample_purchases": 30.0,
+                         "sample_spend": 500.0, "entity_level": "adset", "entity_id": "as1"},
+            "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
+                           "grounding_tier": "correlational", "factors": [], "would_raise": "",
+                           "would_lower": "", "causal_flag": False},
+        }],
+    }
+    reviewed = review_rotation_plan(plan)
+    r = reviewed["rotations"][0]
+    assert r["review"]["verdict"] == "downgrade"
+    assert Band[r["confidence"]["band"]] < Band.high
+    assert r["review_verdict"] == "downgrade"
+    # input plan not mutated
+    assert "review" not in plan["rotations"][0]
+    assert plan["rotations"][0]["confidence"]["band"] == "high"
+
+
+def test_rotation_causal_claim_is_downgraded() -> None:
+    # A rotation rationale asserting the audience CAUSED the drop must not survive at a causal band:
+    # fatigue is correlational, so a cause-claim from a decline alone is downgraded (confirm via A/B).
+    plan = {
+        "plan_type": "audience_rotation", "run_date": "2026-06-25",
+        "rotations": [{
+            "adset_id": "as1", "status": "approved",
+            "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
+                         "window": "2026-06-10..2026-06-24", "sample_purchases": 120.0,
+                         "sample_spend": 2400.0, "entity_level": "adset", "entity_id": "as1"},
+            "confidence": {"band": "high", "data_band": "high", "grounding_band": "medium",
+                           "grounding_tier": "correlational", "factors": [], "would_raise": "",
+                           "would_lower": "", "causal_flag": True},
+        }],
+    }
+    reviewed = review_rotation_plan(plan)
+    r = reviewed["rotations"][0]
+    assert r["review"]["verdict"] == "downgrade"
+    assert "causal" in r["review"]["failed_inputs"]
+    assert r["confidence"]["band"] == "low"  # correlational causal cap
+
+
+def test_advantage_disable_item_attaches_structural_abstain() -> None:
+    # Turning Advantage Audience off is a safety op with NO performance metric — it must abstain with a
+    # structural factor (no sample cited), and review must not refute it for "contradicting its metric".
+    adsets = [_adset("as1", "Set 1", ["A"], ["B"], advantage=True)]
+    plan = build_advantage_disable_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    item = plan["items"][0]
+    assert item["confidence"]["band"] == "abstain"
+    assert item["confidence"]["data_band"] == "abstain"
+    assert item["evidence"]["sample_purchases"] is None and item["evidence"]["sample_spend"] is None
+    # structural abstain (no cited sample) → the gate does not refute it
+    assert item["review"]["verdict"] == "stands"
+
+
+def test_rename_plan_passes_through_review_without_fabricated_band() -> None:
+    # Renames are pure structural (name only) — exempt from grounding. review_rotation_plan must leave
+    # them untouched: no confidence, no review block, no fabricated performance band.
+    adsets = [{
+        "id": "as1", "name": "Stills", "effective_status": "ACTIVE", "campaign_id": "c1",
+        "targeting": {"custom_audiences": [{"id": "1", "name": "high-value-customers.csv"}]},
+    }]
+    plan = build_rename_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    reviewed = review_rotation_plan(plan)
+    r = reviewed["renames"][0]
+    assert "confidence" not in r and "review" not in r
+    assert r["new_name"] == "High Value Customers"  # band-free, unchanged
+
+
+def test_rotation_review_is_idempotent() -> None:
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    again = review_rotation_plan(plan)
+    assert [r["confidence"]["band"] for r in again["rotations"]] == \
+        [r["confidence"]["band"] for r in plan["rotations"]]
+    assert again["rotations"][0]["review"] == plan["rotations"][0]["review"]
+
+
+def test_rotation_high_confidence_still_blocks_on_live_targeting_drift() -> None:
+    # Grounding/review runs at propose; the live-targeting drift check runs at execute. A confidently
+    # grounded rotation is STILL blocked if the ad set's audience drifted since plan time.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] == "medium"  # confidently grounded
+    plan["rotations"][0]["status"] = "approved"
+    adsets[0]["targeting"]["custom_audiences"] = [{"id": "Z"}]  # live drift after plan time
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert client.updates == []
+
+
 # --- Control layer (inspect + guarded ops + enable-ads) ----------------------
 
 from meta_ads_analysis.control import (

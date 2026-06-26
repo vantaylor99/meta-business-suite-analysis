@@ -477,6 +477,14 @@ def propose_rotation_main() -> None:
         ),
     )
     parser.add_argument(
+        "--date-from",
+        help="Fatigue-evidence window start. Defaults to a 30-day trailing window.",
+    )
+    parser.add_argument(
+        "--date-to",
+        help="Fatigue-evidence window end. Defaults to the run date / today.",
+    )
+    parser.add_argument(
         "--reports-root",
         default=str(DEFAULT_REPORTS_ROOT),
         help="Reports root. Defaults to reports/.",
@@ -491,14 +499,34 @@ def propose_rotation_main() -> None:
     run_date = args.run_date or date.today().isoformat()
     reports_root = Path(args.reports_root)
 
+    from .control import _resolve_grounding_window, resolve_action_policy
+
     client = client_from_env(args.api_version)
     ad_account_id, adsets = fetch_active_adsets(account_slug, reader=client)
+    policy = resolve_action_policy(account_slug)
+    date_from, date_to, recency_days, run_date_iso = _resolve_grounding_window(
+        args.date_from, args.date_to, run_date
+    )
+    # Read each ad set's recent performance — the fatigue signal that grounds the swap.
+    metrics_by_id = {
+        str(m["id"]): m
+        for m in fetch_entity_metrics(
+            client, ad_account_id, level="adset", date_from=date_from, date_to=date_to
+        )
+    }
     plan = build_rotation_plan(
         adsets,
         account_slug=account_slug,
         ad_account_id=ad_account_id,
         offset=args.offset,
         disable_advantage_audience=args.disable_advantage_audience,
+        metrics_by_id=metrics_by_id,
+        goal=policy.get("primary_goal"),
+        policy=policy,
+        date_from=date_from,
+        date_to=date_to,
+        recency_days=recency_days,
+        run_date=run_date_iso,
     )
     output_path = Path(args.output_path) if args.output_path else default_rotation_plan_path(
         account_slug,

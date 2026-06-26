@@ -581,6 +581,87 @@ def review_authoring_plan(
     )
 
 
+# Rotation-family plans do NOT produce ``plan["ops"]``; each shape keeps its reviewable items under
+# its own key. Mapping ``plan_type`` → that key is how :func:`review_rotation_plan` avoids the #1
+# failure mode: routing a rotation plan through an ``ops`` iterator silently reviews nothing.
+_ROTATION_PLAN_ITEM_KEYS: dict[str, str] = {
+    "audience_rotation": "rotations",
+    "advantage_disable": "items",
+    "adset_rename": "renames",
+}
+
+
+def review_rotation_plan(
+    plan: dict[str, Any],
+    *,
+    spend_floor: float = MIN_WASTE_SPEND,
+    conversions_floor: float = CONFIDENCE_CONVERSIONS_FLOOR,
+    min_window_days: int = REVIEW_MIN_WINDOW_DAYS,
+    recency_stale_days: int = CONFIDENCE_RECENCY_STALE_DAYS,
+) -> dict[str, Any]:
+    """Adversarially review a **rotation-family** plan, whose items live under a DIFFERENT key than
+    control/authoring ops (these plans carry no ``plan["ops"]``):
+
+    - ``audience_rotation`` → ``plan["rotations"]`` (each item has its own proposed/approved status),
+    - ``advantage_disable`` → ``plan["items"]`` (each item has a status),
+    - ``adset_rename``      → ``plan["renames"]`` (pure structural — no metric/band, so the band-gated
+      loop skips every item; a rename plan therefore passes through with no review block and no
+      fabricated band).
+
+    Same contract as :func:`review_ops_plan`, over the rotation key: returns a NEW plan (the input is
+    never mutated), reviews only items carrying a ``confidence`` block (structural / no-band items pass
+    through untouched), and is idempotent (an item already carrying a ``review`` block is left as-is).
+    Per item it reuses the SAME :func:`review_recommendation` core and the demote-only
+    :func:`_apply_op_verdict` applier — the refutation logic is not forked. Rotation items carry no
+    ``action_type``, so the ``direction`` check no-ops for them; the ``causal`` check still fires, so a
+    rotation rationale asserting a cause (``causal_flag``) from non-experimental data is downgraded —
+    "audience fatigue" is an inference, never a high/causal call from a decline alone. The gate stays
+    **demote-only**: it may lower a band and demote ``status`` approved→proposed, never the reverse.
+    """
+    reviewed = _deepcopy_plan(plan)
+    policy = reviewed.get("account_action_policy") if isinstance(reviewed.get("account_action_policy"), dict) else {}
+    run_date = reviewed.get("run_date")
+
+    for item in _rotation_items(reviewed):
+        if not isinstance(item, dict):
+            continue
+        confidence = item.get("confidence")
+        if not isinstance(confidence, dict) or _band(confidence.get("band")) is None:
+            continue  # structural / no-band item (e.g. a rename) — never reviewed
+        if isinstance(item.get("review"), dict) and item["review"]:
+            continue  # already reviewed — idempotent no-op
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+        result = review_recommendation(
+            evidence=evidence,
+            confidence=confidence,
+            action=item,  # no action_type → direction no-ops; the causal/floor/band checks still fire
+            policy=policy,
+            spend_floor=spend_floor,
+            conversions_floor=conversions_floor,
+            min_window_days=min_window_days,
+            recency_stale_days=recency_stale_days,
+            recency_days=_recency_days_from_window(run_date, evidence.get("window")),
+        )
+        item["review"] = review_result_to_dict(result)
+        _apply_op_verdict(item, result)
+
+    return reviewed
+
+
+def _rotation_items(plan: dict[str, Any]) -> list[Any]:
+    """Return the reviewable item list for a rotation-family plan, keyed by plan shape. Dispatches on
+    ``plan_type`` first (``rotations`` / ``items`` / ``renames``); falls back to the first present
+    known key. Deliberately NEVER reads ``plan["ops"]`` — rotation plans don't produce that, and
+    iterating it would silently review nothing."""
+    key = _ROTATION_PLAN_ITEM_KEYS.get(str(plan.get("plan_type") or ""))
+    if key is not None and isinstance(plan.get(key), list):
+        return plan[key]
+    for fallback in ("rotations", "items", "renames"):
+        if isinstance(plan.get(fallback), list):
+            return plan[fallback]
+    return []
+
+
 def _review_plan_ops(
     plan: dict[str, Any],
     *,

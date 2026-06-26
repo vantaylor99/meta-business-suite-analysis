@@ -84,8 +84,9 @@ Shared scaffolding lets each of these carry grounding uniformly:
   (`status` + a `review_verdict` marker) rather than the action plan's `executable`/`rationale` keys.
   Because an op carries no `action_type`, the gate's `direction` check (scale-vs-ROAS-target) cannot
   fire here — op-level direction-contradiction is the per-capability ticket's job, since it knows the
-  op's semantic. Rotation plans use `plan["rotations"]` / `plan["items"]` rather than `plan["ops"]`, so
-  they get their own review wrapper in the rotation work, not `review_ops_plan`.
+  op's semantic. Rotation plans use `plan["rotations"]` / `plan["items"]` / `plan["renames"]` rather
+  than `plan["ops"]`, so they have their own key-aware wrapper, `review.review_rotation_plan`, **not**
+  `review_ops_plan` (routing a rotation plan through the `ops` iterator would silently review nothing).
 
 ### Grounding-required set and the apply-time guard
 
@@ -186,6 +187,38 @@ is demote-only — so even a `stands` on a high-confidence duplicate, or a `down
 a thin one, can never set a created entity to `ACTIVE`. The `_guard_params` / `FORBIDDEN_FRAGMENTS`
 Meta-AI / Advantage+ block and the create-only scope (no delete/archive) are likewise unchanged: a
 well-grounded create that carries an Advantage+ param is still blocked.
+
+### Audience rotation grounding (`rotation.*`)
+
+Rotation is a reversible experiment — it swaps which saved audiences each active ad set targets — and
+carries grounding like every other write, attached via the shared `write_grounding.attach_op_grounding`
+and reviewed by `review.review_rotation_plan`. The rotation arithmetic and the apply-time live-targeting
+drift guard are unchanged; only `evidence` / `confidence` / `review` are added.
+
+- **Rotations (`build_rotation_plan` → `plan["rotations"]`).** Each item's evidence is the ad set's
+  **own** performance over the fatigue window (`--date-from` / `--date-to`, metric by account goal,
+  sample + `regenerating_query`), populated by `propose_rotation`'s reader. The band is computed at the
+  **`correlational`** tier — "audience fatigue" is an *inference* from a decline, not a controlled
+  observation — so even a large sample caps at `medium`; a rotation can never read `high` from a decline
+  alone. An ad set with no delivery in the window cites a **zero** sample → `abstain` → review marks it
+  `insufficient` (keep observing; don't rotate on no evidence of fatigue).
+- **Causal claims are downgraded.** A rotation rationale asserting the audience *caused* the drop
+  (`causal_flag`) is downgraded by the gate's `causal` check — confirming cause needs an A/B, not a
+  decline. (Tested in `test_rotation_causal_claim_is_downgraded`.)
+- **Advantage-Audience disable (`build_advantage_disable_plan` → `plan["items"]`).** Turning Meta-AI
+  audience automation **off** is a safety toggle with no performance metric, so each item is a
+  **structural abstain** (named ad set, no cited sample). Review must not refute it for "contradicting
+  its metric" (it has none); it `stands` as an honest abstention. The disable only ever turns automation
+  **off**, never on, and the `FORBIDDEN_FRAGMENTS` interaction is unchanged.
+- **Renames (`build_rename_plan` → `plan["renames"]`).** A rename writes only the name — no spend,
+  delivery, or structural change — so it is **exempt** from grounding (mirroring the `rename` op
+  exemption). `review_rotation_plan` passes renames through untouched: no fabricated band, no review
+  block.
+- **Drift precedence (reversibility).** Grounding/review runs at *propose*; the live re-read +
+  no-drift validation in `apply_rotation_plan` runs at *execute*. If the live targeting drifted since
+  plan time, the write is **blocked regardless of the confidence band** — a high-confidence rotation
+  still blocks on drift. Because the results log captures each ad set's prior audience set, a rotation
+  is reversible: rotating back is simply another rotation.
 
 ## Account Goals
 
