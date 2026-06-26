@@ -46,6 +46,7 @@ from .control import (
     account_info,
     apply_ops_plan,
     build_account_snapshot,
+    build_budget_plan,
     build_copy_library,
     build_enable_ads_plan,
     build_pause_plan,
@@ -375,7 +376,7 @@ def propose_meta_actions_main() -> None:
     if args.enrich_live_state:
         from .meta_api import client_from_env
 
-        plan = enrich_action_plan_with_live_state(plan, client=client_from_env(args.api_version))
+        plan = enrich_action_plan_with_live_state(plan, reader=client_from_env(args.api_version))
     output_path = Path(args.output_path) if args.output_path else default_action_plan_path(
         account_slug,
         run_date,
@@ -476,6 +477,14 @@ def propose_rotation_main() -> None:
         ),
     )
     parser.add_argument(
+        "--date-from",
+        help="Fatigue-evidence window start. Defaults to a 30-day trailing window.",
+    )
+    parser.add_argument(
+        "--date-to",
+        help="Fatigue-evidence window end. Defaults to the run date / today.",
+    )
+    parser.add_argument(
         "--reports-root",
         default=str(DEFAULT_REPORTS_ROOT),
         help="Reports root. Defaults to reports/.",
@@ -490,14 +499,34 @@ def propose_rotation_main() -> None:
     run_date = args.run_date or date.today().isoformat()
     reports_root = Path(args.reports_root)
 
+    from .control import _resolve_grounding_window, resolve_action_policy
+
     client = client_from_env(args.api_version)
-    ad_account_id, adsets = fetch_active_adsets(account_slug, client=client)
+    ad_account_id, adsets = fetch_active_adsets(account_slug, reader=client)
+    policy = resolve_action_policy(account_slug)
+    date_from, date_to, recency_days, run_date_iso = _resolve_grounding_window(
+        args.date_from, args.date_to, run_date
+    )
+    # Read each ad set's recent performance — the fatigue signal that grounds the swap.
+    metrics_by_id = {
+        str(m["id"]): m
+        for m in fetch_entity_metrics(
+            client, ad_account_id, level="adset", date_from=date_from, date_to=date_to
+        )
+    }
     plan = build_rotation_plan(
         adsets,
         account_slug=account_slug,
         ad_account_id=ad_account_id,
         offset=args.offset,
         disable_advantage_audience=args.disable_advantage_audience,
+        metrics_by_id=metrics_by_id,
+        goal=policy.get("primary_goal"),
+        policy=policy,
+        date_from=date_from,
+        date_to=date_to,
+        recency_days=recency_days,
+        run_date=run_date_iso,
     )
     output_path = Path(args.output_path) if args.output_path else default_rotation_plan_path(
         account_slug,
@@ -595,7 +624,7 @@ def propose_disable_advantage_main() -> None:
     reports_root = Path(args.reports_root)
 
     client = client_from_env(args.api_version)
-    ad_account_id, adsets = fetch_active_adsets(account_slug, client=client)
+    ad_account_id, adsets = fetch_active_adsets(account_slug, reader=client)
     plan = build_advantage_disable_plan(adsets, account_slug=account_slug, ad_account_id=ad_account_id)
     output_path = Path(args.output_path) if args.output_path else default_advantage_disable_plan_path(
         account_slug,
@@ -693,7 +722,7 @@ def propose_renames_main() -> None:
     reports_root = Path(args.reports_root)
 
     client = client_from_env(args.api_version)
-    ad_account_id, adsets = fetch_active_adsets(account_slug, client=client)
+    ad_account_id, adsets = fetch_active_adsets(account_slug, reader=client)
     plan = build_rename_plan(adsets, account_slug=account_slug, ad_account_id=ad_account_id)
     output_path = Path(args.output_path) if args.output_path else default_rename_plan_path(
         account_slug,
@@ -1414,6 +1443,8 @@ def propose_video_ad_main() -> None:
     parser.add_argument("--description", help="Link description.")
     parser.add_argument("--cta", default="SHOP_NOW", help="Call-to-action type (default SHOP_NOW).")
     parser.add_argument("--image-hash", help="Thumbnail image hash (from upload-image), if required.")
+    parser.add_argument("--date-from", help="Evidence window start (YYYY-MM-DD). Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence window end (YYYY-MM-DD). Defaults to the run date.")
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
     args = parser.parse_args()
@@ -1427,6 +1458,7 @@ def propose_video_ad_main() -> None:
         ad_account_id, name=args.name, adset_id=args.adset_id, video_id=args.video_id, page_id=args.page_id,
         message=args.message, link=args.link, title=args.title, description=args.description,
         call_to_action_type=args.cta, image_hash=args.image_hash, account_slug=account_slug,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
     )
     output_path = default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
     write_authoring_plan(plan, output_path)
@@ -1481,6 +1513,8 @@ def propose_duplicate_ad_main() -> None:
     parser.add_argument("--source-ad-id", required=True, help="Ad to copy the creative from.")
     parser.add_argument("--target-adset-id", required=True, help="Ad set to create the new ad in.")
     parser.add_argument("--name", help="Name for the new ad. Defaults to '<source name> (copy)'.")
+    parser.add_argument("--date-from", help="Evidence window start (YYYY-MM-DD) for the source ad's metric. Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence window end (YYYY-MM-DD). Defaults to the run date.")
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
     parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
@@ -1495,6 +1529,7 @@ def propose_duplicate_ad_main() -> None:
     plan = build_duplicate_ad_plan(
         client, ad_account_id, source_ad_id=args.source_ad_id,
         target_adset_id=args.target_adset_id, name=args.name, account_slug=account_slug,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
     )
     output_path = default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
     write_authoring_plan(plan, output_path)
@@ -1509,6 +1544,8 @@ def propose_lookalike_main() -> None:
     parser.add_argument("--origin-audience-id", required=True, help="Seed custom audience id.")
     parser.add_argument("--country", default="US", help="Country code for the lookalike (default US).")
     parser.add_argument("--ratio", type=float, default=0.01, help="Lookalike ratio 0.01-0.20 (default 0.01 = 1%%).")
+    parser.add_argument("--date-from", help="Evidence window start (YYYY-MM-DD) labeling the seed-basis evidence. Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence window end (YYYY-MM-DD). Defaults to the run date.")
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
     args = parser.parse_args()
@@ -1521,6 +1558,7 @@ def propose_lookalike_main() -> None:
     plan = build_lookalike_plan(
         ad_account_id, name=args.name, origin_audience_id=args.origin_audience_id,
         country=args.country, ratio=args.ratio, account_slug=account_slug,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
     )
     output_path = default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
     write_authoring_plan(plan, output_path)
@@ -1617,13 +1655,65 @@ def propose_pause_ads_main() -> None:
     plan = build_pause_plan(
         client, ad_account_id, account_slug=account_slug, adset_ids=args.adset_id,
         name_contains=args.name_contains, roas_below=args.roas_below, min_spend=args.min_spend,
-        date_from=date_from, date_to=date_to,
+        date_from=date_from, date_to=date_to, run_date=run_date,
     )
     output_path = Path(args.output_path) if args.output_path else default_ops_plan_path(account_slug, run_date, Path(args.reports_root))
     write_plan(plan, output_path)
     print(f"Wrote pause-ads plan for {account_slug} ({len(plan['ops'])} ads): {output_path}")
     for op in plan["ops"]:
         print(f"  {op['name']} — {op['note']}")
+    print("Approve by setting an op's status to 'approved', then run apply-ops --validate-only / --execute.")
+
+
+def propose_budget_main() -> None:
+    from .meta_api import client_from_env
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Propose a CBO-aware daily-budget change (increase OR decrease) for one ad set or "
+            "campaign, grounded + reviewed (no writes). Under CBO, redirects to a campaign-level op."
+        )
+    )
+    parser.add_argument("--account", required=True, help="Account/company slug or name.")
+    parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--adset-id", help="Ad set to set the daily budget on (redirects under CBO).")
+    target.add_argument("--campaign-id", help="Campaign to set the daily budget on (CBO budget level).")
+    parser.add_argument(
+        "--daily-budget-cents", type=int, required=True,
+        help="Target daily budget in account minor units (cents). May be above OR below the current.",
+    )
+    parser.add_argument("--max-increase-percent", type=float, help="Override the increase cap (default 20%%).")
+    parser.add_argument("--max-decrease-percent", type=float, help="Override the decrease cap (default config/per-account).")
+    parser.add_argument("--date-from", help="Evidence-window start. Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence-window end. Defaults to the run date / today.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
+    parser.add_argument("--output-path", help="Override ops plan path.")
+    parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    args = parser.parse_args()
+
+    account_slug = _resolve_account_slug(args.account)
+    if account_slug is None:
+        raise SystemExit("--account is required.")
+    run_date = args.run_date or date.today().isoformat()
+
+    client = client_from_env(args.api_version)
+    ad_account_id = resolve_ad_account_id(account_slug)
+    plan = build_budget_plan(
+        client, ad_account_id, account_slug=account_slug,
+        adset_id=args.adset_id, campaign_id=args.campaign_id,
+        new_daily_budget_cents=args.daily_budget_cents,
+        max_increase_percent=args.max_increase_percent,
+        max_decrease_percent=args.max_decrease_percent,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
+    )
+    output_path = Path(args.output_path) if args.output_path else default_ops_plan_path(account_slug, run_date, Path(args.reports_root))
+    write_plan(plan, output_path)
+    print(f"Wrote budget plan for {account_slug} ({len(plan['ops'])} op(s)): {output_path}")
+    for op in plan["ops"]:
+        flags = " [CBO redirect]" if op.get("cbo_detected") else ""
+        band = (op.get("confidence") or {}).get("band", "?")
+        print(f"  {op['level']}:{op['id']} — {op.get('note')} (band: {band}){flags}")
     print("Approve by setting an op's status to 'approved', then run apply-ops --validate-only / --execute.")
 
 
@@ -1637,6 +1727,8 @@ def propose_enable_ads_main() -> None:
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
     parser.add_argument("--adset-id", action="append", help="Limit to ad(s) in this ad set id (repeatable).")
     parser.add_argument("--name-contains", help="Limit to ads whose name contains this substring.")
+    parser.add_argument("--date-from", help="Evidence-window start. Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence-window end. Defaults to the run date / today.")
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT), help="Reports root. Defaults to reports/.")
     parser.add_argument("--output-path", help="Override ops plan path.")
     parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
@@ -1653,6 +1745,7 @@ def propose_enable_ads_main() -> None:
     plan = build_enable_ads_plan(
         client, ad_account_id, account_slug=account_slug,
         adset_ids=args.adset_id, name_contains=args.name_contains,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
     )
     output_path = Path(args.output_path) if args.output_path else default_ops_plan_path(account_slug, run_date, reports_root)
     write_plan(plan, output_path)

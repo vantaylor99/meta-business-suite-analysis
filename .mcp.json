@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "code-search": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "tess/scripts/mcp-search.mjs"
+      ],
+      "env": {}
+    }
+  },
+  "_candidateMcpServers": {
+    "_README": "DISABLED / UNVETTED. Entries here are NOT launched (only servers under 'mcpServers' are). 'meta-ads-read' is the community token-based Meta read server candidate. To enable: (1) vet the package + pin a known-good version, (2) confirm the token env-var name it expects, (3) move the 'meta-ads-read' object into 'mcpServers' above, then (4) set META_READER_BACKEND=mcp. It authenticates with the existing long-lived META_ACCESS_TOKEN (no OAuth). Reads only; writes always use the direct Graph client.",
+    "_candidate": "meta-ads-mcp-server@1.5.1 (npm) — token-based, read-only tool set by default, no auto-pagination (provides meta_ads_fetch_pagination_url). UNVETTED: operator must review the package and pin before enabling.",
+    "_TODO": "vet and pin meta-ads-mcp-server@<reviewed-version>; confirm its token env var (candidate expects META_ADS_ACCESS_TOKEN, mapped below from META_ACCESS_TOKEN).",
+    "meta-ads-read": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "meta-ads-mcp-server@1.5.1"
+      ],
+      "env": {
+        "META_ADS_ACCESS_TOKEN": "${META_ACCESS_TOKEN}"
+      }
+    }
+  }
+}

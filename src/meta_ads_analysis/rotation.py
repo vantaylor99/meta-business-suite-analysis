@@ -21,10 +21,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import account_registry
-from .config import DEFAULT_REPORTS_ROOT
+from . import account_registry, review
+from .confidence import Evidence, EvidenceTier, build_regenerating_query
+from .config import CONFIDENCE_CONVERSIONS_FLOOR, DEFAULT_REPORTS_ROOT, MIN_WASTE_SPEND
 from .meta_api import MetaApiError, MetaMarketingApiClient
+from .reader_provider import MetaReaderProvider, as_reader, reader_from_env
 from .utils import ensure_dir, write_json
+from .write_grounding import attach_op_grounding, op_grounding_gap
 
 PROPOSED_STATUS = "proposed"
 APPROVED_STATUS = "approved"
@@ -44,6 +47,13 @@ class RotationResult:
 
 def _now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _num(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _audience_refs(raw: Any) -> list[dict[str, str]]:
@@ -114,6 +124,99 @@ def _label(ids: list[str], names: dict[str, str]) -> str:
     return ", ".join(names.get(i, i) for i in ids)
 
 
+# Rotation is grounded at the CORRELATIONAL tier: "audience fatigue" is an inference from a decline,
+# not a direct observation of a controlled swap. The tier ceiling (medium) therefore caps the band, so
+# a rotation can never read `high` from a performance decline alone — confirming the audience caused
+# the change requires an A/B, which is the `causal` review check's job.
+ROTATION_EVIDENCE_TIER = EvidenceTier.correlational
+
+
+def _attach_rotation_grounding(
+    rotation: dict[str, Any],
+    *,
+    metrics_by_id: dict[str, dict[str, Any]] | None,
+    goal: str | None,
+    account_slug: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    recency_days: int | None,
+) -> None:
+    """Attach the fatigue/performance ``evidence`` + a **computed** ``confidence`` band to a rotation
+    item via the shared :func:`write_grounding.attach_op_grounding`. The sample is the ad set's OWN
+    delivery over the window that motivated swapping its audience; the band is computed (or abstained),
+    never free-typed.
+
+    - ``metrics_by_id is None`` (no performance data supplied — e.g. a legacy/pure call): a
+      **structural** abstain that names the ad set but cites NO sample, so the gate/review treat it as
+      an honest abstention rather than a thin-data overclaim.
+    - the ad set has no row in the window: cite a **zero** sample → ``assess`` abstains → review marks
+      it insufficient (keep observing; do not rotate on no evidence of fatigue).
+    - the ad set has a row: cite its real purchases/spend sample → the band is computed and
+      correlational-capped (:data:`ROTATION_EVIDENCE_TIER`).
+    """
+    adset_id = rotation.get("adset_id")
+    adset_name = rotation.get("adset_name")
+    window = f"{date_from}..{date_to}" if (date_from or date_to) else ""
+    regen = build_regenerating_query(account_slug, "adset", date_from, date_to)
+
+    if metrics_by_id is None:
+        evidence = Evidence(
+            metric_name="audience_fatigue",
+            metric_value=None,
+            metric_display="audience fatigue inference (no performance sample supplied)",
+            window=window,
+            sample_purchases=None,
+            sample_spend=None,
+            entity_level="adset",
+            entity_id=str(adset_id) if adset_id else None,
+            entity_name=adset_name,
+            regenerating_query=regen,
+        )
+    else:
+        # Pick the metric the same way every other write path does (ROAS / cost-per-install by goal).
+        # Imported at call-time: ``control`` imports ``rotation`` at module load, so a top-level import
+        # here would be circular — a function-body import is the standard break and is safe because
+        # both modules are fully loaded by the time this runs.
+        from .control import _status_metric
+
+        row = metrics_by_id.get(str(adset_id))
+        metric_name, metric_value, metric_display = _status_metric(row, goal)
+        if row is None:
+            evidence = Evidence(
+                metric_name=metric_name,
+                metric_value=None,
+                metric_display=metric_display,
+                window=window,
+                sample_purchases=0.0,
+                sample_spend=0.0,
+                entity_level="adset",
+                entity_id=str(adset_id) if adset_id else None,
+                entity_name=adset_name,
+                regenerating_query=regen,
+            )
+        else:
+            evidence = Evidence(
+                metric_name=metric_name,
+                metric_value=metric_value,
+                metric_display=metric_display,
+                window=window,
+                sample_purchases=_num(row.get("purchases")),
+                sample_spend=_num(row.get("spend")) or 0.0,
+                entity_level="adset",
+                entity_id=str(adset_id) if adset_id else None,
+                entity_name=row.get("name") or adset_name,
+                regenerating_query=regen,
+            )
+    attach_op_grounding(
+        rotation,
+        evidence=evidence,
+        tier=ROTATION_EVIDENCE_TIER,
+        spend_floor=MIN_WASTE_SPEND,
+        conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=recency_days,
+    )
+
+
 def build_rotation_plan(
     adsets: list[dict[str, Any]],
     *,
@@ -121,6 +224,13 @@ def build_rotation_plan(
     ad_account_id: str,
     offset: int = 1,
     disable_advantage_audience: bool = False,
+    metrics_by_id: dict[str, dict[str, Any]] | None = None,
+    goal: str | None = None,
+    policy: dict[str, Any] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    recency_days: int | None = None,
+    run_date: str | None = None,
 ) -> dict[str, Any]:
     """Build a rotation plan from active ad sets.
 
@@ -128,6 +238,20 @@ def build_rotation_plan(
     moves forward to the next ad set). Each ad set's exclusions become the pool
     of all rotating audiences minus its own new include, preserving any excluded
     audiences that are not part of the rotation pool.
+
+    Each rotation carries grounding like every other account-changing write: an ``evidence`` block
+    (the ad set's own performance over [date_from, date_to], the fatigue signal that motivates the
+    swap) and a **computed** ``confidence`` band, attached via the shared
+    :func:`write_grounding.attach_op_grounding` at the CORRELATIONAL tier (fatigue is an inference, so
+    a decline alone can never read ``high``). ``metrics_by_id`` (keyed by adset id, from the impure
+    caller's reader) supplies the samples; with none, each item is a structural abstain. The finished
+    plan is run through :func:`review.review_rotation_plan` before it is returned, so an over-claimed or
+    below-floor rotation is **marked insufficient** at propose time (rotation items always start
+    ``proposed``, so the review pass relabels/marks them rather than demoting an approval). The plan
+    sets ``guardrails.requires_grounding``, so an operator who approves a below-floor (cited-sample)
+    rotation anyway is **hard-blocked at apply** by the grounding gate in :func:`apply_rotation_plan` —
+    the same second-opinion check every other account-changing write passes. None of this touches the
+    rotation arithmetic or the apply-time live-targeting drift guard.
     """
     summaries = summarize_adsets(adsets)
     eligible = [s for s in summaries if s["included"]]
@@ -189,6 +313,17 @@ def build_rotation_plan(
             }
         )
 
+    for rotation in rotations:
+        _attach_rotation_grounding(
+            rotation,
+            metrics_by_id=metrics_by_id,
+            goal=goal,
+            account_slug=account_slug,
+            date_from=date_from,
+            date_to=date_to,
+            recency_days=recency_days,
+        )
+
     skipped = [s["adset_id"] for s in summaries if not s["included"]]
     if skipped:
         warnings.append(
@@ -196,7 +331,7 @@ def build_rotation_plan(
             + ", ".join(skipped)
         )
 
-    return {
+    plan = {
         "schema_version": 1,
         "plan_type": "audience_rotation",
         "account_slug": account_slug,
@@ -204,13 +339,18 @@ def build_rotation_plan(
         "offset": offset,
         "disable_advantage_audience": disable_advantage_audience,
         "generated_at": _now_iso(),
+        "run_date": run_date,
+        "account_action_policy": policy or {},
+        "selection": {"date_from": date_from, "date_to": date_to},
         "audience_names": names,
         "approval_instructions": (
             "Review each rotation. To allow execution, set its status to 'approved'. "
-            "Only approved rotations are sent to Meta, and only with the --execute flag."
+            "Only approved rotations are sent to Meta, and only with the --execute flag. A rotation "
+            "whose fatigue sample is below the significance floor abstains and is flagged insufficient."
         ),
         "guardrails": {
             "requires_explicit_approval": True,
+            "requires_grounding": True,
             "writes_only_custom_audiences": not disable_advantage_audience,
             "never_enables_advantage_audience": True,
             "advantage_audience_disable_only_when_requested": disable_advantage_audience,
@@ -219,6 +359,7 @@ def build_rotation_plan(
         "warnings": warnings,
         "rotations": rotations,
     }
+    return review.review_rotation_plan(plan)
 
 
 def compute_new_targeting(
@@ -261,15 +402,31 @@ def apply_rotation_plan(
     *,
     execute: bool,
     validate_only: bool = False,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
 ) -> list[RotationResult]:
     """Dry-run, validate against Meta, or execute approved rotations.
+
+    Mixed read+write: the live re-read of each ad set's targeting (drift detection — fresh, not
+    cached) goes through ``reader``; the targeting write stays on the concrete ``client``. When
+    ``reader`` is omitted it defaults to reading through the same ``client``.
 
     - ``validate_only=True``: send each approved rotation to Meta with
       ``execution_options=['validate_only']`` — a real round-trip that returns Meta's
       validation result but changes nothing. Takes precedence over ``execute``.
     - ``execute=True``: perform the real write.
     - otherwise: a local dry run that records the targeting that would be sent.
+
+    Apply-time grounding gate: when the plan sets ``guardrails.requires_grounding`` (every plan from
+    :func:`build_rotation_plan` does), an approved rotation whose fatigue grounding is missing or rests
+    on a **cited** below-floor / zero sample (``abstain`` band with a sample) is hard-``blocked`` here —
+    the same second-opinion check ``apply_ops_plan`` / ``apply_authoring_plan`` enforce. A *structural*
+    abstain (no sample cited — e.g. a plan built with no ``metrics_by_id``) is an honest abstention and
+    is allowed through. The gate runs **after** the two live-drift blocks and **before**
+    :func:`compute_new_targeting` (drift-first: a drifted plan is stale and must be re-proposed
+    regardless of its band, so the drift reason takes precedence over the grounding reason).
     """
+    effective_reader = as_reader(reader) or as_reader(client)
+    require_grounding = bool((plan.get("guardrails") or {}).get("requires_grounding"))
     results: list[RotationResult] = []
     for rotation in plan.get("rotations") or []:
         if not isinstance(rotation, dict):
@@ -279,7 +436,7 @@ def apply_rotation_plan(
             results.append(RotationResult(adset_id, "skipped", reason="Rotation is not approved."))
             continue
 
-        live = client.get_adset(adset_id, fields=ADSET_FIELDS)
+        live = effective_reader.get_adset(adset_id, fields=ADSET_FIELDS)
         live_targeting = live.get("targeting") if isinstance(live.get("targeting"), dict) else {}
         live_included = _ids(_audience_refs(live_targeting.get("custom_audiences")))
         if live_included != list(rotation.get("old_included") or []):
@@ -303,6 +460,11 @@ def apply_rotation_plan(
                 )
             )
             continue
+        if require_grounding:
+            gap = op_grounding_gap(rotation.get("confidence"), rotation.get("evidence"))
+            if gap is not None:
+                results.append(RotationResult(adset_id, "blocked", reason=gap))
+                continue
 
         new_targeting = compute_new_targeting(
             live_targeting,
@@ -404,19 +566,19 @@ def build_advantage_disable_plan(
     names = _name_map(summaries)
     items: list[dict[str, Any]] = []
     for summary in summaries:
-        items.append(
-            {
-                "adset_id": summary["adset_id"],
-                "adset_name": summary["adset_name"],
-                "status": PROPOSED_STATUS,
-                "advantage_audience": summary["advantage_audience"],
-                "included": _ids(summary["included"]),
-                "excluded": _ids(summary["excluded"]),
-                "included_labels": [names.get(i, i) for i in _ids(summary["included"])],
-                "excluded_labels": [names.get(i, i) for i in _ids(summary["excluded"])],
-            }
-        )
-    return {
+        item = {
+            "adset_id": summary["adset_id"],
+            "adset_name": summary["adset_name"],
+            "status": PROPOSED_STATUS,
+            "advantage_audience": summary["advantage_audience"],
+            "included": _ids(summary["included"]),
+            "excluded": _ids(summary["excluded"]),
+            "included_labels": [names.get(i, i) for i in _ids(summary["included"])],
+            "excluded_labels": [names.get(i, i) for i in _ids(summary["excluded"])],
+        }
+        _attach_advantage_disable_grounding(item)
+        items.append(item)
+    plan = {
         "schema_version": 1,
         "plan_type": "advantage_disable",
         "account_slug": account_slug,
@@ -429,11 +591,42 @@ def build_advantage_disable_plan(
         ),
         "guardrails": {
             "requires_explicit_approval": True,
+            "requires_grounding": True,
             "preserves_audiences": True,
             "writes_only_advantage_audience_off_and_age_range": True,
         },
         "items": items,
     }
+    return review.review_rotation_plan(plan)
+
+
+def _attach_advantage_disable_grounding(item: dict[str, Any]) -> None:
+    """Attach a **structural** abstain to an Advantage-Audience disable item. Turning Meta-AI audience
+    automation OFF is a safety toggle with NO performance metric to cite, so it cites no sample: the
+    band abstains honestly (never a fabricated performance band), and because nothing is cited the
+    review gate treats it as a deliberate structural abstention — it must not be refuted for
+    "contradicting its metric" (it has none). Names the ad set in ``evidence`` so the abstention is
+    traceable; the safety direction (only ever OFF, never ON) is unchanged."""
+    evidence = Evidence(
+        metric_name="advantage_audience",
+        metric_value=None,
+        metric_display="Advantage Audience automation toggle (safety op — no performance metric)",
+        window="",
+        sample_purchases=None,
+        sample_spend=None,
+        entity_level="adset",
+        entity_id=str(item.get("adset_id")) if item.get("adset_id") else None,
+        entity_name=item.get("adset_name"),
+        regenerating_query=None,
+    )
+    attach_op_grounding(
+        item,
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=MIN_WASTE_SPEND,
+        conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=None,
+    )
 
 
 def apply_advantage_disable_plan(
@@ -442,12 +635,23 @@ def apply_advantage_disable_plan(
     *,
     execute: bool,
     validate_only: bool = False,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
 ) -> list[RotationResult]:
     """Dry-run, validate, or execute approved Advantage Audience disables.
 
-    Audiences are preserved exactly; only advantage_audience=0 is written (with the
-    automation-managed age_range dropped). Re-reads live targeting per ad set.
+    Mixed read+write: audiences are preserved exactly; only advantage_audience=0 is written (with
+    the automation-managed age_range dropped). The live per-ad-set re-read goes through ``reader``
+    (defaulting to the ``client``); the write stays on the concrete ``client``.
+
+    Apply-time grounding gate: when the plan sets ``guardrails.requires_grounding`` (every plan from
+    :func:`build_advantage_disable_plan` does), the same gate ``apply_rotation_plan`` /
+    ``apply_ops_plan`` enforce runs after the "already off" skip and before
+    :func:`compute_new_targeting`. Disabling Advantage Audience is a safety toggle with no performance
+    metric, so each item is a **structural** abstain (no sample cited) and the gate **allows** it —
+    these items still execute, satisfying rotation-family parity without breaking the safety write.
     """
+    effective_reader = as_reader(reader) or as_reader(client)
+    require_grounding = bool((plan.get("guardrails") or {}).get("requires_grounding"))
     results: list[RotationResult] = []
     for item in plan.get("items") or []:
         if not isinstance(item, dict):
@@ -457,11 +661,16 @@ def apply_advantage_disable_plan(
             results.append(RotationResult(adset_id, "skipped", reason="Item is not approved."))
             continue
 
-        live = client.get_adset(adset_id, fields=ADSET_FIELDS)
+        live = effective_reader.get_adset(adset_id, fields=ADSET_FIELDS)
         live_targeting = live.get("targeting") if isinstance(live.get("targeting"), dict) else {}
         if not advantage_audience_enabled(live_targeting):
             results.append(RotationResult(adset_id, "skipped", reason="Advantage Audience is already off."))
             continue
+        if require_grounding:
+            gap = op_grounding_gap(item.get("confidence"), item.get("evidence"))
+            if gap is not None:
+                results.append(RotationResult(adset_id, "blocked", reason=gap))
+                continue
 
         live_included = _ids(_audience_refs(live_targeting.get("custom_audiences")))
         live_excluded = _ids(_audience_refs(live_targeting.get("excluded_custom_audiences")))
@@ -626,8 +835,14 @@ def apply_rename_plan(
     *,
     execute: bool,
     validate_only: bool = False,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
 ) -> list[RenameResult]:
-    """Dry-run, validate, or execute approved ad set renames (writes only the name field)."""
+    """Dry-run, validate, or execute approved ad set renames (writes only the name field).
+
+    Mixed read+write: the live name re-read (drift detection) goes through ``reader`` (defaulting
+    to the ``client``); the rename write stays on the concrete ``client``.
+    """
+    effective_reader = as_reader(reader) or as_reader(client)
     results: list[RenameResult] = []
     for rename in plan.get("renames") or []:
         if not isinstance(rename, dict):
@@ -642,7 +857,7 @@ def apply_rename_plan(
             results.append(RenameResult(adset_id, "skipped", old_name, new_name, reason="Name is unchanged."))
             continue
 
-        live = client.get_adset(adset_id, fields=ADSET_NAME_FIELDS)
+        live = effective_reader.get_adset(adset_id, fields=ADSET_NAME_FIELDS)
         if live.get("name") != old_name:
             results.append(
                 RenameResult(
@@ -731,18 +946,21 @@ def write_rename_results(
 def fetch_active_adsets(
     account_slug: str,
     *,
-    client: MetaMarketingApiClient | None = None,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
     accounts_config_path: Path | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Resolve the account and return (ad_account_id, active ad set payloads)."""
-    from .meta_api import client_from_env
+    """Resolve the account and return (ad_account_id, active ad set payloads).
 
+    Read-only: ``reader`` accepts a :class:`MetaReaderProvider` or a raw
+    ``MetaMarketingApiClient`` (wrapped); when omitted the env-selected reader is built
+    (``direct`` by default — see :func:`reader_from_env`).
+    """
     account = account_registry.resolve_account(
         account_slug,
         accounts_config_path or account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH,
     )
-    effective_client = client or client_from_env()
-    adsets = effective_client.list_adsets(
+    effective_reader = as_reader(reader) or reader_from_env()
+    adsets = effective_reader.list_adsets(
         account.ad_account_id,
         fields=ADSET_FIELDS,
         effective_status=["ACTIVE"],

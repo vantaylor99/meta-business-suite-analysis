@@ -575,6 +575,69 @@ def test_account_registry_resolves_valid_slug(tmp_path: Path) -> None:
 
     assert "pollen_sense" in accounts
     assert account.ad_account_id == "act_12345"
+    # No action_policy at all → the new field parses to None, not a raise.
+    assert account.max_budget_decrease_percent is None
+
+
+def test_account_registry_max_budget_decrease_percent_override(tmp_path: Path) -> None:
+    config_path = tmp_path / "meta_ads_accounts.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "test_account",
+                        "account_name": "Test Account",
+                        "ad_account_id": "99999",
+                        "action_policy": {
+                            "max_budget_decrease_percent": 25,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accounts = load_account_registry(config_path)
+
+    assert accounts["test_account"].max_budget_decrease_percent == 25.0
+
+
+def test_account_registry_max_budget_decrease_percent_defaults_absent(tmp_path: Path) -> None:
+    config_path = tmp_path / "meta_ads_accounts.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "test_account",
+                        "account_name": "Test Account",
+                        "ad_account_id": "99999",
+                        "action_policy": {
+                            "max_budget_increase_percent": 20,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accounts = load_account_registry(config_path)
+
+    assert accounts["test_account"].max_budget_decrease_percent is None
+
+
+def test_account_registry_existing_config_loads() -> None:
+    from meta_ads_analysis.config import DEFAULT_ACCOUNTS_CONFIG_PATH
+
+    accounts = load_account_registry(DEFAULT_ACCOUNTS_CONFIG_PATH)
+
+    assert "pollen_sense" in accounts
+    assert "divine_designs" in accounts
+    assert accounts["pollen_sense"].max_budget_decrease_percent is None
+    assert accounts["divine_designs"].max_budget_decrease_percent is None
 
 
 def test_default_date_window_uses_trailing_30_days() -> None:
@@ -2181,7 +2244,7 @@ def test_live_state_enrichment_marks_only_ad_status_paused_as_resolved() -> None
         }
     )
 
-    enriched = enrich_action_plan_with_live_state(plan, client=client)
+    enriched = enrich_action_plan_with_live_state(plan, reader=client)
     by_id = {action["action_id"]: action for action in enriched["actions"]}
 
     assert by_id["pause_ad_1"]["status"] == "already_resolved"
@@ -2213,7 +2276,7 @@ def test_live_state_enrichment_redacts_tokens_on_api_failure() -> None:
     )
     client = _LiveStateFakeClient(ad_error=error)
 
-    enriched = enrich_action_plan_with_live_state(plan, client=client)
+    enriched = enrich_action_plan_with_live_state(plan, reader=client)
     message = enriched["actions"][0]["live_state"]["error"]
 
     assert "EAAabcdefghijklmnopqrstuvwx1234567890" not in message
@@ -2260,7 +2323,7 @@ def test_live_state_enrichment_flags_meta_ai_adset_controls() -> None:
         },
     )
 
-    enriched = enrich_action_plan_with_live_state(plan, client=client)
+    enriched = enrich_action_plan_with_live_state(plan, reader=client)
 
     assert any(action["action_type"] == "disable_meta_ai_controls" for action in enriched["actions"])
 
@@ -2652,6 +2715,312 @@ def test_apply_advantage_disable_preserves_audiences_and_turns_off_aa() -> None:
     assert t["excluded_custom_audiences"] == [{"id": "B"}, {"id": "C"}]
 
 
+# --- Rotation grounding (evidence + correlational-capped confidence + review) ----
+
+from meta_ads_analysis.review import review_rotation_plan
+
+_ROTATION_WINDOW = {"date_from": "2026-06-10", "date_to": "2026-06-24",
+                    "recency_days": 1, "run_date": "2026-06-25"}
+
+
+def _rotation_metric_row(adset_id, name, *, purchases, spend):
+    """One fetch_entity_metrics-shaped row for an ad set's window performance."""
+    roas = round(spend / spend, 2) if spend else None  # placeholder ROAS; band is sample-driven
+    return {"id": adset_id, "name": name, "spend": float(spend), "roas": roas,
+            "purchases": float(purchases), "cost_per_app_install": None}
+
+
+def test_rotation_fatigued_adset_carries_correlational_capped_confidence() -> None:
+    # A high-spend ad set proposed for rotation carries the band the rubric COMPUTES from its own
+    # window sample — and because fatigue is correlational, a strong sample caps at MEDIUM, never high.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["evidence"]["sample_purchases"] == 120.0
+    assert op["confidence"]["grounding_tier"] == "correlational"
+    # 120 purchases would read high on the data axis, but correlational grounding caps it at medium.
+    assert op["confidence"]["band"] == "medium"
+    assert op["review"]["verdict"] == "stands"
+
+
+def test_rotation_thin_sample_abstains_and_is_flagged_insufficient() -> None:
+    # A below-floor fatigue sample abstains (never a fabricated low) and review marks it insufficient
+    # — non-executable: rotating on no evidence of fatigue is exactly what grounding prevents.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=9, spend=40)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review_verdict"] == "insufficient"
+
+
+def test_rotation_review_iterates_rotations_not_ops() -> None:
+    # Pin against the #1 failure mode: review_rotation_plan must iterate plan["rotations"], not a
+    # missing plan["ops"]. Every rotation item actually receives a review block.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert len(plan["rotations"]) == 3
+    assert all(isinstance(r.get("review"), dict) and r["review"]["verdict"] for r in plan["rotations"])
+
+
+def test_rotation_review_demotes_overclaimed_band() -> None:
+    # A hand-inflated 'high' band over a sample the correlational rubric only supports at 'medium'.
+    plan = {
+        "plan_type": "audience_rotation", "run_date": "2026-06-25",
+        "rotations": [{
+            "adset_id": "as1", "adset_name": "Set 1", "status": "approved",
+            "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
+                         "window": "2026-06-10..2026-06-24", "sample_purchases": 30.0,
+                         "sample_spend": 500.0, "entity_level": "adset", "entity_id": "as1"},
+            "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
+                           "grounding_tier": "correlational", "factors": [], "would_raise": "",
+                           "would_lower": "", "causal_flag": False},
+        }],
+    }
+    reviewed = review_rotation_plan(plan)
+    r = reviewed["rotations"][0]
+    assert r["review"]["verdict"] == "downgrade"
+    assert Band[r["confidence"]["band"]] < Band.high
+    assert r["review_verdict"] == "downgrade"
+    # input plan not mutated
+    assert "review" not in plan["rotations"][0]
+    assert plan["rotations"][0]["confidence"]["band"] == "high"
+
+
+def test_rotation_causal_claim_is_downgraded() -> None:
+    # A rotation rationale asserting the audience CAUSED the drop must not survive at a causal band:
+    # fatigue is correlational, so a cause-claim from a decline alone is downgraded (confirm via A/B).
+    plan = {
+        "plan_type": "audience_rotation", "run_date": "2026-06-25",
+        "rotations": [{
+            "adset_id": "as1", "status": "approved",
+            "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
+                         "window": "2026-06-10..2026-06-24", "sample_purchases": 120.0,
+                         "sample_spend": 2400.0, "entity_level": "adset", "entity_id": "as1"},
+            "confidence": {"band": "high", "data_band": "high", "grounding_band": "medium",
+                           "grounding_tier": "correlational", "factors": [], "would_raise": "",
+                           "would_lower": "", "causal_flag": True},
+        }],
+    }
+    reviewed = review_rotation_plan(plan)
+    r = reviewed["rotations"][0]
+    assert r["review"]["verdict"] == "downgrade"
+    assert "causal" in r["review"]["failed_inputs"]
+    assert r["confidence"]["band"] == "low"  # correlational causal cap
+
+
+def test_advantage_disable_item_attaches_structural_abstain() -> None:
+    # Turning Advantage Audience off is a safety op with NO performance metric — it must abstain with a
+    # structural factor (no sample cited), and review must not refute it for "contradicting its metric".
+    adsets = [_adset("as1", "Set 1", ["A"], ["B"], advantage=True)]
+    plan = build_advantage_disable_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    item = plan["items"][0]
+    assert item["confidence"]["band"] == "abstain"
+    assert item["confidence"]["data_band"] == "abstain"
+    assert item["evidence"]["sample_purchases"] is None and item["evidence"]["sample_spend"] is None
+    # structural abstain (no cited sample) → the gate does not refute it
+    assert item["review"]["verdict"] == "stands"
+
+
+def test_rename_plan_passes_through_review_without_fabricated_band() -> None:
+    # Renames are pure structural (name only) — exempt from grounding. review_rotation_plan must leave
+    # them untouched: no confidence, no review block, no fabricated performance band.
+    adsets = [{
+        "id": "as1", "name": "Stills", "effective_status": "ACTIVE", "campaign_id": "c1",
+        "targeting": {"custom_audiences": [{"id": "1", "name": "high-value-customers.csv"}]},
+    }]
+    plan = build_rename_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    reviewed = review_rotation_plan(plan)
+    r = reviewed["renames"][0]
+    assert "confidence" not in r and "review" not in r
+    assert r["new_name"] == "High Value Customers"  # band-free, unchanged
+
+
+def test_rotation_review_is_idempotent() -> None:
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    again = review_rotation_plan(plan)
+    assert [r["confidence"]["band"] for r in again["rotations"]] == \
+        [r["confidence"]["band"] for r in plan["rotations"]]
+    assert again["rotations"][0]["review"] == plan["rotations"][0]["review"]
+
+
+def test_rotation_high_confidence_still_blocks_on_live_targeting_drift() -> None:
+    # Grounding/review runs at propose; the live-targeting drift check runs at execute. A confidently
+    # grounded rotation is STILL blocked if the ad set's audience drifted since plan time.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] == "medium"  # confidently grounded
+    plan["rotations"][0]["status"] = "approved"
+    adsets[0]["targeting"]["custom_audiences"] = [{"id": "Z"}]  # live drift after plan time
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert client.updates == []
+
+
+def test_rotation_adset_with_no_window_row_cites_zero_sample_and_abstains() -> None:
+    # Production-realistic: fetch_entity_metrics returns rows only for ad sets that delivered, so the
+    # CLI may pass a metrics map that omits a proposed ad set entirely. That ad set must cite a ZERO
+    # sample (not a structural no-metric abstain) → assess abstains → review marks it insufficient:
+    # rotating on no evidence of fatigue is exactly what grounding prevents.
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id={}, goal="roas", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["evidence"]["sample_purchases"] == 0.0 and op["evidence"]["sample_spend"] == 0.0
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review_verdict"] == "insufficient"
+
+
+def test_apply_rotation_blocks_approved_thin_sample_at_execute() -> None:
+    # An operator approves a rotation whose fatigue sample is below the significance floor (cited
+    # abstain). The propose-time review already marked it insufficient; the apply-time grounding gate
+    # is the hard backstop — it must block the write, the same way an ungrounded ops write is blocked.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=9, spend=40)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] == "abstain"  # cited thin sample
+    plan["rotations"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert client.updates == []
+
+
+def test_apply_rotation_blocks_approved_zero_sample_at_execute() -> None:
+    # An ad set that did not deliver in the window has no metrics row, so it cites a ZERO sample
+    # (abstain WITH a sample). An approved rotation on such an ad set — rotating on no evidence of
+    # fatigue — must be hard-blocked at apply, not silently executed.
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id={}, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["evidence"]["sample_purchases"] == 0.0
+    assert plan["rotations"][0]["confidence"]["band"] == "abstain"
+    plan["rotations"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert client.updates == []
+
+
+def test_apply_rotation_drift_takes_precedence_over_grounding() -> None:
+    # A thin-sample rotation (would be grounding-blocked) that is ALSO live-drifted reports the DRIFT
+    # reason, not the grounding reason: the drift guard runs first because a stale plan must be
+    # re-proposed regardless of band. Pins the drift-first ordering.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=9, spend=40)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] == "abstain"  # would be grounding-blocked
+    plan["rotations"][0]["status"] = "approved"
+    adsets[0]["targeting"]["custom_audiences"] = [{"id": "Z"}]  # live drift after plan time
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "Live included audiences changed" in results[0].reason  # drift reason, not grounding
+    assert "insufficient data" not in (results[0].reason or "")
+    assert client.updates == []
+
+
+def test_apply_advantage_disable_structural_abstain_still_executes() -> None:
+    # The Advantage-disable plan now sets requires_grounding, but each item is a STRUCTURAL abstain
+    # (a safety toggle with no performance metric, no cited sample). The grounding gate must allow it:
+    # an approved disable still executes and writes Advantage Audience off.
+    adsets = [_adset("as1", "Set 1", ["A"], ["B", "C"], advantage=True)]
+    plan = build_advantage_disable_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    assert plan["guardrails"]["requires_grounding"] is True
+    assert plan["items"][0]["confidence"]["band"] == "abstain"  # structural abstain
+    assert plan["items"][0]["evidence"]["sample_purchases"] is None
+    plan["items"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_advantage_disable_plan(plan, client, execute=True)
+    assert results[0].status == "executed"  # structural abstain is gate-allowed
+    assert len(client.updates) == 1
+    _adset_id, params, _validate_only = client.updates[0]
+    assert params["targeting"]["targeting_automation"]["advantage_audience"] == 0
+
+
+def test_apply_rotation_cited_above_floor_band_executes_through_gate() -> None:
+    # The positive case the gate must NOT over-block: an approved rotation grounded on a real,
+    # above-floor sample computes a non-abstain band, so op_grounding_gap returns None and the write
+    # goes through. Without this, a gate bug that blocked every grounded rotation would slip by.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] != "abstain"  # cited, above the floor
+    plan["rotations"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "executed"
+    assert len(client.updates) == 1
+
+
+def test_apply_rotation_blocks_approved_thin_sample_in_dry_run() -> None:
+    # The grounding gate sits BEFORE the validate_only/dry-run branches (same placement as
+    # apply_ops_plan), so a thin-sample approved rotation is blocked in a dry run too — it never even
+    # reaches the would-write dry_run record. Pins gate-in-all-modes.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=9, spend=40)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] == "abstain"
+    plan["rotations"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=False)  # dry run, not execute
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert results[0].targeting is None  # blocked before compute_new_targeting
+    assert client.updates == []
+
+
+def test_apply_rotation_gate_isolates_per_item_blocked_does_not_stop_allowed() -> None:
+    # A single plan mixing a structural-abstain rotation (no cited sample -> allowed) and a
+    # cited-abstain rotation (thin sample -> blocked), both approved, in one apply call. The blocked
+    # item must not abort the loop: the structural-abstain item still executes. Confirms the gate's
+    # per-item continue isolates findings rather than failing the whole plan.
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=None, **_ROTATION_WINDOW)  # all structural abstains
+    # Both start structural (allowed); promote the SECOND item to a cited thin sample (-> blocked).
+    assert plan["rotations"][0]["evidence"]["sample_purchases"] is None  # structural
+    plan["rotations"][1]["evidence"]["sample_purchases"] = 9.0
+    plan["rotations"][1]["evidence"]["sample_spend"] = 40.0
+    assert plan["rotations"][1]["confidence"]["band"] == "abstain"  # now cited abstain
+    plan["rotations"][0]["status"] = "approved"
+    plan["rotations"][1]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    by_id = {r.adset_id: r for r in results}
+    assert by_id[plan["rotations"][0]["adset_id"]].status == "executed"  # structural -> allowed
+    assert by_id[plan["rotations"][1]["adset_id"]].status == "blocked"   # cited thin -> blocked
+    assert "insufficient data" in by_id[plan["rotations"][1]["adset_id"]].reason
+    # Only the allowed item was written; the blocked one sent nothing.
+    assert [u[0] for u in client.updates] == [plan["rotations"][0]["adset_id"]]
+
+
 # --- Control layer (inspect + guarded ops + enable-ads) ----------------------
 
 from meta_ads_analysis.control import (
@@ -2665,10 +3034,11 @@ from meta_ads_analysis.control import (
 class _ControlFakeClient:
     """Fake client for control-layer tests: campaigns/adsets/ads + updates."""
 
-    def __init__(self, campaigns, adsets, ads):
+    def __init__(self, campaigns, adsets, ads, insights=None):
         self._campaigns = campaigns
         self._adsets = adsets
         self._ads = ads
+        self._insights = insights or []
         self._by_id = {e["id"]: e for e in campaigns + adsets + ads}
         self.updates = []
 
@@ -2677,6 +3047,9 @@ class _ControlFakeClient:
 
     def list_adsets(self, ad_account_id, *, fields, effective_status=None):
         return self._adsets
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1, breakdowns=None):
+        return self._insights
 
     def iter_paginated(self, path, *, params=None):
         return list(self._ads)
@@ -2794,6 +3167,114 @@ def test_build_enable_ads_plan_targets_only_inactive_ads() -> None:
     assert "development mode" in plan["ops"][0]["note"]
 
 
+# --- Enable / set_status grounding (evidence + confidence + review on enable ops) ----
+
+
+def _enable_client(insights):
+    """_control_fixture (ad2 is the PAUSED/inactive ad) plus seeded ad-level insights rows."""
+    base = _control_fixture()
+    return _ControlFakeClient(base._campaigns, base._adsets, base._ads, insights=insights)
+
+
+def test_enable_ads_paused_ad_with_strong_sample_carries_computed_band() -> None:
+    # A high-spend ad that is currently paused, proposed for enable, carries the band the rubric
+    # COMPUTES from its own window sample — never a free-typed number.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(_enable_client(insights), "act_1", policy={"primary_goal": "roas"})
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["evidence"]["metric_name"] == "blended_roas"
+    assert op["evidence"]["sample_purchases"] == 30.0
+    # 25 <= 30 < 100 purchases, recent window, direct_observation → medium (matches confidence.assess).
+    assert op["confidence"]["band"] == "medium"
+    assert op["review"]["verdict"] == "stands"
+    assert plan["guardrails"]["requires_grounding"] is True
+
+
+def test_enable_ads_cold_ad_abstains_and_gate_blocks_turn_on() -> None:
+    # A cold ad (no recent insights) cites a ZERO sample → abstains → review marks it insufficient,
+    # and the apply-time grounding gate refuses to turn it on even when approved (keep observing).
+    plan = build_enable_ads_plan(_enable_client([]), "act_1", policy={"primary_goal": "roas"})
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["confidence"]["band"] == "abstain"
+    assert op["confidence"]["data_band"] == "abstain"
+    assert op["evidence"]["sample_spend"] == 0.0  # honest "zero recent delivery" — a cited sample
+    assert op["review_verdict"] == "insufficient"
+    # Operator approves anyway → the gate blocks the write.
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _enable_client([]), execute=False)
+    blocked = next(r for r in results if r.op_id == op["op_id"])
+    assert blocked.status == "blocked"
+    assert "insufficient data" in (blocked.reason or "").lower()
+
+
+def test_enable_ads_thin_new_ad_abstains_so_go_live_is_a_reviewed_step() -> None:
+    # A freshly-authored (PAUSED) ad has thin data; enabling it is the go-live path and must be a
+    # conscious, reviewed step — not an auto-confident enable. Below-floor sample → abstain.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "40",
+        "action_values": [{"action_type": "purchase", "value": "60"}],
+        "actions": [{"action_type": "purchase", "value": "3"}],
+    }]
+    plan = build_enable_ads_plan(_enable_client(insights), "act_1", policy={"primary_goal": "roas"})
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["confidence"]["band"] == "abstain"  # $40 / 3 purchases below the significance floor
+    assert op["review_verdict"] == "insufficient"
+
+
+def test_enable_ads_install_goal_grounds_on_cost_per_install() -> None:
+    # An install-goal account grounds the enable on cost-per-install (the goal metric), mirroring
+    # actions._select_action_metric. The conversion sample is still purchases, so a spend-cleared but
+    # purchase-thin install ad reads `low` (never high) and stands — it is allowed, but never an
+    # over-confident enable.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "actions": [{"action_type": "mobile_app_install", "value": "40"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "maximize_in_app_subscriptions"}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["metric_value"] == 12.5  # $500 / 40 installs
+    assert op["confidence"]["band"] == "low"  # spend cleared the floor, but purchases are thin
+    assert op["review"]["verdict"] == "stands"
+
+
+def test_review_ops_plan_demotes_overclaimed_enable() -> None:
+    from meta_ads_analysis.review import review_ops_plan
+
+    op = {
+        "op_id": "enable_ad_x", "op": "set_status", "level": "ad", "id": "adx", "status": "approved",
+        "params": {"status": "ACTIVE"},
+        "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
+                     "window": "2026-06-10..2026-06-24", "sample_purchases": 30.0,
+                     "sample_spend": 500.0, "entity_level": "ad", "entity_id": "adx"},
+        "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
+                       "grounding_tier": "direct_observation", "factors": [], "would_raise": "",
+                       "would_lower": "", "causal_flag": False},
+    }
+    plan = {"run_date": "2026-06-24", "ops": [op], "guardrails": {"requires_grounding": True}}
+    reviewed = review_ops_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "downgrade"  # 30 purchases supports medium, not the claimed high
+    assert Band[r["confidence"]["band"]] < Band.high
+    assert r["review_verdict"] == "downgrade"
+    assert "review" not in plan["ops"][0]  # input plan not mutated
+
+
+def test_enable_ads_review_is_idempotent() -> None:
+    from meta_ads_analysis.review import review_ops_plan
+
+    plan = build_enable_ads_plan(_enable_client([]), "act_1", policy={"primary_goal": "roas"})
+    again = review_ops_plan(plan)
+    assert [o["confidence"]["band"] for o in again["ops"]] == [o["confidence"]["band"] for o in plan["ops"]]
+    assert again["ops"][0]["review"] == plan["ops"][0]["review"]
+
+
 # --- Metrics / diagnose / audiences / pause ---------------------------------
 
 from meta_ads_analysis.control import (
@@ -2887,6 +3368,35 @@ def test_build_pause_plan_selects_underperformers_by_roas() -> None:
     assert plan["ops"][0]["params"] == {"status": "PAUSED"}
 
 
+def test_pause_roas_below_carries_grounded_band() -> None:
+    # A roas_below pause rests on ROAS by construction → the op cites that metric + a computed band.
+    ads = [{"id": "ad1", "name": "Loser", "effective_status": "ACTIVE", "adset_id": "as1", "issues_info": []}]
+    insights = [{"ad_id": "ad1", "ad_name": "Loser", "spend": "200",
+                 "action_values": [{"action_type": "purchase", "value": "100"}],
+                 "actions": [{"action_type": "purchase", "value": "4"}]}]
+    client = _ControlFakeClient([], [], ads, insights=insights)
+    plan = build_pause_plan(client, "act_1", roas_below=1.5, min_spend=100,
+                            date_from="2026-06-01", date_to="2026-06-24", run_date="2026-06-25")
+    op = next(o for o in plan["ops"] if o["id"] == "ad1")
+    assert op["evidence"]["metric_name"] == "blended_roas"
+    assert op["evidence"]["sample_spend"] == 200.0
+    assert op["confidence"]["band"] != "abstain"  # spend cleared the floor → a real (low) band
+    assert plan["guardrails"]["requires_grounding"] is True
+
+
+def test_pause_structural_abstains_but_gate_allows_safety_pause() -> None:
+    # A purely structural pause (no metric) cites NO sample → structural abstain → the apply-time gate
+    # ALLOWS it (pausing is conservative; PAUSED-by-default safety writes must not be blocked).
+    plan = build_pause_plan(_control_fixture(), "act_1")  # all ACTIVE ads, no perf rule
+    op = next(o for o in plan["ops"] if o["id"] == "ad1")
+    assert op["confidence"]["band"] == "abstain"
+    assert op["evidence"]["sample_spend"] is None  # structural — nothing cited
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _control_fixture(), execute=False)
+    res = next(r for r in results if r.op_id == op["op_id"])
+    assert res.status == "dry_run"  # allowed, not blocked
+
+
 # --- Authoring (create / duplicate / lookalike) + breakdowns + account-info --
 
 from meta_ads_analysis.authoring import (
@@ -2899,12 +3409,19 @@ from meta_ads_analysis.control import account_info, fetch_breakdown_metrics
 
 
 class _AuthoringFakeClient:
-    def __init__(self, ad_creative_id="cr1"):
+    def __init__(self, ad_creative_id="cr1", insights=None):
         self._creative_id = ad_creative_id
+        self._insights = insights or []
         self.creates = []
 
     def get_ad(self, ad_id, *, fields):
         return {"id": ad_id, "name": "Source Ad", "creative": {"id": self._creative_id}}
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level="ad",
+                       time_increment=1, breakdowns=None):
+        # Source-ad metric read for the duplicate builder's grounding. Default: no delivery
+        # (empty) → the duplicate cites a zero sample → abstains.
+        return self._insights
 
     def create_campaign(self, ad_account_id, *, params, validate_only=False):
         self.creates.append(("campaign", params, validate_only))
@@ -3079,9 +3596,21 @@ def test_create_video_ad_builds_object_story_spec_and_pauses() -> None:
     op = plan["ops"][0]
     assert op["kind"] == "create_video_ad"
     _validate_auth(op)  # passes validation
+    # Net-new video ad: no prior performance → abstain → review marks it insufficient.
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review"]["verdict"] == "insufficient"
 
-    client = _AuthoringFakeClient()
+    # Approving + executing under requires_grounding is BLOCKED (conscious override required); the
+    # net-new create with no evidence is never auto-sent.
+    blocked_client = _AuthoringFakeClient()
     plan["ops"][0]["status"] = "approved"
+    blocked = apply_authoring_plan(plan, blocked_client, execute=True)
+    assert blocked[0].status == "blocked"
+    assert blocked_client.creates == []  # nothing created
+
+    # Conscious override: drop requires_grounding → the create is sent, forced PAUSED, right shape.
+    plan["guardrails"]["requires_grounding"] = False
+    client = _AuthoringFakeClient()
     results = apply_authoring_plan(plan, client, execute=True)
     assert results[0].status == "created"
     kind, params, _vo = client.creates[0]
@@ -3237,8 +3766,11 @@ def test_create_video_ad_multi_text_uses_asset_feed_spec_and_opts_out_enhancemen
     op = plan["ops"][0]
     from meta_ads_analysis.authoring import validate_authoring_op as _va
     _va(op)
-    client = _AuthoringFakeClient()
+    # Net-new → abstain → blocked at apply until a conscious override; verify the sent request shape
+    # via that override path (drop requires_grounding), which still forces PAUSED.
     op["status"] = "approved"
+    plan["guardrails"]["requires_grounding"] = False
+    client = _AuthoringFakeClient()
     results = apply_authoring_plan(plan, client, execute=True)
     assert results[0].status == "created"
     _kind, params, _vo = client.creates[0]
@@ -3332,6 +3864,746 @@ def test_set_creative_features_rebuilds_creative_with_enroll_status() -> None:
     assert feats["enhance_cta"]["enroll_status"] == "OPT_IN"
     assert feats["image_brightness_and_contrast"]["enroll_status"] == "OPT_IN"
     assert feats["text_optimizations"]["enroll_status"] == "OPT_OUT"
+
+
+# --- Guarded-write grounding scaffold (evidence/confidence on op + authoring plans) ----
+
+from meta_ads_analysis.authoring import (
+    GROUNDING_REQUIRED_KINDS,
+    apply_authoring_plan as _apply_authoring,
+)
+from meta_ads_analysis.control import (
+    GROUNDING_REQUIRED_OPS,
+    apply_ops_plan as _apply_ops_grounding,
+    write_ops_results,
+)
+from meta_ads_analysis.review import review_authoring_plan, review_ops_plan
+from meta_ads_analysis.write_grounding import attach_op_grounding, op_grounding_gap
+
+
+def _grounded_op(*, op_id, op, level, node_id, status, evidence, tier, spend_floor=100.0,
+                 conversions_floor=25.0, recency_days=1, params=None, kind=None):
+    """A control/authoring op with evidence+confidence attached via the shared scaffold."""
+    out = {"op_id": op_id, "op": op, "level": level, "id": node_id, "status": status,
+           "params": params or {}}
+    if kind is not None:
+        out["kind"] = kind
+    attach_op_grounding(out, evidence=evidence, tier=tier, spend_floor=spend_floor,
+                        conversions_floor=conversions_floor, recency_days=recency_days)
+    return out
+
+
+def test_attach_op_grounding_computes_band_never_free_types() -> None:
+    # A strong sample resolves to the SAME band confidence.assess computes — proving the band came
+    # from the rubric, not a value the caller typed.
+    strong = Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                       120.0, 2400.0, "adset", "as1", "Set 1", None)
+    op = {"op_id": "bump", "op": "set_daily_budget", "level": "adset", "id": "as1", "status": "proposed"}
+    attach_op_grounding(op, evidence=strong, tier=EvidenceTier.direct_observation,
+                        spend_floor=100.0, conversions_floor=25.0, recency_days=1)
+    expected = assess(evidence=strong, tier=EvidenceTier.direct_observation,
+                      spend_floor=100.0, conversions_floor=25.0, recency_days=1)
+    assert op["confidence"]["band"] == expected.band.name == "high"
+    assert op["evidence"]["sample_purchases"] == 120.0
+    assert op["evidence"]["window"] == "2026-06-10..2026-06-24"
+
+
+def test_attach_op_grounding_abstains_when_evidence_absent() -> None:
+    # No sample → abstain (the absence of a score), NEVER a defaulted low/medium.
+    op = {"op_id": "pause", "op": "set_status", "level": "ad", "id": "ad1", "status": "proposed"}
+    attach_op_grounding(op, evidence=None, tier=EvidenceTier.direct_observation,
+                        spend_floor=100.0, conversions_floor=25.0, recency_days=1)
+    assert op["confidence"]["band"] == "abstain"
+    assert op["confidence"]["data_band"] == "abstain"
+    assert op["evidence"]["sample_purchases"] is None and op["evidence"]["sample_spend"] is None
+
+
+def test_attach_op_grounding_no_evidence_keeps_full_evidence_keyset() -> None:
+    # The "no evidence" serialized shape must carry the SAME keys as a real evidence_to_dict, so a
+    # downstream reader (the gate / a renderer) sees a stable schema whether or not a sample was
+    # supplied. Pins write_grounding._empty_evidence_dict against drift if Evidence gains a field.
+    op = {"op_id": "pause", "op": "set_status", "level": "ad", "id": "ad1", "status": "proposed"}
+    attach_op_grounding(op, evidence=None, tier=EvidenceTier.direct_observation,
+                        spend_floor=100.0, conversions_floor=25.0, recency_days=1)
+    reference_keys = evidence_to_dict(
+        Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                 120.0, 2400.0, "adset", "as1", "Set 1", None)
+    ).keys()
+    assert op["evidence"].keys() == reference_keys
+
+
+def test_attach_op_grounding_below_floor_abstains_not_low() -> None:
+    thin = Evidence("blended_roas", 2.0, "ROAS 2.00", "2026-06-19..2026-06-24",
+                    9.0, 40.0, "ad", "ad9", "Thin", None)
+    op = {"op_id": "bump", "op": "set_daily_budget", "level": "adset", "id": "as2", "status": "proposed"}
+    attach_op_grounding(op, evidence=thin, tier=EvidenceTier.correlational,
+                        spend_floor=75.0, conversions_floor=25.0, recency_days=1)
+    assert op["confidence"]["band"] == "abstain"  # below floor, not a fabricated low
+
+
+def test_review_ops_plan_demotes_overclaimed_band() -> None:
+    # Hand-inflated 'high' band over a sample the rubric only supports at 'medium'.
+    op = {
+        "op_id": "oc", "op": "set_daily_budget", "level": "adset", "id": "as3", "status": "approved",
+        "params": {"daily_budget_cents": 11000},
+        "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
+                     "window": "2026-06-10..2026-06-24", "sample_purchases": 30.0,
+                     "sample_spend": 200.0, "entity_level": "adset", "entity_id": "as3"},
+        "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
+                       "grounding_tier": "direct_observation", "factors": [], "would_raise": "",
+                       "would_lower": "", "causal_flag": False},
+    }
+    plan = {"run_date": "2026-06-24", "ops": [op]}
+    reviewed = review_ops_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "downgrade"
+    assert Band[r["confidence"]["band"]] < Band.high
+    assert r["review_verdict"] == "downgrade"
+    # input plan not mutated
+    assert "review" not in plan["ops"][0]
+    assert plan["ops"][0]["confidence"]["band"] == "high"
+
+
+def test_review_ops_plan_skips_ops_without_confidence_block() -> None:
+    plan = {"ops": [{"op_id": "info", "op": "rename", "level": "adset", "id": "as1",
+                     "status": "approved", "params": {"name": "X"}}]}
+    reviewed = review_ops_plan(plan)
+    assert "review" not in reviewed["ops"][0]  # no confidence block → never reviewed
+    assert reviewed["ops"][0] == plan["ops"][0]
+
+
+def test_review_ops_plan_is_idempotent() -> None:
+    op = _grounded_op(
+        op_id="short", op="set_daily_budget", level="adset", node_id="as1", status="approved",
+        params={"daily_budget_cents": 11000},
+        evidence=Evidence("blended_roas", 1.1, "ROAS 1.10", "2026-06-21..2026-06-24",
+                          30.0, 200.0, "adset", "as1", "S", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    plan = {"run_date": "2026-06-24", "ops": [op]}
+    once = review_ops_plan(plan, spend_floor=100.0)
+    twice = review_ops_plan(once, spend_floor=100.0)
+    assert once["ops"][0]["review"]["verdict"] == "downgrade"  # a real correction happened
+    assert twice == once
+
+
+def test_review_ops_gate_only_demotes_never_promotes() -> None:
+    # An approved op claiming 'high' over a thin (below-floor) sample: recompute → abstain →
+    # insufficient → demoted out of approved. Never promoted, never band-raised.
+    op = {
+        "op_id": "thin", "op": "set_status", "level": "ad", "id": "ad9", "status": "approved",
+        "params": {"status": "ACTIVE"},
+        "evidence": {"metric_name": "blended_roas", "metric_value": 2.0,
+                     "window": "2026-06-19..2026-06-24", "sample_purchases": 9.0,
+                     "sample_spend": 40.0, "entity_level": "ad", "entity_id": "ad9"},
+        "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
+                       "grounding_tier": "direct_observation", "factors": [], "would_raise": "",
+                       "would_lower": "", "causal_flag": False},
+    }
+    # A separate proposed clean op must never be promoted to approved.
+    clean = _grounded_op(
+        op_id="clean", op="set_daily_budget", level="adset", node_id="as1", status="proposed",
+        params={"daily_budget_cents": 11000},
+        evidence=Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                          120.0, 2400.0, "adset", "as1", "S", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    plan = {"run_date": "2026-06-24", "ops": [op, clean]}
+    reviewed = review_ops_plan(plan, spend_floor=75.0)
+    demoted, untouched = reviewed["ops"][0], reviewed["ops"][1]
+    assert demoted["review"]["verdict"] == "insufficient"
+    assert demoted["confidence"]["band"] == "abstain"
+    assert demoted["status"] == "proposed"  # approved → proposed (demote only)
+    assert untouched["status"] == "proposed"  # never promoted
+    # band never raised for either op, no executable key injected (op vocabulary)
+    for before, after in zip(plan["ops"], reviewed["ops"]):
+        assert Band[after["confidence"]["band"]] <= Band[before["confidence"]["band"]]
+        assert "executable" not in after
+
+
+def test_apply_ops_blocks_approved_ungrounded_write() -> None:
+    client = _control_fixture()
+    plan = {
+        "guardrails": {"requires_grounding": True},
+        "ops": [
+            # grounding-required, approved, NO confidence block → blocked
+            {"op_id": "ungrounded", "op": "set_daily_budget", "level": "adset", "id": "as1",
+             "params": {"daily_budget_cents": 11000}, "status": "approved"},
+            # rename is exempt → executes even without grounding
+            {"op_id": "rename_ok", "op": "rename", "level": "adset", "id": "as1",
+             "params": {"name": "Renamed"}, "status": "approved"},
+            # grounded approved write → executes
+            _grounded_op(op_id="grounded", op="set_daily_budget", level="adset", node_id="as1",
+                         status="approved", params={"daily_budget_cents": 11000},
+                         evidence=Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                                           120.0, 2400.0, "adset", "as1", "S", None),
+                         tier=EvidenceTier.direct_observation),
+        ],
+    }
+    by_id = {r.op_id: r for r in _apply_ops_grounding(plan, client, execute=True)}
+    assert by_id["ungrounded"].status == "blocked"
+    assert "missing required evidence/confidence" in by_id["ungrounded"].reason
+    assert by_id["rename_ok"].status == "executed"  # exemption holds
+    assert by_id["grounded"].status == "executed"
+
+
+def test_apply_ops_grounding_guard_inert_without_flag() -> None:
+    # Legacy/ungrounded plans (no requires_grounding flag) keep working — no new capability gating.
+    client = _control_fixture()
+    plan = {"ops": [{"op_id": "leg", "op": "set_daily_budget", "level": "adset", "id": "as1",
+                     "params": {"daily_budget_cents": 11000}, "status": "approved"}]}
+    results = _apply_ops_grounding(plan, client, execute=True)
+    assert results[0].status == "executed"
+
+
+def test_apply_ops_blocks_thin_abstain_but_allows_structural_abstain() -> None:
+    client = _control_fixture()
+    thin = _grounded_op(  # cited sample below floor → abstain → blocked when grounding required
+        op_id="thin", op="set_daily_budget", level="adset", node_id="as1", status="approved",
+        params={"daily_budget_cents": 11000},
+        evidence=Evidence("blended_roas", 2.0, "ROAS 2.00", "2026-06-19..2026-06-24",
+                          9.0, 40.0, "adset", "as1", "S", None),
+        tier=EvidenceTier.correlational, spend_floor=75.0,
+    )
+    structural = _grounded_op(  # no sample → structural abstain → allowed (PAUSED safety)
+        op_id="structural", op="set_status", level="ad", node_id="ad2", status="approved",
+        params={"status": "PAUSED"}, evidence=None, tier=EvidenceTier.direct_observation,
+    )
+    plan = {"guardrails": {"requires_grounding": True}, "ops": [thin, structural]}
+    by_id = {r.op_id: r for r in _apply_ops_grounding(plan, client, execute=True)}
+    assert by_id["thin"].status == "blocked"
+    assert "insufficient data" in by_id["thin"].reason
+    assert by_id["structural"].status == "executed"  # honest structural abstention is allowed
+
+
+def test_apply_authoring_blocks_ungrounded_and_keeps_paused() -> None:
+    client = _AuthoringFakeClient()
+    grounded = _grounded_op(
+        op_id="g", op="create_adset", level="adset", node_id="", status="approved", kind="create_adset",
+        params={"name": "New Set", "campaign_id": "c1"},
+        evidence=Evidence("blended_roas", 4.0, "ROAS 4.00", "2026-06-10..2026-06-24",
+                          120.0, 2400.0, "campaign", "c1", "Camp", None),
+        tier=EvidenceTier.correlational,
+    )
+    plan = {
+        "ad_account_id": "act_1",
+        "guardrails": {"requires_grounding": True},
+        "ops": [
+            grounded,
+            {"op_id": "ung", "kind": "create_campaign",
+             "params": {"name": "C", "objective": "OUTCOME_SALES"}, "status": "approved"},
+        ],
+    }
+    by_id = {r.op_id: r for r in _apply_authoring(plan, client, execute=True)}
+    assert by_id["ung"].status == "blocked"
+    assert "missing required evidence/confidence" in by_id["ung"].reason
+    assert by_id["g"].status == "created"
+    # PAUSED-by-default is untouched by the grounding gate — the create that ran is still PAUSED.
+    for _kind, params, _vo in client.creates:
+        assert params["status"] == "PAUSED"
+
+
+def test_review_authoring_plan_demote_only_and_paused_preserved() -> None:
+    # Over-claimed authoring op is demoted; running the gate never un-pauses a create.
+    op = _grounded_op(
+        op_id="g", op="create_adset", level="adset", node_id="", status="approved", kind="create_adset",
+        params={"name": "New Set", "campaign_id": "c1"},
+        evidence=Evidence("blended_roas", 1.1, "ROAS 1.10", "2026-06-21..2026-06-24",
+                          30.0, 200.0, "campaign", "c1", "Camp", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    plan = {"ad_account_id": "act_1", "run_date": "2026-06-24",
+            "guardrails": {"requires_grounding": True}, "ops": [op]}
+    reviewed = review_authoring_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "downgrade"  # short window
+    assert Band[r["confidence"]["band"]] < Band.medium  # demoted, never raised
+    # apply the reviewed plan: create still forced PAUSED
+    client = _AuthoringFakeClient()
+    r["status"] = "approved"  # whatever the band, the create itself stays PAUSED on send
+    _apply_authoring(reviewed, client, execute=True)
+    for _kind, params, _vo in client.creates:
+        assert params["status"] == "PAUSED"
+
+
+def test_build_duplicate_ad_plan_grounds_on_proven_winner() -> None:
+    # Duplicating a proven winner: evidence is the SOURCE ad's own metric over the window → a real
+    # computed band (not abstain) → executable → created PAUSED.
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    reader = FakeMetaReader(
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "name": "Winner", "creative": {"id": "cr-1"}},
+        fetch_insights=lambda *a, **k: [
+            {"ad_id": "ad1", "ad_name": "Winner", "spend": "1200",
+             "action_values": [{"action_type": "purchase", "value": "5040"}],
+             "actions": [{"action_type": "purchase", "value": "60"}]}
+        ],
+    )
+    plan = build_duplicate_ad_plan(
+        reader, "act_1", source_ad_id="ad1", target_adset_id="as2",
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["entity_id"] == "ad1"  # cites the SOURCE ad
+    assert op["evidence"]["sample_purchases"] == 60.0
+    assert Band[op["confidence"]["band"]] >= Band.medium  # computed from a real sample
+    assert op["review"]["verdict"] == "stands"
+    op["status"] = "approved"
+    client = _AuthoringFakeClient()
+    results = apply_authoring_plan(plan, client, execute=True)
+    assert results[0].status == "created"
+    kind, params, _vo = client.creates[0]
+    assert kind == "ad" and params["status"] == "PAUSED"
+    assert params["creative"] == {"creative_id": "cr-1"}  # copies the source creative
+
+
+def test_build_duplicate_ad_plan_abstains_when_source_undelivered() -> None:
+    # Symmetric safety case to the proven-winner test: a source ad with NO delivery in the window has
+    # no insights row → the duplicate cites a ZERO sample → abstain → review marks it insufficient →
+    # the apply-time gate blocks an approved create (you cannot scale out an unproven source).
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    reader = FakeMetaReader(
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "name": "Cold", "creative": {"id": "cr-1"}},
+        fetch_insights=lambda *a, **k: [],  # no delivery → no row for the source ad
+    )
+    plan = build_duplicate_ad_plan(
+        reader, "act_1", source_ad_id="ad1", target_adset_id="as2",
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["entity_id"] == "ad1"  # still names the (undelivered) source
+    assert op["evidence"]["sample_purchases"] == 0.0  # cited zero, not a fabricated band
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review"]["verdict"] == "insufficient"
+    op["status"] = "approved"
+    client = _AuthoringFakeClient()
+    results = apply_authoring_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert client.creates == []  # nothing created from an unproven source
+
+
+def test_authoring_netnew_create_abstains_insufficient_and_non_executable() -> None:
+    # The common brand-new-campaign case: no metric → a cited ZERO sample → abstain → review marks it
+    # insufficient → the apply-time gate blocks an approved create (conscious override required).
+    netnew = _grounded_op(
+        op_id="newcamp", op="create_campaign", level="campaign", node_id="", status="approved",
+        kind="create_campaign", params={"name": "New Launch", "objective": "OUTCOME_SALES"},
+        evidence=Evidence("blended_roas", None, "ROAS n/a", "2026-06-01..2026-06-24",
+                          0.0, 0.0, "campaign", None, None, None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    assert netnew["confidence"]["band"] == "abstain"  # cited zero sample, not a fabricated band
+    plan = {"ad_account_id": "act_1", "run_date": "2026-06-24",
+            "guardrails": {"requires_grounding": True}, "ops": [netnew]}
+    reviewed = review_authoring_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "insufficient"  # net-new → insufficient (non-executable)
+    r["status"] = "approved"
+    client = _AuthoringFakeClient()
+    results = apply_authoring_plan(reviewed, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert client.creates == []  # nothing created on no evidence
+
+
+def test_authoring_lookalike_structural_abstain_is_creatable() -> None:
+    # A lookalike's basis is its seed's size/quality, not a ROAS/conversions metric → NO sample (a
+    # structural abstain naming the seed). Audiences are inert (no status, not in PAUSED_KINDS), so a
+    # structural abstain is gate-allowed and the audience is creatable.
+    plan = build_lookalike_plan(
+        "act_1", name="LAL 2%", origin_audience_id="a1", country="US", ratio=0.02,
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["confidence"]["band"] == "abstain"
+    assert op["evidence"]["sample_purchases"] is None  # structural — no fabricated sample
+    assert op["evidence"]["entity_id"] == "a1"  # names the seed audience
+    assert op["review"]["verdict"] == "stands"  # structural abstain, NOT insufficient
+    op["status"] = "approved"
+    client = _AuthoringFakeClient()
+    results = apply_authoring_plan(plan, client, execute=True)
+    assert results[0].status == "created"
+
+
+def test_review_authoring_plan_is_idempotent() -> None:
+    # The builders return an already-reviewed plan; re-reviewing one (every op already carries a
+    # `review` block) is a no-op.
+    plan = build_lookalike_plan("act_1", name="LAL", origin_audience_id="a1", country="US", ratio=0.01)
+    assert plan["ops"][0]["review"]  # builder already reviewed it
+    assert review_authoring_plan(plan) == plan
+
+
+def test_authoring_paused_invariant_holds_even_when_review_stands() -> None:
+    # A high-confidence duplicate whose verdict STANDS must STILL create PAUSED — the gate is
+    # demote-only and authoring hardcodes PAUSED. Pins the invariant against future drift.
+    op = _grounded_op(
+        op_id="dup", op="create_ad", level="ad", node_id="", status="approved", kind="create_ad",
+        params={"name": "Copy", "adset_id": "as2", "creative": {"creative_id": "cr1"}},
+        evidence=Evidence("blended_roas", 5.0, "ROAS 5.00", "2026-06-01..2026-06-24",
+                          300.0, 5000.0, "ad", "ad1", "Winner", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    assert op["confidence"]["band"] == "high"
+    plan = {"ad_account_id": "act_1", "run_date": "2026-06-24",
+            "guardrails": {"requires_grounding": True}, "ops": [op]}
+    reviewed = review_authoring_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "stands"  # band earned; nothing to refute
+    client = _AuthoringFakeClient()
+    apply_authoring_plan(reviewed, client, execute=True)
+    kind, params, _vo = client.creates[0]
+    assert params["status"] == "PAUSED"  # never ACTIVE, even on a stands
+
+
+def test_authoring_grounded_create_still_blocks_advantage_param() -> None:
+    # Even a well-grounded create is blocked if it carries a Meta-AI / Advantage+ param (the
+    # FORBIDDEN_FRAGMENTS / _guard_params block is untouched by grounding).
+    op = _grounded_op(
+        op_id="ai", op="create_campaign", level="campaign", node_id="", status="approved",
+        kind="create_campaign",
+        params={"name": "C", "objective": "OUTCOME_SALES", "creative_enhancement": True},
+        evidence=Evidence("blended_roas", 4.0, "ROAS 4.00", "2026-06-01..2026-06-24",
+                          300.0, 5000.0, "campaign", "c1", "Camp", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    assert op["confidence"]["band"] == "high"  # grounding alone would pass
+    plan = {"ad_account_id": "act_1", "guardrails": {"requires_grounding": True}, "ops": [op]}
+    by_id = {r.op_id: r for r in apply_authoring_plan(plan, _AuthoringFakeClient(), execute=True)}
+    assert by_id["ai"].status == "blocked"
+    assert "Meta AI / Advantage+" in by_id["ai"].reason
+
+
+def test_authoring_grounded_plan_is_json_serializable() -> None:
+    # The added evidence/confidence/review keys serialize cleanly (plan + audit-log safety): the plan
+    # round-trips, and write_authoring_results still logs only op_id/kind/status/created_id (extra
+    # op-dict keys do not leak into the result log).
+    import json
+
+    from meta_ads_analysis.authoring import AuthoringResult, write_authoring_results
+
+    plan = build_lookalike_plan("act_1", name="LAL", origin_audience_id="a1", country="US", ratio=0.01)
+    json.dumps(plan)  # grounded plan round-trips
+    out = write_authoring_results(
+        plan=plan,
+        results=[AuthoringResult("lookalike_a1_1", "create_lookalike", "created", created_id="lal1")],
+        output_path=_TMP_OPS_RESULTS(), execute=True,
+    )
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["results"][0]["op_id"] == "lookalike_a1_1"
+    assert payload["results"][0]["created_id"] == "lal1"
+    assert "confidence" not in payload["results"][0]  # grounding does not leak into the result log
+
+
+def test_op_grounding_review_keys_are_audit_log_safe() -> None:
+    op = _grounded_op(
+        op_id="oc", op="set_daily_budget", level="adset", node_id="as3", status="approved",
+        params={"daily_budget_cents": 11000},
+        evidence=Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                          30.0, 200.0, "adset", "as3", "S", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    plan = {"run_date": "2026-06-24", "account_slug": "demo", "intent": "scale", "ops": [op]}
+    reviewed = review_ops_plan(plan, spend_floor=100.0)
+    # the reviewed plan (op carries evidence/confidence/review/review_verdict) is JSON-serializable
+    import json
+    json.dumps(reviewed)
+    # write_ops_results ignores the extra op-dict keys (it serializes only OpResult fields)
+    from meta_ads_analysis.control import OpResult
+    results = [OpResult("oc", "dry_run", request={"daily_budget": "11000"})]
+    out = write_ops_results(plan=reviewed, results=results, output_path=_TMP_OPS_RESULTS(), execute=False)
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["results"][0]["op_id"] == "oc"
+    assert "review_verdict" not in payload["results"][0]  # extra keys do not leak into the result log
+
+
+def _TMP_OPS_RESULTS():
+    import tempfile
+    from pathlib import Path
+    return Path(tempfile.mkdtemp()) / "ops_results.json"
+
+
+# --- CBO-aware budget +/- (control ops + actions parity) --------------------
+
+from meta_ads_analysis.control import (
+    BUDGET_ADSET_LEVEL,
+    BUDGET_BROKEN,
+    BUDGET_CBO_ACTIVE,
+    build_budget_plan,
+    classify_adset_budget,
+)
+
+
+def _bud_insights(*, purchases="120", spend="2400", value="9600", ids=True):
+    """One insights row carrying BOTH ad-set and campaign ids, so the same row serves an ad-set-level
+    and a campaign-level metric lookup. Default sample (120 purchases / $2400, value $9600) clears the
+    floor with ROAS 4.0. Override ``value`` to move ROAS (1200→0.5, 2400→1.0, 12000→5.0)."""
+    row = {"spend": spend,
+           "action_values": [{"action_type": "purchase", "value": value}],
+           "actions": [{"action_type": "purchase", "value": purchases}]}
+    if ids:
+        row.update({"adset_id": "as1", "adset_name": "Set 1", "campaign_id": "c1", "campaign_name": "Camp"})
+    return [row]
+
+
+def _adset_level_client(adset_budget="10000", insights=None):
+    campaigns = [{"id": "c1", "name": "Camp", "status": "ACTIVE", "effective_status": "ACTIVE"}]
+    adsets = [{"id": "as1", "name": "Set 1", "status": "ACTIVE", "effective_status": "ACTIVE",
+               "campaign_id": "c1", "daily_budget": adset_budget}]
+    return _ControlFakeClient(campaigns, adsets, [],
+                              insights=_bud_insights() if insights is None else insights)
+
+
+def _cbo_client(campaign_daily="5000", campaign_lifetime=None, insights=None):
+    """Ad set as1 has NO daily budget (CBO); the parent campaign c1 holds the budget."""
+    campaign = {"id": "c1", "name": "Camp", "status": "ACTIVE", "effective_status": "ACTIVE"}
+    if campaign_daily is not None:
+        campaign["daily_budget"] = campaign_daily
+    if campaign_lifetime is not None:
+        campaign["lifetime_budget"] = campaign_lifetime
+    adsets = [{"id": "as1", "name": "Set 1", "status": "ACTIVE", "effective_status": "ACTIVE",
+               "campaign_id": "c1"}]  # no daily_budget
+    return _ControlFakeClient([campaign], adsets, [],
+                              insights=_bud_insights() if insights is None else insights)
+
+
+def test_classify_adset_budget_levels() -> None:
+    adset = classify_adset_budget(_adset_level_client(), "as1")
+    assert adset["classification"] == BUDGET_ADSET_LEVEL
+    assert adset["adset_daily_budget"] == 10000.0
+
+    cbo_daily = classify_adset_budget(_cbo_client(), "as1")
+    assert cbo_daily["classification"] == BUDGET_CBO_ACTIVE
+    assert cbo_daily["campaign_id"] == "c1"
+    assert cbo_daily["campaign_daily_budget"] == 5000.0
+
+    cbo_lifetime = classify_adset_budget(_cbo_client(campaign_daily=None, campaign_lifetime="70000"), "as1")
+    assert cbo_lifetime["classification"] == BUDGET_CBO_ACTIVE  # lifetime ALSO means "budget at campaign"
+    assert cbo_lifetime["campaign_lifetime_budget"] == 70000.0
+
+    broken = classify_adset_budget(_cbo_client(campaign_daily=None, campaign_lifetime=None), "as1")
+    assert broken["classification"] == BUDGET_BROKEN
+
+
+def test_build_budget_plan_cbo_redirects_to_campaign_op() -> None:
+    # ROAS 4.0 (>= 3.0 target) so the scale-up is legit and the campaign op stands (isolates the
+    # redirect mechanics from the direction refutation, which other tests cover).
+    plan = build_budget_plan(
+        _cbo_client(insights=_bud_insights(value="9600")), "act_1", new_daily_budget_cents=6000,
+        adset_id="as1", policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    pointer = next(o for o in plan["ops"] if o["level"] == "adset")
+    campaign_op = next(o for o in plan["ops"] if o["level"] == "campaign")
+    # ad-set op is the non-executable pointer carrying the CBO classification
+    assert pointer["cbo_detected"] is True
+    assert pointer["status"] == "proposed"
+    assert "CBO active" in pointer["note"]
+    assert pointer["live_campaign_state"]["classification"] == "cbo_active"
+    # campaign op is actionable, carries its OWN campaign-level evidence (not a copy of the ad set's)
+    assert campaign_op["id"] == "c1"
+    assert campaign_op["evidence"]["entity_level"] == "campaign"
+    assert campaign_op["cbo_redirect_from_adset_id"] == "as1"
+    assert campaign_op["action_type"] == "increase_campaign_budget"  # 6000 > campaign 5000
+    assert campaign_op["review"]["verdict"] == "stands"
+
+
+def test_apply_ops_cbo_active_adset_blocked_at_execute() -> None:
+    # Re-read drift: an ad-set budget op that finds CBO at execute time is blocked, not mis-applied.
+    client = _cbo_client()
+    plan = {"ops": [{"op_id": "bump", "op": "set_daily_budget", "level": "adset", "id": "as1",
+                     "params": {"daily_budget_cents": 6000}, "status": "approved"}]}
+    res = apply_ops_plan(plan, client, execute=True)[0]
+    assert res.status == "blocked"
+    assert "CBO active" in res.reason
+    assert client.updates == []
+
+
+def test_apply_ops_budget_broken_blocked() -> None:
+    client = _cbo_client(campaign_daily=None, campaign_lifetime=None)
+    plan = {"ops": [{"op_id": "x", "op": "set_daily_budget", "level": "adset", "id": "as1",
+                     "params": {"daily_budget_cents": 6000}, "status": "approved"}]}
+    res = apply_ops_plan(plan, client, execute=True)[0]
+    assert res.status == "blocked"
+    assert "neither" in res.reason
+    assert client.updates == []
+
+
+def test_apply_ops_campaign_lifetime_budget_blocked() -> None:
+    client = _cbo_client(campaign_daily=None, campaign_lifetime="70000")
+    plan = {"ops": [{"op_id": "x", "op": "set_daily_budget", "level": "campaign", "id": "c1",
+                     "params": {"daily_budget_cents": 6000}, "status": "approved"}]}
+    res = apply_ops_plan(plan, client, execute=True)[0]
+    assert res.status == "blocked"
+    assert "lifetime" in res.reason
+    assert client.updates == []
+
+
+def test_apply_ops_campaign_daily_budget_executes() -> None:
+    # The CBO-redirect deliverable's WRITE path: an approved campaign-level daily-budget op (the op
+    # build_budget_plan emits for a CBO ad set) executes through to update_campaign. Covers both an
+    # increase (within the 20% cap over the 5000-cent campaign budget) and a decrease (within the 50%
+    # decrease cap and above the 100-cent floor).
+    inc = _cbo_client()  # campaign c1 daily 5000, ad set as1 no budget
+    inc_res = apply_ops_plan(
+        {"ops": [{"op_id": "up", "op": "set_daily_budget", "level": "campaign", "id": "c1",
+                  "params": {"daily_budget_cents": 5500}, "status": "approved"}]},
+        inc, execute=True,
+    )[0]
+    assert inc_res.status == "executed"
+    assert ("campaign", "c1", {"daily_budget": "5500"}, False) in inc.updates
+
+    dec = _cbo_client()
+    dec_res = apply_ops_plan(
+        {"ops": [{"op_id": "down", "op": "set_daily_budget", "level": "campaign", "id": "c1",
+                  "params": {"daily_budget_cents": 4000}, "status": "approved"}]},
+        dec, execute=True,
+    )[0]
+    assert dec_res.status == "executed"
+    assert ("campaign", "c1", {"daily_budget": "4000"}, False) in dec.updates
+
+
+def test_apply_ops_budget_decrease_paths_and_caps() -> None:
+    client = _adset_level_client()  # ad set as1 has a $100/day (10000-cent) budget
+    plan = {"ops": [
+        # 20% decrease: within the 50% cap and above the 100-cent floor → ok
+        {"op_id": "dec_ok", "op": "set_daily_budget", "level": "adset", "id": "as1",
+         "params": {"daily_budget_cents": 8000}, "status": "approved"},
+        # 60% decrease: exceeds the default 50% decrease cap → blocked
+        {"op_id": "dec_overcap", "op": "set_daily_budget", "level": "adset", "id": "as1",
+         "params": {"daily_budget_cents": 4000}, "status": "approved"},
+        # below the absolute floor (cap lifted to 99.9% so the FLOOR is what blocks, isolating it)
+        {"op_id": "dec_floor", "op": "set_daily_budget", "level": "adset", "id": "as1",
+         "params": {"daily_budget_cents": 50, "max_decrease_percent": 99.9}, "status": "approved"},
+    ]}
+    by_id = {r.op_id: r for r in apply_ops_plan(plan, client, execute=True)}
+    assert by_id["dec_ok"].status == "executed"
+    assert by_id["dec_overcap"].status == "blocked" and "max decrease" in by_id["dec_overcap"].reason
+    assert by_id["dec_floor"].status == "blocked" and "floor" in by_id["dec_floor"].reason
+    assert ("adset", "as1", {"daily_budget": "8000"}, False) in client.updates
+
+
+def test_build_budget_plan_adset_level_increase_grounded() -> None:
+    plan = build_budget_plan(
+        _adset_level_client(insights=_bud_insights(value="9600")), "act_1",
+        new_daily_budget_cents=11000, adset_id="as1",
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    assert len(plan["ops"]) == 1  # ad-set level → no campaign redirect
+    op = plan["ops"][0]
+    assert op["level"] == "adset" and op["action_type"] == "increase_adset_budget"
+    assert op["evidence"]["entity_level"] == "adset"
+    assert op["confidence"]["band"] in {"high", "medium"}
+    assert op["review"]["verdict"] == "stands"
+
+
+def test_build_budget_plan_thin_sample_abstains_and_is_blocked() -> None:
+    thin = _bud_insights(purchases="9", spend="40", value="80")
+    plan = build_budget_plan(
+        _adset_level_client(insights=thin), "act_1", new_daily_budget_cents=11000, adset_id="as1",
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-19", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["confidence"]["band"] == "abstain"  # below floor — never a fabricated low
+    assert op["review"]["verdict"] == "insufficient"
+    # Approving it anyway is blocked at the apply-time grounding gate (cited sample + abstain).
+    op["status"] = "approved"
+    res = apply_ops_plan(plan, _adset_level_client(insights=thin), execute=True)[0]
+    assert res.status == "blocked"
+    assert "insufficient data" in res.reason
+
+
+def test_build_budget_plan_review_refutes_scale_up_below_target() -> None:
+    below = _bud_insights(value="2400")  # ROAS 1.0, sample 120/$2400 clears the floor
+    plan = build_budget_plan(
+        _adset_level_client(insights=below), "act_1", new_daily_budget_cents=11000, adset_id="as1",
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["review"]["verdict"] == "refuted"  # scaling up an entity below the ROAS target
+    assert op["review_verdict"] == "refuted"
+
+
+def test_build_budget_plan_review_refutes_cutting_a_clear_winner() -> None:
+    winner = _bud_insights(value="12000")  # ROAS 5.0 ≥ 3.0 * 1.5 winner margin
+    plan = build_budget_plan(
+        _adset_level_client(insights=winner), "act_1", new_daily_budget_cents=8000, adset_id="as1",
+        policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["action_type"] == "decrease_adset_budget"  # 8000 < current 10000
+    assert op["review"]["verdict"] == "refuted"  # cutting the budget of a clear winner
+
+
+def test_actions_ops_cbo_classification_parity() -> None:
+    # The ops path (classify_adset_budget) and the action path
+    # (_populate_budget_params_from_live_state) must classify an identical fixture identically.
+    from meta_ads_analysis.actions import _populate_budget_params_from_live_state
+
+    def _reader():
+        return FakeMetaReader(
+            get_adset=lambda adset_id, *, fields: {"id": "as1", "campaign_id": "c1"},  # no daily_budget
+            get_campaign=lambda campaign_id, *, fields: {"id": "c1", "daily_budget": "5000"},
+        )
+
+    ops_state = classify_adset_budget(_reader(), "as1")
+    assert ops_state["classification"] == BUDGET_CBO_ACTIVE
+
+    action = {
+        "action_type": "increase_adset_budget",
+        "target": {"type": "adset", "id": "as1"},
+        "params": {},
+        "live_adset_state": {"adset_id": "as1", "campaign_id": "c1", "daily_budget": None},
+        "rationale": "scale candidate",
+    }
+    _populate_budget_params_from_live_state(action, _reader())
+    assert action["cbo_detected"] is True
+    assert action["executable"] is False
+    assert action["live_campaign_state"]["classification"] == ops_state["classification"]
+
+
+def test_build_budget_plan_direct_campaign_target() -> None:
+    plan = build_budget_plan(
+        _cbo_client(insights=_bud_insights(value="9600")), "act_1", new_daily_budget_cents=5500,
+        campaign_id="c1", policy={"primary_goal": "roas", "target_roas": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    assert len(plan["ops"]) == 1
+    op = plan["ops"][0]
+    assert op["level"] == "campaign" and op["id"] == "c1"
+    assert op["action_type"] == "increase_campaign_budget"  # 5500 > campaign 5000
+    assert "cbo_redirect_from_adset_id" not in op  # direct target, not a redirect
+    assert op["evidence"]["entity_level"] == "campaign"
+
+
+def test_build_budget_plan_requires_exactly_one_target() -> None:
+    client = _adset_level_client()
+    for kwargs in ({}, {"adset_id": "as1", "campaign_id": "c1"}):
+        try:
+            build_budget_plan(client, "act_1", new_daily_budget_cents=11000, **kwargs)
+            raise AssertionError("expected ValueError for ambiguous/missing target")
+        except ValueError:
+            pass
+
+
+def test_actions_adset_level_budget_populates_current() -> None:
+    # Non-CBO ad set with its own budget: current is populated and no CBO redirect happens.
+    from meta_ads_analysis.actions import _populate_budget_params_from_live_state
+
+    action = {
+        "action_type": "increase_adset_budget",
+        "target": {"type": "adset", "id": "as1"},
+        "params": {},
+        "live_adset_state": {"adset_id": "as1", "campaign_id": "c1", "daily_budget": "10000"},
+    }
+    _populate_budget_params_from_live_state(action, FakeMetaReader())  # reader never consulted
+    assert action["params"]["current_daily_budget_cents"] == 10000
+    assert "cbo_detected" not in action
 
 
 # --- Runaway / outlier watch scanner ----------------------------------------
@@ -4910,3 +6182,545 @@ def test_audit_logs_each_drifted_metric_in_a_multi_metric_entry_and_is_idempoten
     # A second --apply on the same --as-of adds nothing (idempotent across both metric names).
     _, t2, _ = _audit(t1, _fixed_fetch(rows), apply=True)
     assert t2 == t1
+
+
+# --- Reader provider seam (MOCKS ONLY: no test here makes a live Meta call) ---
+
+import inspect
+
+from meta_ads_analysis.reader_provider import (
+    READ_METHODS,
+    DirectMetaReader,
+    FakeMetaReader,
+    MetaReaderProvider,
+    as_reader,
+)
+
+# Representative (args, kwargs) per read method — also pins the call shape each one takes.
+_READER_CALL_SPECS = {
+    "fetch_insights": (("act_1",), {"fields": ["spend"], "date_from": "2026-06-01", "date_to": "2026-06-30"}),
+    "fetch_ads": (("act_1",), {"fields": ["id"]}),
+    "list_campaigns": (("act_1",), {"fields": ["id"]}),
+    "get_campaign": (("c1",), {"fields": ["id"]}),
+    "list_adsets": (("act_1",), {"fields": ["id"]}),
+    "get_adset": (("as1",), {"fields": ["id"]}),
+    "get_ad": (("ad1",), {"fields": ["id"]}),
+    "list_custom_audiences": (("act_1",), {"fields": ["id"]}),
+    "get_account": (("act_1",), {"fields": ["name"]}),
+    "get_delivery_estimate": (("as1",), {"fields": ["estimate_dau"]}),
+    "search_targeting": ((), {"query": "jewelry"}),
+    "list_pixels": (("act_1",), {"fields": ["id"]}),
+    "list_custom_conversions": (("act_1",), {"fields": ["id"]}),
+    "iter_paginated": (("/act_1/ads",), {"params": {"limit": 1}}),
+}
+
+
+class _RecordingClient:
+    """Records every call and returns a per-method sentinel — to prove DirectMetaReader delegates 1:1.
+
+    MOCKS ONLY: stands in for MetaMarketingApiClient; never touches the network.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def __getattr__(self, name):
+        def _method(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return f"<{name}>"
+
+        return _method
+
+
+def _sig_params(sig: inspect.Signature) -> list[tuple]:
+    return [(p.name, p.kind, p.default) for p in sig.parameters.values()]
+
+
+def test_reader_call_specs_cover_every_read_method() -> None:
+    # Guard: the delegation test is only meaningful if it exercises the full read surface.
+    assert set(_READER_CALL_SPECS) == set(READ_METHODS)
+
+
+def test_direct_meta_reader_delegates_each_read_method_one_to_one() -> None:
+    # Every reader method forwards to the same-named client method and returns its result verbatim.
+    for name, (args, kwargs) in _READER_CALL_SPECS.items():
+        recorder = _RecordingClient()
+        reader = DirectMetaReader(recorder)
+        result = getattr(reader, name)(*args, **kwargs)
+        assert [c[0] for c in recorder.calls] == [name], f"{name} did not delegate 1:1"
+        assert result == f"<{name}>", f"{name} did not return the wrapped client's result"
+
+
+def test_reader_signatures_match_client_exactly() -> None:
+    # Keyword-only splits and defaults must match MetaMarketingApiClient so a call-site swap is a
+    # pure rename; drift here surfaces as a TypeError only at some distant call site otherwise.
+    for name in READ_METHODS:
+        client_params = _sig_params(inspect.signature(getattr(MetaMarketingApiClient, name)))
+        for cls in (MetaReaderProvider, DirectMetaReader, FakeMetaReader):
+            reader_params = _sig_params(inspect.signature(getattr(cls, name)))
+            assert reader_params == client_params, (
+                f"{cls.__name__}.{name} signature drifted from MetaMarketingApiClient"
+            )
+
+
+def test_direct_meta_reader_iter_paginated_preserves_lazy_iterator() -> None:
+    # iter_paginated must return an iterator (not a list), preserving the client's laziness.
+    def _gen(path, *, params=None):
+        yield {"id": "1"}
+        yield {"id": "2"}
+
+    class _Client:
+        iter_paginated = staticmethod(_gen)
+
+    reader = DirectMetaReader(_Client())
+    out = reader.iter_paginated("/act_1/ads", params={"limit": 1})
+    assert iter(out) is out  # a real iterator, returned unchanged
+    assert list(out) == [{"id": "1"}, {"id": "2"}]
+
+
+def test_fake_meta_reader_returns_canned_values_and_records_calls() -> None:
+    reader = FakeMetaReader(
+        get_account={"name": "Acme"},
+        list_campaigns=[{"id": "c1"}],
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "fields": fields},
+    )
+    assert reader.get_account("act_1", fields=["name"]) == {"name": "Acme"}
+    assert reader.list_campaigns("act_1", fields=["id"]) == [{"id": "c1"}]
+    # A callable stub receives the actual call args.
+    assert reader.get_ad("ad9", fields=["id"]) == {"id": "ad9", "fields": ["id"]}
+    assert ("get_account", ("act_1",), {"fields": ["name"]}) in reader.calls
+
+
+def test_fake_meta_reader_raises_on_unstubbed_method() -> None:
+    reader = FakeMetaReader(get_account={"name": "Acme"})
+    try:
+        reader.get_adset("as1", fields=["id"])
+    except NotImplementedError as exc:
+        assert "get_adset" in str(exc)
+    else:
+        raise AssertionError("expected NotImplementedError for an unstubbed read method")
+
+
+def test_fake_meta_reader_iter_paginated_is_reiterable_per_call() -> None:
+    reader = FakeMetaReader(iter_paginated=[{"id": "1"}, {"id": "2"}])
+    # Each call yields the full seeded list, so list()/iterate-twice behave like the real client.
+    assert list(reader.iter_paginated("/act_1/ads")) == [{"id": "1"}, {"id": "2"}]
+    assert list(reader.iter_paginated("/act_1/ads")) == [{"id": "1"}, {"id": "2"}]
+
+
+def test_fake_meta_reader_rejects_unknown_stub_name() -> None:
+    try:
+        FakeMetaReader(get_widgets=[])
+    except ValueError as exc:
+        assert "get_widgets" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for an unknown read method name")
+
+
+def test_as_reader_wraps_client_and_passes_reader_through() -> None:
+    fake = FakeMetaReader(get_account={"name": "X"})
+    assert as_reader(fake) is fake  # already a provider -> returned unchanged
+    assert as_reader(None) is None  # None passes through for lazy-default callers
+    wrapped = as_reader(_RecordingClient())
+    assert isinstance(wrapped, DirectMetaReader)
+    assert wrapped.get_account("act_1", fields=["name"]) == "<get_account>"
+
+
+def test_supplied_reader_short_circuits_from_env(monkeypatch) -> None:
+    # A supplied reader must never trigger DirectMetaReader.from_env()'s env/token lookup (laziness).
+    def _boom(*_a, **_k):
+        raise AssertionError("client_from_env must not be called when a reader is supplied")
+
+    monkeypatch.setattr("meta_ads_analysis.reader_provider.client_from_env", _boom)
+    plan = {
+        "account_slug": "x",
+        "run_date": "2026-06-16",
+        "actions": [
+            {
+                "action_id": "pause_ad_1",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "target": {"type": "ad", "id": "1"},
+                "params": {"status": "paused"},
+                "rationale": "r",
+            }
+        ],
+    }
+    reader = FakeMetaReader(
+        get_ad={"id": "1", "name": "Ad", "status": "PAUSED", "effective_status": "PAUSED"}
+    )
+    enriched = enrich_action_plan_with_live_state(plan, reader=reader)
+    assert enriched["actions"][0]["live_state"]["status"] == "PAUSED"
+
+
+def test_build_account_snapshot_accepts_a_fake_reader() -> None:
+    # The control read entry point works with a pure FakeMetaReader (no client wrapping needed).
+    reader = FakeMetaReader(
+        list_campaigns=[{"id": "c1", "name": "C", "status": "ACTIVE", "effective_status": "ACTIVE"}],
+        list_adsets=[
+            {
+                "id": "as1", "name": "S", "status": "ACTIVE", "effective_status": "ACTIVE",
+                "campaign_id": "c1", "targeting": {"custom_audiences": [{"id": "A", "name": "aud-A"}]},
+            }
+        ],
+        iter_paginated=[
+            {"id": "ad1", "name": "Ad", "status": "ACTIVE", "effective_status": "ACTIVE",
+             "adset_id": "as1", "issues_info": []}
+        ],
+    )
+    from meta_ads_analysis.control import build_account_snapshot as _snap
+
+    snap = _snap(reader, "act_1")
+    assert snap["rollup"]["campaigns"] == 1
+    assert snap["campaigns"][0]["adsets"][0]["included_audiences"] == ["aud-A"]
+
+
+class _WriteOnlyRecordingClient:
+    """A write-only client: records update_* calls and has NO read methods.
+
+    Used to prove a mixed read+write apply routes the live re-read through the supplied
+    ``reader`` (not the write client) — if the read leaked to the client, it would raise
+    AttributeError here. MOCKS ONLY.
+    """
+
+    def __init__(self) -> None:
+        self.updates: list[tuple] = []
+
+    def update_adset(self, node_id, *, params, validate_only=False):
+        self.updates.append(("adset", node_id, params, validate_only))
+        return {"id": node_id, "success": True}
+
+
+def test_apply_ops_plan_routes_read_through_reader_and_write_through_client() -> None:
+    # The hybrid path: a distinct reader supplies the live re-read; the concrete client does the
+    # write. The write client deliberately has no get_adset, so a leaked read would AttributeError.
+    from meta_ads_analysis.control import apply_ops_plan as _apply
+
+    reader = FakeMetaReader(get_adset={"id": "as1", "daily_budget": "10000"})
+    client = _WriteOnlyRecordingClient()
+    plan = {
+        "ops": [
+            {"op_id": "bump", "op": "set_daily_budget", "level": "adset", "id": "as1",
+             "params": {"daily_budget_cents": 11000, "max_increase_percent": 20}, "status": "approved"},
+        ]
+    }
+
+    results = _apply(plan, client, execute=True, reader=reader)
+
+    assert results[0].status == "executed"
+    # Read hit the reader...
+    assert [c[0] for c in reader.calls] == ["get_adset"]
+    # ...and the write hit the concrete client.
+    assert client.updates == [("adset", "as1", {"daily_budget": "11000"}, False)]
+
+
+# --- MCP read backend (MOCKS ONLY: the tool-executor is fake; no live MCP / Meta call) ---
+
+from meta_ads_analysis.reader_provider import (  # noqa: E402
+    MCPMetaReader,
+    reader_from_env,
+)
+
+
+class _RecordingExecutor:
+    """A fake MCP tool-executor: records ``(tool, arguments)`` and returns a canned raw result.
+
+    ``returns`` maps tool-name -> the value the MCP tool would emit (a dict / list / Graph-style
+    envelope / JSON string). A callable value receives the arguments dict. An unexpected tool call
+    raises, so a test proves which tools were (and were not) invoked. MOCKS ONLY.
+    """
+
+    def __init__(self, returns: dict | None = None) -> None:
+        self.returns = returns or {}
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, tool: str, arguments: dict):
+        self.calls.append((tool, arguments))
+        if tool not in self.returns:
+            raise AssertionError(f"unexpected MCP tool call: {tool}")
+        value = self.returns[tool]
+        return value(arguments) if callable(value) else value
+
+
+def test_mcp_reader_signatures_match_client_exactly() -> None:
+    # MCPMetaReader must be a drop-in for the same seam: its read signatures match the client's, so
+    # a backend swap is invisible to every call site.
+    for name in READ_METHODS:
+        client_params = _sig_params(inspect.signature(getattr(MetaMarketingApiClient, name)))
+        reader_params = _sig_params(inspect.signature(getattr(MCPMetaReader, name)))
+        assert reader_params == client_params, f"MCPMetaReader.{name} signature drifted"
+
+
+def test_mcp_reader_translates_fields_list_to_comma_string_without_dropping_any() -> None:
+    # Field-list translation is the high-risk edge: a dropped field silently blanks a metric.
+    execu = _RecordingExecutor({"meta_ads_get_ads_by_adaccount": {"data": []}})
+    MCPMetaReader(execu).fetch_ads("act_1", fields=["ad_id", "ad_name", "spend", "impressions"])
+    tool, args = execu.calls[0]
+    assert tool == "meta_ads_get_ads_by_adaccount"
+    assert args["act_id"] == "act_1"
+    assert args["fields"] == "ad_id,ad_name,spend,impressions"  # joined to a comma string
+    # Round-trips with nothing dropped — the exact guarantee the metrics pipeline depends on.
+    assert args["fields"].split(",") == ["ad_id", "ad_name", "spend", "impressions"]
+
+
+def test_mcp_reader_insights_translates_window_and_breakdowns() -> None:
+    execu = _RecordingExecutor({"meta_ads_get_adaccount_insights": {"data": []}})
+    MCPMetaReader(execu).fetch_insights(
+        "act_9",
+        fields=["spend", "actions"],
+        date_from="2026-06-01",
+        date_to="2026-06-30",
+        level="ad",
+        time_increment=1,
+        breakdowns=["age", "gender"],
+    )
+    tool, args = execu.calls[0]
+    assert tool == "meta_ads_get_adaccount_insights"
+    assert args["fields"] == "spend,actions"
+    assert args["time_range"] == {"since": "2026-06-01", "until": "2026-06-30"}
+    assert args["level"] == "ad"
+    assert args["breakdowns"] == ["age", "gender"]
+
+
+def test_mcp_reader_list_result_shape_matches_direct_reader() -> None:
+    # Result-shape parity: both backends return identical list[dict] for a list read, so every
+    # downstream parser is backend-agnostic.
+    canned = [
+        {"id": "400", "name": "API Ad", "status": "ACTIVE"},
+        {"id": "401", "name": "API Ad 2", "status": "PAUSED"},
+    ]
+
+    class _Client:
+        def fetch_ads(self, ad_account_id, *, fields):
+            return canned
+
+    direct = DirectMetaReader(_Client())
+    mcp = MCPMetaReader(_RecordingExecutor({"meta_ads_get_ads_by_adaccount": {"data": canned}}))
+    assert mcp.fetch_ads("act_1", fields=["id"]) == direct.fetch_ads("act_1", fields=["id"]) == canned
+
+
+def test_mcp_reader_node_result_shape_matches_direct_reader() -> None:
+    canned = {"id": "act_1", "name": "Acme", "currency": "USD"}
+
+    class _Client:
+        def get_account(self, ad_account_id, *, fields):
+            return canned
+
+    direct = DirectMetaReader(_Client())
+    mcp = MCPMetaReader(_RecordingExecutor({"meta_ads_get_ad_account_details": canned}))
+    assert (
+        mcp.get_account("act_1", fields=["name"])
+        == direct.get_account("act_1", fields=["name"])
+        == canned
+    )
+
+
+def test_mcp_reader_accepts_bare_list_and_json_string_results() -> None:
+    # Robust to two common community-server shapes: a bare list, and tool output returned as text.
+    bare = MCPMetaReader(_RecordingExecutor({"meta_ads_get_campaigns_by_adaccount": [{"id": "c1"}]}))
+    assert bare.list_campaigns("act_1", fields=["id"]) == [{"id": "c1"}]
+    as_text = MCPMetaReader(
+        _RecordingExecutor({"meta_ads_get_ad_account_details": json.dumps({"id": "act_1"})})
+    )
+    assert as_text.get_account("act_1", fields=["id"]) == {"id": "act_1"}
+
+
+def test_mcp_reader_drains_pagination_so_no_page_is_dropped() -> None:
+    # The candidate server does not auto-paginate; the wrapper follows paging.next, never truncates.
+    returns = {
+        "meta_ads_get_adsets_by_adaccount": {"data": [{"id": "as1"}], "paging": {"next": "URL2"}},
+        "meta_ads_fetch_pagination_url": {"data": [{"id": "as2"}], "paging": {}},
+    }
+    reader = MCPMetaReader(_RecordingExecutor(returns))
+    assert reader.list_adsets("act_1", fields=["id"]) == [{"id": "as1"}, {"id": "as2"}]
+
+
+def test_mcp_reader_refuses_to_truncate_when_pagination_tool_disabled() -> None:
+    # Decision: rather than silently truncate a paged result, raise when no pagination tool exists.
+    returns = {
+        "meta_ads_get_adsets_by_adaccount": {"data": [{"id": "as1"}], "paging": {"next": "URL2"}}
+    }
+    reader = MCPMetaReader(_RecordingExecutor(returns), pagination_tool=None)
+    try:
+        reader.list_adsets("act_1", fields=["id"])
+    except MetaApiError as exc:
+        assert "truncate" in str(exc)
+    else:
+        raise AssertionError("expected a refusal to silently truncate a paged result")
+
+
+def test_mcp_reader_unsupported_reads_raise_naming_the_method() -> None:
+    # Partial coverage: reads the candidate server does not expose must raise NotImplementedError
+    # naming the read, so a caller can fall back to META_READER_BACKEND=direct for that one read.
+    execu = _RecordingExecutor()
+    reader = MCPMetaReader(execu)
+    cases = {
+        "get_delivery_estimate": lambda: reader.get_delivery_estimate("as1", fields=["estimate_dau"]),
+        "search_targeting": lambda: reader.search_targeting(query="jewelry"),
+        "list_pixels": lambda: reader.list_pixels("act_1", fields=["id"]),
+        "list_custom_conversions": lambda: reader.list_custom_conversions("act_1", fields=["id"]),
+        "list_custom_audiences": lambda: reader.list_custom_audiences("act_1", fields=["id"]),
+        "iter_paginated": lambda: reader.iter_paginated("/act_1/ads"),
+    }
+    for name, call in cases.items():
+        try:
+            call()
+        except NotImplementedError as exc:
+            assert name in str(exc), f"NotImplementedError should name the read {name!r}"
+        else:
+            raise AssertionError(f"{name}: expected NotImplementedError for an unexposed MCP read")
+    # _tool_for raised before the executor was ever invoked for any unsupported read.
+    assert execu.calls == []
+
+
+def test_reader_from_env_defaults_to_direct_when_unset(monkeypatch) -> None:
+    # Default-off guarantee: unset backend == DirectMetaReader (today's behavior, byte-for-byte).
+    monkeypatch.delenv("META_READER_BACKEND", raising=False)
+    sentinel = object()
+    monkeypatch.setattr("meta_ads_analysis.reader_provider.client_from_env", lambda *a, **k: sentinel)
+    reader = reader_from_env()
+    assert isinstance(reader, DirectMetaReader)
+    assert reader._client is sentinel  # wraps the env client; no MCP involved
+
+
+def test_reader_from_env_explicit_direct(monkeypatch) -> None:
+    monkeypatch.setenv("META_READER_BACKEND", "direct")
+    monkeypatch.setattr("meta_ads_analysis.reader_provider.client_from_env", lambda *a, **k: object())
+    assert isinstance(reader_from_env(), DirectMetaReader)
+
+
+def test_reader_from_env_mcp_requires_a_tool_executor(monkeypatch) -> None:
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    try:
+        reader_from_env()
+    except RuntimeError as exc:
+        assert "tool-executor" in str(exc)
+    else:
+        raise AssertionError("mcp backend without an injected executor must raise")
+
+
+def test_reader_from_env_mcp_with_executor_builds_mcp_reader(monkeypatch) -> None:
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    assert isinstance(reader_from_env(tool_executor=_RecordingExecutor()), MCPMetaReader)
+
+
+def test_reader_from_env_rejects_unknown_backend(monkeypatch) -> None:
+    monkeypatch.setenv("META_READER_BACKEND", "bogus")
+    try:
+        reader_from_env()
+    except ValueError as exc:
+        assert "bogus" in str(exc)
+    else:
+        raise AssertionError("unknown backend must raise ValueError")
+
+
+def test_entry_point_default_reads_through_direct_when_backend_unset(monkeypatch) -> None:
+    # The behavioral guarantee this whole ticket rides on: with META_READER_BACKEND unset and no
+    # reader supplied, the writes-adjacent re-read path builds a DirectMetaReader around the env
+    # client exactly as before — adding the MCP server cannot change production reads.
+    monkeypatch.delenv("META_READER_BACKEND", raising=False)
+    seen: dict = {}
+
+    class _Client:
+        def get_ad(self, ad_id, *, fields):
+            seen["ad_id"] = ad_id
+            return {"id": ad_id, "name": "Ad", "status": "PAUSED", "effective_status": "PAUSED"}
+
+    monkeypatch.setattr("meta_ads_analysis.reader_provider.client_from_env", lambda *a, **k: _Client())
+    plan = {
+        "account_slug": "x",
+        "run_date": "2026-06-16",
+        "actions": [
+            {
+                "action_id": "pause_ad_1",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "target": {"type": "ad", "id": "1"},
+                "params": {"status": "paused"},
+                "rationale": "r",
+            }
+        ],
+    }
+    enriched = enrich_action_plan_with_live_state(plan)
+    assert seen["ad_id"] == "1"
+    assert enriched["actions"][0]["live_state"]["status"] == "PAUSED"
+
+
+# --- MCP read backend: translation/error branches (review-stage coverage; still MOCKS ONLY) ---
+
+
+def test_mcp_reader_node_unwraps_single_object_data_envelope() -> None:
+    # A node read returning {"data": {...}} must be unwrapped to the inner node, matching the bare
+    # shape DirectMetaReader returns. This branch of _call_node was previously untested.
+    canned = {"id": "c1", "name": "Campaign", "status": "ACTIVE"}
+    reader = MCPMetaReader(_RecordingExecutor({"meta_ads_get_campaign_by_id": {"data": canned}}))
+    assert reader.get_campaign("c1", fields=["name"]) == canned
+
+
+def test_mcp_reader_raises_on_non_json_string_result() -> None:
+    # A tool that returns text which is not JSON must surface a clear MetaApiError, not crash.
+    reader = MCPMetaReader(_RecordingExecutor({"meta_ads_get_ad_account_details": "not json {"}))
+    try:
+        reader.get_account("act_1", fields=["id"])
+    except MetaApiError as exc:
+        assert "non-JSON" in str(exc)
+    else:
+        raise AssertionError("expected MetaApiError when the MCP tool returns non-JSON text")
+
+
+def test_mcp_reader_list_read_rejects_unexpected_result_shape() -> None:
+    # A scalar (neither a list nor a {"data": [...]} envelope) must raise, naming the read, rather
+    # than silently coercing to an empty result.
+    reader = MCPMetaReader(_RecordingExecutor({"meta_ads_get_campaigns_by_adaccount": 42}))
+    try:
+        reader.list_campaigns("act_1", fields=["id"])
+    except MetaApiError as exc:
+        assert "list_campaigns" in str(exc)
+    else:
+        raise AssertionError("expected MetaApiError for an unexpected list-read result shape")
+
+
+def test_mcp_reader_node_read_rejects_non_object_result() -> None:
+    reader = MCPMetaReader(_RecordingExecutor({"meta_ads_get_campaign_by_id": [1, 2, 3]}))
+    try:
+        reader.get_campaign("c1", fields=["id"])
+    except MetaApiError as exc:
+        assert "get_campaign" in str(exc)
+    else:
+        raise AssertionError("expected MetaApiError when a node read returns a non-object")
+
+
+def test_mcp_reader_drains_three_pages_and_passes_each_next_url_to_pagination_tool() -> None:
+    # More than two pages, and the pagination tool must receive the exact paging.next URL each hop.
+    returns = {
+        "meta_ads_get_adsets_by_adaccount": {"data": [{"id": "as1"}], "paging": {"next": "URL2"}},
+        "meta_ads_fetch_pagination_url": lambda args: {
+            "URL2": {"data": [{"id": "as2"}], "paging": {"next": "URL3"}},
+            "URL3": {"data": [{"id": "as3"}], "paging": {}},
+        }[args["url"]],
+    }
+    execu = _RecordingExecutor(returns)
+    assert MCPMetaReader(execu).list_adsets("act_1", fields=["id"]) == [
+        {"id": "as1"}, {"id": "as2"}, {"id": "as3"}
+    ]
+    # The pagination tool was handed each cursor in order.
+    pagination_urls = [a["url"] for t, a in execu.calls if t == "meta_ads_fetch_pagination_url"]
+    assert pagination_urls == ["URL2", "URL3"]
+
+
+def test_mcp_reader_aborts_runaway_pagination_at_max_pages() -> None:
+    # A server that returns a fresh paging.next forever must hit the runaway guard, not loop.
+    returns = {
+        "meta_ads_get_adsets_by_adaccount": {"data": [{"id": "as1"}], "paging": {"next": "URL"}},
+        "meta_ads_fetch_pagination_url": {"data": [{"id": "asN"}], "paging": {"next": "URL"}},
+    }
+    reader = MCPMetaReader(_RecordingExecutor(returns))
+    reader.MAX_PAGES = 3  # instance override keeps the test cheap
+    try:
+        reader.list_adsets("act_1", fields=["id"])
+    except MetaApiError as exc:
+        assert "runaway" in str(exc)
+    else:
+        raise AssertionError("expected the MAX_PAGES runaway guard to fire")
