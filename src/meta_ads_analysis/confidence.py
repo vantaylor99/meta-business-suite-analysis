@@ -331,6 +331,60 @@ def abstain_confidence(
     )
 
 
+def analog_confidence(
+    *,
+    analogs: int,
+    recovered: int,
+    min_analogs: int,
+    strong_analogs: int,
+    factors: list[str],
+) -> Confidence:
+    """Confidence for an analog-grounded early-life triage call (see :mod:`early_triage`).
+
+    The call grades a brand-new, still-sub-floor ad against how *other* comparable ads on the same
+    account behaved at the same age — a cross-sectional comparison, so grounding is pinned to
+    ``correlational`` (ceiling ``medium``). An analog-grounded call can therefore never read
+    ``high`` no matter how many analogs back it, exactly like the scale-candidate / trajectory calls
+    in :mod:`actions`.
+
+    Routing this through :func:`assess` would be wrong: the triaged ad's *own* sample is below the
+    significance floor by definition (that is the whole reason early triage exists), so ``assess``
+    would abstain on every ad. Instead the data axis here is computed deterministically from the
+    **analog population size** — never a number the caller types:
+
+    - ``analogs < min_analogs`` → ``abstain`` (too little comparable history to trust the cross-section)
+    - ``analogs >= strong_analogs`` → ``medium``
+    - otherwise → ``low``
+
+    The combined band is the weaker axis (:func:`combine_bands`), so the verdict is at most
+    ``medium``. ``recovered`` is part of the call's basis (the caller folds it into ``factors``); it
+    does not move the band, which depends only on how much comparable history exists, not on the
+    direction of the verdict. Like :func:`abstain_confidence`, this keeps every :class:`Confidence`
+    construction inside this module and preserves the "a band is never a value the caller supplies"
+    invariant.
+    """
+    grounding, _ = grounding_strength(EvidenceTier.correlational, causal_claim=False)
+    if analogs < min_analogs:
+        data_band = Band.abstain
+    elif analogs >= strong_analogs:
+        data_band = Band.medium
+    else:
+        data_band = Band.low
+    return Confidence(
+        band=combine_bands(data_band, grounding),
+        data_band=data_band,
+        grounding_band=grounding,
+        grounding_tier=EvidenceTier.correlational.name,
+        factors=list(factors),
+        would_raise=(
+            f"more comparable analogs (≥{strong_analogs} for medium) / "
+            "a completed A/B vs this creative direction"
+        ),
+        would_lower="fewer comparable analogs / account history that contradicts the comparison",
+        causal_flag=False,
+    )
+
+
 def render_confidence_line(conf: Confidence, *, max_factors: int = 3) -> str:
     """Compact one-line confidence renderer (emoji + label + range + top factors). Presentation
     only — the structured data lives on :class:`Confidence`."""

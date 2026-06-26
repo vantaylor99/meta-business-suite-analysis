@@ -26,6 +26,7 @@ from meta_ads_analysis.confidence import (
     Evidence,
     EvidenceTier,
     abstain_confidence,
+    analog_confidence,
     assess,
     build_regenerating_query,
     combine_bands,
@@ -58,6 +59,13 @@ from meta_ads_analysis.knowledge_provenance import (
     plan_edits,
     render_report,
     select_auditable,
+)
+from meta_ads_analysis.early_triage import (
+    AdDailyPoint,
+    AdHistory,
+    DuckDBHistoryProvider,
+    group_histories,
+    triage_ad,
 )
 from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
@@ -7188,3 +7196,315 @@ def test_mcp_reader_aborts_runaway_pagination_at_max_pages() -> None:
         assert "runaway" in str(exc)
     else:
         raise AssertionError("expected the MAX_PAGES runaway guard to fire")
+
+
+# ---------------------------------------------------------------------------
+# Early-life ad triage (early_triage.py) — mocks only; no live Meta.
+# ---------------------------------------------------------------------------
+
+_TRIAGE_START = date(2026, 6, 24)
+_ROAS_POLICY = {"primary_goal": "roas"}
+_INSTALL_POLICY = {
+    "primary_goal": "maximize_in_app_subscriptions",
+    "secondary_cost_per_app_install_target": 3.0,
+}
+
+
+def _point(d, *, spend=0.0, purchases=0.0, purchase_value=0.0, installs=0.0):
+    return AdDailyPoint(
+        report_date=d,
+        spend=spend,
+        results=purchases,
+        purchase_count=purchases,
+        purchase_value=purchase_value,
+        app_installs=installs,
+    )
+
+
+def _hist(ad_id, points, name=None):
+    return AdHistory(ad_id=ad_id, ad_name=name or f"ad {ad_id}", points=points)
+
+
+def _roas_ad(ad_id, *, days, daily_spend=15.0, recover_from=None, start=_TRIAGE_START):
+    """A ROAS-goal ad: zero-purchase (struggling) early; if ``recover_from`` (an age index) is set,
+    later days book purchases/value that clear the 3.0 ROAS target over the recovery window."""
+    points = []
+    for i in range(days):
+        if recover_from is not None and i >= recover_from:
+            points.append(
+                _point(start + timedelta(days=i), spend=daily_spend, purchases=5.0,
+                       purchase_value=daily_spend * 5)
+            )
+        else:
+            points.append(_point(start + timedelta(days=i), spend=daily_spend))
+    return _hist(ad_id, points)
+
+
+def _install_ad(ad_id, *, days, daily_spend=5.0, recover_from=None, start=_TRIAGE_START):
+    """An install-goal ad: zero installs (struggling) early; if ``recover_from`` is set, later days
+    book cheap installs that clear the $3.00 cost-per-install target over the recovery window."""
+    points = []
+    for i in range(days):
+        if recover_from is not None and i >= recover_from:
+            points.append(_point(start + timedelta(days=i), spend=daily_spend, installs=5.0))
+        else:
+            points.append(_point(start + timedelta(days=i), spend=daily_spend))
+    return _hist(ad_id, points)
+
+
+def test_early_triage_keep_watch_when_comparable_new_ads_recovered() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)  # age 2 (day 3)
+    triaged = _roas_ad("T", days=3)  # struggling, zero-result, $45 life-to-date
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=3) for i in range(3)]  # 3 recovered
+    analogs += [_roas_ad(f"B{i}", days=10) for i in range(2)]  # 2 stayed bad
+
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "keep_watch"
+    assert v.age == 2
+    assert v.analog_basis["analogs"] == 5
+    assert v.analog_basis["recovered"] == 3
+    assert v.analog_basis["matched_ids"] == sorted(v.analog_basis["matched_ids"])  # deterministic
+    # Correlational grounding (cross-sectional), so the call can never read High.
+    assert v.confidence["grounding_tier"] == "correlational"
+    # 5 analogs < EARLY_LIFE_STRONG_ANALOGS (6) -> the cross-sectional data band is `low`. (The source
+    # ticket narrative loosely said "medium" for 5; the authoritative knee is strong_analogs=6.)
+    assert v.confidence["band"] == "low"
+    # Evidence cites the ad's own thin life-to-date window first_seen..as_of.
+    assert v.evidence["window"] == f"{_TRIAGE_START.isoformat()}..{as_of.isoformat()}"
+
+
+def test_early_triage_strong_population_reads_medium() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]  # 4 recovered
+    analogs += [_roas_ad(f"B{i}", days=10) for i in range(2)]  # 2 stayed bad -> 6 total
+
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "keep_watch"
+    assert v.analog_basis["analogs"] == 6
+    assert v.confidence["band"] == "medium"  # >= strong_analogs; capped at medium by correlational
+
+
+def test_early_triage_survivorship_one_of_twenty_is_pause_candidate() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad("R0", days=10, recover_from=3)]  # 1 lucky recovery
+    analogs += [_roas_ad(f"B{i}", days=10) for i in range(19)]  # 19 stayed bad
+
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    # Survivorship guard works on the population RATE (1/20 = 5%), not "any recovery".
+    assert v.verdict == "pause_candidate"
+    assert v.analog_basis["analogs"] == 20
+    assert v.analog_basis["recovered"] == 1
+    assert v.analog_basis["rate"] == 0.05
+    assert any("5%" in reason for reason in v.reasons)  # reasons name the rate
+    assert Band[v.confidence["band"]] <= Band.medium
+
+
+def test_early_triage_too_few_analogs_abstains_keep() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad(f"B{i}", days=10) for i in range(2)]  # only 2 comparable
+
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "abstain_keep"
+    # Uses the existing abstain_confidence: data axis abstains, so the combined verdict abstains.
+    assert v.confidence["data_band"] == "abstain"
+    assert v.confidence["band"] == "abstain"
+
+
+def test_early_triage_not_struggling_short_circuits_before_analog_work() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    # Healthy early ad: ROAS well above floor.
+    healthy = _hist("OK", [
+        _point(_TRIAGE_START + timedelta(days=i), spend=15.0, purchases=5.0, purchase_value=150.0)
+        for i in range(3)
+    ])
+    analogs = [_roas_ad(f"B{i}", days=10) for i in range(10)]
+
+    v = triage_ad(
+        ad_id="OK", account_slug="divine_designs", as_of=as_of,
+        histories=[healthy] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "not_struggling"
+    assert v.analog_basis["analogs"] == 0  # no analog work was done
+    assert v.analog_basis["matched_ids"] == []
+
+
+def test_early_triage_install_goal_grades_on_cost_per_install() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _install_ad("TI", days=3)  # $15, zero installs -> struggling on cost-per-install
+    analogs = [_install_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]  # recover to $1/install
+    analogs += [_install_ad(f"B{i}", days=10) for i in range(2)]  # stayed bad
+
+    v = triage_ad(
+        ad_id="TI", account_slug="pollen_sense", as_of=as_of,
+        histories=[triaged] + analogs, policy=_INSTALL_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "keep_watch"
+    assert v.analog_basis["analogs"] == 6
+    assert v.analog_basis["recovered"] == 4
+    assert v.evidence["metric_name"] == "cost_per_app_install"
+
+
+def test_early_triage_install_goal_without_target_degrades_to_abstain() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _install_ad("TI", days=3)
+    analogs = [_install_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]
+
+    v = triage_ad(
+        ad_id="TI", account_slug="pollen_sense", as_of=as_of,
+        histories=[triaged] + analogs,
+        policy={"primary_goal": "maximize_in_app_subscriptions"},  # no install-cost target
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "abstain_keep"  # graceful, not a crash
+    assert v.confidence["band"] == "abstain"
+
+
+def test_early_triage_excludes_too_short_to_judge_from_population() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)
+    long_stayed_bad = [_roas_ad(f"L{i}", days=10) for i in range(3)]  # last_age 9 >= horizon
+    short_lived = _roas_ad("SHORT", days=5)  # last_age 4 < horizon (7) -> too short to judge
+
+    only_long = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + long_stayed_bad, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    with_short = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + long_stayed_bad + [short_lived], policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    # The too-short ad does NOT swell the "stayed bad" population: same count, and it is not matched.
+    assert only_long.analog_basis["analogs"] == 3
+    assert with_short.analog_basis["analogs"] == 3
+    assert "SHORT" not in with_short.analog_basis["matched_ids"]
+    assert with_short.verdict == "pause_candidate"  # 0/3 recovered
+
+
+def test_early_triage_age_is_deterministic_from_as_of() -> None:
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]
+
+    def run(as_of):
+        return triage_ad(
+            ad_id="T", account_slug="divine_designs", as_of=as_of,
+            histories=[triaged] + analogs, policy=_ROAS_POLICY,
+            roas_floor=1.5, roas_target=3.0,
+        )
+
+    assert run(_TRIAGE_START).age == 0  # day 1 == age 0
+    assert run(_TRIAGE_START + timedelta(days=2)).age == 2
+    # Identical inputs -> identical verdict (no clock, no randomness).
+    assert run(_TRIAGE_START + timedelta(days=2)) == run(_TRIAGE_START + timedelta(days=2))
+
+
+def test_early_triage_clock_skew_before_first_seen_clamps_age_zero() -> None:
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs",
+        as_of=_TRIAGE_START - timedelta(days=4),  # as_of predates first_seen
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.age == 0
+
+
+def test_early_triage_returns_none_when_missing_or_past_early_life() -> None:
+    triaged = _roas_ad("T", days=10)
+    # Not found.
+    assert triage_ad(
+        ad_id="NOPE", account_slug="x", as_of=_TRIAGE_START + timedelta(days=2),
+        histories=[triaged], policy=_ROAS_POLICY, roas_floor=1.5, roas_target=3.0,
+    ) is None
+    # Past the early-life window (age 5 > EARLY_LIFE_MAX_AGE).
+    assert triage_ad(
+        ad_id="T", account_slug="x", as_of=_TRIAGE_START + timedelta(days=5),
+        histories=[triaged], policy=_ROAS_POLICY, roas_floor=1.5, roas_target=3.0,
+    ) is None
+
+
+def test_analog_confidence_is_capped_at_medium() -> None:
+    strong = analog_confidence(analogs=50, recovered=50, min_analogs=3, strong_analogs=6, factors=[])
+    assert strong.grounding_tier == "correlational"
+    assert strong.data_band == Band.medium
+    assert strong.band == Band.medium  # never High, regardless of analog count
+    # Ladder: below strong -> low; below min -> abstain.
+    assert analog_confidence(analogs=4, recovered=4, min_analogs=3, strong_analogs=6, factors=[]).band == Band.low
+    assert analog_confidence(analogs=2, recovered=0, min_analogs=3, strong_analogs=6, factors=[]).band == Band.abstain
+
+
+def test_group_histories_parses_dates_and_sorts() -> None:
+    rows = [
+        {"ad_id": "A", "ad_name": "Ad A", "report_date": "2026-06-26", "spend": 5.0,
+         "purchase_count": 0.0, "purchase_value": 0.0, "app_installs": 0.0, "results": 0.0},
+        {"ad_id": "A", "ad_name": "Ad A", "report_date": date(2026, 6, 24), "spend": 5.0,
+         "purchase_count": 0.0, "purchase_value": 0.0, "app_installs": 0.0, "results": 0.0},
+        {"ad_id": "", "ad_name": "no id", "report_date": "2026-06-24", "spend": 1.0},  # dropped
+    ]
+    histories = group_histories(rows)
+    assert [h.ad_id for h in histories] == ["A"]
+    history = histories[0]
+    assert [p.report_date for p in history.points] == [date(2026, 6, 24), date(2026, 6, 26)]
+    assert history.first_seen == date(2026, 6, 24)
+    assert history.last_seen == date(2026, 6, 26)
+
+
+def test_duckdb_history_provider_uses_latest_ingestion_run(tmp_path: Path) -> None:
+    db_path = tmp_path / "meta_ads.duckdb"
+
+    def row(run_date, slug, ad_id, ad_name, report_date, spend):
+        return {
+            "ingestion_run_date": run_date, "account_slug": slug, "report_date": report_date,
+            "ad_id": ad_id, "ad_name": ad_name, "spend": spend, "purchase_count": 0.0,
+            "purchase_value": 0.0, "app_installs": 0.0, "results": 0.0,
+        }
+
+    old_run = "2026-06-01"
+    new_run = "2026-06-26"
+    old_rows = [row(old_run, "acct", "OLD", "Old Ad", "2026-05-31", 1.0)]
+    new_rows = [
+        row(new_run, "acct", "A1", "Ad One", "2026-06-24", 10.0),
+        row(new_run, "acct", "A1", "Ad One", "2026-06-25", 11.0),
+        row(new_run, "acct", "A2", "Ad Two", "2026-06-25", 20.0),
+    ]
+    other_rows = [row(new_run, "other", "X", "Other Ad", "2026-06-25", 99.0)]
+
+    with connect(db_path) as con:
+        replace_run_rows(con, "acct", old_run, old_rows, [])
+        replace_run_rows(con, "acct", new_run, new_rows, [])
+        replace_run_rows(con, "other", new_run, other_rows, [])
+
+    histories = DuckDBHistoryProvider(db_path).ad_histories("acct")
+    # Latest run only (A1, A2) — the older run's "OLD" ad is not included.
+    assert sorted(h.ad_id for h in histories) == ["A1", "A2"]
+    a1 = next(h for h in histories if h.ad_id == "A1")
+    assert [p.report_date for p in a1.points] == [date(2026, 6, 24), date(2026, 6, 25)]
+    assert a1.ad_name == "Ad One"
+
+
+def test_duckdb_history_provider_empty_for_unknown_account(tmp_path: Path) -> None:
+    db_path = tmp_path / "meta_ads.duckdb"
+    assert DuckDBHistoryProvider(db_path).ad_histories("nobody") == []
