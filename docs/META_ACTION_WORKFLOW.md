@@ -97,8 +97,15 @@ Only executable actions with `status: "approved"` are sent to the Meta Graph API
 
 Each recommendation-bearing action (`pause_ad`, `increase_adset_budget`, `consider_scale_budget`, `refresh_creative`) carries two structured blocks:
 
-- `evidence`: the deterministic facts behind the call — the metric the decision rests on (ROAS for ROAS-goal accounts, cost-per-install for install-goal accounts), the window, the sample (purchases / spend), the entity, and a `regenerating_query` that reproduces the metric.
+- `evidence`: the deterministic facts behind the call — the metric the decision rests on (ROAS for ROAS-goal accounts, cost-per-install for install-goal accounts), the window, the sample (conversions / spend), the entity, and a `regenerating_query` that reproduces the metric.
 - `confidence`: a computed band (`high` / `medium` / `low` / `abstain`) from the shared confidence engine. The band is never free-typed; it is derived from sample size, recency, and how causal the evidence is. Grounding caps data strength, so a large-sample correlational call can never read `high`.
+
+The sample that grounds significance is **goal-aware**, mirroring the metric selection and pause logic so all three agree on what the account's conversion signal is:
+
+- **install-goal accounts** (`maximize_in_app_subscriptions`): in-app subscription results (`total_results`) when present, otherwise app installs (`total_app_installs`). This is why an install account that reports zero purchases is no longer stuck at `low` — its significance now rests on the installs/subscriptions that actually back the call. A handful of subscriptions still grounds on those few (and may honestly stay thin) rather than falling back to a richer install count; the installs fallback is only for "no subscription volume yet".
+- **ROAS / default accounts**: purchases (`total_purchase_count`), unchanged.
+
+The operator-facing sample wording is **"conversions"** (goal-neutral — a purchase, a subscription, and an install are all conversions). The serialized JSON key remains `sample_purchases` for back-compatibility with stored `action_plan.json` files; renaming it to `sample_conversions` is tracked separately.
 
 For the executable pause/budget paths, a sample below the significance floor (too few conversions and too little spend) does **not** become a confident pause or scale. The action is flipped to a non-executable `verdict: "insufficient_data"` recommendation — "promising test, keep running and re-check as more data accrues" — with `executable: false` and `approval_required: false`, so thin data can never be approved into a write.
 

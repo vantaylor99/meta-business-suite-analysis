@@ -89,7 +89,7 @@ def _coerce_tier(tier: EvidenceTier | str) -> EvidenceTier:
         raise ValueError(f"Unknown evidence tier {tier!r}; expected one of: {valid}") from exc
 
 
-def _fmt_purchases(value: float | None) -> str:
+def _fmt_conversions(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{int(value)}" if float(value).is_integer() else f"{value:g}"
@@ -181,7 +181,7 @@ def data_strength(
 
     if not cleared_conversions and not cleared_spend:
         return Band.abstain, [
-            f"below significance floor: {_fmt_purchases(sample_purchases)} purchases "
+            f"below significance floor: {_fmt_conversions(sample_purchases)} conversions "
             f"< {conversions_floor:g} and {_fmt_spend(sample_spend)} spend "
             f"< ${spend_floor:,.0f} — insufficient data, abstain"
         ]
@@ -196,14 +196,14 @@ def data_strength(
         else:
             base = Band.medium
         factors.append(
-            f"sample: {_fmt_purchases(sample_purchases)} purchases / "
+            f"sample: {_fmt_conversions(sample_purchases)} conversions / "
             f"{_fmt_spend(sample_spend)} spend (over floor)"
         )
     else:
         base = Band.low
         factors.append(
             f"sample: {_fmt_spend(sample_spend)} spend cleared but only "
-            f"{_fmt_purchases(sample_purchases)} purchases (< {conversions_floor:g}) — thin on conversions"
+            f"{_fmt_conversions(sample_purchases)} conversions (< {conversions_floor:g}) — thin on conversions"
         )
 
     band = base
@@ -414,7 +414,7 @@ def render_evidence_line(evidence: Evidence, *, include_regen: bool = True) -> s
     otherwise print it twice."""
     parts = [evidence.metric_display or evidence.metric_name, f"window {evidence.window}"]
     parts.append(
-        f"n={_fmt_purchases(evidence.sample_purchases)} purchases / "
+        f"n={_fmt_conversions(evidence.sample_purchases)} conversions / "
         f"{_fmt_spend(evidence.sample_spend)} spend"
     )
     if evidence.entity_id or evidence.entity_name:

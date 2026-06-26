@@ -1272,7 +1272,7 @@ def test_operator_brief_renders_high_confidence_evidence_and_recheck_line() -> N
     assert "🟢 High (~80–100%)" in markdown
     assert "ROAS 1.20" in markdown                       # the number
     assert "2026-06-10..2026-06-24" in markdown          # the time window
-    assert "120 purchases" in markdown                   # the sample size
+    assert "120 conversions" in markdown                 # the sample size
     assert "ad:123 'Cody - Copy'" in markdown            # which ad
     assert (
         "Re-check: account_metrics --account divine_designs --level ad "
@@ -5290,7 +5290,7 @@ def test_render_helpers_produce_compact_lines() -> None:
     ev_line = render_evidence_line(evidence)
     assert "ROAS 1.20" in ev_line
     assert "2026-06-10..2026-06-24" in ev_line
-    assert "42 purchases" in ev_line
+    assert "42 conversions" in ev_line
     assert "account_metrics --account divine_designs" in ev_line
 
 
@@ -5346,7 +5346,12 @@ def _use_account_policy(tmp_path: Path, monkeypatch, slug: str, policy: dict[str
     )
 
 
-def _pause_ad_payload(*, ad_overrides: dict[str, Any], run_date: str = "2026-06-24") -> dict[str, Any]:
+def _pause_ad_payload(
+    *,
+    ad_overrides: dict[str, Any],
+    run_date: str = "2026-06-24",
+    account_slug: str = "divine_designs",
+) -> dict[str, Any]:
     ad = {
         "ad_id": "123",
         "ad_name": "Cody - Copy",
@@ -5361,7 +5366,7 @@ def _pause_ad_payload(*, ad_overrides: dict[str, Any], run_date: str = "2026-06-
     }
     ad.update(ad_overrides)
     return {
-        "account_slug": "divine_designs",
+        "account_slug": account_slug,
         "run_date": run_date,
         "budget_waste": [ad],
         "fatigue_findings": [],
@@ -5472,6 +5477,120 @@ def test_action_plan_zero_sample_ad_abstains_never_fabricates_pause(tmp_path, mo
     assert pause["verdict"] == "insufficient_data"
     assert pause["executable"] is False
     assert pause["approval_required"] is False
+
+
+def test_action_plan_install_goal_grounds_significance_on_app_installs(tmp_path, monkeypatch) -> None:
+    # The headline fix: an install-goal account reports 0 purchases, so before this change its sample
+    # was 0 and the band was stuck at `low` (spend cleared, "thin on conversions"). Now significance is
+    # grounded on the conversion type that fits the goal — app installs when no subscription results —
+    # so a pause backed by real install volume reads above `low`.
+    _use_account_policy(
+        tmp_path, monkeypatch, "pollen_sense", {"primary_goal": "maximize_in_app_subscriptions"}
+    )
+    payload = _pause_ad_payload(
+        account_slug="pollen_sense",
+        ad_overrides={
+            "total_purchase_count": 0.0,   # install accounts rarely have purchases
+            "total_results": 0.0,          # no in-app subscriptions yet
+            "total_app_installs": 100.0,   # but real install volume (>= 4 * floor of 25)
+            "cost_per_app_install": 2.50,
+            "total_spend": 250.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        },
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    # 100 installs >= 4 * 25 floor + recent + direct_observation ceiling → high (definitely not low).
+    assert pause["confidence"]["band"] == "high"
+    assert pause["confidence"]["band"] not in {"low", "abstain"}
+    # Significance is grounded on the installs that actually back the call, not the (zero) purchases.
+    evidence = pause["evidence"]
+    assert evidence["sample_purchases"] == 100.0
+    assert evidence["metric_name"] == "cost_per_app_install"
+    assert pause["executable"] is True
+
+
+def test_action_plan_install_goal_grounds_on_subscriptions_not_installs(tmp_path, monkeypatch) -> None:
+    # Decision-1 tradeoff, pinned so it is a choice and not an accident: when in-app subscription
+    # results are present at all, significance grounds on THOSE (the account's real commercial signal),
+    # NOT on a richer app-install count. So a handful of subscriptions honestly stays thin/`low` even
+    # though the ad has plenty of installs — the installs fallback is only for "no subscriptions yet".
+    _use_account_policy(
+        tmp_path, monkeypatch, "pollen_sense", {"primary_goal": "maximize_in_app_subscriptions"}
+    )
+    payload = _pause_ad_payload(
+        account_slug="pollen_sense",
+        ad_overrides={
+            "total_purchase_count": 0.0,
+            "total_results": 3.0,          # a few subscriptions present → these are the signal
+            "total_app_installs": 80.0,    # many installs, but NOT used because results > 0
+            "cost_per_app_install": 3.10,
+            "total_spend": 250.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        },
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    # Grounds on the 3 subscriptions, NOT the 80 installs.
+    assert pause["evidence"]["sample_purchases"] == 3.0
+    # 3 conversions is below the 25 floor (spend cleared) → thin-on-conversions → low. Conservative,
+    # and exactly the intended behavior: subscriptions are thin, so the call stays thin.
+    assert pause["confidence"]["band"] == "low"
+
+
+def test_action_plan_install_goal_abstains_when_both_signals_and_spend_are_thin(
+    tmp_path, monkeypatch
+) -> None:
+    # Install ad with no subscriptions, few installs, AND spend below the floor → both axes fail →
+    # abstain. For the guarded pause path that flips to a non-executable "keep running" recommendation.
+    _use_account_policy(
+        tmp_path, monkeypatch, "pollen_sense", {"primary_goal": "maximize_in_app_subscriptions"}
+    )
+    payload = _pause_ad_payload(
+        account_slug="pollen_sense",
+        ad_overrides={
+            "total_purchase_count": 0.0,
+            "total_results": 0.0,
+            "total_app_installs": 5.0,     # below the 25 conversions floor
+            "cost_per_app_install": 8.0,
+            "total_spend": 40.0,           # below the MIN_WASTE_SPEND ($100) spend floor
+            "first_seen": "2026-06-20",
+            "last_seen": "2026-06-23",
+        },
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["confidence"]["band"] == "abstain"
+    assert pause["verdict"] == "insufficient_data"
+    assert pause["executable"] is False
+    assert pause["approval_required"] is False
+    # The sample grounded on installs (5), and the operator-facing rationale says "conversions".
+    assert pause["evidence"]["sample_purchases"] == 5.0
+    assert "conversions" in pause["rationale"]
+
+
+def test_action_plan_roas_goal_still_grounds_on_purchase_count(tmp_path, monkeypatch) -> None:
+    # Non-install goals are byte-identical to before: a ROAS account grounds significance on
+    # total_purchase_count and never leaks the install/subscription fallback, even if those fields
+    # happen to be populated.
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={
+            "blended_roas": 1.2,
+            "total_purchase_count": 120.0,
+            "total_results": 999.0,        # present, but must be ignored for a ROAS account
+            "total_app_installs": 999.0,   # ditto
+            "total_spend": 2400.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        },
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["evidence"]["sample_purchases"] == 120.0  # the purchase count, not 999
+    assert pause["evidence"]["metric_name"] == "blended_roas"
 
 
 def test_evaluate_action_confidence_flags_causal_correlational_and_caps_band() -> None:
