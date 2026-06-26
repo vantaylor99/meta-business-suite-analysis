@@ -2810,6 +2810,20 @@ def test_rotation_high_confidence_still_blocks_on_live_targeting_drift() -> None
     assert client.updates == []
 
 
+def test_rotation_adset_with_no_window_row_cites_zero_sample_and_abstains() -> None:
+    # Production-realistic: fetch_entity_metrics returns rows only for ad sets that delivered, so the
+    # CLI may pass a metrics map that omits a proposed ad set entirely. That ad set must cite a ZERO
+    # sample (not a structural no-metric abstain) → assess abstains → review marks it insufficient:
+    # rotating on no evidence of fatigue is exactly what grounding prevents.
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id={}, goal="roas", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["evidence"]["sample_purchases"] == 0.0 and op["evidence"]["sample_spend"] == 0.0
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review_verdict"] == "insufficient"
+
+
 # --- Control layer (inspect + guarded ops + enable-ads) ----------------------
 
 from meta_ads_analysis.control import (
