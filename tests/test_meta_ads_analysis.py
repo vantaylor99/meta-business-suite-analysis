@@ -2665,10 +2665,11 @@ from meta_ads_analysis.control import (
 class _ControlFakeClient:
     """Fake client for control-layer tests: campaigns/adsets/ads + updates."""
 
-    def __init__(self, campaigns, adsets, ads):
+    def __init__(self, campaigns, adsets, ads, insights=None):
         self._campaigns = campaigns
         self._adsets = adsets
         self._ads = ads
+        self._insights = insights or []
         self._by_id = {e["id"]: e for e in campaigns + adsets + ads}
         self.updates = []
 
@@ -2677,6 +2678,9 @@ class _ControlFakeClient:
 
     def list_adsets(self, ad_account_id, *, fields, effective_status=None):
         return self._adsets
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1, breakdowns=None):
+        return self._insights
 
     def iter_paginated(self, path, *, params=None):
         return list(self._ads)
@@ -2794,6 +2798,95 @@ def test_build_enable_ads_plan_targets_only_inactive_ads() -> None:
     assert "development mode" in plan["ops"][0]["note"]
 
 
+# --- Enable / set_status grounding (evidence + confidence + review on enable ops) ----
+
+
+def _enable_client(insights):
+    """_control_fixture (ad2 is the PAUSED/inactive ad) plus seeded ad-level insights rows."""
+    base = _control_fixture()
+    return _ControlFakeClient(base._campaigns, base._adsets, base._ads, insights=insights)
+
+
+def test_enable_ads_paused_ad_with_strong_sample_carries_computed_band() -> None:
+    # A high-spend ad that is currently paused, proposed for enable, carries the band the rubric
+    # COMPUTES from its own window sample — never a free-typed number.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(_enable_client(insights), "act_1", policy={"primary_goal": "roas"})
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["evidence"]["metric_name"] == "blended_roas"
+    assert op["evidence"]["sample_purchases"] == 30.0
+    # 25 <= 30 < 100 purchases, recent window, direct_observation → medium (matches confidence.assess).
+    assert op["confidence"]["band"] == "medium"
+    assert op["review"]["verdict"] == "stands"
+    assert plan["guardrails"]["requires_grounding"] is True
+
+
+def test_enable_ads_cold_ad_abstains_and_gate_blocks_turn_on() -> None:
+    # A cold ad (no recent insights) cites a ZERO sample → abstains → review marks it insufficient,
+    # and the apply-time grounding gate refuses to turn it on even when approved (keep observing).
+    plan = build_enable_ads_plan(_enable_client([]), "act_1", policy={"primary_goal": "roas"})
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["confidence"]["band"] == "abstain"
+    assert op["confidence"]["data_band"] == "abstain"
+    assert op["evidence"]["sample_spend"] == 0.0  # honest "zero recent delivery" — a cited sample
+    assert op["review_verdict"] == "insufficient"
+    # Operator approves anyway → the gate blocks the write.
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _enable_client([]), execute=False)
+    blocked = next(r for r in results if r.op_id == op["op_id"])
+    assert blocked.status == "blocked"
+    assert "insufficient data" in (blocked.reason or "").lower()
+
+
+def test_enable_ads_thin_new_ad_abstains_so_go_live_is_a_reviewed_step() -> None:
+    # A freshly-authored (PAUSED) ad has thin data; enabling it is the go-live path and must be a
+    # conscious, reviewed step — not an auto-confident enable. Below-floor sample → abstain.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "40",
+        "action_values": [{"action_type": "purchase", "value": "60"}],
+        "actions": [{"action_type": "purchase", "value": "3"}],
+    }]
+    plan = build_enable_ads_plan(_enable_client(insights), "act_1", policy={"primary_goal": "roas"})
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["confidence"]["band"] == "abstain"  # $40 / 3 purchases below the significance floor
+    assert op["review_verdict"] == "insufficient"
+
+
+def test_review_ops_plan_demotes_overclaimed_enable() -> None:
+    from meta_ads_analysis.review import review_ops_plan
+
+    op = {
+        "op_id": "enable_ad_x", "op": "set_status", "level": "ad", "id": "adx", "status": "approved",
+        "params": {"status": "ACTIVE"},
+        "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
+                     "window": "2026-06-10..2026-06-24", "sample_purchases": 30.0,
+                     "sample_spend": 500.0, "entity_level": "ad", "entity_id": "adx"},
+        "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
+                       "grounding_tier": "direct_observation", "factors": [], "would_raise": "",
+                       "would_lower": "", "causal_flag": False},
+    }
+    plan = {"run_date": "2026-06-24", "ops": [op], "guardrails": {"requires_grounding": True}}
+    reviewed = review_ops_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "downgrade"  # 30 purchases supports medium, not the claimed high
+    assert Band[r["confidence"]["band"]] < Band.high
+    assert r["review_verdict"] == "downgrade"
+    assert "review" not in plan["ops"][0]  # input plan not mutated
+
+
+def test_enable_ads_review_is_idempotent() -> None:
+    from meta_ads_analysis.review import review_ops_plan
+
+    plan = build_enable_ads_plan(_enable_client([]), "act_1", policy={"primary_goal": "roas"})
+    again = review_ops_plan(plan)
+    assert [o["confidence"]["band"] for o in again["ops"]] == [o["confidence"]["band"] for o in plan["ops"]]
+    assert again["ops"][0]["review"] == plan["ops"][0]["review"]
+
+
 # --- Metrics / diagnose / audiences / pause ---------------------------------
 
 from meta_ads_analysis.control import (
@@ -2885,6 +2978,35 @@ def test_build_pause_plan_selects_underperformers_by_roas() -> None:
     ids = [op["id"] for op in plan["ops"]]
     assert ids == ["ad1"]  # only the active, below-floor, enough-spend ad
     assert plan["ops"][0]["params"] == {"status": "PAUSED"}
+
+
+def test_pause_roas_below_carries_grounded_band() -> None:
+    # A roas_below pause rests on ROAS by construction → the op cites that metric + a computed band.
+    ads = [{"id": "ad1", "name": "Loser", "effective_status": "ACTIVE", "adset_id": "as1", "issues_info": []}]
+    insights = [{"ad_id": "ad1", "ad_name": "Loser", "spend": "200",
+                 "action_values": [{"action_type": "purchase", "value": "100"}],
+                 "actions": [{"action_type": "purchase", "value": "4"}]}]
+    client = _ControlFakeClient([], [], ads, insights=insights)
+    plan = build_pause_plan(client, "act_1", roas_below=1.5, min_spend=100,
+                            date_from="2026-06-01", date_to="2026-06-24", run_date="2026-06-25")
+    op = next(o for o in plan["ops"] if o["id"] == "ad1")
+    assert op["evidence"]["metric_name"] == "blended_roas"
+    assert op["evidence"]["sample_spend"] == 200.0
+    assert op["confidence"]["band"] != "abstain"  # spend cleared the floor → a real (low) band
+    assert plan["guardrails"]["requires_grounding"] is True
+
+
+def test_pause_structural_abstains_but_gate_allows_safety_pause() -> None:
+    # A purely structural pause (no metric) cites NO sample → structural abstain → the apply-time gate
+    # ALLOWS it (pausing is conservative; PAUSED-by-default safety writes must not be blocked).
+    plan = build_pause_plan(_control_fixture(), "act_1")  # all ACTIVE ads, no perf rule
+    op = next(o for o in plan["ops"] if o["id"] == "ad1")
+    assert op["confidence"]["band"] == "abstain"
+    assert op["evidence"]["sample_spend"] is None  # structural — nothing cited
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _control_fixture(), execute=False)
+    res = next(r for r in results if r.op_id == op["op_id"])
+    assert res.status == "dry_run"  # allowed, not blocked
 
 
 # --- Authoring (create / duplicate / lookalike) + breakdowns + account-info --

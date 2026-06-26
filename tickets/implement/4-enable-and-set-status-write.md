@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-26T01:52:04.854Z (agent: claude)
+  Log file: /Users/vantaylor99/Developer/projects/meta-business-suite-analysis/tickets/.logs/4-enable-and-set-status-write.implement.2026-06-26T01-52-04-854Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: The existing "turn ads on/off" controls now must carry the facts and confidence behind each enable/pause, and pass the automatic second-opinion check, before an operator can approve them — closing the gap where a status change could be approved with no evidence.
 prereq: guarded-write-evidence-scaffold
 files: src/meta_ads_analysis/control.py, src/meta_ads_analysis/confidence.py, src/meta_ads_analysis/review.py, src/meta_ads_analysis/cli.py, tests/test_meta_ads_analysis.py, docs/META_ACTION_WORKFLOW.md

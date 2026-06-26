@@ -115,6 +115,41 @@ unaffected; the grounded per-capability builders set the flag and attach the blo
 live-state reads that build evidence and derive `recency_days` happen in the impure caller and are
 passed in.
 
+### Enabling and pausing ads (`set_status` grounding)
+
+`control.build_enable_ads_plan` and `control.build_pause_plan` are grounded producers: they set
+`guardrails.requires_grounding: true`, attach an `evidence` + computed `confidence` block to every
+`set_status` op, and run the plan through `review.review_ops_plan` before returning it. The evidence
+is the toggled ad's **own** performance over a stated window (`--date-from` / `--date-to`, defaulting
+to a 30-day trailing window), with the metric chosen by the account goal — ROAS for ROAS-goal
+accounts, cost-per-install for install-goal accounts (the same selection `actions._select_action_metric`
+uses) — plus the purchases/spend sample, the entity, and a `regenerating_query`.
+
+Enabling and pausing are deliberately **asymmetric** at the no-data boundary, because turning an ad ON
+and turning it OFF carry opposite risk:
+
+- **Enable a cold ad** — an ad paused long enough to have no recent insights cites a **zero**
+  purchases/spend sample (an honest "spent $0 in the window"). That is below the significance floor, so
+  the band is `abstain`, review marks the op `insufficient`, and — because a sample *is* cited — the
+  apply-time gate **blocks** the write even if it is approved ("not enough data to safely turn this on —
+  keep observing"). A freshly-authored (PAUSED) ad's go-live is the same path: thin/new data abstains,
+  so flipping it live is a conscious, reviewed step, never an auto-confident enable.
+- **Pause for a structural / safety reason** — a pause selected by name / ad-set filter with no
+  performance metric cites **no** sample (a structural abstain). The gate **allows** it, because pausing
+  is the conservative direction and blocking it would break PAUSED-by-default safety writes. A
+  `--roas-below` pause instead rests on ROAS by construction, so it cites that metric and a computed
+  band.
+
+A high-spend ad that happens to be paused still grounds normally: its real window sample computes a
+real band (e.g. `medium`), so re-enabling it is an evidence-backed, reviewable proposal. Ops carry no
+`action_type`, so the review gate's `direction` check (scale-vs-ROAS-target) does not fire on an
+enable; the protection against an enable whose metric contradicts the goal is that its band is computed
+from sample strength alone and can never be *over*-confident. Enabling a campaign or ad set toggles only
+that node — it does **not** un-pause PAUSED children — so evidence is attached at the level being
+toggled. The ad list is read once at propose time, so live `effective_status` may drift before execute;
+re-applying `ACTIVE` to an ad that is already ACTIVE is idempotent on Meta's side (and `--validate-only`
+pre-flights the change), so the drift does not produce a confusing error.
+
 ## Account Goals
 
 Account-specific action policy lives in `config/meta_ads_accounts.json`.

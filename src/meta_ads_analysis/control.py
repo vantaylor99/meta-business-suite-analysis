@@ -16,17 +16,18 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from . import account_registry
-from .config import DEFAULT_REPORTS_ROOT
+from . import account_registry, review
+from .confidence import Evidence, EvidenceTier, build_regenerating_query
+from .config import CONFIDENCE_CONVERSIONS_FLOOR, DEFAULT_REPORTS_ROOT, MIN_WASTE_SPEND
 from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
 from .reader_provider import MetaReaderProvider, as_reader
 from .rotation import _audience_refs, _ids, advantage_audience_enabled
 from .utils import ensure_dir, write_json
-from .write_grounding import op_grounding_gap
+from .write_grounding import attach_op_grounding, op_grounding_gap
 
 APPROVED_STATUS = "approved"
 PROPOSED_STATUS = "proposed"
@@ -417,6 +418,164 @@ def apply_ops_plan(
     return results
 
 
+# --- set_status grounding (shared by enable / pause builders) ---------------
+
+
+def _optional_str(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def _fmt_roas(value: float | None) -> str:
+    return f"ROAS {value:.2f}" if value is not None else "ROAS n/a"
+
+
+def _fmt_cost_per_install(value: float | None) -> str:
+    return f"cost/install ${value:.2f}" if value is not None else "cost/install n/a"
+
+
+def resolve_action_policy(account_slug: str | None) -> dict[str, Any]:
+    """The account's action policy (``primary_goal`` etc.), or ``{}`` when unknown — mirrors
+    ``actions._action_policy_for_account`` so control plans pick the SAME goal-based metric as the
+    action plan without coupling ``control`` to ``actions``."""
+    if not account_slug:
+        return {}
+    try:
+        account = account_registry.resolve_account(
+            account_slug, account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH
+        )
+    except (FileNotFoundError, KeyError, ValueError):
+        return {}
+    return dict(account.action_policy or {})
+
+
+def _status_metric(
+    metrics_row: dict[str, Any] | None, goal: str | None
+) -> tuple[str, float | None, str]:
+    """Pick the metric a ``set_status`` decision rests on, mirroring ``actions._select_action_metric``:
+    ROAS for ROAS-goal accounts, cost-per-install for install-goal accounts, else whichever is present
+    in the window's metrics."""
+    row = metrics_row or {}
+    roas = _num(row.get("roas"))
+    cost_per_install = _num(row.get("cost_per_app_install"))
+    if goal == "maximize_in_app_subscriptions":
+        return "cost_per_app_install", cost_per_install, _fmt_cost_per_install(cost_per_install)
+    if goal == "roas":
+        return "blended_roas", roas, _fmt_roas(roas)
+    if roas is not None:
+        return "blended_roas", roas, _fmt_roas(roas)
+    if cost_per_install is not None:
+        return "cost_per_app_install", cost_per_install, _fmt_cost_per_install(cost_per_install)
+    return "blended_roas", None, _fmt_roas(None)
+
+
+def _resolve_grounding_window(
+    date_from: str | None, date_to: str | None, run_date: str | None
+) -> tuple[str, str, int | None, str]:
+    """Resolve the evidence window + recency for a set_status plan. Returns
+    ``(date_from, date_to, recency_days, run_date_iso)``. ``run_date`` (default today) and the window
+    end derive recency the SAME way the producer feeds :func:`confidence.assess` and the way
+    ``review`` re-derives it from ``plan["run_date"]`` — so the gate's recompute is faithful."""
+    from .sync_api import resolve_date_window
+
+    run_dt = _parse_iso_date(run_date) or date.today()
+    resolved_from, resolved_to = resolve_date_window(run_dt, date_from=date_from, date_to=date_to)
+    end = _parse_iso_date(resolved_to)
+    recency_days = (run_dt - end).days if end is not None else None
+    return resolved_from, resolved_to, recency_days, run_dt.isoformat()
+
+
+def _attach_status_grounding(
+    op: dict[str, Any],
+    ad: dict[str, Any],
+    metrics_row: dict[str, Any] | None,
+    *,
+    metric_name: str,
+    metric_value: float | None,
+    metric_display: str,
+    account_slug: str | None,
+    date_from: str,
+    date_to: str,
+    recency_days: int | None,
+    cold_cites_zero: bool,
+) -> None:
+    """Attach ``evidence`` + a COMPUTED ``confidence`` band to a ``set_status`` op via the shared
+    :func:`write_grounding.attach_op_grounding`. The sample is the entity's own delivery over the
+    window; the band is computed (or abstained) — never free-typed.
+
+    ``cold_cites_zero`` decides what "no recent delivery" means, and this is the whole asymmetry
+    between turning an ad ON vs OFF:
+
+    - **enable (True):** an ad with no recent insights cites a *zero* purchases/spend sample — an
+      honest "this ad spent $0 in the window." Below the floor, ``assess`` abstains, and because the
+      sample IS cited the apply-time gate BLOCKS the write: you cannot confidently turn ON an ad with
+      no evidence it still works (the cold-ad boundary).
+    - **pause (False):** a structural/safety pause with no metric cites NO sample, so the abstain is a
+      *structural* abstain the gate ALLOWS — pausing is the conservative, safe direction, and blocking
+      it would break PAUSED-by-default safety writes.
+    """
+    if metrics_row is None and not cold_cites_zero:
+        # Structural / safety pause: name WHICH entity over WHAT window, but cite NO sample
+        # (sample_*=None). attach_op_grounding then abstains, and because nothing is cited the gate
+        # treats it as a structural abstain and ALLOWS it — never a fabricated band.
+        evidence: Evidence | None = Evidence(
+            metric_name=metric_name,
+            metric_value=None,
+            metric_display=metric_display,
+            window=f"{date_from}..{date_to}" if (date_from or date_to) else "",
+            sample_purchases=None,
+            sample_spend=None,
+            entity_level="ad",
+            entity_id=_optional_str(ad.get("id")),
+            entity_name=ad.get("name"),
+            regenerating_query=build_regenerating_query(account_slug, "ad", date_from, date_to),
+        )
+    elif metrics_row is None:
+        evidence = Evidence(
+            metric_name=metric_name,
+            metric_value=None,
+            metric_display=metric_display,
+            window=f"{date_from}..{date_to}",
+            sample_purchases=0.0,
+            sample_spend=0.0,
+            entity_level="ad",
+            entity_id=_optional_str(ad.get("id")),
+            entity_name=ad.get("name"),
+            regenerating_query=build_regenerating_query(account_slug, "ad", date_from, date_to),
+        )
+    else:
+        evidence = Evidence(
+            metric_name=metric_name,
+            metric_value=metric_value,
+            metric_display=metric_display,
+            window=f"{date_from}..{date_to}",
+            sample_purchases=_num(metrics_row.get("purchases")),
+            sample_spend=_num(metrics_row.get("spend")) or 0.0,
+            entity_level="ad",
+            entity_id=_optional_str(ad.get("id")),
+            entity_name=ad.get("name"),
+            regenerating_query=build_regenerating_query(account_slug, "ad", date_from, date_to),
+        )
+    attach_op_grounding(
+        op,
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=MIN_WASTE_SPEND,
+        conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=recency_days,
+    )
+
+
 # --- Convenience builder: enable paused ads ---------------------------------
 
 
@@ -427,20 +586,38 @@ def build_enable_ads_plan(
     account_slug: str | None = None,
     adset_ids: list[str] | None = None,
     name_contains: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    run_date: str | None = None,
+    policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Propose set_status=ACTIVE ops for currently-not-active ads, optionally filtered.
 
-    Read-only (reads ads through ``reader``): each op starts ``proposed`` with the ad's current
-    effective_status + delivery issues in its note, so the operator/agent approves only the ads
-    worth turning on.
+    Read-only (reads ads + per-ad metrics through ``reader``). Each op starts ``proposed`` and carries
+    grounding: an ``evidence`` block (the ad's own performance over [date_from, date_to], metric chosen
+    by the account goal) and a **computed** ``confidence`` band. An ad with no recent delivery (a cold
+    ad) cites a zero sample → abstains → the apply-time grounding gate refuses to turn it on (keep
+    observing). The plan is run through :func:`review.review_ops_plan` before it is returned, so an
+    over-claimed or below-floor enable is demoted/marked insufficient before it reaches the operator.
     """
     reader = as_reader(reader)
+    policy = policy if policy is not None else resolve_action_policy(account_slug)
+    goal = policy.get("primary_goal")
+    date_from, date_to, recency_days, run_date_iso = _resolve_grounding_window(
+        date_from, date_to, run_date
+    )
     ads = list(
         reader.iter_paginated(
             f"/{ad_account_id}/ads",
             params={"fields": ",".join(AD_FIELDS), "limit": 200},
         )
     )
+    metrics_by_id = {
+        str(m["id"]): m
+        for m in fetch_entity_metrics(
+            reader, ad_account_id, level="ad", date_from=date_from, date_to=date_to
+        )
+    }
     scope = set(adset_ids or [])
     ops: list[dict[str, Any]] = []
     for ad in ads:
@@ -451,38 +628,62 @@ def build_enable_ads_plan(
         if name_contains and name_contains.lower() not in str(ad.get("name") or "").lower():
             continue
         issues = _issue_summaries(ad)
-        ops.append(
-            {
-                "op_id": f"enable_ad_{ad.get('id')}",
-                "op": "set_status",
-                "level": "ad",
-                "id": ad.get("id"),
-                "name": ad.get("name"),
-                "params": {"status": "ACTIVE"},
-                "status": PROPOSED_STATUS,
-                "note": f"currently {ad.get('effective_status')}; issues: {'; '.join(issues) or 'none'}",
-            }
+        metrics_row = metrics_by_id.get(str(ad.get("id")))
+        metric_name, metric_value, metric_display = _status_metric(metrics_row, goal)
+        op = {
+            "op_id": f"enable_ad_{ad.get('id')}",
+            "op": "set_status",
+            "level": "ad",
+            "id": ad.get("id"),
+            "name": ad.get("name"),
+            "params": {"status": "ACTIVE"},
+            "status": PROPOSED_STATUS,
+            "note": f"currently {ad.get('effective_status')}; issues: {'; '.join(issues) or 'none'}",
+        }
+        _attach_status_grounding(
+            op,
+            ad,
+            metrics_row,
+            metric_name=metric_name,
+            metric_value=metric_value,
+            metric_display=metric_display,
+            account_slug=account_slug,
+            date_from=date_from,
+            date_to=date_to,
+            recency_days=recency_days,
+            cold_cites_zero=True,
         )
-    return {
+        ops.append(op)
+    plan = {
         "schema_version": 1,
         "plan_type": "ops",
         "intent": "enable_ads",
         "account_slug": account_slug,
         "ad_account_id": ad_account_id,
         "generated_at": _now_iso(),
+        "run_date": run_date_iso,
+        "account_action_policy": policy,
+        "selection": {"date_from": date_from, "date_to": date_to},
         "approval_instructions": (
             "Review each ad. To enable it, set its op status to 'approved'. Only approved ops are "
-            "sent to Meta, and only with --execute (or tested with --validate-only)."
+            "sent to Meta, and only with --execute (or tested with --validate-only). An enable with a "
+            "below-floor / no-delivery sample abstains and is blocked until the ad shows it works."
         ),
-        "guardrails": {"requires_explicit_approval": True, "statuses": sorted(ALLOWED_STATUSES)},
+        "guardrails": {
+            "requires_explicit_approval": True,
+            "requires_grounding": True,
+            "statuses": sorted(ALLOWED_STATUSES),
+        },
         "ops": ops,
     }
+    return review.review_ops_plan(plan)
 
 
 # --- Winning copy library (+ shared metric helpers) -------------------------
 
 from .config import PROJECT_ROOT  # noqa: E402
 from .sync_api import (  # noqa: E402
+    APP_INSTALL_KEYS,
     PURCHASE_KEYS,
     _extract_headline,
     _extract_primary_text,
@@ -633,6 +834,7 @@ def fetch_entity_metrics(
         spend = _number(r.get("spend")) or 0.0
         value = _find_metric(_metric_blob_list(r.get("action_values")), PURCHASE_KEYS)
         purchases = _find_metric(_metric_blob_list(r.get("actions")), PURCHASE_KEYS)
+        app_installs = _find_metric(_metric_blob_list(r.get("actions")), APP_INSTALL_KEYS)
         roas = (value / spend) if (value is not None and spend) else None
         out.append({
             "id": r.get(idk),
@@ -641,6 +843,8 @@ def fetch_entity_metrics(
             "purchase_value": round(value, 2) if value is not None else None,
             "roas": round(roas, 2) if roas is not None else None,
             "purchases": purchases,
+            "app_installs": app_installs,
+            "cost_per_app_install": round(spend / app_installs, 2) if app_installs else None,
             "impressions": _number(r.get("impressions")),
             "cost_per_purchase": round(spend / purchases, 2) if purchases else None,
         })
@@ -828,12 +1032,19 @@ def build_pause_plan(
     min_spend: float = 0.0,
     date_from: str | None = None,
     date_to: str | None = None,
+    run_date: str | None = None,
 ) -> dict[str, Any]:
     """Propose pausing ACTIVE ads, by name/ad-set filter and/or a performance rule.
 
     Read-only (ads + optional metrics via ``reader``; only proposes ops). If ``roas_below`` is
     set, pulls live ad-level metrics over [date_from, date_to] and selects ads whose ROAS is
     below the threshold with spend >= ``min_spend``.
+
+    Each op carries grounding. A ``roas_below`` pause cites the ad's ROAS over the window (a computed
+    band). A purely structural pause (name/ad-set filter, no metric) cites NO sample → an honest
+    *structural* abstain the apply-time gate allows, because pausing is the conservative direction (the
+    no-metric policy: never fabricate a band for a safety pause). The plan is run through
+    :func:`review.review_ops_plan` before it is returned.
     """
     reader = as_reader(reader)
     ads = list(
@@ -856,9 +1067,15 @@ def build_pause_plan(
             raise ValueError("roas_below requires date_from and date_to.")
         perf = {str(m["id"]): m for m in fetch_entity_metrics(reader, ad_account_id, level="ad", date_from=date_from, date_to=date_to)}
 
+    run_dt = _parse_iso_date(run_date) or date.today()
+    end = _parse_iso_date(date_to)
+    recency_days = (run_dt - end).days if end is not None else None
+    window_from, window_to = date_from or "", date_to or ""
+
     ops = []
     for ad in candidates:
         note = "active"
+        metrics_row: dict[str, Any] | None = None
         if roas_below is not None:
             m = perf.get(str(ad.get("id")))
             roas = (m or {}).get("roas")
@@ -866,7 +1083,8 @@ def build_pause_plan(
             if roas is None or roas >= roas_below or spend < min_spend:
                 continue
             note = f"ROAS {roas} on ${spend:.0f} spend (< {roas_below} floor)"
-        ops.append({
+            metrics_row = m
+        op = {
             "op_id": f"pause_ad_{ad.get('id')}",
             "op": "set_status",
             "level": "ad",
@@ -875,22 +1093,44 @@ def build_pause_plan(
             "params": {"status": "PAUSED"},
             "status": PROPOSED_STATUS,
             "note": note,
-        })
-    return {
+        }
+        # A roas_below pause rests on ROAS by construction (it is how the ad was selected); a
+        # structural pause has no metric → no sample cited (structural abstain, gate-allowed).
+        _attach_status_grounding(
+            op,
+            ad,
+            metrics_row,
+            metric_name="blended_roas",
+            metric_value=_num((metrics_row or {}).get("roas")),
+            metric_display=_fmt_roas(_num((metrics_row or {}).get("roas"))),
+            account_slug=account_slug,
+            date_from=window_from,
+            date_to=window_to,
+            recency_days=recency_days,
+            cold_cites_zero=False,
+        )
+        ops.append(op)
+    plan = {
         "schema_version": 1,
         "plan_type": "ops",
         "intent": "pause_ads",
         "account_slug": account_slug,
         "ad_account_id": ad_account_id,
         "generated_at": _now_iso(),
+        "run_date": run_dt.isoformat(),
         "selection": {"roas_below": roas_below, "min_spend": min_spend, "date_from": date_from, "date_to": date_to},
         "approval_instructions": (
             "Review each ad. To pause it, set its op status to 'approved'. Only approved ops are "
             "sent to Meta, and only with --execute (or tested with --validate-only)."
         ),
-        "guardrails": {"requires_explicit_approval": True, "statuses": sorted(ALLOWED_STATUSES)},
+        "guardrails": {
+            "requires_explicit_approval": True,
+            "requires_grounding": True,
+            "statuses": sorted(ALLOWED_STATUSES),
+        },
         "ops": ops,
     }
+    return review.review_ops_plan(plan)
 
 
 # --- Paths / writers --------------------------------------------------------

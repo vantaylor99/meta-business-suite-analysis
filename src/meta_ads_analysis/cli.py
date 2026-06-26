@@ -1617,7 +1617,7 @@ def propose_pause_ads_main() -> None:
     plan = build_pause_plan(
         client, ad_account_id, account_slug=account_slug, adset_ids=args.adset_id,
         name_contains=args.name_contains, roas_below=args.roas_below, min_spend=args.min_spend,
-        date_from=date_from, date_to=date_to,
+        date_from=date_from, date_to=date_to, run_date=run_date,
     )
     output_path = Path(args.output_path) if args.output_path else default_ops_plan_path(account_slug, run_date, Path(args.reports_root))
     write_plan(plan, output_path)
@@ -1637,6 +1637,8 @@ def propose_enable_ads_main() -> None:
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
     parser.add_argument("--adset-id", action="append", help="Limit to ad(s) in this ad set id (repeatable).")
     parser.add_argument("--name-contains", help="Limit to ads whose name contains this substring.")
+    parser.add_argument("--date-from", help="Evidence-window start. Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence-window end. Defaults to the run date / today.")
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT), help="Reports root. Defaults to reports/.")
     parser.add_argument("--output-path", help="Override ops plan path.")
     parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
@@ -1653,6 +1655,7 @@ def propose_enable_ads_main() -> None:
     plan = build_enable_ads_plan(
         client, ad_account_id, account_slug=account_slug,
         adset_ids=args.adset_id, name_contains=args.name_contains,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
     )
     output_path = Path(args.output_path) if args.output_path else default_ops_plan_path(account_slug, run_date, reports_root)
     write_plan(plan, output_path)
