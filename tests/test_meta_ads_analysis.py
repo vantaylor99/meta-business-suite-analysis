@@ -577,6 +577,67 @@ def test_account_registry_resolves_valid_slug(tmp_path: Path) -> None:
     assert account.ad_account_id == "act_12345"
 
 
+def test_account_registry_max_budget_decrease_percent_override(tmp_path: Path) -> None:
+    config_path = tmp_path / "meta_ads_accounts.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "test_account",
+                        "account_name": "Test Account",
+                        "ad_account_id": "99999",
+                        "action_policy": {
+                            "max_budget_decrease_percent": 25,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accounts = load_account_registry(config_path)
+
+    assert accounts["test_account"].max_budget_decrease_percent == 25.0
+
+
+def test_account_registry_max_budget_decrease_percent_defaults_absent(tmp_path: Path) -> None:
+    config_path = tmp_path / "meta_ads_accounts.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "test_account",
+                        "account_name": "Test Account",
+                        "ad_account_id": "99999",
+                        "action_policy": {
+                            "max_budget_increase_percent": 20,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accounts = load_account_registry(config_path)
+
+    assert accounts["test_account"].max_budget_decrease_percent is None
+
+
+def test_account_registry_existing_config_loads() -> None:
+    from meta_ads_analysis.config import DEFAULT_ACCOUNTS_CONFIG_PATH
+
+    accounts = load_account_registry(DEFAULT_ACCOUNTS_CONFIG_PATH)
+
+    assert "pollen_sense" in accounts
+    assert "divine_designs" in accounts
+    assert accounts["pollen_sense"].max_budget_decrease_percent is None
+    assert accounts["divine_designs"].max_budget_decrease_percent is None
+
+
 def test_default_date_window_uses_trailing_30_days() -> None:
     date_from, date_to = resolve_date_window(date(2026, 4, 22))
     assert date_from == "2026-03-24"

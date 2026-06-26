@@ -25,6 +25,8 @@ class MetaAdsAccount:
     roas_role: str | None = None
     analysis_notes: str | None = None
     action_policy: dict[str, object] | None = None
+    # Per-account override of config.MAX_BUDGET_DECREASE_PERCENT; None means use the global default.
+    max_budget_decrease_percent: float | None = None
 
 
 def load_account_registry(
@@ -71,6 +73,9 @@ def load_account_registry(
         if not ad_account_id:
             raise ValueError(f"Account entry '{account_slug}' is missing ad_account_id.")
 
+        raw_decrease = policy.get("max_budget_decrease_percent")
+        max_budget_decrease_percent = float(raw_decrease) if raw_decrease is not None else None
+
         accounts[account_slug] = MetaAdsAccount(
             account_slug=account_slug,
             account_name=account_name,
@@ -90,6 +95,7 @@ def load_account_registry(
             roas_role=_none_if_blank(focus.get("roas_role")),
             analysis_notes=_none_if_blank(focus.get("analysis_notes")),
             action_policy=policy,
+            max_budget_decrease_percent=max_budget_decrease_percent,
         )
     if not accounts:
         raise ValueError("Account registry is empty.")

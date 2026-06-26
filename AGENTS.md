@@ -211,6 +211,7 @@ confidence-bearing actions and passes informational ones through untouched). Thi
 - Do not collapse missing data into zeros unless the normalized output already did so intentionally.
 - Do not execute Meta account changes directly from a written analysis. Use the action workflow: generate `action_plan.json`, require explicit approval, dry-run, then execute approved actions.
 - Keep Meta AI / Advantage+ creative features off by default. Do not enable automatic text variations, image expansion, visual touch-ups, generated music, flexible media, or AI-generated creative variants unless a human explicitly requests that exact change.
+- Budget-decrease operations are double-gated by two safety knobs in `config.py`: `MAX_BUDGET_DECREASE_PERCENT` (default 50 — a single op may not cut the live budget by more than this percent) and `MIN_DAILY_BUDGET_CENTS` (absolute floor in account minor units). A per-account override (`max_budget_decrease_percent` in `action_policy`) narrows the percent cap further; `validate_only` against Meta enforces the real per-currency minimum as the final check.
 
 ## Read backend (direct vs MCP)
 
