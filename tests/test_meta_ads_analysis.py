@@ -4837,6 +4837,54 @@ def test_build_budget_plan_review_refutes_cutting_a_clear_winner() -> None:
     assert op["review"]["verdict"] == "refuted"  # cutting the budget of a clear winner
 
 
+def _bud_install_insights(installs: str, spend: str = "2400"):
+    """An install-goal insights row carrying ad-set + campaign ids and app-install actions, so
+    ``fetch_entity_metrics`` computes cost/install = spend / installs. No purchase actions, so the
+    conversion sample is 0 (install ops cap at low band) — but $2400 spend clears MIN_SCALING_SPEND,
+    so the sample-floor abstain does not fire and the direction refutation surfaces as the verdict."""
+    return [{"spend": spend,
+             "actions": [{"action_type": "mobile_app_install", "value": installs}],
+             "adset_id": "as1", "adset_name": "Set 1", "campaign_id": "c1", "campaign_name": "Camp"}]
+
+
+def test_build_budget_plan_install_goal_refutes_scale_up_above_cost_target() -> None:
+    # End-to-end on the control BUDGET-op surface for an install goal (the composition no other test
+    # drives together: _budget_op's action_type + _status_metric's cost_per_app_install + the gate's
+    # install branch). Scaling up an entity whose cited cost/install ($4 = $2400 / 600) sits ABOVE the
+    # $3 target is scaling a loser — the cost-polarity mirror of the ROAS scale-up-below-target test.
+    loser = _bud_install_insights("600")  # 2400 / 600 = $4.00 cost/install, above $3 target
+    plan = build_budget_plan(
+        _adset_level_client(insights=loser), "act_1", new_daily_budget_cents=11000, adset_id="as1",
+        policy={"primary_goal": "maximize_in_app_subscriptions",
+                "secondary_cost_per_app_install_target": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["action_type"] == "increase_adset_budget"  # 11000 > current 10000
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["metric_value"] == 4.0
+    assert op["review"]["verdict"] == "refuted"
+    assert op["review_verdict"] == "refuted"
+    assert "direction" in op["review"]["failed_inputs"]
+
+
+def test_build_budget_plan_install_goal_refutes_cutting_a_clear_winner() -> None:
+    # The inverted-polarity mirror on the budget surface: cutting the budget of an entity whose cited
+    # cost/install ($1.50 = $2400 / 1600) is comfortably below the $3 target (<= 3/1.5 = $2) is cutting
+    # a winner. Refuted.
+    winner = _bud_install_insights("1600")  # 2400 / 1600 = $1.50 cost/install, below the $2 margin
+    plan = build_budget_plan(
+        _adset_level_client(insights=winner), "act_1", new_daily_budget_cents=8000, adset_id="as1",
+        policy={"primary_goal": "maximize_in_app_subscriptions",
+                "secondary_cost_per_app_install_target": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["action_type"] == "decrease_adset_budget"  # 8000 < current 10000
+    assert op["evidence"]["metric_value"] == 1.5
+    assert op["review"]["verdict"] == "refuted"  # cutting the budget of a cost-per-install winner
+
+
 def test_actions_ops_cbo_classification_parity() -> None:
     # The ops path (classify_adset_budget) and the action path
     # (_populate_budget_params_from_live_state) must classify an identical fixture identically.

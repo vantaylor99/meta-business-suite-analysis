@@ -77,13 +77,15 @@ _ACTION_SPEND_FLOOR: dict[str, float] = {
     "refresh_creative": MIN_WASTE_SPEND,
 }
 
-# Action types whose *direction* is a scale-up. For a ROAS-goal account, scaling an entity whose cited
-# ROAS is below the goal target contradicts its own number. (Budget ops set ``action_type`` so this
-# check can fire on them — see ``control._budget_op``.)
+# Action types whose *direction* is a scale-up. Scaling an entity whose own cited goal metric is on the
+# losing side of target (ROAS below target, or cost-per-install above target) contradicts its own
+# number. Both polarity branches consume this set. (Budget ops set ``action_type`` so this check can
+# fire on them — see ``control._budget_op``.)
 _SCALE_ACTIONS = {"increase_adset_budget", "increase_campaign_budget", "consider_scale_budget"}
 
 # Action types whose *direction* is a budget scale-DOWN. Cutting the budget of a clear winner (cited
-# ROAS comfortably above target) contradicts the account goal, the mirror of pausing a winner.
+# ROAS comfortably above target, or cost-per-install comfortably below it) contradicts the account goal,
+# the mirror of pausing a winner. Both polarity branches consume this set.
 _SCALE_DOWN_BUDGET_ACTIONS = {"decrease_adset_budget", "decrease_campaign_budget"}
 
 # Enabling an ad is directionally a scale-up (0 → live). Turning ON an ad whose own cited goal metric
