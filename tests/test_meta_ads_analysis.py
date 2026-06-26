@@ -6150,6 +6150,23 @@ def test_parse_evidence_selector_field() -> None:
     ))[0].evidence[0]
     assert multi.metric_selector == {"publisher_platform": "instagram", "platform_position": "stories"}
 
+    # Incidental whitespace around commas / pairs is tolerated — a space after the comma must NOT
+    # silently drop the trailing pair (it would otherwise resolve a coarser slice → wrong blend).
+    spaced = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · acct: d · metric: r=4.5 · select: publisher_platform=instagram, platform_position=stories)_",
+        header="spaced select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert spaced.metric_selector == {"publisher_platform": "instagram", "platform_position": "stories"}
+
+    # A `select:` placed BEFORE another tag field stops at the `·` separator (does not swallow acct).
+    mid = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · metric: r=4.5 · select: publisher_platform=instagram · acct: d)_",
+        header="mid select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert mid.metric_selector == {"publisher_platform": "instagram"} and mid.account == "d"
+
     # Malformed (a bare key with no `=`) → None → falls back to the token heuristic (no crash).
     bad = parse_learnings(_entry(
         "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "

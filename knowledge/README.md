@@ -188,7 +188,10 @@ scale).
   metric *name* to a row by token overlap — which is ambiguous when several rows share a token
   (every IG cell matches `ig_roas`), so a ≥2-breakdown metric with no `select:` draws a `lint-vault`
   ⏳ warning. A selector matching **several** rows is intentional: those cells are blended into the
-  platform-level value; matching **one** row resolves that cell; matching **none** abstains.
+  platform-level value; matching **one** row resolves that cell; matching **none** abstains. To pin
+  a single cell, list every dimension (`select: publisher_platform=instagram,platform_position=stories`);
+  spaces around the commas are tolerated. Keys/values are matched case-insensitively against the
+  full segment value (not substrings).
 - A `src: external` line **MUST** carry a URL (and per "External evidence" below, a date + verbatim
   quote) — `lint-vault` fails an external line with no link.
 

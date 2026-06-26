@@ -86,9 +86,10 @@ _METRIC_RE = re.compile(r"\bmetric:\s*(?P<name>[A-Za-z0-9_.]+)\s*=\s*(?P<value>[
 
 # A `select:` slice — comma-separated key=value pairs naming the exact breakdown cells this metric
 # summarizes (so a two-dimension breakdown row resolves exactly instead of by name-token overlap).
-# Value chars are [A-Za-z0-9_=,.] so it stops at whitespace / the `·` field separator, not at the
-# commas *inside* the selector.
-_SELECT_RE = re.compile(r"\bselect:\s*(?P<select>[A-Za-z0-9_=,.]+)")
+# Capture runs to the next tag field (`·`), tag end (`)`), or a stray `;`/newline — NOT to the first
+# space — so the commas *inside* the selector survive AND incidental whitespace (`a=b, c=d`) is
+# tolerated; `_parse_evidence` strips each pair/key/value, so spacing never silently drops a pair.
+_SELECT_RE = re.compile(r"\bselect:\s*(?P<select>[^·;)\n]+)")
 
 # The inline reproduce-it command (`verify: account_metrics …`) and any URL, anywhere on the line.
 _VERIFY_RE = re.compile(r"`?verify:\s*(?P<cmd>account_metrics[^`\n]*)`?")
@@ -195,7 +196,7 @@ def _parse_evidence(joined: str, lineno: int) -> EvidenceLine:
             pairs: dict[str, str] = {}
             for piece in selm.group("select").split(","):
                 if "=" in piece:
-                    k, v = piece.split("=", 1)
+                    k, v = (part.strip() for part in piece.split("=", 1))
                     if k and v:
                         pairs[k] = v
             metric_selector = pairs or None  # malformed / empty → None → token-heuristic fallback
