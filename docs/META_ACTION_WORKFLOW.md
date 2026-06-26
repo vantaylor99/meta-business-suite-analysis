@@ -150,6 +150,43 @@ toggled. The ad list is read once at propose time, so live `effective_status` ma
 re-applying `ACTIVE` to an ad that is already ACTIVE is idempotent on Meta's side (and `--validate-only`
 pre-flights the change), so the drift does not produce a confusing error.
 
+### Authoring grounding (`create_*`)
+
+`authoring.build_duplicate_ad_plan` (CLI: `propose-duplicate-ad`), `authoring.build_video_ad_plan`
+(`propose-video-ad`), and `authoring.build_lookalike_plan` (`propose-lookalike`) are grounded
+producers: they set `guardrails.requires_grounding: true`, attach an `evidence` + computed
+`confidence` block to every create op via `write_grounding.attach_op_grounding`, and run the plan
+through `review.review_authoring_plan` before returning it. Two shapes of justification:
+
+- **Duplicate / scale-out of a proven entity** — the evidence is the **source ad's** own metric over a
+  stated window (`--date-from` / `--date-to`, defaulting to a 30-day trailing window), metric chosen by
+  the account goal (the same selection enable/pause use). A proven winner computes a real band (e.g.
+  `medium`/`high`), so the duplicate is an evidence-backed, executable proposal; a source with no
+  delivery cites a **zero** sample → `abstain`. The evidence reflects the *propose-time* justification,
+  not a live precondition — the create copies the source creative regardless of any later drift in the
+  source's metrics.
+- **Net-new create** (a brand-new campaign / ad set / ad, including a fresh video ad — there is no
+  entity to measure yet) — it cites a **zero** sample → `abstain`, exactly like the cold-ad enable
+  boundary. Review marks the op `insufficient`, and the apply-time gate **blocks an approved net-new
+  create**: creating PAUSED is fine, but auto-executing a create on no performance evidence requires a
+  conscious operator override (e.g. dropping `requires_grounding`, or grounding it by duplicating a
+  proven winner instead). Going live is a separate, separately-gated `set_status ACTIVE` (the enable
+  path), never part of the create.
+
+A **lookalike** is the deliberate exception. Its basis is the seed audience's size/quality, which the
+metric pipeline does not express as ROAS/conversions, so it cites **no** sample — a *structural*
+abstain naming the seed, never a fabricated band. A structural abstain is gate-**allowed**, because
+creating an audience is inert: an audience has no status (it is **not** in `authoring.PAUSED_KINDS`)
+and never spends, so it need not require the override a spending create does. The seed becomes a
+spending decision only when an ad set targets it, which goes through the ops gate on its own.
+
+PAUSED-by-default is non-negotiable and untouched by grounding: `authoring._build_create` forces
+`status=PAUSED` for every kind in `PAUSED_KINDS` regardless of any review verdict, and the review gate
+is demote-only — so even a `stands` on a high-confidence duplicate, or a `downgrade`/`insufficient` on
+a thin one, can never set a created entity to `ACTIVE`. The `_guard_params` / `FORBIDDEN_FRAGMENTS`
+Meta-AI / Advantage+ block and the create-only scope (no delete/archive) are likewise unchanged: a
+well-grounded create that carries an Advantage+ param is still blocked.
+
 ## Account Goals
 
 Account-specific action policy lives in `config/meta_ads_accounts.json`.

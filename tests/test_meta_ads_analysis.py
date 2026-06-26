@@ -3021,12 +3021,19 @@ from meta_ads_analysis.control import account_info, fetch_breakdown_metrics
 
 
 class _AuthoringFakeClient:
-    def __init__(self, ad_creative_id="cr1"):
+    def __init__(self, ad_creative_id="cr1", insights=None):
         self._creative_id = ad_creative_id
+        self._insights = insights or []
         self.creates = []
 
     def get_ad(self, ad_id, *, fields):
         return {"id": ad_id, "name": "Source Ad", "creative": {"id": self._creative_id}}
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level="ad",
+                       time_increment=1, breakdowns=None):
+        # Source-ad metric read for the duplicate builder's grounding. Default: no delivery
+        # (empty) → the duplicate cites a zero sample → abstains.
+        return self._insights
 
     def create_campaign(self, ad_account_id, *, params, validate_only=False):
         self.creates.append(("campaign", params, validate_only))
@@ -3201,9 +3208,21 @@ def test_create_video_ad_builds_object_story_spec_and_pauses() -> None:
     op = plan["ops"][0]
     assert op["kind"] == "create_video_ad"
     _validate_auth(op)  # passes validation
+    # Net-new video ad: no prior performance → abstain → review marks it insufficient.
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review"]["verdict"] == "insufficient"
 
-    client = _AuthoringFakeClient()
+    # Approving + executing under requires_grounding is BLOCKED (conscious override required); the
+    # net-new create with no evidence is never auto-sent.
+    blocked_client = _AuthoringFakeClient()
     plan["ops"][0]["status"] = "approved"
+    blocked = apply_authoring_plan(plan, blocked_client, execute=True)
+    assert blocked[0].status == "blocked"
+    assert blocked_client.creates == []  # nothing created
+
+    # Conscious override: drop requires_grounding → the create is sent, forced PAUSED, right shape.
+    plan["guardrails"]["requires_grounding"] = False
+    client = _AuthoringFakeClient()
     results = apply_authoring_plan(plan, client, execute=True)
     assert results[0].status == "created"
     kind, params, _vo = client.creates[0]
@@ -3359,8 +3378,11 @@ def test_create_video_ad_multi_text_uses_asset_feed_spec_and_opts_out_enhancemen
     op = plan["ops"][0]
     from meta_ads_analysis.authoring import validate_authoring_op as _va
     _va(op)
-    client = _AuthoringFakeClient()
+    # Net-new → abstain → blocked at apply until a conscious override; verify the sent request shape
+    # via that override path (drop requires_grounding), which still forces PAUSED.
     op["status"] = "approved"
+    plan["guardrails"]["requires_grounding"] = False
+    client = _AuthoringFakeClient()
     results = apply_authoring_plan(plan, client, execute=True)
     assert results[0].status == "created"
     _kind, params, _vo = client.creates[0]
@@ -3714,6 +3736,149 @@ def test_review_authoring_plan_demote_only_and_paused_preserved() -> None:
     _apply_authoring(reviewed, client, execute=True)
     for _kind, params, _vo in client.creates:
         assert params["status"] == "PAUSED"
+
+
+def test_build_duplicate_ad_plan_grounds_on_proven_winner() -> None:
+    # Duplicating a proven winner: evidence is the SOURCE ad's own metric over the window → a real
+    # computed band (not abstain) → executable → created PAUSED.
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    reader = FakeMetaReader(
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "name": "Winner", "creative": {"id": "cr-1"}},
+        fetch_insights=lambda *a, **k: [
+            {"ad_id": "ad1", "ad_name": "Winner", "spend": "1200",
+             "action_values": [{"action_type": "purchase", "value": "5040"}],
+             "actions": [{"action_type": "purchase", "value": "60"}]}
+        ],
+    )
+    plan = build_duplicate_ad_plan(
+        reader, "act_1", source_ad_id="ad1", target_adset_id="as2",
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["entity_id"] == "ad1"  # cites the SOURCE ad
+    assert op["evidence"]["sample_purchases"] == 60.0
+    assert Band[op["confidence"]["band"]] >= Band.medium  # computed from a real sample
+    assert op["review"]["verdict"] == "stands"
+    op["status"] = "approved"
+    client = _AuthoringFakeClient()
+    results = apply_authoring_plan(plan, client, execute=True)
+    assert results[0].status == "created"
+    kind, params, _vo = client.creates[0]
+    assert kind == "ad" and params["status"] == "PAUSED"
+    assert params["creative"] == {"creative_id": "cr-1"}  # copies the source creative
+
+
+def test_authoring_netnew_create_abstains_insufficient_and_non_executable() -> None:
+    # The common brand-new-campaign case: no metric → a cited ZERO sample → abstain → review marks it
+    # insufficient → the apply-time gate blocks an approved create (conscious override required).
+    netnew = _grounded_op(
+        op_id="newcamp", op="create_campaign", level="campaign", node_id="", status="approved",
+        kind="create_campaign", params={"name": "New Launch", "objective": "OUTCOME_SALES"},
+        evidence=Evidence("blended_roas", None, "ROAS n/a", "2026-06-01..2026-06-24",
+                          0.0, 0.0, "campaign", None, None, None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    assert netnew["confidence"]["band"] == "abstain"  # cited zero sample, not a fabricated band
+    plan = {"ad_account_id": "act_1", "run_date": "2026-06-24",
+            "guardrails": {"requires_grounding": True}, "ops": [netnew]}
+    reviewed = review_authoring_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "insufficient"  # net-new → insufficient (non-executable)
+    r["status"] = "approved"
+    client = _AuthoringFakeClient()
+    results = apply_authoring_plan(reviewed, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert client.creates == []  # nothing created on no evidence
+
+
+def test_authoring_lookalike_structural_abstain_is_creatable() -> None:
+    # A lookalike's basis is its seed's size/quality, not a ROAS/conversions metric → NO sample (a
+    # structural abstain naming the seed). Audiences are inert (no status, not in PAUSED_KINDS), so a
+    # structural abstain is gate-allowed and the audience is creatable.
+    plan = build_lookalike_plan(
+        "act_1", name="LAL 2%", origin_audience_id="a1", country="US", ratio=0.02,
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["confidence"]["band"] == "abstain"
+    assert op["evidence"]["sample_purchases"] is None  # structural — no fabricated sample
+    assert op["evidence"]["entity_id"] == "a1"  # names the seed audience
+    assert op["review"]["verdict"] == "stands"  # structural abstain, NOT insufficient
+    op["status"] = "approved"
+    client = _AuthoringFakeClient()
+    results = apply_authoring_plan(plan, client, execute=True)
+    assert results[0].status == "created"
+
+
+def test_review_authoring_plan_is_idempotent() -> None:
+    # The builders return an already-reviewed plan; re-reviewing one (every op already carries a
+    # `review` block) is a no-op.
+    plan = build_lookalike_plan("act_1", name="LAL", origin_audience_id="a1", country="US", ratio=0.01)
+    assert plan["ops"][0]["review"]  # builder already reviewed it
+    assert review_authoring_plan(plan) == plan
+
+
+def test_authoring_paused_invariant_holds_even_when_review_stands() -> None:
+    # A high-confidence duplicate whose verdict STANDS must STILL create PAUSED — the gate is
+    # demote-only and authoring hardcodes PAUSED. Pins the invariant against future drift.
+    op = _grounded_op(
+        op_id="dup", op="create_ad", level="ad", node_id="", status="approved", kind="create_ad",
+        params={"name": "Copy", "adset_id": "as2", "creative": {"creative_id": "cr1"}},
+        evidence=Evidence("blended_roas", 5.0, "ROAS 5.00", "2026-06-01..2026-06-24",
+                          300.0, 5000.0, "ad", "ad1", "Winner", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    assert op["confidence"]["band"] == "high"
+    plan = {"ad_account_id": "act_1", "run_date": "2026-06-24",
+            "guardrails": {"requires_grounding": True}, "ops": [op]}
+    reviewed = review_authoring_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "stands"  # band earned; nothing to refute
+    client = _AuthoringFakeClient()
+    apply_authoring_plan(reviewed, client, execute=True)
+    kind, params, _vo = client.creates[0]
+    assert params["status"] == "PAUSED"  # never ACTIVE, even on a stands
+
+
+def test_authoring_grounded_create_still_blocks_advantage_param() -> None:
+    # Even a well-grounded create is blocked if it carries a Meta-AI / Advantage+ param (the
+    # FORBIDDEN_FRAGMENTS / _guard_params block is untouched by grounding).
+    op = _grounded_op(
+        op_id="ai", op="create_campaign", level="campaign", node_id="", status="approved",
+        kind="create_campaign",
+        params={"name": "C", "objective": "OUTCOME_SALES", "creative_enhancement": True},
+        evidence=Evidence("blended_roas", 4.0, "ROAS 4.00", "2026-06-01..2026-06-24",
+                          300.0, 5000.0, "campaign", "c1", "Camp", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    assert op["confidence"]["band"] == "high"  # grounding alone would pass
+    plan = {"ad_account_id": "act_1", "guardrails": {"requires_grounding": True}, "ops": [op]}
+    by_id = {r.op_id: r for r in apply_authoring_plan(plan, _AuthoringFakeClient(), execute=True)}
+    assert by_id["ai"].status == "blocked"
+    assert "Meta AI / Advantage+" in by_id["ai"].reason
+
+
+def test_authoring_grounded_plan_is_json_serializable() -> None:
+    # The added evidence/confidence/review keys serialize cleanly (plan + audit-log safety): the plan
+    # round-trips, and write_authoring_results still logs only op_id/kind/status/created_id (extra
+    # op-dict keys do not leak into the result log).
+    import json
+
+    from meta_ads_analysis.authoring import AuthoringResult, write_authoring_results
+
+    plan = build_lookalike_plan("act_1", name="LAL", origin_audience_id="a1", country="US", ratio=0.01)
+    json.dumps(plan)  # grounded plan round-trips
+    out = write_authoring_results(
+        plan=plan,
+        results=[AuthoringResult("lookalike_a1_1", "create_lookalike", "created", created_id="lal1")],
+        output_path=_TMP_OPS_RESULTS(), execute=True,
+    )
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["results"][0]["op_id"] == "lookalike_a1_1"
+    assert payload["results"][0]["created_id"] == "lal1"
+    assert "confidence" not in payload["results"][0]  # grounding does not leak into the result log
 
 
 def test_op_grounding_review_keys_are_audit_log_safe() -> None:

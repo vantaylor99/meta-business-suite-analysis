@@ -1415,6 +1415,8 @@ def propose_video_ad_main() -> None:
     parser.add_argument("--description", help="Link description.")
     parser.add_argument("--cta", default="SHOP_NOW", help="Call-to-action type (default SHOP_NOW).")
     parser.add_argument("--image-hash", help="Thumbnail image hash (from upload-image), if required.")
+    parser.add_argument("--date-from", help="Evidence window start (YYYY-MM-DD). Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence window end (YYYY-MM-DD). Defaults to the run date.")
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
     args = parser.parse_args()
@@ -1428,6 +1430,7 @@ def propose_video_ad_main() -> None:
         ad_account_id, name=args.name, adset_id=args.adset_id, video_id=args.video_id, page_id=args.page_id,
         message=args.message, link=args.link, title=args.title, description=args.description,
         call_to_action_type=args.cta, image_hash=args.image_hash, account_slug=account_slug,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
     )
     output_path = default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
     write_authoring_plan(plan, output_path)
@@ -1482,6 +1485,8 @@ def propose_duplicate_ad_main() -> None:
     parser.add_argument("--source-ad-id", required=True, help="Ad to copy the creative from.")
     parser.add_argument("--target-adset-id", required=True, help="Ad set to create the new ad in.")
     parser.add_argument("--name", help="Name for the new ad. Defaults to '<source name> (copy)'.")
+    parser.add_argument("--date-from", help="Evidence window start (YYYY-MM-DD) for the source ad's metric. Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence window end (YYYY-MM-DD). Defaults to the run date.")
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
     parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
@@ -1496,6 +1501,7 @@ def propose_duplicate_ad_main() -> None:
     plan = build_duplicate_ad_plan(
         client, ad_account_id, source_ad_id=args.source_ad_id,
         target_adset_id=args.target_adset_id, name=args.name, account_slug=account_slug,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
     )
     output_path = default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
     write_authoring_plan(plan, output_path)
@@ -1510,6 +1516,8 @@ def propose_lookalike_main() -> None:
     parser.add_argument("--origin-audience-id", required=True, help="Seed custom audience id.")
     parser.add_argument("--country", default="US", help="Country code for the lookalike (default US).")
     parser.add_argument("--ratio", type=float, default=0.01, help="Lookalike ratio 0.01-0.20 (default 0.01 = 1%%).")
+    parser.add_argument("--date-from", help="Evidence window start (YYYY-MM-DD) labeling the seed-basis evidence. Defaults to a 30-day trailing window.")
+    parser.add_argument("--date-to", help="Evidence window end (YYYY-MM-DD). Defaults to the run date.")
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
     args = parser.parse_args()
@@ -1522,6 +1530,7 @@ def propose_lookalike_main() -> None:
     plan = build_lookalike_plan(
         ad_account_id, name=args.name, origin_audience_id=args.origin_audience_id,
         country=args.country, ratio=args.ratio, account_slug=account_slug,
+        date_from=args.date_from, date_to=args.date_to, run_date=run_date,
     )
     output_path = default_authoring_plan_path(account_slug, run_date, Path(args.reports_root))
     write_authoring_plan(plan, output_path)
