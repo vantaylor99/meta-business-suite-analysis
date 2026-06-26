@@ -5141,3 +5141,236 @@ def test_apply_ops_plan_routes_read_through_reader_and_write_through_client() ->
     assert [c[0] for c in reader.calls] == ["get_adset"]
     # ...and the write hit the concrete client.
     assert client.updates == [("adset", "as1", {"daily_budget": "11000"}, False)]
+
+
+# --- MCP read backend (MOCKS ONLY: the tool-executor is fake; no live MCP / Meta call) ---
+
+from meta_ads_analysis.reader_provider import (  # noqa: E402
+    MCPMetaReader,
+    reader_from_env,
+)
+
+
+class _RecordingExecutor:
+    """A fake MCP tool-executor: records ``(tool, arguments)`` and returns a canned raw result.
+
+    ``returns`` maps tool-name -> the value the MCP tool would emit (a dict / list / Graph-style
+    envelope / JSON string). A callable value receives the arguments dict. An unexpected tool call
+    raises, so a test proves which tools were (and were not) invoked. MOCKS ONLY.
+    """
+
+    def __init__(self, returns: dict | None = None) -> None:
+        self.returns = returns or {}
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, tool: str, arguments: dict):
+        self.calls.append((tool, arguments))
+        if tool not in self.returns:
+            raise AssertionError(f"unexpected MCP tool call: {tool}")
+        value = self.returns[tool]
+        return value(arguments) if callable(value) else value
+
+
+def test_mcp_reader_signatures_match_client_exactly() -> None:
+    # MCPMetaReader must be a drop-in for the same seam: its read signatures match the client's, so
+    # a backend swap is invisible to every call site.
+    for name in READ_METHODS:
+        client_params = _sig_params(inspect.signature(getattr(MetaMarketingApiClient, name)))
+        reader_params = _sig_params(inspect.signature(getattr(MCPMetaReader, name)))
+        assert reader_params == client_params, f"MCPMetaReader.{name} signature drifted"
+
+
+def test_mcp_reader_translates_fields_list_to_comma_string_without_dropping_any() -> None:
+    # Field-list translation is the high-risk edge: a dropped field silently blanks a metric.
+    execu = _RecordingExecutor({"meta_ads_get_ads_by_adaccount": {"data": []}})
+    MCPMetaReader(execu).fetch_ads("act_1", fields=["ad_id", "ad_name", "spend", "impressions"])
+    tool, args = execu.calls[0]
+    assert tool == "meta_ads_get_ads_by_adaccount"
+    assert args["act_id"] == "act_1"
+    assert args["fields"] == "ad_id,ad_name,spend,impressions"  # joined to a comma string
+    # Round-trips with nothing dropped — the exact guarantee the metrics pipeline depends on.
+    assert args["fields"].split(",") == ["ad_id", "ad_name", "spend", "impressions"]
+
+
+def test_mcp_reader_insights_translates_window_and_breakdowns() -> None:
+    execu = _RecordingExecutor({"meta_ads_get_adaccount_insights": {"data": []}})
+    MCPMetaReader(execu).fetch_insights(
+        "act_9",
+        fields=["spend", "actions"],
+        date_from="2026-06-01",
+        date_to="2026-06-30",
+        level="ad",
+        time_increment=1,
+        breakdowns=["age", "gender"],
+    )
+    tool, args = execu.calls[0]
+    assert tool == "meta_ads_get_adaccount_insights"
+    assert args["fields"] == "spend,actions"
+    assert args["time_range"] == {"since": "2026-06-01", "until": "2026-06-30"}
+    assert args["level"] == "ad"
+    assert args["breakdowns"] == ["age", "gender"]
+
+
+def test_mcp_reader_list_result_shape_matches_direct_reader() -> None:
+    # Result-shape parity: both backends return identical list[dict] for a list read, so every
+    # downstream parser is backend-agnostic.
+    canned = [
+        {"id": "400", "name": "API Ad", "status": "ACTIVE"},
+        {"id": "401", "name": "API Ad 2", "status": "PAUSED"},
+    ]
+
+    class _Client:
+        def fetch_ads(self, ad_account_id, *, fields):
+            return canned
+
+    direct = DirectMetaReader(_Client())
+    mcp = MCPMetaReader(_RecordingExecutor({"meta_ads_get_ads_by_adaccount": {"data": canned}}))
+    assert mcp.fetch_ads("act_1", fields=["id"]) == direct.fetch_ads("act_1", fields=["id"]) == canned
+
+
+def test_mcp_reader_node_result_shape_matches_direct_reader() -> None:
+    canned = {"id": "act_1", "name": "Acme", "currency": "USD"}
+
+    class _Client:
+        def get_account(self, ad_account_id, *, fields):
+            return canned
+
+    direct = DirectMetaReader(_Client())
+    mcp = MCPMetaReader(_RecordingExecutor({"meta_ads_get_ad_account_details": canned}))
+    assert (
+        mcp.get_account("act_1", fields=["name"])
+        == direct.get_account("act_1", fields=["name"])
+        == canned
+    )
+
+
+def test_mcp_reader_accepts_bare_list_and_json_string_results() -> None:
+    # Robust to two common community-server shapes: a bare list, and tool output returned as text.
+    bare = MCPMetaReader(_RecordingExecutor({"meta_ads_get_campaigns_by_adaccount": [{"id": "c1"}]}))
+    assert bare.list_campaigns("act_1", fields=["id"]) == [{"id": "c1"}]
+    as_text = MCPMetaReader(
+        _RecordingExecutor({"meta_ads_get_ad_account_details": json.dumps({"id": "act_1"})})
+    )
+    assert as_text.get_account("act_1", fields=["id"]) == {"id": "act_1"}
+
+
+def test_mcp_reader_drains_pagination_so_no_page_is_dropped() -> None:
+    # The candidate server does not auto-paginate; the wrapper follows paging.next, never truncates.
+    returns = {
+        "meta_ads_get_adsets_by_adaccount": {"data": [{"id": "as1"}], "paging": {"next": "URL2"}},
+        "meta_ads_fetch_pagination_url": {"data": [{"id": "as2"}], "paging": {}},
+    }
+    reader = MCPMetaReader(_RecordingExecutor(returns))
+    assert reader.list_adsets("act_1", fields=["id"]) == [{"id": "as1"}, {"id": "as2"}]
+
+
+def test_mcp_reader_refuses_to_truncate_when_pagination_tool_disabled() -> None:
+    # Decision: rather than silently truncate a paged result, raise when no pagination tool exists.
+    returns = {
+        "meta_ads_get_adsets_by_adaccount": {"data": [{"id": "as1"}], "paging": {"next": "URL2"}}
+    }
+    reader = MCPMetaReader(_RecordingExecutor(returns), pagination_tool=None)
+    try:
+        reader.list_adsets("act_1", fields=["id"])
+    except MetaApiError as exc:
+        assert "truncate" in str(exc)
+    else:
+        raise AssertionError("expected a refusal to silently truncate a paged result")
+
+
+def test_mcp_reader_unsupported_reads_raise_naming_the_method() -> None:
+    # Partial coverage: reads the candidate server does not expose must raise NotImplementedError
+    # naming the read, so a caller can fall back to META_READER_BACKEND=direct for that one read.
+    execu = _RecordingExecutor()
+    reader = MCPMetaReader(execu)
+    cases = {
+        "get_delivery_estimate": lambda: reader.get_delivery_estimate("as1", fields=["estimate_dau"]),
+        "search_targeting": lambda: reader.search_targeting(query="jewelry"),
+        "list_pixels": lambda: reader.list_pixels("act_1", fields=["id"]),
+        "list_custom_conversions": lambda: reader.list_custom_conversions("act_1", fields=["id"]),
+        "list_custom_audiences": lambda: reader.list_custom_audiences("act_1", fields=["id"]),
+        "iter_paginated": lambda: reader.iter_paginated("/act_1/ads"),
+    }
+    for name, call in cases.items():
+        try:
+            call()
+        except NotImplementedError as exc:
+            assert name in str(exc), f"NotImplementedError should name the read {name!r}"
+        else:
+            raise AssertionError(f"{name}: expected NotImplementedError for an unexposed MCP read")
+    # _tool_for raised before the executor was ever invoked for any unsupported read.
+    assert execu.calls == []
+
+
+def test_reader_from_env_defaults_to_direct_when_unset(monkeypatch) -> None:
+    # Default-off guarantee: unset backend == DirectMetaReader (today's behavior, byte-for-byte).
+    monkeypatch.delenv("META_READER_BACKEND", raising=False)
+    sentinel = object()
+    monkeypatch.setattr("meta_ads_analysis.reader_provider.client_from_env", lambda *a, **k: sentinel)
+    reader = reader_from_env()
+    assert isinstance(reader, DirectMetaReader)
+    assert reader._client is sentinel  # wraps the env client; no MCP involved
+
+
+def test_reader_from_env_explicit_direct(monkeypatch) -> None:
+    monkeypatch.setenv("META_READER_BACKEND", "direct")
+    monkeypatch.setattr("meta_ads_analysis.reader_provider.client_from_env", lambda *a, **k: object())
+    assert isinstance(reader_from_env(), DirectMetaReader)
+
+
+def test_reader_from_env_mcp_requires_a_tool_executor(monkeypatch) -> None:
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    try:
+        reader_from_env()
+    except RuntimeError as exc:
+        assert "tool-executor" in str(exc)
+    else:
+        raise AssertionError("mcp backend without an injected executor must raise")
+
+
+def test_reader_from_env_mcp_with_executor_builds_mcp_reader(monkeypatch) -> None:
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    assert isinstance(reader_from_env(tool_executor=_RecordingExecutor()), MCPMetaReader)
+
+
+def test_reader_from_env_rejects_unknown_backend(monkeypatch) -> None:
+    monkeypatch.setenv("META_READER_BACKEND", "bogus")
+    try:
+        reader_from_env()
+    except ValueError as exc:
+        assert "bogus" in str(exc)
+    else:
+        raise AssertionError("unknown backend must raise ValueError")
+
+
+def test_entry_point_default_reads_through_direct_when_backend_unset(monkeypatch) -> None:
+    # The behavioral guarantee this whole ticket rides on: with META_READER_BACKEND unset and no
+    # reader supplied, the writes-adjacent re-read path builds a DirectMetaReader around the env
+    # client exactly as before — adding the MCP server cannot change production reads.
+    monkeypatch.delenv("META_READER_BACKEND", raising=False)
+    seen: dict = {}
+
+    class _Client:
+        def get_ad(self, ad_id, *, fields):
+            seen["ad_id"] = ad_id
+            return {"id": ad_id, "name": "Ad", "status": "PAUSED", "effective_status": "PAUSED"}
+
+    monkeypatch.setattr("meta_ads_analysis.reader_provider.client_from_env", lambda *a, **k: _Client())
+    plan = {
+        "account_slug": "x",
+        "run_date": "2026-06-16",
+        "actions": [
+            {
+                "action_id": "pause_ad_1",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "target": {"type": "ad", "id": "1"},
+                "params": {"status": "paused"},
+                "rationale": "r",
+            }
+        ],
+    }
+    enriched = enrich_action_plan_with_live_state(plan)
+    assert seen["ad_id"] == "1"
+    assert enriched["actions"][0]["live_state"]["status"] == "PAUSED"

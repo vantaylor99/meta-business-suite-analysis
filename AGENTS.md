@@ -212,6 +212,20 @@ confidence-bearing actions and passes informational ones through untouched). Thi
 - Do not execute Meta account changes directly from a written analysis. Use the action workflow: generate `action_plan.json`, require explicit approval, dry-run, then execute approved actions.
 - Keep Meta AI / Advantage+ creative features off by default. Do not enable automatic text variations, image expansion, visual touch-ups, generated music, flexible media, or AI-generated creative variants unless a human explicitly requests that exact change.
 
+## Read backend (direct vs MCP)
+
+Meta **reads** flow through a swappable seam, `MetaReaderProvider` (`src/meta_ads_analysis/reader_provider.py`),
+selected by the `META_READER_BACKEND` env var: `direct` (default — the live Graph API client) or `mcp`
+(route reads through a Meta MCP read server). Default is `direct`, so behavior is unchanged unless an
+operator opts in. The MCP path is **reads-only** (`MCPMetaReader`, consumed by the agent runtime with an
+injected tool-executor); **writes always use the direct Graph client** and stay behind the
+propose → approve → validate_only → execute guardrails. Two MCP options are documented in
+[`docs/META_API_SETUP.md`](docs/META_API_SETUP.md): a community token-based server (a candidate,
+unvetted entry parked disabled in `.mcp.json`) usable with the current token now, and Meta's official
+hosted OAuth server as a config-only drop-in for later. Single-operator with the current token is the
+supported path now; OAuth/multi-user is a later concern. Full hybrid-model docs + tool catalog land in
+the `hybrid-model-docs-and-tool-catalog` ticket.
+
 ## Tickets (tess)
 
 This project uses [tess](tess/) for AI-driven ticket management.

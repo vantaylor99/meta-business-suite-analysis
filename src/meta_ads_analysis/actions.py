@@ -30,7 +30,7 @@ from .confidence import (
     evidence_to_dict,
 )
 from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
-from .reader_provider import DirectMetaReader, MetaReaderProvider, as_reader
+from .reader_provider import MetaReaderProvider, as_reader, reader_from_env
 from .utils import ensure_dir, write_json
 
 APPROVED_STATUS = "approved"
@@ -259,10 +259,11 @@ def enrich_action_plan_with_live_state(
     """Re-read each action's live Meta state (read-only) and annotate the plan.
 
     ``reader`` accepts a :class:`MetaReaderProvider` or a raw ``MetaMarketingApiClient`` (wrapped
-    in a ``DirectMetaReader``); when omitted a direct reader is built from env. The re-read is the
-    fresh source of truth for drift detection — it is not a cache.
+    in a ``DirectMetaReader``); when omitted the env-selected reader is built (``direct`` by
+    default — see :func:`reader_from_env`). The re-read is the fresh source of truth for drift
+    detection — it is not a cache.
     """
-    effective_reader = as_reader(reader) or DirectMetaReader.from_env()
+    effective_reader = as_reader(reader) or reader_from_env()
     enriched = {**plan, "actions": [dict(action) for action in plan.get("actions") or []]}
     checked_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     for action in enriched["actions"]:

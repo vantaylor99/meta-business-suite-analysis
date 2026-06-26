@@ -24,7 +24,7 @@ from typing import Any
 from . import account_registry
 from .config import DEFAULT_REPORTS_ROOT
 from .meta_api import MetaApiError, MetaMarketingApiClient
-from .reader_provider import DirectMetaReader, MetaReaderProvider, as_reader
+from .reader_provider import MetaReaderProvider, as_reader, reader_from_env
 from .utils import ensure_dir, write_json
 
 PROPOSED_STATUS = "proposed"
@@ -753,13 +753,14 @@ def fetch_active_adsets(
     """Resolve the account and return (ad_account_id, active ad set payloads).
 
     Read-only: ``reader`` accepts a :class:`MetaReaderProvider` or a raw
-    ``MetaMarketingApiClient`` (wrapped); when omitted a direct reader is built from env.
+    ``MetaMarketingApiClient`` (wrapped); when omitted the env-selected reader is built
+    (``direct`` by default — see :func:`reader_from_env`).
     """
     account = account_registry.resolve_account(
         account_slug,
         accounts_config_path or account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH,
     )
-    effective_reader = as_reader(reader) or DirectMetaReader.from_env()
+    effective_reader = as_reader(reader) or reader_from_env()
     adsets = effective_reader.list_adsets(
         account.ad_account_id,
         fields=ADSET_FIELDS,
