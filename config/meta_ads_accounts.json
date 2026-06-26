@@ -46,13 +46,44 @@
         "primary_goal": "roas",
         "primary_metric": "blended_roas",
         "target_roas": 3.0,
-        "pause_roas_floor": 1.5,
+        "pause_roas_floor": 1.8,
         "scale_roas_floor": 3.0,
+        "evaluation_grace_days": 3,
+        "min_spend_before_pause": 100.0,
         "max_budget_increase_percent": 20,
         "disable_meta_ai_features": true,
-        "operator_brief_todo": true
+        "operator_brief_todo": true,
+        "guardrail_notes": "CUTOFF = 1.8 ROAS: if an ad has been running more than a couple of days (past evaluation_grace_days) and shows no other positive signals (improving trajectory, strong hook rate, etc.), pause it when blended ROAS is at or below 1.8. DO NOT apply the cutoff to a brand-new ad in its first 1-2 days, or to any ad right after a BIG change (creative/audience/budget) — give it up to evaluation_grace_days to stabilize. NEVER pause on the cutoff if the ad has barely spent (< min_spend_before_pause): that is insufficient data, so keep it running rather than calling it a loser."
       },
       "notes": "Replace with the real Meta ad account ID before using sync-api."
+    },
+    {
+      "account_slug": "seattle_mission",
+      "account_name": "Washington Seattle Mission",
+      "ad_account_id": "103014553",
+      "measurement_focus": {
+        "primary_metric": "results",
+        "primary_result_action_type": "leadgen_grouped",
+        "primary_result_label": "Leads (form)",
+        "secondary_metric": null,
+        "secondary_metric_label": null,
+        "roas_role": "not_applicable",
+        "analysis_notes": "Lead generation via Meta Instant Forms (objective OUTCOME_LEADS). Success = form leads; efficiency = cost per lead (CPR). This account does NOT sell products — do not apply purchases, purchase value, or ROAS to it. VERIFY primary_result_action_type on first sync-api run (instant-form lead action type may resolve as 'leadgen_grouped' or 'onsite_conversion.lead_grouped'); if Results come back blank, let the sync infer or adjust here."
+      },
+      "action_policy": {
+        "primary_goal": "minimize_cost_per_lead",
+        "primary_metric": "cost_per_result",
+        "primary_result_label": "Leads (form)",
+        "target_cost_per_result": 10.0,
+        "pause_cost_per_result_above": 40.0,
+        "evaluation_grace_days": 3,
+        "min_spend_before_pause": 100.0,
+        "max_budget_increase_percent": 20,
+        "disable_meta_ai_features": true,
+        "operator_brief_todo": true,
+        "guardrail_notes": "GOAL = $10 per lead (target_cost_per_result). CUTOFF = $40 per lead (pause_cost_per_result_above): if an ad has run more than a couple of days (past evaluation_grace_days) with no other positive signals, pause it when cost-per-lead is at or above $40. DO NOT apply the cutoff in a new ad's first 1-2 days, or right after a BIG change — give it up to evaluation_grace_days. NEVER pause on the cutoff if the ad has barely spent (< min_spend_before_pause): insufficient data, keep running. ROAS/purchase metrics do not apply to this account."
+      },
+      "notes": "Currently PAUSED (no spend in the last 30 days). ~$98k spent and 12,600+ form leads across 2024-2025 at roughly $25-30 cost-per-lead historically. Instant Forms capture leads on-platform, so there is no website destination or offsite-checkout requirement for this account."
     }
   ]
 }
