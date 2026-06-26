@@ -3386,6 +3386,20 @@ def test_attach_op_grounding_abstains_when_evidence_absent() -> None:
     assert op["evidence"]["sample_purchases"] is None and op["evidence"]["sample_spend"] is None
 
 
+def test_attach_op_grounding_no_evidence_keeps_full_evidence_keyset() -> None:
+    # The "no evidence" serialized shape must carry the SAME keys as a real evidence_to_dict, so a
+    # downstream reader (the gate / a renderer) sees a stable schema whether or not a sample was
+    # supplied. Pins write_grounding._empty_evidence_dict against drift if Evidence gains a field.
+    op = {"op_id": "pause", "op": "set_status", "level": "ad", "id": "ad1", "status": "proposed"}
+    attach_op_grounding(op, evidence=None, tier=EvidenceTier.direct_observation,
+                        spend_floor=100.0, conversions_floor=25.0, recency_days=1)
+    reference_keys = evidence_to_dict(
+        Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                 120.0, 2400.0, "adset", "as1", "Set 1", None)
+    ).keys()
+    assert op["evidence"].keys() == reference_keys
+
+
 def test_attach_op_grounding_below_floor_abstains_not_low() -> None:
     thin = Evidence("blended_roas", 2.0, "ROAS 2.00", "2026-06-19..2026-06-24",
                     9.0, 40.0, "ad", "ad9", "Thin", None)
