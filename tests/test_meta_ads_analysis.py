@@ -5374,3 +5374,81 @@ def test_entry_point_default_reads_through_direct_when_backend_unset(monkeypatch
     enriched = enrich_action_plan_with_live_state(plan)
     assert seen["ad_id"] == "1"
     assert enriched["actions"][0]["live_state"]["status"] == "PAUSED"
+
+
+# --- MCP read backend: translation/error branches (review-stage coverage; still MOCKS ONLY) ---
+
+
+def test_mcp_reader_node_unwraps_single_object_data_envelope() -> None:
+    # A node read returning {"data": {...}} must be unwrapped to the inner node, matching the bare
+    # shape DirectMetaReader returns. This branch of _call_node was previously untested.
+    canned = {"id": "c1", "name": "Campaign", "status": "ACTIVE"}
+    reader = MCPMetaReader(_RecordingExecutor({"meta_ads_get_campaign_by_id": {"data": canned}}))
+    assert reader.get_campaign("c1", fields=["name"]) == canned
+
+
+def test_mcp_reader_raises_on_non_json_string_result() -> None:
+    # A tool that returns text which is not JSON must surface a clear MetaApiError, not crash.
+    reader = MCPMetaReader(_RecordingExecutor({"meta_ads_get_ad_account_details": "not json {"}))
+    try:
+        reader.get_account("act_1", fields=["id"])
+    except MetaApiError as exc:
+        assert "non-JSON" in str(exc)
+    else:
+        raise AssertionError("expected MetaApiError when the MCP tool returns non-JSON text")
+
+
+def test_mcp_reader_list_read_rejects_unexpected_result_shape() -> None:
+    # A scalar (neither a list nor a {"data": [...]} envelope) must raise, naming the read, rather
+    # than silently coercing to an empty result.
+    reader = MCPMetaReader(_RecordingExecutor({"meta_ads_get_campaigns_by_adaccount": 42}))
+    try:
+        reader.list_campaigns("act_1", fields=["id"])
+    except MetaApiError as exc:
+        assert "list_campaigns" in str(exc)
+    else:
+        raise AssertionError("expected MetaApiError for an unexpected list-read result shape")
+
+
+def test_mcp_reader_node_read_rejects_non_object_result() -> None:
+    reader = MCPMetaReader(_RecordingExecutor({"meta_ads_get_campaign_by_id": [1, 2, 3]}))
+    try:
+        reader.get_campaign("c1", fields=["id"])
+    except MetaApiError as exc:
+        assert "get_campaign" in str(exc)
+    else:
+        raise AssertionError("expected MetaApiError when a node read returns a non-object")
+
+
+def test_mcp_reader_drains_three_pages_and_passes_each_next_url_to_pagination_tool() -> None:
+    # More than two pages, and the pagination tool must receive the exact paging.next URL each hop.
+    returns = {
+        "meta_ads_get_adsets_by_adaccount": {"data": [{"id": "as1"}], "paging": {"next": "URL2"}},
+        "meta_ads_fetch_pagination_url": lambda args: {
+            "URL2": {"data": [{"id": "as2"}], "paging": {"next": "URL3"}},
+            "URL3": {"data": [{"id": "as3"}], "paging": {}},
+        }[args["url"]],
+    }
+    execu = _RecordingExecutor(returns)
+    assert MCPMetaReader(execu).list_adsets("act_1", fields=["id"]) == [
+        {"id": "as1"}, {"id": "as2"}, {"id": "as3"}
+    ]
+    # The pagination tool was handed each cursor in order.
+    pagination_urls = [a["url"] for t, a in execu.calls if t == "meta_ads_fetch_pagination_url"]
+    assert pagination_urls == ["URL2", "URL3"]
+
+
+def test_mcp_reader_aborts_runaway_pagination_at_max_pages() -> None:
+    # A server that returns a fresh paging.next forever must hit the runaway guard, not loop.
+    returns = {
+        "meta_ads_get_adsets_by_adaccount": {"data": [{"id": "as1"}], "paging": {"next": "URL"}},
+        "meta_ads_fetch_pagination_url": {"data": [{"id": "asN"}], "paging": {"next": "URL"}},
+    }
+    reader = MCPMetaReader(_RecordingExecutor(returns))
+    reader.MAX_PAGES = 3  # instance override keeps the test cheap
+    try:
+        reader.list_adsets("act_1", fields=["id"])
+    except MetaApiError as exc:
+        assert "runaway" in str(exc)
+    else:
+        raise AssertionError("expected the MAX_PAGES runaway guard to fire")
