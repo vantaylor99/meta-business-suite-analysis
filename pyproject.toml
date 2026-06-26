@@ -58,6 +58,8 @@ apply_authoring = "meta_ads_analysis.cli:apply_authoring_main"
 intake_video = "meta_ads_analysis.cli:intake_video_main"
 upload_video = "meta_ads_analysis.cli:upload_video_main"
 propose_video_ad = "meta_ads_analysis.cli:propose_video_ad_main"
+propose_creative_features = "meta_ads_analysis.cli:propose_creative_features_main"
+operator_brief = "meta_ads_analysis.cli:operator_brief_main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

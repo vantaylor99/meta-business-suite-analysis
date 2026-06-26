@@ -326,13 +326,6 @@ Those can be added later, but they need tighter account-specific controls becaus
 `review.review_ops_plan`; `apply-ops` then validates/executes it under the same
 propose → approve → validate_only → execute gate.
 
-> **Invocation note:** the budget proposer currently ships **only** as the `propose_budget` console
-> script (available after `pip install -e .`). Unlike the sibling write commands it is **not** wired
-> into the `python -m meta_ads_analysis` dispatcher, so `python -m meta_ads_analysis propose-budget`
-> fails with "Unknown command". Use the `propose_budget` console script until
-> `tickets/backlog/wire-propose-budget-into-m-dispatch` lands. `apply-ops` (which executes the plan) is
-> reachable both ways.
-
 **CBO detection.** Under Meta's campaign-budget-optimization the **campaign** holds the budget and the
 ad sets inherit it. When a `set_daily_budget` op (or the action-plan `increase_adset_budget`) finds the
 ad set has no `daily_budget`, the code re-reads the **parent campaign** (`classify_adset_budget`) and
