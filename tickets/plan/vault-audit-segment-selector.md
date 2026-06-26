@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-26T06:29:43.614Z (agent: claude)
+  Log file: /Users/vantaylor99/Developer/projects/meta-business-suite-analysis/tickets/.logs/vault-audit-segment-selector.plan.2026-06-26T06-29-43-614Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: When the vault re-checks a stored number that was sliced by two or more dimensions at once (for example "Instagram, in the feed"), it can't tell which live row to compare against and gives up. Let a fact say exactly which slice it came from so the re-check can find it.
 prereq:
 files: src/meta_ads_analysis/cli.py, src/meta_ads_analysis/knowledge_provenance.py, knowledge/README.md, knowledge/learnings.md
