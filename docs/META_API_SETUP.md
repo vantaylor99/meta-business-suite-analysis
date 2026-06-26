@@ -11,7 +11,10 @@ python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-2
 - A Meta app with access to the ad accounts you manage
 - A working access token:
   - `ads_read` is enough for reporting sync, dry runs, and live-state reads
-  - `ads_management` is required to *execute* actions (`apply-actions --execute`, `apply-rotation --execute`)
+  - `ads_management` is required to *execute* any write with `--execute` — across all pipelines:
+    `apply-actions`, `apply-ops` (status / budget / targeting / creative), `apply-authoring`
+    (`create_*`), `apply-rotation`, `apply-disable-advantage`, and `apply-renames`. The full
+    guarded-write catalog is in [`../AGENTS.md`](../AGENTS.md) under **Hybrid Meta integration**.
 - Real ad account IDs in `config/meta_ads_accounts.json`
 
 ## Configuration
@@ -177,13 +180,14 @@ it later needs **no code change**, only config:
 ```
 
 Then point `META_READER_BACKEND=mcp` at it. Because both the community token server and the official
-OAuth server satisfy the same `MetaReaderProvider` seam, swapping is config-only. (The single-operator
-vs multi-user / OAuth auth model is cross-referenced in the auth note that lands with the
-`hybrid-model-docs-and-tool-catalog` ticket.)
+OAuth server satisfy the same `MetaReaderProvider` seam, swapping is config-only. **It is not wired or
+tested here** — only the seam is proven to support it. The single-operator-now vs multi-user/OAuth-later
+auth posture is documented in [`../AGENTS.md`](../AGENTS.md) under **Hybrid Meta integration → Auth
+posture**.
 
 ## Notes
 
-- Reads now flow through a swappable provider seam (`MetaReaderProvider` in `reader_provider.py`) so an MCP read backend can supply reads without touching call sites; writes stay on the direct Graph API client. See **Read backend: direct vs MCP** above; full hybrid-model docs land in the `hybrid-model-docs-and-tool-catalog` ticket.
+- Reads now flow through a swappable provider seam (`MetaReaderProvider` in `reader_provider.py`) so an MCP read backend can supply reads without touching call sites; writes stay on the direct Graph API client. See **Read backend: direct vs MCP** above; the read model, auth posture, and full guarded-write catalog are in [`../AGENTS.md`](../AGENTS.md) under **Hybrid Meta integration**.
 - The reporting sync (`sync-api`) is read-only. It does not modify account settings or ads.
 - Writes (action execution and audience rotation) go through the same Graph API client but only run with an explicit `--execute` flag and an `ads_management`-scoped token.
 - V1 runs one account at a time.

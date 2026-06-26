@@ -11,6 +11,47 @@ This repo now supports a guarded path from analysis to action:
 7. Execute only after the dry run matches the operator's intent.
 8. Review the timestamped action result log.
 
+## Unified write workflow (all pipelines)
+
+There are **four** write pipelines, and they all run through the *same* gate. The action plan
+(`pause_ad` / `increase_adset_budget`), the control ops (`set_status`, `set_daily_budget`, targeting,
+creative), authoring (`create_*`), and rotation (audience swap / Advantage-disable / rename) each:
+**propose → review → approve → validate_only → execute → audit.**
+
+```
+                 build plan (proposed)           operator           Meta Graph API
+                 + grounding + review            edits status        (write client)
+  read live  ┌────────────────────────┐  approve   ┌─────────┐  --validate-only   ┌──────────┐
+  state ───▶ │ evidence + COMPUTED    │ ─────────▶ │ status: │ ───────────────▶  │ pre-flight│
+  (reader)   │ confidence  →  review  │            │ approved│       --execute     │  → write  │
+             │ (DEMOTE-ONLY gate)     │            └─────────┘ ───────────────▶  └────┬─────┘
+             └────────────────────────┘                                                │
+                  │ abstain / refute                                                   ▼
+                  ▼                                                          timestamped results
+            non-executable /                                                 log (audit trail)
+            blocked at apply
+```
+
+- **Review is per-pipeline but shares one engine.** Control ops and authoring ops live under
+  `plan["ops"]` and are reviewed by `review.review_ops_plan` / `review.review_authoring_plan`. Rotation
+  plans carry **no `plan["ops"]`** — their reviewable items live under their own keys
+  (`audience_rotation`→`rotations`, `advantage_disable`→`items`, `adset_rename`→`renames`) and are
+  reviewed by `review.review_rotation_plan`. All three reuse the same `review_recommendation` core and
+  the same demote-only applier; routing a rotation plan through the `ops` iterator would silently review
+  nothing, which is exactly what the key-aware wrapper prevents.
+- **Grounding enforcement differs at apply time, by design.** `set_status`, `set_daily_budget`, and
+  authoring creates set `guardrails.requires_grounding: true`, so an approved-but-ungrounded write is
+  **hard-blocked** at apply (`op_grounding_gap`). The rotation family and `set_creative_features` carry
+  evidence/confidence and run review, but **do not** set that flag — their review is **advisory**
+  (demote-only at propose) and there is no apply-time grounding block yet (rotation's gap is tracked in
+  `fix/rotation-apply-time-grounding-gate`). Rotation still has its own apply-time **live-drift guard**
+  that blocks a write regardless of band.
+
+The **full per-capability write catalog (levels, reversible vs create-only, exact guardrails, and which
+CLI proposes each)** is the single source of truth in
+[`../AGENTS.md`](../AGENTS.md) under **Hybrid Meta integration** — it is not duplicated here. The reader
+backend (direct vs MCP) and auth posture also live there and in [`META_API_SETUP.md`](META_API_SETUP.md).
+
 ## Commands
 
 Generate a plan:
@@ -253,9 +294,16 @@ Those can be added later, but they need tighter account-specific controls becaus
 
 ### CBO-aware budget +/- (`control.set_daily_budget`)
 
-`control.build_budget_plan` (CLI: `propose-budget`) proposes a single grounded daily-budget move and
-runs it through `review.review_ops_plan`; `apply-ops` then validates/executes it under the same
+`control.build_budget_plan` proposes a single grounded daily-budget move and runs it through
+`review.review_ops_plan`; `apply-ops` then validates/executes it under the same
 propose → approve → validate_only → execute gate.
+
+> **Invocation note:** the budget proposer currently ships **only** as the `propose_budget` console
+> script (available after `pip install -e .`). Unlike the sibling write commands it is **not** wired
+> into the `python -m meta_ads_analysis` dispatcher, so `python -m meta_ads_analysis propose-budget`
+> fails with "Unknown command". Use the `propose_budget` console script until
+> `tickets/backlog/wire-propose-budget-into-m-dispatch` lands. `apply-ops` (which executes the plan) is
+> reachable both ways.
 
 **CBO detection.** Under Meta's campaign-budget-optimization the **campaign** holds the budget and the
 ad sets inherit it. When a `set_daily_budget` op (or the action-plan `increase_adset_budget`) finds the

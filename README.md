@@ -11,17 +11,51 @@ The workflow is:
 5. Review the generated report in `reports/<account_slug>/<run_date>/`.
 6. Generate an approved action plan before making Meta account changes.
 
-The implementation keeps one normalized reporting pipeline and supports two input paths:
+The implementation keeps one normalized reporting pipeline with two read input paths and a broad
+guarded-write surface:
 
-- manual Ads Manager exports
-- direct API sync into the same raw CSV contract
-- guarded Meta Graph API actions from approved report findings
+- **Reads:** manual Ads Manager exports, or a direct API sync into the same raw CSV contract. Reads
+  flow through a swappable backend (direct Graph client by default, or an opt-in Meta MCP read server).
+- **Guarded writes:** the action plan (pause / budget-increase), control ops (enable/pause, CBO-aware
+  budget +/-, targeting, creative features), authoring (create campaign / ad set / ad / video ad /
+  lookalike — all created PAUSED), and audience rotation / Advantage-disable / rename. Every write is
+  proposed, evidence-grounded, adversarially reviewed, approved, dry-run/validated, then executed —
+  **there is no delete or archive**. See [Hybrid Meta integration](#hybrid-meta-integration) for the
+  full catalog.
 
 ## Install
 
 ```powershell
 pip install -e .[dev]
 ```
+
+## Hybrid Meta integration
+
+The Meta integration is **hybrid and grounded**, and runs as a **single operator** today:
+
+- **Reads are swappable.** They flow through a `MetaReaderProvider` seam selected by
+  `META_READER_BACKEND` — `direct` (default; the live Graph client) or `mcp` (a Meta MCP read server).
+  A community token-based MCP server is wired as a **disabled, unvetted placeholder** in `.mcp.json`,
+  and Meta's official OAuth server is a **config-only drop-in for later** (no code change). Writes
+  always use the direct Graph client.
+- **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
+  CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
+  sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable
+  Advantage-Audience / rename — all behind a propose → review → approve → validate → execute gate with
+  an audit log, and **no delete/archive**.
+- **Auth is single-operator now.** One long-lived `META_ACCESS_TOKEN`; multi-user / OAuth login is a
+  documented later concern, not built.
+
+**The authoritative reference** — read model, auth posture, and the full per-capability write catalog
+(levels, reversible vs create-only, exact guardrails, and which CLI proposes each) — is
+[AGENTS.md → Hybrid Meta integration](AGENTS.md#hybrid-meta-integration-read-model--auth--write-catalog).
+The end-to-end workflow + diagram is in
+[docs/META_ACTION_WORKFLOW.md](docs/META_ACTION_WORKFLOW.md), and MCP/token setup is in
+[docs/META_API_SETUP.md](docs/META_API_SETUP.md).
+
+> One command caveat: the budget proposer ships only as the `propose_budget` console script (after
+> `pip install -e .`); it is not yet wired into `python -m meta_ads_analysis` (tracked in
+> `tickets/backlog/wire-propose-budget-into-m-dispatch`). All other write commands work both ways.
 
 ## API Sync
 
@@ -259,12 +293,10 @@ This writes a timestamped results log:
 
 - `reports/<account_slug>/<run_date>/action_results_<timestamp>.json`
 
-The executor uses the installed `meta` CLI and currently sends commands shaped like:
-
-```text
-meta --no-input -o json ads --ad-account-id <act_id> ad update <ad_id> --status paused
-meta --no-input -o json ads --ad-account-id <act_id> adset update <adset_id> --daily-budget <cents>
-```
+The executor writes directly through the Meta Graph API client
+(`MetaMarketingApiClient.update_ad` / `update_adset` / `update_campaign`) — there is no dependency on
+the old `meta` CLI or WSL. It only changes explicit approved fields, and `--validate-only` pre-flights
+the change against Meta before any real write.
 
 Meta AI / Advantage+ features are kept out of the execution surface by default. The action executor only changes explicit approved fields and blocks parameters that try to set Meta AI or Advantage+ controls.
 

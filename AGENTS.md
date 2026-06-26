@@ -200,11 +200,15 @@ confidence-bearing actions and passes informational ones through untouched). Thi
 - Do not let external/web evidence raise the confidence of a live recommendation. External findings
   are hypotheses for the experiment queue, capped at the `external` grounding tier — see "External
   evidence" in [`knowledge/README.md`](knowledge/README.md).
-- Do not finalize a pause/scale/budget recommendation — structured *or* prose — until it survives the
-  **fresh-context adversarial-review pass** (see the **Adversarial-review rule** under Interpretation
-  Rules). The reviewer refutes by default and names the failing input; that pass only filters and
-  downgrades proposals upstream of approval — it never approves an action, enables a write, or alters
-  PAUSED-by-default.
+- Do not finalize **any** account-changing write — the action plan *and* the control-ops, authoring,
+  and rotation pipelines, structured *or* prose — until it survives the **fresh-context
+  adversarial-review pass** (see the **Adversarial-review rule** under Interpretation Rules). Evidence,
+  a **computed** confidence band, and a `review.py` pass are required on every grounded write, not just
+  the action plan; below the significance floor, abstain (the gate hard-blocks an approved-but-thin
+  `set_status` / `set_daily_budget` / create). The reviewer refutes by default and names the failing
+  input; that pass only filters and downgrades proposals upstream of approval — it never approves an
+  action, enables a write, or alters PAUSED-by-default. See the **Hybrid Meta integration** section for
+  the full write catalog and per-capability gates.
 - Do not assume the pixel or Conversions API is healthy just because Meta reports purchases.
 - Do not assume revenue is healthy just because Meta reports results or app installs.
 - Do not recommend scaling solely off hook rate without downstream conversion evidence.
@@ -213,19 +217,108 @@ confidence-bearing actions and passes informational ones through untouched). Thi
 - Keep Meta AI / Advantage+ creative features off by default. Do not enable automatic text variations, image expansion, visual touch-ups, generated music, flexible media, or AI-generated creative variants unless a human explicitly requests that exact change.
 - Budget-decrease operations are double-gated by two safety knobs in `config.py`: `MAX_BUDGET_DECREASE_PERCENT` (default 50 — a single op may not cut the live budget by more than this percent) and `MIN_DAILY_BUDGET_CENTS` (absolute floor in account minor units). A per-account override (`max_budget_decrease_percent` in `action_policy`) narrows the percent cap further; `validate_only` against Meta enforces the real per-currency minimum as the final check.
 
-## Read backend (direct vs MCP)
+## Hybrid Meta integration (read model · auth · write catalog)
 
-Meta **reads** flow through a swappable seam, `MetaReaderProvider` (`src/meta_ads_analysis/reader_provider.py`),
-selected by the `META_READER_BACKEND` env var: `direct` (default — the live Graph API client) or `mcp`
-(route reads through a Meta MCP read server). Default is `direct`, so behavior is unchanged unless an
-operator opts in. The MCP path is **reads-only** (`MCPMetaReader`, consumed by the agent runtime with an
-injected tool-executor); **writes always use the direct Graph client** and stay behind the
-propose → approve → validate_only → execute guardrails. Two MCP options are documented in
-[`docs/META_API_SETUP.md`](docs/META_API_SETUP.md): a community token-based server (a candidate,
-unvetted entry parked disabled in `.mcp.json`) usable with the current token now, and Meta's official
-hosted OAuth server as a config-only drop-in for later. Single-operator with the current token is the
-supported path now; OAuth/multi-user is a later concern. Full hybrid-model docs + tool catalog land in
-the `hybrid-model-docs-and-tool-catalog` ticket.
+This is the single reference for how the agent and a fresh operator should think about the Meta
+integration: where reads come from, what auth we actually run on, and the full set of guarded writes.
+The deep procedural docs are [`docs/META_ACTION_WORKFLOW.md`](docs/META_ACTION_WORKFLOW.md) (workflow +
+diagram) and [`docs/META_API_SETUP.md`](docs/META_API_SETUP.md) (MCP setup); the write catalog below is
+the **single source of truth** — those docs cross-link here rather than re-listing it.
+
+### Read model (hybrid, swappable)
+
+Meta **reads** flow through a provider seam, `MetaReaderProvider`
+(`src/meta_ads_analysis/reader_provider.py`), selected at every `*.from_env()` construction point by the
+`META_READER_BACKEND` env var (`reader_from_env`):
+
+- **`direct` (default)** — `DirectMetaReader`, a 1:1 pass-through to the live Graph API client
+  (`MetaMarketingApiClient`). Unset or `direct` is byte-for-byte today's behavior; nothing changes
+  unless an operator opts in.
+- **`mcp` (opt-in)** — `MCPMetaReader`, which routes each read to a token-based Meta MCP read server's
+  equivalent tool and translates the result back into the exact shapes `DirectMetaReader` returns. It is
+  consumed by the **agent runtime**, which injects the MCP tool-call surface
+  (`MCPMetaReader(tool_executor=…)`); the pure-Python CLI cannot synthesize that surface, so a CLI run
+  with `META_READER_BACKEND=mcp` raises a clear error rather than silently degrading.
+
+**The community MCP server is wired as config only, and as an *unvetted placeholder*.** It sits in
+`.mcp.json` under the non-launched `_candidateMcpServers` key (`meta-ads-mcp-server@1.5.1`,
+token-based), so **it is present but not started** — only `code-search` launches. Enabling it requires
+an operator to vet the package, pin a known-good version, confirm its token env var, move it under
+`mcpServers`, and set `META_READER_BACKEND=mcp`. This is **not** a live, vetted integration today. The
+candidate covers 8 reads (`fetch_insights`, `fetch_ads`, `list_campaigns`, `get_campaign`,
+`list_adsets`, `get_adset`, `get_ad`, `get_account`); the rest (`list_custom_audiences`,
+`get_delivery_estimate`, `search_targeting`, `list_pixels`, `list_custom_conversions`, and the raw
+`iter_paginated` escape hatch) are **not** mapped and raise a clear `NotImplementedError` naming the
+read — fall back to `direct` for those.
+
+Meta's **official hosted OAuth MCP server is a documented drop-in for later** — same seam, config-only,
+**no code change** (see `docs/META_API_SETUP.md`). It is **not wired or tested here**; only the seam is
+proven to support it.
+
+**Writes are deliberately not part of this seam.** `create_*` / `update_*` / `upload_*` always use the
+direct Graph client and stay behind the propose → approve → validate_only → execute gate, so the MCP
+read path is reads-only and the existing `ads_read` token is enough for it (writes still need
+`ads_management` + `--execute`).
+
+### Auth posture (single operator now; multi-user later, not built)
+
+We run as **one operator** today, authenticated with the current **long-lived `META_ACCESS_TOKEN`** (a
+user/system-user token, no OAuth). That is the **only supported auth path right now** — for both the
+direct client and the community MCP candidate (which reads the same token). **Multi-user auth / OAuth /
+per-user login is a documented later concern that is not built.** When it is wanted, it plugs in at two
+points and needs no rewrite of any call site: the read side swaps in the official OAuth MCP server at
+the `MetaReaderProvider` seam, and the write side would need a future **per-user token store** feeding
+`client_from_env`'s token lookup. Until then, assume one token, one operator.
+
+### Write tool catalog
+
+Every guarded write capability and its guardrails. All writes are **reversible or create-only —
+there is no `delete` / `archive` anywhere** (`control.py` excludes them by design). "Pipeline" names the
+apply entry point and the proposing CLI; commands are `python -m meta_ads_analysis <cmd>` unless noted.
+
+| Capability | Pipeline · CLI | Level | Kind | Grounding & gate |
+|---|---|---|---|---|
+| `pause_ad` | action plan · `propose-actions` → `apply-actions` | ad | reversible | Grounded (evidence + computed confidence) + `review_action_plan`; thin sample → non-executable "insufficient". |
+| `increase_adset_budget` | action plan · `propose-actions` → `apply-actions` | adset | reversible | Grounded + reviewed; needs live current budget; capped by `max_increase_percent`. |
+| `set_status` (enable / pause) | ops · `propose-enable-ads` / `propose-pause-ads` → `apply-ops` | ad / adset / campaign | reversible | **Grounded + hard apply-time gate** (`requires_grounding`) + `review_ops_plan`. Cold-ad enable cites a zero sample → abstain → **blocked**; structural safety pause cites no sample → allowed. |
+| `set_daily_budget` (+/-, CBO-aware) | ops · `propose-budget`¹ → `apply-ops` | adset / campaign | reversible | **Grounded + hard apply-time gate** + reviewed. CBO ad-set op redirects to a campaign op; increase cap `max_increase_percent` (20%), decrease cap `MAX_BUDGET_DECREASE_PERCENT` (50%) **and** floor `MIN_DAILY_BUDGET_CENTS`; direction check refutes scaling a loser / cutting a winner. |
+| `set_creative_features` | ops · `propose-creative-features` → `apply-ops` | ad | reversible | **Approval-gated only** (`requires_explicit_approval`) — this builder does **not** attach grounding. `FORBIDDEN_FRAGMENTS` still blocks Advantage+/AI params; opt-in is additive, opt-out is text rewriting. |
+| `set_creative` | ops · hand-authored (no CLI proposer) | ad | reversible | In the grounding-required set, but no grounded proposer ships; applied via `apply-ops` under the universal gate. |
+| targeting: `set_age_range` / `set_genders` / `set_geo_locations` / `set_placements` | ops · hand-authored (no CLI proposer) | adset | reversible | Read-modify-write preserves other fields; in the grounding-required set, no grounded proposer ships; applied via `apply-ops`. |
+| `rename` (op) | ops · hand-authored | ad / adset / campaign | reversible | **Exempt from grounding** (cosmetic — no spend/delivery/structure change). |
+| `create_campaign` / `create_adset` | authoring · hand-authored → `apply-authoring` | campaign / adset | create-only | **Grounded + hard apply-time gate** + `review_authoring_plan`; forced **PAUSED**; net-new cites zero sample → abstain → approved create **blocked** unless the operator drops `requires_grounding`. |
+| `create_ad` | authoring · `propose-duplicate-ad` → `apply-authoring` | ad | create-only | Grounded by the **source ad's** own metric (proven winner → executable; undelivered source → abstain → blocked); forced **PAUSED**. |
+| `create_video_ad` | authoring · `propose-video-ad` → `apply-authoring` | ad | create-only | Net-new → zero sample → abstain → blocked unless overridden; forced **PAUSED**. (Asset comes from `intake-video` / `upload-video`.) |
+| `create_lookalike` | authoring · `propose-lookalike` → `apply-authoring` | audience | create-only | **Structural abstain** (seed size/quality is not a ROAS/conversions metric) → gate-**allowed**; an audience is inert — **no status, not PAUSED, never spends**. |
+| `audience_rotation` | rotation · `propose-rotation` → `apply-rotation` | adset (targeting) | reversible | Grounded at the **`correlational`** tier (caps at `medium`) + `review_rotation_plan`. **Review is advisory only — no apply-time grounding gate** (open: `fix/rotation-apply-time-grounding-gate`); the apply-time **live-drift guard blocks regardless of band**. Prior audience set is logged, so a rotation is reversible. |
+| `advantage_disable` | rotation · `propose-disable-advantage` → `apply-disable-advantage` | adset (automation) | reversible | **Structural abstain** + reviewed (advisory only). Only ever turns Advantage-Audience automation **off**, never on. |
+| `adset_rename` | rotation · `propose-renames` → `apply-renames` | adset | reversible | **Exempt from grounding** (writes only the name); passes through review untouched. |
+
+¹ **`propose-budget` ships only as the `propose_budget` console script** (`pip install -e .`); it is
+**not** wired into the `python -m meta_ads_analysis` dispatcher, so `python -m meta_ads_analysis
+propose-budget` currently fails. Tracked in `tickets/backlog/wire-propose-budget-into-m-dispatch`.
+
+**The universal gate (every row above).** Writes are only ever **proposed**; an operator changes a
+plan's status to `approved`; nothing reaches Meta without `--execute` (and `--validate-only` pre-flights
+the change against Meta first); every dry-run/validate/execute appends a **timestamped results log** as
+the audit trail. PAUSED-by-default holds for all created entities (`authoring._build_create` hardcodes
+`status=PAUSED`); `FORBIDDEN_FRAGMENTS` blocks Advantage+/Meta-AI params on every write. Where a grounded
+producer is used, the op carries an `Evidence` block + a **computed** `Confidence` band (never
+free-typed — `confidence.assess` or an explicit `abstain`) and is run through the matching `review.py`
+gate, which is **demote-only**. The hard apply-time grounding gate (`op_grounding_gap`, fired when the
+plan sets `requires_grounding`) blocks an approved-but-ungrounded write for `set_status` /
+`set_daily_budget` / authoring creates; rotation and `set_creative_features` are reviewed/approval-gated
+but do **not** yet have that apply-time block (noted above).
+
+### Where the review gate lives relative to the write gate
+
+`review.py` sits **upstream** of the guarded-write approval and can only **demote** (lower a band,
+flip executable→non-executable, demote `approved`→`proposed`) — it never raises a band, promotes a
+status, enables a write, or touches PAUSED-by-default. Control/authoring ops live under `plan["ops"]`
+and are reviewed by `review_ops_plan` / `review_authoring_plan`; rotation-family plans carry their
+reviewable items under their **own** keys (`rotations` / `items` / `renames`, never `plan["ops"]`) and
+are reviewed by `review_rotation_plan` — routing a rotation plan through the ops iterator would silently
+review nothing.
 
 ## Tickets (tess)
 
