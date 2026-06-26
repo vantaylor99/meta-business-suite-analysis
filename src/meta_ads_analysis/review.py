@@ -86,6 +86,13 @@ _SCALE_ACTIONS = {"increase_adset_budget", "increase_campaign_budget", "consider
 # ROAS comfortably above target) contradicts the account goal, the mirror of pausing a winner.
 _SCALE_DOWN_BUDGET_ACTIONS = {"decrease_adset_budget", "decrease_campaign_budget"}
 
+# Enabling an ad is directionally a scale-up (0 → live). For a ROAS-goal account, turning ON an ad
+# whose own cited ROAS sits below target contradicts the goal the same way a budget scale-up does, so
+# it is refuted with an enable-specific reason (kept distinct from ``_SCALE_ACTIONS`` so the operator
+# message reads as "enabling", not "scaling"). The enable op sets this ``action_type`` — see
+# ``control.build_enable_ads_plan``.
+_ENABLE_ACTIONS = {"enable_ad"}
+
 # How far above target a paused ad's cited ROAS must sit before pausing it reads as "pausing a winner"
 # (a clear self-contradiction). A generous margin keeps borderline pauses — which may be justified for
 # reasons outside the cited metric — from being falsely refuted.
@@ -413,6 +420,11 @@ def _direction_contradiction(
             f"recommendation contradicts its cited metric vs the account goal: scaling an entity "
             f"whose ROAS {roas:.2f} is below the {target:g} target"
         )
+    if action_type in _ENABLE_ACTIONS and roas < target:
+        return (
+            f"recommendation contradicts its cited metric vs the account goal: enabling an ad "
+            f"whose ROAS {roas:.2f} is below the {target:g} target"
+        )
     if action_type in _SCALE_DOWN_BUDGET_ACTIONS and roas >= target * _PAUSE_WINNER_MARGIN:
         return (
             f"recommendation contradicts its cited metric vs the account goal: cutting the budget of "
@@ -543,10 +555,12 @@ def review_ops_plan(
     never mutated), reviews only ops carrying a ``confidence`` block (informational / structural ops
     with no band pass through untouched), and is idempotent (an op already carrying a ``review`` block
     is left as-is). Most op dicts carry no ``action_type``, so the ``direction`` check no-ops for them;
-    the exception is budget ops, which set one (``increase_*``/``decrease_*_budget`` — see
-    ``control._budget_op``) so the direction-contradiction check fires on them (refuting a scale-up
-    below target / a budget cut of a clear winner). The gate stays **demote-only**: it may lower a band
-    and demote ``status`` approved→proposed, never raise a band or promote a status.
+    the exceptions are budget ops (``increase_*``/``decrease_*_budget`` — see ``control._budget_op``)
+    and enable ops (``enable_ad`` — see ``control.build_enable_ads_plan``), which set one so the
+    direction-contradiction check fires on them: refuting a budget scale-up below target / a budget cut
+    of a clear winner, and a re-enable whose cited ROAS is below target. The gate stays
+    **demote-only**: it may lower a band and demote ``status`` approved→proposed, never raise a band or
+    promote a status.
     """
     return _review_plan_ops(
         plan,
@@ -689,7 +703,7 @@ def _review_plan_ops(
         result = review_recommendation(
             evidence=evidence,
             confidence=confidence,
-            action=op,  # most ops carry no action_type (direction no-ops); budget ops set one and do fire
+            action=op,  # most ops carry no action_type (direction no-ops); budget + enable ops set one and do fire
             policy=policy,
             spend_floor=spend_floor,
             conversions_floor=conversions_floor,

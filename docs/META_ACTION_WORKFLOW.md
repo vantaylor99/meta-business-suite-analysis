@@ -193,10 +193,17 @@ and turning it OFF carry opposite risk:
   band.
 
 A high-spend ad that happens to be paused still grounds normally: its real window sample computes a
-real band (e.g. `medium`), so re-enabling it is an evidence-backed, reviewable proposal. Ops carry no
-`action_type`, so the review gate's `direction` check (scale-vs-ROAS-target) does not fire on an
-enable; the protection against an enable whose metric contradicts the goal is that its band is computed
-from sample strength alone and can never be *over*-confident. Enabling a campaign or ad set toggles only
+real band (e.g. `medium`), so re-enabling it is an evidence-backed, reviewable proposal. Enabling an ad
+is directionally a **scale-up** (0 → live), so each enable op sets `action_type: enable_ad` — which lets
+the review gate's `direction` check fire on it. On a ROAS-goal account with a numeric `target_roas`, a
+re-enable whose own cited ROAS sits below target is **refuted** (the same verdict a below-target budget
+scale-up gets), so a known loser cannot reach the operator looking as trustworthy as a genuine performer.
+This complements the band protection above (which caps over-confidence): the band guards *how* confident
+the claim is, the direction check guards *which way* it points. The refutation is a loud, evidence-named
+warning, **not** a hard block — `apply_ops_plan`'s gate keys on grounding, not on `review_verdict`, so an
+operator who genuinely wants the retest can still set the op to `approved` and execute it. The check is
+ROAS-only for now: an install-goal enable is judged on cost-per-install and already caps at `low`, so it
+is not direction-judged here (deferred to a follow-up). Enabling a campaign or ad set toggles only
 that node — it does **not** un-pause PAUSED children — so evidence is attached at the level being
 toggled. The ad list is read once at propose time, so live `effective_status` may drift before execute;
 re-applying `ACTIVE` to an ad that is already ACTIVE is idempotent on Meta's side (and `--validate-only`

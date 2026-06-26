@@ -3273,6 +3273,146 @@ def test_review_ops_plan_demotes_overclaimed_enable() -> None:
     assert "review" not in plan["ops"][0]  # input plan not mutated
 
 
+def test_enable_ads_below_target_roas_strong_sample_is_refuted() -> None:
+    # Enabling an ad is directionally a scale-up (0 -> live). A re-enable whose own cited ROAS (1.0)
+    # sits below the account target (2.0) on a statistically STRONG sample is turning a known loser back
+    # on — the gate REFUTES it (the same verdict a below-target budget scale-up gets) so it reaches the
+    # operator named as a loser, not dressed up as a genuine performer. The refutation is a warning, not
+    # a band-cap: the computed band is left intact (still medium for 30 purchases).
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_value"] == 1.0  # $500 revenue / $500 spend
+    assert op["review"]["verdict"] == "refuted"
+    assert "direction" in op["review"]["failed_inputs"]
+    reason = " ".join(op["review"]["reasons"])
+    assert "enabling" in reason and "1.00" in reason and "2 target" in reason
+    assert op["review_verdict"] == "refuted"
+    assert op["confidence"]["band"] == "medium"  # refuted is a warning, not a band-cap
+
+
+def test_enable_ads_above_target_roas_stands() -> None:
+    # Same policy, but the cited ROAS (5.0) is comfortably above target — a genuine performer. The
+    # direction rule does NOT fire; the band is computed from the sample and the call stands.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "2500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_value"] == 5.0  # $2500 / $500
+    assert op["review"]["verdict"] == "stands"
+    assert op["confidence"]["band"] == "medium"
+
+
+def test_enable_ads_roas_goal_without_target_does_not_refute() -> None:
+    # Guard pin: with a ROAS goal but NO target_roas configured, the direction rule cannot fire — a
+    # below-1.0 ROAS still stands. This is the guard that keeps the existing computed-band tests green;
+    # pin it so a future refactor can't silently start refuting when no target is set.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(_enable_client(insights), "act_1", policy={"primary_goal": "roas"})
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_value"] == 1.0
+    assert op["review"]["verdict"] == "stands"
+
+
+def test_enable_ads_install_goal_not_direction_refuted() -> None:
+    # The enable direction rule is ROAS-ONLY. An install-goal enable carries action_type == "enable_ad"
+    # but is judged on cost-per-install, not ROAS vs target — so even with a target_roas in the policy it
+    # is never direction-refuted; it stays low/stands (the conversion sample is purchases, not installs,
+    # so it already caps at low). The install-goal direction polarity is deferred to a follow-up.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "actions": [{"action_type": "mobile_app_install", "value": "40"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1",
+        policy={"primary_goal": "maximize_in_app_subscriptions", "target_roas": 2.0},
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["review"]["verdict"] != "refuted"
+    assert op["review"]["verdict"] == "stands"
+    assert op["confidence"]["band"] == "low"
+
+
+def test_enable_ads_cold_ad_with_target_stays_insufficient_not_refuted() -> None:
+    # A cold ad cites a ZERO sample → metric_value is None → the direction rule can't fire even with a
+    # target configured. It must stay `insufficient` (keep observing), never flip to `refuted`, and the
+    # apply gate still blocks the approved turn-on.
+    plan = build_enable_ads_plan(
+        _enable_client([]), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review_verdict"] == "insufficient"
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _enable_client([]), execute=False)
+    blocked = next(r for r in results if r.op_id == op["op_id"])
+    assert blocked.status == "blocked"
+
+
+def test_enable_ads_below_target_and_below_floor_is_insufficient_not_refuted() -> None:
+    # Most-conservative-wins for enables: a below-target ROAS (1.0 < 2.0) on a BELOW-FLOOR sample yields
+    # `insufficient` (rank 3) over `refuted` (rank 2). The apply gate still blocks the approved turn-on.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "40",
+        "action_values": [{"action_type": "purchase", "value": "40"}],
+        "actions": [{"action_type": "purchase", "value": "3"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["evidence"]["metric_value"] == 1.0  # below target, but the sample is below the floor
+    assert op["review"]["verdict"] == "insufficient"
+    assert op["review_verdict"] == "insufficient"
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _enable_client(insights), execute=False)
+    blocked = next(r for r in results if r.op_id == op["op_id"])
+    assert blocked.status == "blocked"
+
+
+def test_enable_ads_refuted_can_still_be_operator_approved() -> None:
+    # `refuted` is a loud warning, not a hard block for ops: the apply gate keys on grounding
+    # (op_grounding_gap), not on review_verdict. An operator who genuinely wants the retest can set the
+    # refuted op to `approved` and it is NOT blocked (its band is grounded/non-abstain) — proving the
+    # refutation refuses to PRESENT a loser as a performer without trapping deliberate operator intent.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["review_verdict"] == "refuted"
+    assert op["confidence"]["band"] != "abstain"  # grounded — the gate has nothing to block on
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _enable_client(insights), execute=False)
+    result = next(r for r in results if r.op_id == op["op_id"])
+    assert result.status == "dry_run"  # NOT blocked — refusal is a warning, not a gate
+
+
 def test_enable_ads_review_is_idempotent() -> None:
     from meta_ads_analysis.review import review_ops_plan
 
