@@ -58,6 +58,63 @@ Each recommendation-bearing action (`pause_ad`, `increase_adset_budget`, `consid
 
 For the executable pause/budget paths, a sample below the significance floor (too few conversions and too little spend) does **not** become a confident pause or scale. The action is flipped to a non-executable `verdict: "insufficient_data"` recommendation — "promising test, keep running and re-check as more data accrues" — with `executable: false` and `approval_required: false`, so thin data can never be approved into a write.
 
+## Grounding on every write path (ops, authoring, rotation)
+
+The same proof-and-trust discipline applies to **all** account-changing writes, not just the action
+plan. The other write pipelines are:
+
+- **ops** (`control.apply_ops_plan`): `set_status`, `set_daily_budget`, `set_creative`,
+  `set_creative_features`, targeting ops, and `rename`.
+- **authoring** (`authoring.apply_authoring_plan`): `create_campaign` / `create_adset` / `create_ad`
+  / `create_video_ad` / `create_lookalike`.
+- **rotation** (`rotation.apply_rotation_plan` and friends): custom-audience swaps.
+
+Shared scaffolding lets each of these carry grounding uniformly:
+
+- **`write_grounding.attach_op_grounding(op, …)`** attaches a serialized `evidence` block and a
+  **computed** `confidence` band to a write op — computed by `confidence.assess` (or
+  `confidence.abstain_confidence` when no sample is supplied), never free-typed. With no sample, or a
+  sample below the significance floor, the band is `abstain` — never a defaulted `low`/`medium`.
+- **`review.review_ops_plan` / `review.review_authoring_plan`** are the op-shaped siblings of
+  `review_action_plan`. They iterate `plan["ops"]`, review only ops carrying a `confidence` block
+  (informational / structural ops with no band pass through untouched), and are idempotent (an op
+  already carrying a `review` block is left as-is). Like the action gate they are **demote-only**:
+  they may lower a band and demote an op's `status` from `approved` back to `proposed`, but never raise
+  a band, promote a status, or touch PAUSED-by-default. They use the op's own vocabulary
+  (`status` + a `review_verdict` marker) rather than the action plan's `executable`/`rationale` keys.
+  Because an op carries no `action_type`, the gate's `direction` check (scale-vs-ROAS-target) cannot
+  fire here — op-level direction-contradiction is the per-capability ticket's job, since it knows the
+  op's semantic. Rotation plans use `plan["rotations"]` / `plan["items"]` rather than `plan["ops"]`, so
+  they get their own review wrapper in the rotation work, not `review_ops_plan`.
+
+### Grounding-required set and the apply-time guard
+
+`apply_ops_plan` / `apply_authoring_plan` enforce grounding at the gate, not just by convention. When a
+plan opts in via `guardrails.requires_grounding: true`, an **approved** op that is *grounding-required*
+is **blocked** before any write is sent when it is not adequately grounded:
+
+- no `confidence` block at all → `blocked` ("approved write missing required evidence/confidence") —
+  this closes the hole where a hand-edited plan could approve an ungrounded write;
+- an `abstain` band **with a cited sample** (it tried to ground on data but the sample is below the
+  floor) → `blocked` ("insufficient data — keep running");
+- an `abstain` band with **no** sample (a structural / no-metric op, e.g. a safety PAUSE) → **allowed**:
+  this is an honest, deliberate abstention, not a thin-data overclaim, so blocking it would needlessly
+  break PAUSED-by-default safety writes.
+
+The grounding-required set is "anything that changes spend / delivery / structure":
+
+- **ops:** every supported op **except `rename`**. A pure rename is cosmetic — no spend, delivery, or
+  structural change — so it is exempt. (`control.GROUNDING_REQUIRED_OPS`.)
+- **authoring:** **all** create kinds, since every create changes account structure.
+  (`authoring.GROUNDING_REQUIRED_KINDS`.) Grounding gates whether a create is *sent*; the create is
+  forced `PAUSED` regardless, so the gate never weakens PAUSED-by-default.
+
+The guard is inert on plans that do not set `requires_grounding`, so legacy/ungrounded plans are
+unaffected; the grounded per-capability builders set the flag and attach the blocks together. The
+`confidence.py` / `review.py` / `write_grounding.py` layers stay pure (no Meta / network / clock): the
+live-state reads that build evidence and derive `recency_days` happen in the impure caller and are
+passed in.
+
 ## Account Goals
 
 Account-specific action policy lives in `config/meta_ads_accounts.json`.

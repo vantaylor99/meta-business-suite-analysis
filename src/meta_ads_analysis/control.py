@@ -26,6 +26,7 @@ from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
 from .reader_provider import MetaReaderProvider, as_reader
 from .rotation import _audience_refs, _ids, advantage_audience_enabled
 from .utils import ensure_dir, write_json
+from .write_grounding import op_grounding_gap
 
 APPROVED_STATUS = "approved"
 PROPOSED_STATUS = "proposed"
@@ -55,6 +56,13 @@ DEFAULT_OPT_IN_FEATURES = [
 DEFAULT_OPT_OUT_FEATURES = ["text_optimizations", "replace_media_text"]
 ALLOWED_STATUSES = {"ACTIVE", "PAUSED"}
 FORBIDDEN_FRAGMENTS = ("advantage", "ai_", "creative_enhancement", "image_expansion", "text_variation")
+
+# Ops that change spend / delivery / structure must carry a computed confidence band before an
+# approved write is sent (see ``write_grounding.attach_op_grounding`` / ``op_grounding_gap``). A pure
+# ``rename`` is cosmetic — no spend, delivery, or structural change — so it is exempt. The guard is
+# enforced only when the plan opts in via ``guardrails.requires_grounding`` (set by the grounded
+# per-capability builders); legacy/ungrounded plans are unaffected.
+GROUNDING_REQUIRED_OPS = SUPPORTED_OPS - {"rename"}
 
 CAMPAIGN_FIELDS = ["id", "name", "status", "effective_status", "objective", "daily_budget", "lifetime_budget"]
 ADSET_FIELDS = [
@@ -362,6 +370,7 @@ def apply_ops_plan(
     """
     effective_client = client
     effective_reader = as_reader(reader)
+    require_grounding = bool((plan.get("guardrails") or {}).get("requires_grounding"))
     results: list[OpResult] = []
     for op in plan.get("ops") or []:
         if not isinstance(op, dict):
@@ -370,6 +379,11 @@ def apply_ops_plan(
         if op.get("status") != APPROVED_STATUS:
             results.append(OpResult(op_id, "skipped", reason="Op is not approved."))
             continue
+        if require_grounding and op.get("op") in GROUNDING_REQUIRED_OPS:
+            gap = op_grounding_gap(op.get("confidence"), op.get("evidence"))
+            if gap is not None:
+                results.append(OpResult(op_id, "blocked", reason=gap))
+                continue
         try:
             validate_op(op)
         except ValueError as exc:

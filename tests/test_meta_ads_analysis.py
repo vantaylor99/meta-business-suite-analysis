@@ -3334,6 +3334,280 @@ def test_set_creative_features_rebuilds_creative_with_enroll_status() -> None:
     assert feats["text_optimizations"]["enroll_status"] == "OPT_OUT"
 
 
+# --- Guarded-write grounding scaffold (evidence/confidence on op + authoring plans) ----
+
+from meta_ads_analysis.authoring import (
+    GROUNDING_REQUIRED_KINDS,
+    apply_authoring_plan as _apply_authoring,
+)
+from meta_ads_analysis.control import (
+    GROUNDING_REQUIRED_OPS,
+    apply_ops_plan as _apply_ops_grounding,
+    write_ops_results,
+)
+from meta_ads_analysis.review import review_authoring_plan, review_ops_plan
+from meta_ads_analysis.write_grounding import attach_op_grounding, op_grounding_gap
+
+
+def _grounded_op(*, op_id, op, level, node_id, status, evidence, tier, spend_floor=100.0,
+                 conversions_floor=25.0, recency_days=1, params=None, kind=None):
+    """A control/authoring op with evidence+confidence attached via the shared scaffold."""
+    out = {"op_id": op_id, "op": op, "level": level, "id": node_id, "status": status,
+           "params": params or {}}
+    if kind is not None:
+        out["kind"] = kind
+    attach_op_grounding(out, evidence=evidence, tier=tier, spend_floor=spend_floor,
+                        conversions_floor=conversions_floor, recency_days=recency_days)
+    return out
+
+
+def test_attach_op_grounding_computes_band_never_free_types() -> None:
+    # A strong sample resolves to the SAME band confidence.assess computes — proving the band came
+    # from the rubric, not a value the caller typed.
+    strong = Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                       120.0, 2400.0, "adset", "as1", "Set 1", None)
+    op = {"op_id": "bump", "op": "set_daily_budget", "level": "adset", "id": "as1", "status": "proposed"}
+    attach_op_grounding(op, evidence=strong, tier=EvidenceTier.direct_observation,
+                        spend_floor=100.0, conversions_floor=25.0, recency_days=1)
+    expected = assess(evidence=strong, tier=EvidenceTier.direct_observation,
+                      spend_floor=100.0, conversions_floor=25.0, recency_days=1)
+    assert op["confidence"]["band"] == expected.band.name == "high"
+    assert op["evidence"]["sample_purchases"] == 120.0
+    assert op["evidence"]["window"] == "2026-06-10..2026-06-24"
+
+
+def test_attach_op_grounding_abstains_when_evidence_absent() -> None:
+    # No sample → abstain (the absence of a score), NEVER a defaulted low/medium.
+    op = {"op_id": "pause", "op": "set_status", "level": "ad", "id": "ad1", "status": "proposed"}
+    attach_op_grounding(op, evidence=None, tier=EvidenceTier.direct_observation,
+                        spend_floor=100.0, conversions_floor=25.0, recency_days=1)
+    assert op["confidence"]["band"] == "abstain"
+    assert op["confidence"]["data_band"] == "abstain"
+    assert op["evidence"]["sample_purchases"] is None and op["evidence"]["sample_spend"] is None
+
+
+def test_attach_op_grounding_below_floor_abstains_not_low() -> None:
+    thin = Evidence("blended_roas", 2.0, "ROAS 2.00", "2026-06-19..2026-06-24",
+                    9.0, 40.0, "ad", "ad9", "Thin", None)
+    op = {"op_id": "bump", "op": "set_daily_budget", "level": "adset", "id": "as2", "status": "proposed"}
+    attach_op_grounding(op, evidence=thin, tier=EvidenceTier.correlational,
+                        spend_floor=75.0, conversions_floor=25.0, recency_days=1)
+    assert op["confidence"]["band"] == "abstain"  # below floor, not a fabricated low
+
+
+def test_review_ops_plan_demotes_overclaimed_band() -> None:
+    # Hand-inflated 'high' band over a sample the rubric only supports at 'medium'.
+    op = {
+        "op_id": "oc", "op": "set_daily_budget", "level": "adset", "id": "as3", "status": "approved",
+        "params": {"daily_budget_cents": 11000},
+        "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
+                     "window": "2026-06-10..2026-06-24", "sample_purchases": 30.0,
+                     "sample_spend": 200.0, "entity_level": "adset", "entity_id": "as3"},
+        "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
+                       "grounding_tier": "direct_observation", "factors": [], "would_raise": "",
+                       "would_lower": "", "causal_flag": False},
+    }
+    plan = {"run_date": "2026-06-24", "ops": [op]}
+    reviewed = review_ops_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "downgrade"
+    assert Band[r["confidence"]["band"]] < Band.high
+    assert r["review_verdict"] == "downgrade"
+    # input plan not mutated
+    assert "review" not in plan["ops"][0]
+    assert plan["ops"][0]["confidence"]["band"] == "high"
+
+
+def test_review_ops_plan_skips_ops_without_confidence_block() -> None:
+    plan = {"ops": [{"op_id": "info", "op": "rename", "level": "adset", "id": "as1",
+                     "status": "approved", "params": {"name": "X"}}]}
+    reviewed = review_ops_plan(plan)
+    assert "review" not in reviewed["ops"][0]  # no confidence block → never reviewed
+    assert reviewed["ops"][0] == plan["ops"][0]
+
+
+def test_review_ops_plan_is_idempotent() -> None:
+    op = _grounded_op(
+        op_id="short", op="set_daily_budget", level="adset", node_id="as1", status="approved",
+        params={"daily_budget_cents": 11000},
+        evidence=Evidence("blended_roas", 1.1, "ROAS 1.10", "2026-06-21..2026-06-24",
+                          30.0, 200.0, "adset", "as1", "S", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    plan = {"run_date": "2026-06-24", "ops": [op]}
+    once = review_ops_plan(plan, spend_floor=100.0)
+    twice = review_ops_plan(once, spend_floor=100.0)
+    assert once["ops"][0]["review"]["verdict"] == "downgrade"  # a real correction happened
+    assert twice == once
+
+
+def test_review_ops_gate_only_demotes_never_promotes() -> None:
+    # An approved op claiming 'high' over a thin (below-floor) sample: recompute → abstain →
+    # insufficient → demoted out of approved. Never promoted, never band-raised.
+    op = {
+        "op_id": "thin", "op": "set_status", "level": "ad", "id": "ad9", "status": "approved",
+        "params": {"status": "ACTIVE"},
+        "evidence": {"metric_name": "blended_roas", "metric_value": 2.0,
+                     "window": "2026-06-19..2026-06-24", "sample_purchases": 9.0,
+                     "sample_spend": 40.0, "entity_level": "ad", "entity_id": "ad9"},
+        "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
+                       "grounding_tier": "direct_observation", "factors": [], "would_raise": "",
+                       "would_lower": "", "causal_flag": False},
+    }
+    # A separate proposed clean op must never be promoted to approved.
+    clean = _grounded_op(
+        op_id="clean", op="set_daily_budget", level="adset", node_id="as1", status="proposed",
+        params={"daily_budget_cents": 11000},
+        evidence=Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                          120.0, 2400.0, "adset", "as1", "S", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    plan = {"run_date": "2026-06-24", "ops": [op, clean]}
+    reviewed = review_ops_plan(plan, spend_floor=75.0)
+    demoted, untouched = reviewed["ops"][0], reviewed["ops"][1]
+    assert demoted["review"]["verdict"] == "insufficient"
+    assert demoted["confidence"]["band"] == "abstain"
+    assert demoted["status"] == "proposed"  # approved → proposed (demote only)
+    assert untouched["status"] == "proposed"  # never promoted
+    # band never raised for either op, no executable key injected (op vocabulary)
+    for before, after in zip(plan["ops"], reviewed["ops"]):
+        assert Band[after["confidence"]["band"]] <= Band[before["confidence"]["band"]]
+        assert "executable" not in after
+
+
+def test_apply_ops_blocks_approved_ungrounded_write() -> None:
+    client = _control_fixture()
+    plan = {
+        "guardrails": {"requires_grounding": True},
+        "ops": [
+            # grounding-required, approved, NO confidence block → blocked
+            {"op_id": "ungrounded", "op": "set_daily_budget", "level": "adset", "id": "as1",
+             "params": {"daily_budget_cents": 11000}, "status": "approved"},
+            # rename is exempt → executes even without grounding
+            {"op_id": "rename_ok", "op": "rename", "level": "adset", "id": "as1",
+             "params": {"name": "Renamed"}, "status": "approved"},
+            # grounded approved write → executes
+            _grounded_op(op_id="grounded", op="set_daily_budget", level="adset", node_id="as1",
+                         status="approved", params={"daily_budget_cents": 11000},
+                         evidence=Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                                           120.0, 2400.0, "adset", "as1", "S", None),
+                         tier=EvidenceTier.direct_observation),
+        ],
+    }
+    by_id = {r.op_id: r for r in _apply_ops_grounding(plan, client, execute=True)}
+    assert by_id["ungrounded"].status == "blocked"
+    assert "missing required evidence/confidence" in by_id["ungrounded"].reason
+    assert by_id["rename_ok"].status == "executed"  # exemption holds
+    assert by_id["grounded"].status == "executed"
+
+
+def test_apply_ops_grounding_guard_inert_without_flag() -> None:
+    # Legacy/ungrounded plans (no requires_grounding flag) keep working — no new capability gating.
+    client = _control_fixture()
+    plan = {"ops": [{"op_id": "leg", "op": "set_daily_budget", "level": "adset", "id": "as1",
+                     "params": {"daily_budget_cents": 11000}, "status": "approved"}]}
+    results = _apply_ops_grounding(plan, client, execute=True)
+    assert results[0].status == "executed"
+
+
+def test_apply_ops_blocks_thin_abstain_but_allows_structural_abstain() -> None:
+    client = _control_fixture()
+    thin = _grounded_op(  # cited sample below floor → abstain → blocked when grounding required
+        op_id="thin", op="set_daily_budget", level="adset", node_id="as1", status="approved",
+        params={"daily_budget_cents": 11000},
+        evidence=Evidence("blended_roas", 2.0, "ROAS 2.00", "2026-06-19..2026-06-24",
+                          9.0, 40.0, "adset", "as1", "S", None),
+        tier=EvidenceTier.correlational, spend_floor=75.0,
+    )
+    structural = _grounded_op(  # no sample → structural abstain → allowed (PAUSED safety)
+        op_id="structural", op="set_status", level="ad", node_id="ad2", status="approved",
+        params={"status": "PAUSED"}, evidence=None, tier=EvidenceTier.direct_observation,
+    )
+    plan = {"guardrails": {"requires_grounding": True}, "ops": [thin, structural]}
+    by_id = {r.op_id: r for r in _apply_ops_grounding(plan, client, execute=True)}
+    assert by_id["thin"].status == "blocked"
+    assert "insufficient data" in by_id["thin"].reason
+    assert by_id["structural"].status == "executed"  # honest structural abstention is allowed
+
+
+def test_apply_authoring_blocks_ungrounded_and_keeps_paused() -> None:
+    client = _AuthoringFakeClient()
+    grounded = _grounded_op(
+        op_id="g", op="create_adset", level="adset", node_id="", status="approved", kind="create_adset",
+        params={"name": "New Set", "campaign_id": "c1"},
+        evidence=Evidence("blended_roas", 4.0, "ROAS 4.00", "2026-06-10..2026-06-24",
+                          120.0, 2400.0, "campaign", "c1", "Camp", None),
+        tier=EvidenceTier.correlational,
+    )
+    plan = {
+        "ad_account_id": "act_1",
+        "guardrails": {"requires_grounding": True},
+        "ops": [
+            grounded,
+            {"op_id": "ung", "kind": "create_campaign",
+             "params": {"name": "C", "objective": "OUTCOME_SALES"}, "status": "approved"},
+        ],
+    }
+    by_id = {r.op_id: r for r in _apply_authoring(plan, client, execute=True)}
+    assert by_id["ung"].status == "blocked"
+    assert "missing required evidence/confidence" in by_id["ung"].reason
+    assert by_id["g"].status == "created"
+    # PAUSED-by-default is untouched by the grounding gate — the create that ran is still PAUSED.
+    for _kind, params, _vo in client.creates:
+        assert params["status"] == "PAUSED"
+
+
+def test_review_authoring_plan_demote_only_and_paused_preserved() -> None:
+    # Over-claimed authoring op is demoted; running the gate never un-pauses a create.
+    op = _grounded_op(
+        op_id="g", op="create_adset", level="adset", node_id="", status="approved", kind="create_adset",
+        params={"name": "New Set", "campaign_id": "c1"},
+        evidence=Evidence("blended_roas", 1.1, "ROAS 1.10", "2026-06-21..2026-06-24",
+                          30.0, 200.0, "campaign", "c1", "Camp", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    plan = {"ad_account_id": "act_1", "run_date": "2026-06-24",
+            "guardrails": {"requires_grounding": True}, "ops": [op]}
+    reviewed = review_authoring_plan(plan, spend_floor=100.0)
+    r = reviewed["ops"][0]
+    assert r["review"]["verdict"] == "downgrade"  # short window
+    assert Band[r["confidence"]["band"]] < Band.medium  # demoted, never raised
+    # apply the reviewed plan: create still forced PAUSED
+    client = _AuthoringFakeClient()
+    r["status"] = "approved"  # whatever the band, the create itself stays PAUSED on send
+    _apply_authoring(reviewed, client, execute=True)
+    for _kind, params, _vo in client.creates:
+        assert params["status"] == "PAUSED"
+
+
+def test_op_grounding_review_keys_are_audit_log_safe() -> None:
+    op = _grounded_op(
+        op_id="oc", op="set_daily_budget", level="adset", node_id="as3", status="approved",
+        params={"daily_budget_cents": 11000},
+        evidence=Evidence("blended_roas", 1.0, "ROAS 1.00", "2026-06-10..2026-06-24",
+                          30.0, 200.0, "adset", "as3", "S", None),
+        tier=EvidenceTier.direct_observation, spend_floor=100.0,
+    )
+    plan = {"run_date": "2026-06-24", "account_slug": "demo", "intent": "scale", "ops": [op]}
+    reviewed = review_ops_plan(plan, spend_floor=100.0)
+    # the reviewed plan (op carries evidence/confidence/review/review_verdict) is JSON-serializable
+    import json
+    json.dumps(reviewed)
+    # write_ops_results ignores the extra op-dict keys (it serializes only OpResult fields)
+    from meta_ads_analysis.control import OpResult
+    results = [OpResult("oc", "dry_run", request={"daily_budget": "11000"})]
+    out = write_ops_results(plan=reviewed, results=results, output_path=_TMP_OPS_RESULTS(), execute=False)
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["results"][0]["op_id"] == "oc"
+    assert "review_verdict" not in payload["results"][0]  # extra keys do not leak into the result log
+
+
+def _TMP_OPS_RESULTS():
+    import tempfile
+    from pathlib import Path
+    return Path(tempfile.mkdtemp()) / "ops_results.json"
+
+
 # --- Runaway / outlier watch scanner ----------------------------------------
 
 from datetime import date as _d

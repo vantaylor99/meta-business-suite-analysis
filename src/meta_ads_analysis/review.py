@@ -515,6 +515,136 @@ def _apply_verdict(action: dict[str, Any], result: ReviewResult) -> None:
         return
 
 
+def review_ops_plan(
+    plan: dict[str, Any],
+    *,
+    spend_floor: float = MIN_WASTE_SPEND,
+    conversions_floor: float = CONFIDENCE_CONVERSIONS_FLOOR,
+    min_window_days: int = REVIEW_MIN_WINDOW_DAYS,
+    recency_stale_days: int = CONFIDENCE_RECENCY_STALE_DAYS,
+) -> dict[str, Any]:
+    """Adversarially review a **control ops** plan (``plan["ops"]`` — ``set_status`` /
+    ``set_daily_budget`` / targeting / creative ops).
+
+    Same contract as :func:`review_action_plan`, over the op key: returns a NEW plan (the input is
+    never mutated), reviews only ops carrying a ``confidence`` block (informational / structural ops
+    with no band pass through untouched), and is idempotent (an op already carrying a ``review`` block
+    is left as-is). Op dicts have no ``action_type``, so the ``direction`` check cannot fire here — see
+    the module note in ``docs/META_ACTION_WORKFLOW.md``; op-level direction-contradiction is the
+    per-capability ticket's job (it knows the op semantics). The gate stays **demote-only**: it may
+    lower a band and demote ``status`` approved→proposed, never raise a band or promote a status.
+    """
+    return _review_plan_ops(
+        plan,
+        spend_floor=spend_floor,
+        conversions_floor=conversions_floor,
+        min_window_days=min_window_days,
+        recency_stale_days=recency_stale_days,
+    )
+
+
+def review_authoring_plan(
+    plan: dict[str, Any],
+    *,
+    spend_floor: float = MIN_WASTE_SPEND,
+    conversions_floor: float = CONFIDENCE_CONVERSIONS_FLOOR,
+    min_window_days: int = REVIEW_MIN_WINDOW_DAYS,
+    recency_stale_days: int = CONFIDENCE_RECENCY_STALE_DAYS,
+) -> dict[str, Any]:
+    """Adversarially review an **authoring** plan (``plan["ops"]`` — ``create_*`` ops).
+
+    Identical mechanics to :func:`review_ops_plan` (authoring ops also live under ``plan["ops"]``);
+    exposed under its own name so a caller's intent is explicit. Demote-only and idempotent. The gate
+    never touches PAUSED-by-default — authoring forces every create to ``PAUSED`` in
+    ``authoring._build_create`` regardless of any review verdict.
+    """
+    return _review_plan_ops(
+        plan,
+        spend_floor=spend_floor,
+        conversions_floor=conversions_floor,
+        min_window_days=min_window_days,
+        recency_stale_days=recency_stale_days,
+    )
+
+
+def _review_plan_ops(
+    plan: dict[str, Any],
+    *,
+    spend_floor: float,
+    conversions_floor: float,
+    min_window_days: int,
+    recency_stale_days: int,
+) -> dict[str, Any]:
+    """Shared driver for :func:`review_ops_plan` / :func:`review_authoring_plan`. Both control ops
+    (keyed ``op``) and authoring ops (keyed ``kind``) live under ``plan["ops"]``; neither carries an
+    ``action_type``, so review is identical for both shapes."""
+    reviewed = _deepcopy_plan(plan)
+    policy = reviewed.get("account_action_policy") if isinstance(reviewed.get("account_action_policy"), dict) else {}
+    run_date = reviewed.get("run_date")
+
+    for op in reviewed.get("ops") or []:
+        if not isinstance(op, dict):
+            continue
+        confidence = op.get("confidence")
+        if not isinstance(confidence, dict) or _band(confidence.get("band")) is None:
+            continue  # informational / structural op with no band — skip entirely
+        if isinstance(op.get("review"), dict) and op["review"]:
+            continue  # already reviewed — idempotent no-op
+        evidence = op.get("evidence") if isinstance(op.get("evidence"), dict) else {}
+        result = review_recommendation(
+            evidence=evidence,
+            confidence=confidence,
+            action=op,  # ops carry no action_type → the direction check no-ops (documented)
+            policy=policy,
+            spend_floor=spend_floor,
+            conversions_floor=conversions_floor,
+            min_window_days=min_window_days,
+            recency_stale_days=recency_stale_days,
+            recency_days=_recency_days_from_window(run_date, evidence.get("window")),
+        )
+        op["review"] = review_result_to_dict(result)
+        _apply_op_verdict(op, result)
+
+    return reviewed
+
+
+def _apply_op_verdict(op: dict[str, Any], result: ReviewResult) -> None:
+    """Apply one verdict to a write op IN PLACE, in the op's own vocabulary (``status``
+    proposed/approved — ops have no ``executable``/``rationale`` key, so unlike :func:`_apply_verdict`
+    this injects neither). Only ever demotes: lowers a band, demotes ``status`` approved→proposed, sets
+    a ``review_verdict`` marker. It never raises a band and never promotes a status.
+
+    The effective non-executable demotion for an op is ``status`` approved→proposed: ``apply_ops_plan``
+    / ``apply_authoring_plan`` only send ops whose ``status == "approved"``, so a demoted op is skipped.
+    """
+    confidence = op.get("confidence")
+    if not isinstance(confidence, dict):
+        return
+
+    if result.verdict == VERDICT_STANDS:
+        return
+
+    if result.verdict == VERDICT_DOWNGRADE and result.revised_band is not None:
+        revised = result.revised_band
+        confidence["band"] = revised
+        confidence["data_band"] = _min_band_name(confidence.get("data_band"), revised)
+        confidence["grounding_band"] = _min_band_name(confidence.get("grounding_band"), revised)
+        confidence["factors"] = list(confidence.get("factors") or []) + list(result.reasons)
+        op["review_verdict"] = result.verdict
+        return
+
+    if result.verdict == VERDICT_INSUFFICIENT:
+        # Pin the data axis to abstain (the absence of a score); combine yields abstain. The op stays a
+        # "keep running" recommendation, never a confident write.
+        confidence["band"] = Band.abstain.name
+        confidence["data_band"] = Band.abstain.name
+
+    confidence["factors"] = list(confidence.get("factors") or []) + list(result.reasons)
+    op["review_verdict"] = result.verdict
+    if op.get("status") == "approved":
+        op["status"] = "proposed"  # demote out of approved — never the reverse
+
+
 def _min_band_name(existing: Any, revised: str) -> str:
     existing_band = _band(existing)
     revised_band = _band(revised) or Band.abstain

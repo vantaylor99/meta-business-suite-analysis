@@ -21,6 +21,7 @@ from .control import FORBIDDEN_FRAGMENTS
 from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
 from .reader_provider import MetaReaderProvider, as_reader
 from .utils import ensure_dir, write_json
+from .write_grounding import op_grounding_gap
 
 APPROVED_STATUS = "approved"
 PROPOSED_STATUS = "proposed"
@@ -28,6 +29,13 @@ CREATED_STATUS = "created"
 
 CREATE_KINDS = {"create_campaign", "create_adset", "create_ad", "create_video_ad", "create_lookalike"}
 PAUSED_KINDS = {"create_campaign", "create_adset", "create_ad", "create_video_ad"}
+
+# Every create changes account structure, so all authoring kinds are grounding-required: an approved
+# create must carry a computed confidence band before it is sent (see ``write_grounding``). As in
+# ``control.py`` the guard is enforced only when the plan opts in via
+# ``guardrails.requires_grounding``; legacy/ungrounded plans are unaffected. Creates remain PAUSED
+# regardless — grounding gates whether the create is *sent*, never the forced-PAUSED safety.
+GROUNDING_REQUIRED_KINDS = set(CREATE_KINDS)
 
 
 def _now_iso() -> str:
@@ -188,6 +196,7 @@ def apply_authoring_plan(
 ) -> list[AuthoringResult]:
     effective_client = client
     ad_account_id = str(plan.get("ad_account_id") or "")
+    require_grounding = bool((plan.get("guardrails") or {}).get("requires_grounding"))
     results: list[AuthoringResult] = []
     for op in plan.get("ops") or []:
         if not isinstance(op, dict):
@@ -197,6 +206,11 @@ def apply_authoring_plan(
         if op.get("status") != APPROVED_STATUS:
             results.append(AuthoringResult(op_id, kind, "skipped", reason="Op is not approved."))
             continue
+        if require_grounding and kind in GROUNDING_REQUIRED_KINDS:
+            gap = op_grounding_gap(op.get("confidence"), op.get("evidence"))
+            if gap is not None:
+                results.append(AuthoringResult(op_id, kind, "blocked", reason=gap))
+                continue
         try:
             validate_authoring_op(op)
             method_name, request = _build_create(op)
