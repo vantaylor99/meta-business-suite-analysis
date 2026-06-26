@@ -575,6 +575,8 @@ def test_account_registry_resolves_valid_slug(tmp_path: Path) -> None:
 
     assert "pollen_sense" in accounts
     assert account.ad_account_id == "act_12345"
+    # No action_policy at all → the new field parses to None, not a raise.
+    assert account.max_budget_decrease_percent is None
 
 
 def test_account_registry_max_budget_decrease_percent_override(tmp_path: Path) -> None:
