@@ -3298,6 +3298,24 @@ def test_enable_ads_below_target_roas_strong_sample_is_refuted() -> None:
     assert op["confidence"]["band"] == "medium"  # refuted is a warning, not a band-cap
 
 
+def test_enable_ads_exactly_at_target_roas_stands() -> None:
+    # Boundary: ROAS (2.0) sits EXACTLY at target (2.0). The enable branch uses a strict `<` (the
+    # scale-up convention), so an at-target re-enable is NOT refuted — it stands. Pins the intentional
+    # strict-`<` semantics so a future `<=` slip can't silently start refuting break-even re-enables.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "1000"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["evidence"]["metric_value"] == 2.0  # $1000 / $500 — exactly at the 2.0 target
+    assert op["review"]["verdict"] == "stands"  # strict `<`: at-target is not below-target
+    assert "direction" not in op["review"]["failed_inputs"]
+
+
 def test_enable_ads_above_target_roas_stands() -> None:
     # Same policy, but the cited ROAS (5.0) is comfortably above target — a genuine performer. The
     # direction rule does NOT fire; the band is computed from the sample and the call stands.

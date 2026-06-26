@@ -685,8 +685,10 @@ def _review_plan_ops(
     recency_stale_days: int,
 ) -> dict[str, Any]:
     """Shared driver for :func:`review_ops_plan` / :func:`review_authoring_plan`. Both control ops
-    (keyed ``op``) and authoring ops (keyed ``kind``) live under ``plan["ops"]``; neither carries an
-    ``action_type``, so review is identical for both shapes."""
+    (keyed ``op``) and authoring ops (keyed ``kind``) live under ``plan["ops"]``. Most ops carry no
+    ``action_type`` (the ``direction`` check no-ops for them); the exceptions are budget ops
+    (``increase_*``/``decrease_*_budget``) and enable ops (``enable_ad``), which set one so the
+    direction-contradiction check fires. Review is otherwise identical for both shapes."""
     reviewed = _deepcopy_plan(plan)
     policy = reviewed.get("account_action_policy") if isinstance(reviewed.get("account_action_policy"), dict) else {}
     run_date = reviewed.get("run_date")
