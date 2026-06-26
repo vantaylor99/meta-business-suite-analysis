@@ -3769,6 +3769,33 @@ def test_build_duplicate_ad_plan_grounds_on_proven_winner() -> None:
     assert params["creative"] == {"creative_id": "cr-1"}  # copies the source creative
 
 
+def test_build_duplicate_ad_plan_abstains_when_source_undelivered() -> None:
+    # Symmetric safety case to the proven-winner test: a source ad with NO delivery in the window has
+    # no insights row → the duplicate cites a ZERO sample → abstain → review marks it insufficient →
+    # the apply-time gate blocks an approved create (you cannot scale out an unproven source).
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    reader = FakeMetaReader(
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "name": "Cold", "creative": {"id": "cr-1"}},
+        fetch_insights=lambda *a, **k: [],  # no delivery → no row for the source ad
+    )
+    plan = build_duplicate_ad_plan(
+        reader, "act_1", source_ad_id="ad1", target_adset_id="as2",
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["entity_id"] == "ad1"  # still names the (undelivered) source
+    assert op["evidence"]["sample_purchases"] == 0.0  # cited zero, not a fabricated band
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review"]["verdict"] == "insufficient"
+    op["status"] = "approved"
+    client = _AuthoringFakeClient()
+    results = apply_authoring_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert client.creates == []  # nothing created from an unproven source
+
+
 def test_authoring_netnew_create_abstains_insufficient_and_non_executable() -> None:
     # The common brand-new-campaign case: no metric → a cited ZERO sample → abstain → review marks it
     # insufficient → the apply-time gate blocks an approved create (conscious override required).
