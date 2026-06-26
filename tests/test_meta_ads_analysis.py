@@ -7566,3 +7566,319 @@ def test_duckdb_history_provider_uses_latest_ingestion_run(tmp_path: Path) -> No
 def test_duckdb_history_provider_empty_for_unknown_account(tmp_path: Path) -> None:
     db_path = tmp_path / "meta_ads.duckdb"
     assert DuckDBHistoryProvider(db_path).ad_histories("nobody") == []
+
+
+# ---------------------------------------------------------------------------
+# Early-life triage ↔ watch-scan integration (monitor.build_watch_report + cli
+# follow-up application). Mocks only: a fake reader for live metrics/meta, a fake
+# HistoryProvider for analog histories, and a tmp followups root. No live Meta,
+# no DuckDB, no account writes.
+# ---------------------------------------------------------------------------
+
+_WATCH_AS_OF = date(2026, 6, 26)
+_ROAS_GOAL_POLICY = {"primary_goal": "roas"}
+
+
+def _watch_insight(ad_id, *, spend, value=0.0, purchases=0.0, name=None):
+    """One ad's aggregated insight blob in the shape ``fetch_entity_metrics`` parses (ad-level keys,
+    string-valued actions/action_values like the live API)."""
+    row = {"ad_id": ad_id, "ad_name": name or f"ad {ad_id}", "spend": str(spend)}
+    if value:
+        row["action_values"] = [{"action_type": "purchase", "value": str(value)}]
+    row["actions"] = [{"action_type": "purchase", "value": str(purchases)}] if purchases else []
+    return row
+
+
+def _watch_meta(ad_id, *, status="ACTIVE", updated="2026-06-25", adset="as1", name=None):
+    return {"id": ad_id, "name": name or f"ad {ad_id}", "effective_status": status,
+            "adset_id": adset, "updated_time": f"{updated}T00:00:00+0000"}
+
+
+class _FakeHistoryProvider:
+    def __init__(self, histories):
+        self._histories = list(histories)
+
+    def ad_histories(self, account_slug):
+        return list(self._histories)
+
+
+def _run_watch(*, insights, meta, histories, open_followups=None, **kw):
+    base = dict(
+        account_slug="acct", as_of=_WATCH_AS_OF,
+        roas_floor=1.5, roas_target=3.0, min_spend=100.0, grace_days=5,
+        policy=_ROAS_GOAL_POLICY, history_provider=_FakeHistoryProvider(histories),
+        open_followups=open_followups or [],
+    )
+    base.update(kw)
+    return build_watch_report(_WatchFakeClient(insights, meta), "act_1", **base)
+
+
+def _apply_followup_actions(report, *, as_of_iso, root):
+    """Mirror cli.watch_main's apply loop: file (deduped) / close (idempotent), with an explicit
+    root so the test never touches the real followups tree."""
+    filed = closed = 0
+    for action in report.get("followup_actions", []):
+        if action["action"] == "file":
+            _, created = _fu.add_followup_if_absent(
+                account=action["account"], slug=action["slug"], title=action["title"],
+                due=action["due"], note=action["note"], created=as_of_iso,
+                marker=action.get("marker", _fu.EARLY_LIFE_MARKER), ad_id=action.get("ad_id", ""),
+                root=root,
+            )
+            filed += int(created)
+        elif action["action"] == "close":
+            if _fu.mark_done(account=action["account"], task_id=action["task_id"],
+                             completed=as_of_iso, missing_ok=True, root=root) is not None:
+                closed += 1
+    return filed, closed
+
+
+def test_watch_early_life_keep_watch_files_day3_followup_no_write() -> None:
+    # Brand-new struggling ad (age 1) whose comparable past ads recovered → keep on probation and
+    # file a day-3 follow-up at first_seen + decision_age. The scan itself writes nothing.
+    triaged = _roas_ad("T", days=2, start=date(2026, 6, 25))  # first_seen 6/25 -> age 1
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=2) for i in range(3)]  # 3 recovered
+    report = _run_watch(
+        insights=[_watch_insight("T", spend=30)],
+        meta=[_watch_meta("T")],
+        histories=[triaged] + analogs,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "T")
+    assert row["early_life"] is True
+    assert row["age"] == 1
+    assert row["verdict"] == "keep_watch"
+    assert row["classification"] == "watch"
+    # Cross-sectional grounding, capped low (3 analogs < strong_analogs).
+    assert row["confidence"]["grounding_tier"] == "correlational"
+    assert row["confidence"]["band"] == "low"
+    assert row["analog_basis"]["analogs"] == 3 and row["analog_basis"]["recovered"] == 3
+
+    files = [a for a in report["followup_actions"] if a["action"] == "file" and a["ad_id"] == "T"]
+    assert len(files) == 1
+    assert files[0]["slug"] == "early-life-triage-T"
+    assert files[0]["due"] == "2026-06-27"  # first_seen 6/25 + decision_age 2
+    assert files[0]["marker"] == _fu.EARLY_LIFE_MARKER
+    # Flag-only: no close action, schema bumped, never an account write/op on the report.
+    assert [a for a in report["followup_actions"] if a["action"] == "close"] == []
+    assert report["schema_version"] == 2
+    assert "ops" not in report and "plan" not in report
+
+
+def test_watch_early_life_pause_candidate_carries_evidence_no_write() -> None:
+    # Brand-new struggling ad whose comparable past ads stayed bad → early pause candidate carrying
+    # the analog confidence (≤ medium) + evidence; flag-only, nothing filed, no account write.
+    triaged = _roas_ad("T", days=2, start=date(2026, 6, 25))  # age 1
+    analogs = [_roas_ad(f"B{i}", days=10) for i in range(3)]  # 0 recovered
+    report = _run_watch(
+        insights=[_watch_insight("T", spend=30)],
+        meta=[_watch_meta("T")],
+        histories=[triaged] + analogs,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "T")
+    assert row["verdict"] == "pause_candidate"
+    assert row["classification"] == "pause_candidate"
+    assert row["confidence"]["grounding_tier"] == "correlational"
+    assert row["confidence"]["band"] in ("abstain", "low", "medium")  # never high
+    assert row["evidence"]["entity_id"] == "T"
+    assert row["analog_basis"]["analogs"] == 3 and row["analog_basis"]["recovered"] == 0
+    # pause_candidate never auto-writes and never files a follow-up — it is surfaced for the operator
+    # to route through propose-pause-ads.
+    assert [a for a in report["followup_actions"] if a["ad_id"] == "T"] == []
+
+
+def test_watch_age_from_first_seen_not_updated_time() -> None:
+    # An ad edited yesterday (updated_time) but launched two weeks ago (first_seen) is NOT early-life:
+    # age must come from first_seen. It falls through to the normal grace-protected path.
+    old = _roas_ad("OLD", days=15, start=date(2026, 6, 12))  # first_seen 6/12 -> age 14
+    report = _run_watch(
+        insights=[_watch_insight("OLD", spend=200)],
+        meta=[_watch_meta("OLD", updated="2026-06-25")],  # edited yesterday -> days_since_change 1
+        histories=[old],
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "OLD")
+    assert not row.get("early_life")
+    assert row["classification"] == "watch"  # grace-protected, not triaged
+    assert row["days_since_change"] == 1
+    assert report["followup_actions"] == []
+
+
+def test_watch_no_history_falls_back_to_classify_ad() -> None:
+    # The provider has no history for a delivering ad (not yet synced) → triage returns nothing and the
+    # ad takes today's normal classify_ad path. No crash.
+    report = _run_watch(
+        insights=[_watch_insight("M", spend=300)],  # mature loser, zero purchases
+        meta=[_watch_meta("M", updated="2026-06-01")],  # days_since_change 25 -> unprotected
+        histories=[_roas_ad("SOMEONE_ELSE", days=10)],  # M absent from histories
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "M")
+    assert not row.get("early_life")
+    assert row["classification"] == "urgent"  # mature + below floor -> normal flow
+    assert report["followup_actions"] == []
+
+
+def test_watch_day3_probation_own_sample_clears_floor_keep_and_close(tmp_path: Path) -> None:
+    # Age-3 ad on probation whose OWN window now clears the significance floor → a real classify_ad
+    # decision (direct observation, grace deliberately overridden), follow-up closed.
+    root = tmp_path / "followups"
+    _fu.add_followup_if_absent(
+        account="acct", slug=_fu.early_life_slug("P"),
+        title="day-3 decision", due="2026-06-25", created="2026-06-23",
+        marker=_fu.EARLY_LIFE_MARKER, ad_id="P", root=root,
+    )
+    open_followups = _fu.iter_followups("acct", root=root)
+    triaged = _roas_ad("P", days=4, start=date(2026, 6, 23))  # first_seen 6/23 -> age 3
+    report = _run_watch(
+        insights=[_watch_insight("P", spend=300, value=600, purchases=30)],  # ROAS 2.0, clears floor
+        meta=[_watch_meta("P", updated="2026-06-24")],  # young (grace) — must be overridden
+        histories=[triaged],
+        open_followups=open_followups,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "P")
+    assert row["age"] == 3
+    assert row["verdict"] == "keep"
+    assert row["classification"] == "watch"
+    # Grace abstain overridden: a REAL direct-observation call, not the "too young to judge" abstain.
+    assert row["confidence"]["grounding_tier"] == "direct_observation"
+    assert row["confidence"]["band"] != "abstain"
+    close = [a for a in report["followup_actions"] if a["action"] == "close" and a["ad_id"] == "P"]
+    assert len(close) == 1
+    # Applying the close archives the probation follow-up (it stops looping).
+    _apply_followup_actions(report, as_of_iso=_WATCH_AS_OF.isoformat(), root=root)
+    assert _fu.iter_followups("acct", root=root) == []
+
+
+def test_watch_day3_probation_own_sample_below_floor_pauses_and_closes(tmp_path: Path) -> None:
+    # Age-3 ad on probation whose own window clears the floor but sits BELOW the pause floor → forced
+    # to a pause candidate (not another protective watch), follow-up closed.
+    root = tmp_path / "followups"
+    _fu.add_followup_if_absent(
+        account="acct", slug=_fu.early_life_slug("P"), title="day-3 decision",
+        due="2026-06-25", created="2026-06-23", marker=_fu.EARLY_LIFE_MARKER, ad_id="P", root=root,
+    )
+    report = _run_watch(
+        insights=[_watch_insight("P", spend=300, value=60, purchases=4)],  # ROAS 0.20 < pause floor
+        meta=[_watch_meta("P", updated="2026-06-24")],
+        histories=[_roas_ad("P", days=4, start=date(2026, 6, 23))],
+        open_followups=_fu.iter_followups("acct", root=root),
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "P")
+    assert row["classification"] == "pause_candidate"
+    assert row["confidence"]["grounding_tier"] == "direct_observation"
+    assert any(a["action"] == "close" and a["ad_id"] == "P" for a in report["followup_actions"])
+
+
+def test_watch_day3_probation_still_below_floor_analog_governs(tmp_path: Path) -> None:
+    # Age-3 ad on probation whose own sample is STILL below the significance floor → the analog verdict
+    # governs the keep-vs-pause call (no indefinite abstain). Recovering analogs -> keep; non-recovering
+    # -> pause. Either way the follow-up closes.
+    def run(analogs):
+        root = tmp_path / _fu.slugify_name("acct_" + analogs[0].ad_id)  # isolate the two sub-cases
+        _fu.add_followup_if_absent(
+            account="acct", slug=_fu.early_life_slug("P"), title="day-3 decision",
+            due="2026-06-25", created="2026-06-23", marker=_fu.EARLY_LIFE_MARKER, ad_id="P", root=root,
+        )
+        triaged = _roas_ad("P", days=4, start=date(2026, 6, 23))  # spend 60 through age 3, struggling
+        report = _run_watch(
+            insights=[_watch_insight("P", spend=60)],  # < min_spend 100 -> classify_ad insufficient
+            meta=[_watch_meta("P", updated="2026-06-24")],
+            histories=[triaged] + analogs,
+            open_followups=_fu.iter_followups("acct", root=root),
+        )
+        row = next(r for r in report["rows"] if r["ad_id"] == "P")
+        closed = [a for a in report["followup_actions"] if a["action"] == "close" and a["ad_id"] == "P"]
+        return row, closed
+
+    keep_row, keep_close = run([_roas_ad(f"R{i}", days=10, recover_from=4) for i in range(3)])
+    assert keep_row["verdict"] == "keep_watch"
+    assert keep_row["classification"] == "watch"
+    assert keep_row["confidence"]["grounding_tier"] == "correlational"  # analog-grounded
+    assert len(keep_close) == 1
+
+    pause_row, pause_close = run([_roas_ad(f"B{i}", days=10) for i in range(3)])
+    assert pause_row["verdict"] == "pause_candidate"
+    assert pause_row["classification"] == "pause_candidate"
+    assert len(pause_close) == 1
+
+
+def test_watch_running_scan_twice_files_one_followup(tmp_path: Path) -> None:
+    # Re-running the scan while the ad is still on probation must not spawn a second follow-up: the
+    # dedupe holds at both the scan level (already on probation -> no file action) and the file level.
+    root = tmp_path / "followups"
+    triaged = _roas_ad("T", days=2, start=date(2026, 6, 25))  # age 1
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=2) for i in range(3)]
+    insights = [_watch_insight("T", spend=30)]
+    meta = [_watch_meta("T")]
+
+    report1 = _run_watch(insights=insights, meta=meta, histories=[triaged] + analogs)
+    filed1, _ = _apply_followup_actions(report1, as_of_iso=_WATCH_AS_OF.isoformat(), root=root)
+    assert filed1 == 1
+
+    # Second run feeds back the now-open follow-up — the scan returns no new file action.
+    open_followups = _fu.iter_followups("acct", root=root)
+    report2 = _run_watch(insights=insights, meta=meta, histories=[triaged] + analogs,
+                         open_followups=open_followups)
+    assert [a for a in report2["followup_actions"] if a["action"] == "file"] == []
+    filed2, _ = _apply_followup_actions(report2, as_of_iso=_WATCH_AS_OF.isoformat(), root=root)
+    assert filed2 == 0
+
+    open_files = list(_fu.account_dir("acct", root).glob("*.md"))
+    assert len(open_files) == 1
+
+
+def test_watch_build_report_performs_no_followup_writes(tmp_path, monkeypatch) -> None:
+    # The pure scan returns followup_actions but writes nothing to the followups tree itself
+    # (the CLI applies them). Point the followups root at an empty tmp dir and confirm it stays empty.
+    monkeypatch.setattr(_fu, "FOLLOWUPS_ROOT", tmp_path / "followups")
+    triaged = _roas_ad("T", days=2, start=date(2026, 6, 25))
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=2) for i in range(3)]
+    report = _run_watch(
+        insights=[_watch_insight("T", spend=30)],
+        meta=[_watch_meta("T")],
+        histories=[triaged] + analogs,
+    )
+    assert any(a["action"] == "file" for a in report["followup_actions"])
+    assert not (tmp_path / "followups").exists()  # scan touched no files
+
+
+def test_followups_add_if_absent_dedupes_and_marker_roundtrips(tmp_path: Path) -> None:
+    root = tmp_path / "followups"
+    slug = _fu.early_life_slug("123")
+    assert slug == "early-life-triage-123"
+
+    path1, created1 = _fu.add_followup_if_absent(
+        account="acct", slug=slug, title="t", due="2026-06-27", created="2026-06-26",
+        marker=_fu.EARLY_LIFE_MARKER, ad_id="123", root=root,
+    )
+    assert created1 is True
+    # A second call with the same slug is a no-op (same path, created False) even on a different due.
+    path2, created2 = _fu.add_followup_if_absent(
+        account="acct", slug=slug, title="t", due="2026-07-01", created="2026-06-30",
+        marker=_fu.EARLY_LIFE_MARKER, ad_id="123", root=root,
+    )
+    assert created2 is False and path2 == path1
+    assert len(list(_fu.account_dir("acct", root).glob("*.md"))) == 1
+
+    found = _fu.find_open_followup("acct", slug=slug, root=root)
+    assert found is not None
+    assert _fu.early_life_ad_id(found) == "123"  # ad_id round-trips out of the filename slug
+    # A non-early-life follow-up yields None.
+    other = _fu.add_followup(account="acct", title="quarterly refresh", due="2026-09-01",
+                             created="2026-06-26", root=root)
+    assert _fu.early_life_ad_id(_fu._parse(other)) is None
+
+
+def test_followups_mark_done_missing_ok_is_idempotent(tmp_path: Path) -> None:
+    import pytest
+
+    root = tmp_path / "followups"
+    path, _ = _fu.add_followup_if_absent(
+        account="acct", slug=_fu.early_life_slug("9"), title="t", due="2026-06-27",
+        created="2026-06-26", marker=_fu.EARLY_LIFE_MARKER, ad_id="9", root=root,
+    )
+    task_id = path.stem
+    assert _fu.mark_done(account="acct", task_id=task_id, completed="2026-06-28", root=root) is not None
+    # Closing an already-archived follow-up must not raise when missing_ok.
+    assert _fu.mark_done(account="acct", task_id=task_id, completed="2026-06-29",
+                         missing_ok=True, root=root) is None
+    with pytest.raises(FileNotFoundError):
+        _fu.mark_done(account="acct", task_id=task_id, completed="2026-06-29", root=root)
