@@ -298,6 +298,15 @@ apply entry point and the proposing CLI; commands are `python -m meta_ads_analys
 **not** wired into the `python -m meta_ads_analysis` dispatcher, so `python -m meta_ads_analysis
 propose-budget` currently fails. Tracked in `tickets/backlog/wire-propose-budget-into-m-dispatch`.
 
+**One write class sits *outside* the propose→approve gate: media-library uploads.** `upload-video`
+(`MetaMarketingApiClient.upload_video`) and the image upload used during ad authoring
+(`upload_image`) push an asset to the account immediately — no plan, no review, no `--execute`. They
+are intentionally ungated because the result is an **inert, unreferenced media asset**: it carries no
+status, no budget, and no delivery, and nothing spends or serves until a *gated* `create_*` ad
+references it. `intake-video` is purely local (transcription), not a Meta write. So the "every write
+is gated" framing above and in the README applies to every write that changes spend / delivery /
+structure / status; media uploads are the deliberate exception.
+
 **The universal gate (every row above).** Writes are only ever **proposed**; an operator changes a
 plan's status to `approved`; nothing reaches Meta without `--execute` (and `--validate-only` pre-flights
 the change against Meta first); every dry-run/validate/execute appends a **timestamped results log** as

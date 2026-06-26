@@ -42,7 +42,9 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable
   Advantage-Audience / rename — all behind a propose → review → approve → validate → execute gate with
-  an audit log, and **no delete/archive**.
+  an audit log, and **no delete/archive**. (The one exception is media-library uploads — `upload-video`
+  and ad-authoring image upload — which push an *inert, unreferenced* asset to the account directly;
+  see the AGENTS.md catalog for why they are deliberately ungated.)
 - **Auth is single-operator now.** One long-lived `META_ACCESS_TOKEN`; multi-user / OAuth login is a
   documented later concern, not built.
 

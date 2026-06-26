@@ -3,13 +3,15 @@
 Two halves:
 - **Read / situational awareness**: ``build_account_snapshot`` returns the full
   campaign -> ad set -> ad tree with status, delivery issues, budgets, and audiences.
-- **Guarded write**: a small typed operations vocabulary (``set_status``,
-  ``set_daily_budget``, ``rename``) over ad / ad set / campaign, applied through the same
+- **Guarded write**: a typed operations vocabulary (``set_status``, ``set_daily_budget``,
+  ``rename``, ``set_creative``, ``set_creative_features``, and the ``TARGETING_OPS``
+  ``set_age_range`` / ``set_genders`` / ``set_geo_locations`` / ``set_placements``) over
+  ad / ad set / campaign, applied through the same
   ``proposed -> approved -> validate-only -> execute`` gate as the rest of the repo.
 
 Deliberately NOT supported here (too destructive / out of scope for now): delete, archive,
-creating new campaigns/ad sets/ads, and arbitrary targeting edits (targeting has its own
-guarded tools: rotation + advantage-audience disable).
+and creating new campaigns/ad sets/ads (creation lives in ``authoring.py``). Audience rotation
+and advantage-audience disable have their own dedicated guarded tools in ``rotation.py``.
 """
 
 from __future__ import annotations
