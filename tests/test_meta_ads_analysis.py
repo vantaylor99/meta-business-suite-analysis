@@ -7446,6 +7446,64 @@ def test_early_triage_returns_none_when_missing_or_past_early_life() -> None:
     ) is None
 
 
+def test_early_triage_result_presence_mismatch_is_not_an_analog() -> None:
+    # Magnitude can only be compared like-for-like: an ad WITH conversions and one with none are not
+    # comparable in either direction, so neither becomes an analog of the other (engine returns no
+    # matches -> abstain_keep). Covers the _is_analog branch the implement handoff flagged as untested.
+    as_of = _TRIAGE_START + timedelta(days=2)
+
+    def _with_results(ad_id, days):  # struggling (ROAS 0.67 < floor) but has conversions every day
+        return _hist(ad_id, [
+            _point(_TRIAGE_START + timedelta(days=i), spend=15.0, purchases=2.0, purchase_value=10.0)
+            for i in range(days)
+        ])
+
+    # (a) triaged HAS results, every candidate has none.
+    triaged_has = _with_results("T", 3)
+    zero_result_candidates = [_roas_ad(f"B{i}", days=10) for i in range(5)]
+    v_a = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged_has] + zero_result_candidates, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v_a.verdict == "abstain_keep"
+    assert v_a.analog_basis["analogs"] == 0
+    assert v_a.analog_basis["matched_ids"] == []
+
+    # (b) mirror: triaged has NO results, every candidate does.
+    triaged_zero = _roas_ad("T", days=3)
+    has_result_candidates = [_with_results(f"R{i}", 10) for i in range(5)]
+    v_b = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged_zero] + has_result_candidates, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v_b.verdict == "abstain_keep"
+    assert v_b.analog_basis["analogs"] == 0
+    assert v_b.analog_basis["matched_ids"] == []
+
+
+def test_early_triage_ratio_tolerance_band_is_inclusive() -> None:
+    # ANALOG_RATIO_TOLERANCE=0.5 -> the comparable band is the CLOSED interval [0.5x, 2.0x] of the
+    # triaged ad's cumulative spend (the zero-result day-1 fallback). Confirms the boundary is
+    # inclusive: an analog exactly at 2.0x / 0.5x matches; a hair past it does not.
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)  # spend 45 through age 2, zero-result -> spend-magnitude match
+    candidates = [
+        _roas_ad("HIGH_AT", days=10, daily_spend=30.0),    # 90 == 2.0x  -> inclusive match
+        _roas_ad("HIGH_OVER", days=10, daily_spend=31.0),  # 93 > 2.0x   -> excluded
+        _roas_ad("LOW_AT", days=10, daily_spend=7.5),      # 22.5 == 0.5x -> inclusive match
+        _roas_ad("LOW_OVER", days=10, daily_spend=7.0),    # 21 < 0.5x   -> excluded
+    ]
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + candidates, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    matched = set(v.analog_basis["matched_ids"])
+    assert matched == {"HIGH_AT", "LOW_AT"}
+
+
 def test_analog_confidence_is_capped_at_medium() -> None:
     strong = analog_confidence(analogs=50, recovered=50, min_analogs=3, strong_analogs=6, factors=[])
     assert strong.grounding_tier == "correlational"
