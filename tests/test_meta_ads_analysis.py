@@ -5102,3 +5102,42 @@ def test_build_account_snapshot_accepts_a_fake_reader() -> None:
     snap = _snap(reader, "act_1")
     assert snap["rollup"]["campaigns"] == 1
     assert snap["campaigns"][0]["adsets"][0]["included_audiences"] == ["aud-A"]
+
+
+class _WriteOnlyRecordingClient:
+    """A write-only client: records update_* calls and has NO read methods.
+
+    Used to prove a mixed read+write apply routes the live re-read through the supplied
+    ``reader`` (not the write client) — if the read leaked to the client, it would raise
+    AttributeError here. MOCKS ONLY.
+    """
+
+    def __init__(self) -> None:
+        self.updates: list[tuple] = []
+
+    def update_adset(self, node_id, *, params, validate_only=False):
+        self.updates.append(("adset", node_id, params, validate_only))
+        return {"id": node_id, "success": True}
+
+
+def test_apply_ops_plan_routes_read_through_reader_and_write_through_client() -> None:
+    # The hybrid path: a distinct reader supplies the live re-read; the concrete client does the
+    # write. The write client deliberately has no get_adset, so a leaked read would AttributeError.
+    from meta_ads_analysis.control import apply_ops_plan as _apply
+
+    reader = FakeMetaReader(get_adset={"id": "as1", "daily_budget": "10000"})
+    client = _WriteOnlyRecordingClient()
+    plan = {
+        "ops": [
+            {"op_id": "bump", "op": "set_daily_budget", "level": "adset", "id": "as1",
+             "params": {"daily_budget_cents": 11000, "max_increase_percent": 20}, "status": "approved"},
+        ]
+    }
+
+    results = _apply(plan, client, execute=True, reader=reader)
+
+    assert results[0].status == "executed"
+    # Read hit the reader...
+    assert [c[0] for c in reader.calls] == ["get_adset"]
+    # ...and the write hit the concrete client.
+    assert client.updates == [("adset", "as1", {"daily_budget": "11000"}, False)]
