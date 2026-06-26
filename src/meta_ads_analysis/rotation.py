@@ -27,7 +27,7 @@ from .config import CONFIDENCE_CONVERSIONS_FLOOR, DEFAULT_REPORTS_ROOT, MIN_WAST
 from .meta_api import MetaApiError, MetaMarketingApiClient
 from .reader_provider import MetaReaderProvider, as_reader, reader_from_env
 from .utils import ensure_dir, write_json
-from .write_grounding import attach_op_grounding
+from .write_grounding import attach_op_grounding, op_grounding_gap
 
 PROPOSED_STATUS = "proposed"
 APPROVED_STATUS = "approved"
@@ -246,8 +246,12 @@ def build_rotation_plan(
     a decline alone can never read ``high``). ``metrics_by_id`` (keyed by adset id, from the impure
     caller's reader) supplies the samples; with none, each item is a structural abstain. The finished
     plan is run through :func:`review.review_rotation_plan` before it is returned, so an over-claimed or
-    below-floor rotation is demoted / marked insufficient before it reaches the operator. None of this
-    touches the rotation arithmetic or the apply-time live-targeting drift guard.
+    below-floor rotation is **marked insufficient** at propose time (rotation items always start
+    ``proposed``, so the review pass relabels/marks them rather than demoting an approval). The plan
+    sets ``guardrails.requires_grounding``, so an operator who approves a below-floor (cited-sample)
+    rotation anyway is **hard-blocked at apply** by the grounding gate in :func:`apply_rotation_plan` —
+    the same second-opinion check every other account-changing write passes. None of this touches the
+    rotation arithmetic or the apply-time live-targeting drift guard.
     """
     summaries = summarize_adsets(adsets)
     eligible = [s for s in summaries if s["included"]]
@@ -346,6 +350,7 @@ def build_rotation_plan(
         ),
         "guardrails": {
             "requires_explicit_approval": True,
+            "requires_grounding": True,
             "writes_only_custom_audiences": not disable_advantage_audience,
             "never_enables_advantage_audience": True,
             "advantage_audience_disable_only_when_requested": disable_advantage_audience,
@@ -410,8 +415,18 @@ def apply_rotation_plan(
       validation result but changes nothing. Takes precedence over ``execute``.
     - ``execute=True``: perform the real write.
     - otherwise: a local dry run that records the targeting that would be sent.
+
+    Apply-time grounding gate: when the plan sets ``guardrails.requires_grounding`` (every plan from
+    :func:`build_rotation_plan` does), an approved rotation whose fatigue grounding is missing or rests
+    on a **cited** below-floor / zero sample (``abstain`` band with a sample) is hard-``blocked`` here —
+    the same second-opinion check ``apply_ops_plan`` / ``apply_authoring_plan`` enforce. A *structural*
+    abstain (no sample cited — e.g. a plan built with no ``metrics_by_id``) is an honest abstention and
+    is allowed through. The gate runs **after** the two live-drift blocks and **before**
+    :func:`compute_new_targeting` (drift-first: a drifted plan is stale and must be re-proposed
+    regardless of its band, so the drift reason takes precedence over the grounding reason).
     """
     effective_reader = as_reader(reader) or as_reader(client)
+    require_grounding = bool((plan.get("guardrails") or {}).get("requires_grounding"))
     results: list[RotationResult] = []
     for rotation in plan.get("rotations") or []:
         if not isinstance(rotation, dict):
@@ -445,6 +460,11 @@ def apply_rotation_plan(
                 )
             )
             continue
+        if require_grounding:
+            gap = op_grounding_gap(rotation.get("confidence"), rotation.get("evidence"))
+            if gap is not None:
+                results.append(RotationResult(adset_id, "blocked", reason=gap))
+                continue
 
         new_targeting = compute_new_targeting(
             live_targeting,
@@ -571,6 +591,7 @@ def build_advantage_disable_plan(
         ),
         "guardrails": {
             "requires_explicit_approval": True,
+            "requires_grounding": True,
             "preserves_audiences": True,
             "writes_only_advantage_audience_off_and_age_range": True,
         },
@@ -621,8 +642,16 @@ def apply_advantage_disable_plan(
     Mixed read+write: audiences are preserved exactly; only advantage_audience=0 is written (with
     the automation-managed age_range dropped). The live per-ad-set re-read goes through ``reader``
     (defaulting to the ``client``); the write stays on the concrete ``client``.
+
+    Apply-time grounding gate: when the plan sets ``guardrails.requires_grounding`` (every plan from
+    :func:`build_advantage_disable_plan` does), the same gate ``apply_rotation_plan`` /
+    ``apply_ops_plan`` enforce runs after the "already off" skip and before
+    :func:`compute_new_targeting`. Disabling Advantage Audience is a safety toggle with no performance
+    metric, so each item is a **structural** abstain (no sample cited) and the gate **allows** it —
+    these items still execute, satisfying rotation-family parity without breaking the safety write.
     """
     effective_reader = as_reader(reader) or as_reader(client)
+    require_grounding = bool((plan.get("guardrails") or {}).get("requires_grounding"))
     results: list[RotationResult] = []
     for item in plan.get("items") or []:
         if not isinstance(item, dict):
@@ -637,6 +666,11 @@ def apply_advantage_disable_plan(
         if not advantage_audience_enabled(live_targeting):
             results.append(RotationResult(adset_id, "skipped", reason="Advantage Audience is already off."))
             continue
+        if require_grounding:
+            gap = op_grounding_gap(item.get("confidence"), item.get("evidence"))
+            if gap is not None:
+                results.append(RotationResult(adset_id, "blocked", reason=gap))
+                continue
 
         live_included = _ids(_audience_refs(live_targeting.get("custom_audiences")))
         live_excluded = _ids(_audience_refs(live_targeting.get("excluded_custom_audiences")))

@@ -39,13 +39,16 @@ creative), authoring (`create_*`), and rotation (audience swap / Advantage-disab
   reviewed by `review.review_rotation_plan`. All three reuse the same `review_recommendation` core and
   the same demote-only applier; routing a rotation plan through the `ops` iterator would silently review
   nothing, which is exactly what the key-aware wrapper prevents.
-- **Grounding enforcement differs at apply time, by design.** `set_status`, `set_daily_budget`, and
-  authoring creates set `guardrails.requires_grounding: true`, so an approved-but-ungrounded write is
-  **hard-blocked** at apply (`op_grounding_gap`). The rotation family and `set_creative_features` carry
-  evidence/confidence and run review, but **do not** set that flag — their review is **advisory**
-  (demote-only at propose) and there is no apply-time grounding block yet (rotation's gap is tracked in
-  `fix/rotation-apply-time-grounding-gate`). Rotation still has its own apply-time **live-drift guard**
-  that blocks a write regardless of band.
+- **Grounding is enforced at apply time across the account-changing writes.** `set_status`,
+  `set_daily_budget`, authoring creates, **and the rotation family** (`audience_rotation`,
+  `advantage_disable`) set `guardrails.requires_grounding: true`, so an approved-but-ungrounded write —
+  or one resting on a **cited** below-floor/zero sample (`abstain` band with a sample) — is
+  **hard-blocked** at apply (`op_grounding_gap`). A *structural* abstain (no sample cited — an honest
+  "no metric to cite", e.g. an Advantage-Audience disable or a rotation built with no metrics) is
+  allowed through. `set_creative_features` carries evidence/confidence and runs review but **does not**
+  set the flag — its review remains **advisory** (demote-only at propose, no apply-time block).
+  Rotation also keeps its own apply-time **live-drift guard**, which runs *before* the grounding gate
+  and blocks a write regardless of band (drift-first: a stale plan must be re-proposed).
 
 The **full per-capability write catalog (levels, reversible vs create-only, exact guardrails, and which
 CLI proposes each)** is the single source of truth in
@@ -233,8 +236,11 @@ well-grounded create that carries an Advantage+ param is still blocked.
 
 Rotation is a reversible experiment — it swaps which saved audiences each active ad set targets — and
 carries grounding like every other write, attached via the shared `write_grounding.attach_op_grounding`
-and reviewed by `review.review_rotation_plan`. The rotation arithmetic and the apply-time live-targeting
-drift guard are unchanged; only `evidence` / `confidence` / `review` are added.
+and reviewed by `review.review_rotation_plan`. Both rotation plans set
+`guardrails.requires_grounding: true`, so — like ops and authoring — an approved rotation whose fatigue
+sample is a **cited** below-floor/zero sample (`abstain` band with a sample) is **hard-blocked at
+apply** by `op_grounding_gap`; a *structural* abstain (no sample cited) is allowed through. The
+rotation arithmetic and the apply-time live-targeting drift guard are unchanged.
 
 - **Rotations (`build_rotation_plan` → `plan["rotations"]`).** Each item's evidence is the ad set's
   **own** performance over the fatigue window (`--date-from` / `--date-to`, metric by account goal,
@@ -242,24 +248,28 @@ drift guard are unchanged; only `evidence` / `confidence` / `review` are added.
   **`correlational`** tier — "audience fatigue" is an *inference* from a decline, not a controlled
   observation — so even a large sample caps at `medium`; a rotation can never read `high` from a decline
   alone. An ad set with no delivery in the window cites a **zero** sample → `abstain` → review marks it
-  `insufficient` (keep observing; don't rotate on no evidence of fatigue).
+  `insufficient` at propose **and** the apply-time grounding gate hard-blocks it if approved anyway
+  (keep observing; don't rotate on no evidence of fatigue).
 - **Causal claims are downgraded.** A rotation rationale asserting the audience *caused* the drop
   (`causal_flag`) is downgraded by the gate's `causal` check — confirming cause needs an A/B, not a
   decline. (Tested in `test_rotation_causal_claim_is_downgraded`.)
 - **Advantage-Audience disable (`build_advantage_disable_plan` → `plan["items"]`).** Turning Meta-AI
   audience automation **off** is a safety toggle with no performance metric, so each item is a
   **structural abstain** (named ad set, no cited sample). Review must not refute it for "contradicting
-  its metric" (it has none); it `stands` as an honest abstention. The disable only ever turns automation
+  its metric" (it has none); it `stands` as an honest abstention. Because the plan now sets
+  `requires_grounding`, this item also hits the apply-time gate — but a structural abstain is
+  gate-**allowed**, so an approved disable still executes. The disable only ever turns automation
   **off**, never on, and the `FORBIDDEN_FRAGMENTS` interaction is unchanged.
 - **Renames (`build_rename_plan` → `plan["renames"]`).** A rename writes only the name — no spend,
   delivery, or structural change — so it is **exempt** from grounding (mirroring the `rename` op
   exemption). `review_rotation_plan` passes renames through untouched: no fabricated band, no review
   block.
-- **Drift precedence (reversibility).** Grounding/review runs at *propose*; the live re-read +
-  no-drift validation in `apply_rotation_plan` runs at *execute*. If the live targeting drifted since
-  plan time, the write is **blocked regardless of the confidence band** — a high-confidence rotation
-  still blocks on drift. Because the results log captures each ad set's prior audience set, a rotation
-  is reversible: rotating back is simply another rotation.
+- **Drift precedence (reversibility).** Review runs at *propose*; at *execute* `apply_rotation_plan`
+  runs the live re-read + no-drift validation **first** and the grounding gate **second**. If the live
+  targeting drifted since plan time, the write is **blocked regardless of the confidence band** — a
+  high-confidence rotation still blocks on drift, and a thin-sample rotation that is *also* drifted
+  reports the **drift** reason, not the grounding reason. Because the results log captures each ad
+  set's prior audience set, a rotation is reversible: rotating back is simply another rotation.
 
 ## Account Goals
 

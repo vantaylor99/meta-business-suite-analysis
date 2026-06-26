@@ -2887,6 +2887,79 @@ def test_rotation_adset_with_no_window_row_cites_zero_sample_and_abstains() -> N
     assert op["review_verdict"] == "insufficient"
 
 
+def test_apply_rotation_blocks_approved_thin_sample_at_execute() -> None:
+    # An operator approves a rotation whose fatigue sample is below the significance floor (cited
+    # abstain). The propose-time review already marked it insufficient; the apply-time grounding gate
+    # is the hard backstop — it must block the write, the same way an ungrounded ops write is blocked.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=9, spend=40)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] == "abstain"  # cited thin sample
+    plan["rotations"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert client.updates == []
+
+
+def test_apply_rotation_blocks_approved_zero_sample_at_execute() -> None:
+    # An ad set that did not deliver in the window has no metrics row, so it cites a ZERO sample
+    # (abstain WITH a sample). An approved rotation on such an ad set — rotating on no evidence of
+    # fatigue — must be hard-blocked at apply, not silently executed.
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id={}, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["evidence"]["sample_purchases"] == 0.0
+    assert plan["rotations"][0]["confidence"]["band"] == "abstain"
+    plan["rotations"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert client.updates == []
+
+
+def test_apply_rotation_drift_takes_precedence_over_grounding() -> None:
+    # A thin-sample rotation (would be grounding-blocked) that is ALSO live-drifted reports the DRIFT
+    # reason, not the grounding reason: the drift guard runs first because a stale plan must be
+    # re-proposed regardless of band. Pins the drift-first ordering.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=9, spend=40)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] == "abstain"  # would be grounding-blocked
+    plan["rotations"][0]["status"] = "approved"
+    adsets[0]["targeting"]["custom_audiences"] = [{"id": "Z"}]  # live drift after plan time
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "blocked"
+    assert "Live included audiences changed" in results[0].reason  # drift reason, not grounding
+    assert "insufficient data" not in (results[0].reason or "")
+    assert client.updates == []
+
+
+def test_apply_advantage_disable_structural_abstain_still_executes() -> None:
+    # The Advantage-disable plan now sets requires_grounding, but each item is a STRUCTURAL abstain
+    # (a safety toggle with no performance metric, no cited sample). The grounding gate must allow it:
+    # an approved disable still executes and writes Advantage Audience off.
+    adsets = [_adset("as1", "Set 1", ["A"], ["B", "C"], advantage=True)]
+    plan = build_advantage_disable_plan(adsets, account_slug="demo", ad_account_id="act_1")
+    assert plan["guardrails"]["requires_grounding"] is True
+    assert plan["items"][0]["confidence"]["band"] == "abstain"  # structural abstain
+    assert plan["items"][0]["evidence"]["sample_purchases"] is None
+    plan["items"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_advantage_disable_plan(plan, client, execute=True)
+    assert results[0].status == "executed"  # structural abstain is gate-allowed
+    assert len(client.updates) == 1
+    _adset_id, params, _validate_only = client.updates[0]
+    assert params["targeting"]["targeting_automation"]["advantage_audience"] == 0
+
+
 # --- Control layer (inspect + guarded ops + enable-ads) ----------------------
 
 from meta_ads_analysis.control import (
