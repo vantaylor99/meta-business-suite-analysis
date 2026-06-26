@@ -294,7 +294,7 @@ def assess(
         grounding_band=grounding_band,
         grounding_tier=resolved_tier.name,
         factors=factors,
-        would_raise="more purchases / a more recent window / a completed A/B",
+        would_raise="more conversions / a more recent window / a completed A/B",
         would_lower="smaller sample / a stale or contradicting window / a refuting A/B",
         causal_flag=causal_flag,
     )

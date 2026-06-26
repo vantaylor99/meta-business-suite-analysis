@@ -1279,6 +1279,9 @@ def test_operator_brief_renders_high_confidence_evidence_and_recheck_line() -> N
         "--date-from 2026-06-10 --date-to 2026-06-24"
     ) in markdown
     assert "Would raise:" in markdown and "Would lower:" in markdown
+    # Goal-neutral wording: the assess() would_raise hint reads "conversions", never "purchases",
+    # so an install account (which never has purchases) is not told to get "more purchases".
+    assert "more conversions" in markdown and "more purchases" not in markdown
 
 
 def test_operator_brief_abstain_action_reads_as_keep_running_not_a_percentage() -> None:
@@ -1522,6 +1525,10 @@ def test_review_below_floor_returns_insufficient() -> None:
     assert result.verdict == "insufficient"
     assert "sample_floor" in result.failed_inputs
     assert any("floor" in reason for reason in result.reasons)
+    # Goal-neutral wording: the below-floor reason reads "conversions", never "purchases", so the
+    # review gate matches the action plan for install accounts that never generate purchases.
+    sample_reason = next(r for r in result.reasons if "floor" in r)
+    assert "conversions" in sample_reason and "purchases" not in sample_reason
 
 
 def test_review_short_window_downgrades() -> None:

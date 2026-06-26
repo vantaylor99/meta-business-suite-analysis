@@ -231,8 +231,8 @@ def review_recommendation(
                     verdict=VERDICT_INSUFFICIENT,
                     failed_input="sample_floor",
                     reason=(
-                        f"sample of {_fmt_count(purchases)} purchases / {_fmt_spend(spend)} spend is "
-                        f"below the {conversions_floor:g}-purchase floor — should abstain"
+                        f"sample of {_fmt_count(purchases)} conversions / {_fmt_spend(spend)} spend is "
+                        f"below the {conversions_floor:g}-conversion floor — should abstain"
                     ),
                 )
             )
