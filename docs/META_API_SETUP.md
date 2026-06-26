@@ -117,6 +117,7 @@ reports/<account_slug>/<run_date>/
 
 ## Notes
 
+- Reads now flow through a swappable provider seam (`MetaReaderProvider` in `reader_provider.py`) so a future MCP read backend can supply reads without touching call sites; writes stay on the direct Graph API client. Full hybrid-model docs land in the `hybrid-model-docs-and-tool-catalog` ticket.
 - The reporting sync (`sync-api`) is read-only. It does not modify account settings or ads.
 - Writes (action execution and audience rotation) go through the same Graph API client but only run with an explicit `--execute` flag and an `ads_management`-scoped token.
 - V1 runs one account at a time.

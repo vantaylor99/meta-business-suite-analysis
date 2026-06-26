@@ -36,6 +36,7 @@ from .confidence import (
 )
 from .control import fetch_entity_metrics
 from .meta_api import MetaMarketingApiClient
+from .reader_provider import MetaReaderProvider, as_reader
 from .utils import ensure_dir, write_json
 
 AD_META_FIELDS = ["id", "name", "status", "effective_status", "adset_id", "created_time", "updated_time"]
@@ -145,7 +146,7 @@ def _policy_floors(account_slug: str) -> tuple[float, float]:
 
 
 def build_watch_report(
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider | MetaMarketingApiClient,
     ad_account_id: str,
     *,
     account_slug: str,
@@ -158,6 +159,10 @@ def build_watch_report(
     roas_target: float | None = None,
     prior_watchlist: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Read-only runaway/outlier scan. ``reader`` (a :class:`MetaReaderProvider`, or a raw
+    ``MetaMarketingApiClient`` which is wrapped) supplies the live insights + ad metadata; this
+    module never writes to the account."""
+    reader = as_reader(reader)
     if roas_floor is None or roas_target is None:
         pf, pt = _policy_floors(account_slug)
         roas_floor = roas_floor if roas_floor is not None else pf
@@ -166,11 +171,11 @@ def build_watch_report(
     rec_from = (as_of - timedelta(days=recent_days - 1)).isoformat()
     to = as_of.isoformat()
 
-    window = {str(m["id"]): m for m in fetch_entity_metrics(client, ad_account_id, level="ad", date_from=win_from, date_to=to)}
-    recent = {str(m["id"]): m for m in fetch_entity_metrics(client, ad_account_id, level="ad", date_from=rec_from, date_to=to)}
+    window = {str(m["id"]): m for m in fetch_entity_metrics(reader, ad_account_id, level="ad", date_from=win_from, date_to=to)}
+    recent = {str(m["id"]): m for m in fetch_entity_metrics(reader, ad_account_id, level="ad", date_from=rec_from, date_to=to)}
     meta = {
         str(a.get("id")): a
-        for a in client.iter_paginated(f"/{ad_account_id}/ads", params={"fields": ",".join(AD_META_FIELDS), "limit": 200})
+        for a in reader.iter_paginated(f"/{ad_account_id}/ads", params={"fields": ",".join(AD_META_FIELDS), "limit": 200})
     }
 
     prior = (prior_watchlist or {}).get("ads", {})

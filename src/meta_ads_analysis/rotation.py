@@ -24,6 +24,7 @@ from typing import Any
 from . import account_registry
 from .config import DEFAULT_REPORTS_ROOT
 from .meta_api import MetaApiError, MetaMarketingApiClient
+from .reader_provider import DirectMetaReader, MetaReaderProvider, as_reader
 from .utils import ensure_dir, write_json
 
 PROPOSED_STATUS = "proposed"
@@ -261,8 +262,13 @@ def apply_rotation_plan(
     *,
     execute: bool,
     validate_only: bool = False,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
 ) -> list[RotationResult]:
     """Dry-run, validate against Meta, or execute approved rotations.
+
+    Mixed read+write: the live re-read of each ad set's targeting (drift detection — fresh, not
+    cached) goes through ``reader``; the targeting write stays on the concrete ``client``. When
+    ``reader`` is omitted it defaults to reading through the same ``client``.
 
     - ``validate_only=True``: send each approved rotation to Meta with
       ``execution_options=['validate_only']`` — a real round-trip that returns Meta's
@@ -270,6 +276,7 @@ def apply_rotation_plan(
     - ``execute=True``: perform the real write.
     - otherwise: a local dry run that records the targeting that would be sent.
     """
+    effective_reader = as_reader(reader) or as_reader(client)
     results: list[RotationResult] = []
     for rotation in plan.get("rotations") or []:
         if not isinstance(rotation, dict):
@@ -279,7 +286,7 @@ def apply_rotation_plan(
             results.append(RotationResult(adset_id, "skipped", reason="Rotation is not approved."))
             continue
 
-        live = client.get_adset(adset_id, fields=ADSET_FIELDS)
+        live = effective_reader.get_adset(adset_id, fields=ADSET_FIELDS)
         live_targeting = live.get("targeting") if isinstance(live.get("targeting"), dict) else {}
         live_included = _ids(_audience_refs(live_targeting.get("custom_audiences")))
         if live_included != list(rotation.get("old_included") or []):
@@ -442,12 +449,15 @@ def apply_advantage_disable_plan(
     *,
     execute: bool,
     validate_only: bool = False,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
 ) -> list[RotationResult]:
     """Dry-run, validate, or execute approved Advantage Audience disables.
 
-    Audiences are preserved exactly; only advantage_audience=0 is written (with the
-    automation-managed age_range dropped). Re-reads live targeting per ad set.
+    Mixed read+write: audiences are preserved exactly; only advantage_audience=0 is written (with
+    the automation-managed age_range dropped). The live per-ad-set re-read goes through ``reader``
+    (defaulting to the ``client``); the write stays on the concrete ``client``.
     """
+    effective_reader = as_reader(reader) or as_reader(client)
     results: list[RotationResult] = []
     for item in plan.get("items") or []:
         if not isinstance(item, dict):
@@ -457,7 +467,7 @@ def apply_advantage_disable_plan(
             results.append(RotationResult(adset_id, "skipped", reason="Item is not approved."))
             continue
 
-        live = client.get_adset(adset_id, fields=ADSET_FIELDS)
+        live = effective_reader.get_adset(adset_id, fields=ADSET_FIELDS)
         live_targeting = live.get("targeting") if isinstance(live.get("targeting"), dict) else {}
         if not advantage_audience_enabled(live_targeting):
             results.append(RotationResult(adset_id, "skipped", reason="Advantage Audience is already off."))
@@ -626,8 +636,14 @@ def apply_rename_plan(
     *,
     execute: bool,
     validate_only: bool = False,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
 ) -> list[RenameResult]:
-    """Dry-run, validate, or execute approved ad set renames (writes only the name field)."""
+    """Dry-run, validate, or execute approved ad set renames (writes only the name field).
+
+    Mixed read+write: the live name re-read (drift detection) goes through ``reader`` (defaulting
+    to the ``client``); the rename write stays on the concrete ``client``.
+    """
+    effective_reader = as_reader(reader) or as_reader(client)
     results: list[RenameResult] = []
     for rename in plan.get("renames") or []:
         if not isinstance(rename, dict):
@@ -642,7 +658,7 @@ def apply_rename_plan(
             results.append(RenameResult(adset_id, "skipped", old_name, new_name, reason="Name is unchanged."))
             continue
 
-        live = client.get_adset(adset_id, fields=ADSET_NAME_FIELDS)
+        live = effective_reader.get_adset(adset_id, fields=ADSET_NAME_FIELDS)
         if live.get("name") != old_name:
             results.append(
                 RenameResult(
@@ -731,18 +747,20 @@ def write_rename_results(
 def fetch_active_adsets(
     account_slug: str,
     *,
-    client: MetaMarketingApiClient | None = None,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
     accounts_config_path: Path | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Resolve the account and return (ad_account_id, active ad set payloads)."""
-    from .meta_api import client_from_env
+    """Resolve the account and return (ad_account_id, active ad set payloads).
 
+    Read-only: ``reader`` accepts a :class:`MetaReaderProvider` or a raw
+    ``MetaMarketingApiClient`` (wrapped); when omitted a direct reader is built from env.
+    """
     account = account_registry.resolve_account(
         account_slug,
         accounts_config_path or account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH,
     )
-    effective_client = client or client_from_env()
-    adsets = effective_client.list_adsets(
+    effective_reader = as_reader(reader) or DirectMetaReader.from_env()
+    adsets = effective_reader.list_adsets(
         account.ad_account_id,
         fields=ADSET_FIELDS,
         effective_status=["ACTIVE"],

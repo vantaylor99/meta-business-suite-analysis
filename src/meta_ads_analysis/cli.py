@@ -375,7 +375,7 @@ def propose_meta_actions_main() -> None:
     if args.enrich_live_state:
         from .meta_api import client_from_env
 
-        plan = enrich_action_plan_with_live_state(plan, client=client_from_env(args.api_version))
+        plan = enrich_action_plan_with_live_state(plan, reader=client_from_env(args.api_version))
     output_path = Path(args.output_path) if args.output_path else default_action_plan_path(
         account_slug,
         run_date,
@@ -491,7 +491,7 @@ def propose_rotation_main() -> None:
     reports_root = Path(args.reports_root)
 
     client = client_from_env(args.api_version)
-    ad_account_id, adsets = fetch_active_adsets(account_slug, client=client)
+    ad_account_id, adsets = fetch_active_adsets(account_slug, reader=client)
     plan = build_rotation_plan(
         adsets,
         account_slug=account_slug,
@@ -595,7 +595,7 @@ def propose_disable_advantage_main() -> None:
     reports_root = Path(args.reports_root)
 
     client = client_from_env(args.api_version)
-    ad_account_id, adsets = fetch_active_adsets(account_slug, client=client)
+    ad_account_id, adsets = fetch_active_adsets(account_slug, reader=client)
     plan = build_advantage_disable_plan(adsets, account_slug=account_slug, ad_account_id=ad_account_id)
     output_path = Path(args.output_path) if args.output_path else default_advantage_disable_plan_path(
         account_slug,
@@ -693,7 +693,7 @@ def propose_renames_main() -> None:
     reports_root = Path(args.reports_root)
 
     client = client_from_env(args.api_version)
-    ad_account_id, adsets = fetch_active_adsets(account_slug, client=client)
+    ad_account_id, adsets = fetch_active_adsets(account_slug, reader=client)
     plan = build_rename_plan(adsets, account_slug=account_slug, ad_account_id=ad_account_id)
     output_path = Path(args.output_path) if args.output_path else default_rename_plan_path(
         account_slug,

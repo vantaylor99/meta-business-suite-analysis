@@ -19,6 +19,7 @@ from .config import (
     DEFAULT_REPORTS_ROOT,
 )
 from .meta_api import MetaMarketingApiClient
+from .reader_provider import MetaReaderProvider, as_reader
 from .utils import ensure_dir, parse_date, safe_divide, write_csv_rows, write_json
 
 PERFORMANCE_HEADERS = [
@@ -131,8 +132,15 @@ def sync_account_from_api(
     date_from: str | None = None,
     date_to: str | None = None,
     api_version: str | None = None,
-    client: MetaMarketingApiClient | None = None,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
 ) -> ApiSyncArtifacts:
+    """Sync one account's reporting from Meta (read-only).
+
+    ``reader`` accepts either a :class:`MetaReaderProvider` or a raw
+    ``MetaMarketingApiClient`` (wrapped in a ``DirectMetaReader``); when omitted, a direct
+    client is built from env. Reads flow through the reader seam so a future MCP read backend
+    can supply them unchanged.
+    """
     effective_raw_root = raw_root or DEFAULT_RAW_ROOT
     effective_accounts_config_path = accounts_config_path or DEFAULT_ACCOUNTS_CONFIG_PATH
     account = resolve_account(account_slug, effective_accounts_config_path)
@@ -142,12 +150,13 @@ def sync_account_from_api(
         date_from=date_from,
         date_to=date_to,
     )
-    access_token = os.environ.get("META_ACCESS_TOKEN", "").strip()
     effective_api_version = api_version or os.environ.get("META_API_VERSION") or DEFAULT_META_API_VERSION
-    effective_client = client or MetaMarketingApiClient(
-        access_token=access_token,
-        api_version=effective_api_version,
-    )
+    if reader is None:
+        # Construct via the module-local MetaMarketingApiClient symbol so it stays patchable
+        # (tests monkeypatch sync_api.MetaMarketingApiClient); then wrap it in the read seam.
+        access_token = os.environ.get("META_ACCESS_TOKEN", "").strip()
+        reader = MetaMarketingApiClient(access_token=access_token, api_version=effective_api_version)
+    effective_reader = as_reader(reader)
     raw_dir = effective_raw_root / account.account_slug / resolved_run_date.isoformat()
     ensure_dir(raw_dir)
 
@@ -181,7 +190,7 @@ def sync_account_from_api(
         "cost_per_action_type",
         "purchase_roas",
     ]
-    insights_rows = effective_client.fetch_insights(
+    insights_rows = effective_reader.fetch_insights(
         account.ad_account_id,
         fields=insights_fields,
         date_from=resolved_date_from,
@@ -196,7 +205,7 @@ def sync_account_from_api(
         for row in insights_rows
     ]
 
-    ad_rows = effective_client.fetch_ads(
+    ad_rows = effective_reader.fetch_ads(
         account.ad_account_id,
         fields=[
             "id",

@@ -2181,7 +2181,7 @@ def test_live_state_enrichment_marks_only_ad_status_paused_as_resolved() -> None
         }
     )
 
-    enriched = enrich_action_plan_with_live_state(plan, client=client)
+    enriched = enrich_action_plan_with_live_state(plan, reader=client)
     by_id = {action["action_id"]: action for action in enriched["actions"]}
 
     assert by_id["pause_ad_1"]["status"] == "already_resolved"
@@ -2213,7 +2213,7 @@ def test_live_state_enrichment_redacts_tokens_on_api_failure() -> None:
     )
     client = _LiveStateFakeClient(ad_error=error)
 
-    enriched = enrich_action_plan_with_live_state(plan, client=client)
+    enriched = enrich_action_plan_with_live_state(plan, reader=client)
     message = enriched["actions"][0]["live_state"]["error"]
 
     assert "EAAabcdefghijklmnopqrstuvwx1234567890" not in message
@@ -2260,7 +2260,7 @@ def test_live_state_enrichment_flags_meta_ai_adset_controls() -> None:
         },
     )
 
-    enriched = enrich_action_plan_with_live_state(plan, client=client)
+    enriched = enrich_action_plan_with_live_state(plan, reader=client)
 
     assert any(action["action_type"] == "disable_meta_ai_controls" for action in enriched["actions"])
 
@@ -4910,3 +4910,195 @@ def test_audit_logs_each_drifted_metric_in_a_multi_metric_entry_and_is_idempoten
     # A second --apply on the same --as-of adds nothing (idempotent across both metric names).
     _, t2, _ = _audit(t1, _fixed_fetch(rows), apply=True)
     assert t2 == t1
+
+
+# --- Reader provider seam (MOCKS ONLY: no test here makes a live Meta call) ---
+
+import inspect
+
+from meta_ads_analysis.reader_provider import (
+    READ_METHODS,
+    DirectMetaReader,
+    FakeMetaReader,
+    MetaReaderProvider,
+    as_reader,
+)
+
+# Representative (args, kwargs) per read method — also pins the call shape each one takes.
+_READER_CALL_SPECS = {
+    "fetch_insights": (("act_1",), {"fields": ["spend"], "date_from": "2026-06-01", "date_to": "2026-06-30"}),
+    "fetch_ads": (("act_1",), {"fields": ["id"]}),
+    "list_campaigns": (("act_1",), {"fields": ["id"]}),
+    "get_campaign": (("c1",), {"fields": ["id"]}),
+    "list_adsets": (("act_1",), {"fields": ["id"]}),
+    "get_adset": (("as1",), {"fields": ["id"]}),
+    "get_ad": (("ad1",), {"fields": ["id"]}),
+    "list_custom_audiences": (("act_1",), {"fields": ["id"]}),
+    "get_account": (("act_1",), {"fields": ["name"]}),
+    "get_delivery_estimate": (("as1",), {"fields": ["estimate_dau"]}),
+    "search_targeting": ((), {"query": "jewelry"}),
+    "list_pixels": (("act_1",), {"fields": ["id"]}),
+    "list_custom_conversions": (("act_1",), {"fields": ["id"]}),
+    "iter_paginated": (("/act_1/ads",), {"params": {"limit": 1}}),
+}
+
+
+class _RecordingClient:
+    """Records every call and returns a per-method sentinel — to prove DirectMetaReader delegates 1:1.
+
+    MOCKS ONLY: stands in for MetaMarketingApiClient; never touches the network.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def __getattr__(self, name):
+        def _method(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return f"<{name}>"
+
+        return _method
+
+
+def _sig_params(sig: inspect.Signature) -> list[tuple]:
+    return [(p.name, p.kind, p.default) for p in sig.parameters.values()]
+
+
+def test_reader_call_specs_cover_every_read_method() -> None:
+    # Guard: the delegation test is only meaningful if it exercises the full read surface.
+    assert set(_READER_CALL_SPECS) == set(READ_METHODS)
+
+
+def test_direct_meta_reader_delegates_each_read_method_one_to_one() -> None:
+    # Every reader method forwards to the same-named client method and returns its result verbatim.
+    for name, (args, kwargs) in _READER_CALL_SPECS.items():
+        recorder = _RecordingClient()
+        reader = DirectMetaReader(recorder)
+        result = getattr(reader, name)(*args, **kwargs)
+        assert [c[0] for c in recorder.calls] == [name], f"{name} did not delegate 1:1"
+        assert result == f"<{name}>", f"{name} did not return the wrapped client's result"
+
+
+def test_reader_signatures_match_client_exactly() -> None:
+    # Keyword-only splits and defaults must match MetaMarketingApiClient so a call-site swap is a
+    # pure rename; drift here surfaces as a TypeError only at some distant call site otherwise.
+    for name in READ_METHODS:
+        client_params = _sig_params(inspect.signature(getattr(MetaMarketingApiClient, name)))
+        for cls in (MetaReaderProvider, DirectMetaReader, FakeMetaReader):
+            reader_params = _sig_params(inspect.signature(getattr(cls, name)))
+            assert reader_params == client_params, (
+                f"{cls.__name__}.{name} signature drifted from MetaMarketingApiClient"
+            )
+
+
+def test_direct_meta_reader_iter_paginated_preserves_lazy_iterator() -> None:
+    # iter_paginated must return an iterator (not a list), preserving the client's laziness.
+    def _gen(path, *, params=None):
+        yield {"id": "1"}
+        yield {"id": "2"}
+
+    class _Client:
+        iter_paginated = staticmethod(_gen)
+
+    reader = DirectMetaReader(_Client())
+    out = reader.iter_paginated("/act_1/ads", params={"limit": 1})
+    assert iter(out) is out  # a real iterator, returned unchanged
+    assert list(out) == [{"id": "1"}, {"id": "2"}]
+
+
+def test_fake_meta_reader_returns_canned_values_and_records_calls() -> None:
+    reader = FakeMetaReader(
+        get_account={"name": "Acme"},
+        list_campaigns=[{"id": "c1"}],
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "fields": fields},
+    )
+    assert reader.get_account("act_1", fields=["name"]) == {"name": "Acme"}
+    assert reader.list_campaigns("act_1", fields=["id"]) == [{"id": "c1"}]
+    # A callable stub receives the actual call args.
+    assert reader.get_ad("ad9", fields=["id"]) == {"id": "ad9", "fields": ["id"]}
+    assert ("get_account", ("act_1",), {"fields": ["name"]}) in reader.calls
+
+
+def test_fake_meta_reader_raises_on_unstubbed_method() -> None:
+    reader = FakeMetaReader(get_account={"name": "Acme"})
+    try:
+        reader.get_adset("as1", fields=["id"])
+    except NotImplementedError as exc:
+        assert "get_adset" in str(exc)
+    else:
+        raise AssertionError("expected NotImplementedError for an unstubbed read method")
+
+
+def test_fake_meta_reader_iter_paginated_is_reiterable_per_call() -> None:
+    reader = FakeMetaReader(iter_paginated=[{"id": "1"}, {"id": "2"}])
+    # Each call yields the full seeded list, so list()/iterate-twice behave like the real client.
+    assert list(reader.iter_paginated("/act_1/ads")) == [{"id": "1"}, {"id": "2"}]
+    assert list(reader.iter_paginated("/act_1/ads")) == [{"id": "1"}, {"id": "2"}]
+
+
+def test_fake_meta_reader_rejects_unknown_stub_name() -> None:
+    try:
+        FakeMetaReader(get_widgets=[])
+    except ValueError as exc:
+        assert "get_widgets" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for an unknown read method name")
+
+
+def test_as_reader_wraps_client_and_passes_reader_through() -> None:
+    fake = FakeMetaReader(get_account={"name": "X"})
+    assert as_reader(fake) is fake  # already a provider -> returned unchanged
+    assert as_reader(None) is None  # None passes through for lazy-default callers
+    wrapped = as_reader(_RecordingClient())
+    assert isinstance(wrapped, DirectMetaReader)
+    assert wrapped.get_account("act_1", fields=["name"]) == "<get_account>"
+
+
+def test_supplied_reader_short_circuits_from_env(monkeypatch) -> None:
+    # A supplied reader must never trigger DirectMetaReader.from_env()'s env/token lookup (laziness).
+    def _boom(*_a, **_k):
+        raise AssertionError("client_from_env must not be called when a reader is supplied")
+
+    monkeypatch.setattr("meta_ads_analysis.reader_provider.client_from_env", _boom)
+    plan = {
+        "account_slug": "x",
+        "run_date": "2026-06-16",
+        "actions": [
+            {
+                "action_id": "pause_ad_1",
+                "action_type": "pause_ad",
+                "status": "proposed",
+                "executable": True,
+                "target": {"type": "ad", "id": "1"},
+                "params": {"status": "paused"},
+                "rationale": "r",
+            }
+        ],
+    }
+    reader = FakeMetaReader(
+        get_ad={"id": "1", "name": "Ad", "status": "PAUSED", "effective_status": "PAUSED"}
+    )
+    enriched = enrich_action_plan_with_live_state(plan, reader=reader)
+    assert enriched["actions"][0]["live_state"]["status"] == "PAUSED"
+
+
+def test_build_account_snapshot_accepts_a_fake_reader() -> None:
+    # The control read entry point works with a pure FakeMetaReader (no client wrapping needed).
+    reader = FakeMetaReader(
+        list_campaigns=[{"id": "c1", "name": "C", "status": "ACTIVE", "effective_status": "ACTIVE"}],
+        list_adsets=[
+            {
+                "id": "as1", "name": "S", "status": "ACTIVE", "effective_status": "ACTIVE",
+                "campaign_id": "c1", "targeting": {"custom_audiences": [{"id": "A", "name": "aud-A"}]},
+            }
+        ],
+        iter_paginated=[
+            {"id": "ad1", "name": "Ad", "status": "ACTIVE", "effective_status": "ACTIVE",
+             "adset_id": "as1", "issues_info": []}
+        ],
+    )
+    from meta_ads_analysis.control import build_account_snapshot as _snap
+
+    snap = _snap(reader, "act_1")
+    assert snap["rollup"]["campaigns"] == 1
+    assert snap["campaigns"][0]["adsets"][0]["included_audiences"] == ["aud-A"]

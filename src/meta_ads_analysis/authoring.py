@@ -19,6 +19,7 @@ from typing import Any
 from .config import DEFAULT_REPORTS_ROOT
 from .control import FORBIDDEN_FRAGMENTS
 from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
+from .reader_provider import MetaReaderProvider, as_reader
 from .utils import ensure_dir, write_json
 
 APPROVED_STATUS = "approved"
@@ -229,7 +230,7 @@ def apply_authoring_plan(
 
 
 def build_duplicate_ad_plan(
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider | MetaMarketingApiClient,
     ad_account_id: str,
     *,
     source_ad_id: str,
@@ -237,8 +238,12 @@ def build_duplicate_ad_plan(
     name: str | None = None,
     account_slug: str | None = None,
 ) -> dict[str, Any]:
-    """Plan to recreate an existing ad's creative in a target ad set (created PAUSED)."""
-    src = client.get_ad(source_ad_id, fields=["id", "name", "creative"])
+    """Plan to recreate an existing ad's creative in a target ad set (created PAUSED).
+
+    Read-only (reads the source ad's creative through ``reader``); the build only proposes an op.
+    """
+    reader = as_reader(reader)
+    src = reader.get_ad(source_ad_id, fields=["id", "name", "creative"])
     creative = src.get("creative") if isinstance(src.get("creative"), dict) else {}
     creative_id = creative.get("id")
     if not creative_id:

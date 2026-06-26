@@ -30,6 +30,7 @@ from .confidence import (
     evidence_to_dict,
 )
 from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
+from .reader_provider import DirectMetaReader, MetaReaderProvider, as_reader
 from .utils import ensure_dir, write_json
 
 APPROVED_STATUS = "approved"
@@ -253,9 +254,15 @@ ADSET_STATE_FIELDS = [
 def enrich_action_plan_with_live_state(
     plan: dict[str, Any],
     *,
-    client: MetaMarketingApiClient | None = None,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
 ) -> dict[str, Any]:
-    effective_client = client or client_from_env()
+    """Re-read each action's live Meta state (read-only) and annotate the plan.
+
+    ``reader`` accepts a :class:`MetaReaderProvider` or a raw ``MetaMarketingApiClient`` (wrapped
+    in a ``DirectMetaReader``); when omitted a direct reader is built from env. The re-read is the
+    fresh source of truth for drift detection — it is not a cache.
+    """
+    effective_reader = as_reader(reader) or DirectMetaReader.from_env()
     enriched = {**plan, "actions": [dict(action) for action in plan.get("actions") or []]}
     checked_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     for action in enriched["actions"]:
@@ -265,7 +272,7 @@ def enrich_action_plan_with_live_state(
         live_state: dict[str, Any] = {}
         if target.get("type") == "ad":
             try:
-                live_state = fetch_live_ad_state(str(target["id"]), client=effective_client)
+                live_state = fetch_live_ad_state(str(target["id"]), reader=effective_reader)
             except MetaApiError as exc:
                 action["live_state"] = {
                     "checked_at": checked_at,
@@ -280,7 +287,7 @@ def enrich_action_plan_with_live_state(
                 action["approval_required"] = False
                 action["rationale"] = f"{action.get('rationale', '').rstrip()} Live Meta state already shows this ad is paused."
         if target.get("type") == "adset" or live_state.get("adset_id"):
-            _maybe_add_live_adset_state(action, live_state, checked_at, effective_client)
+            _maybe_add_live_adset_state(action, live_state, checked_at, effective_reader)
             _populate_budget_params_from_live_state(action)
     _append_meta_ai_remediation_actions(enriched, checked_at)
     enriched["live_state_enriched_at"] = checked_at
@@ -290,9 +297,9 @@ def enrich_action_plan_with_live_state(
 def fetch_live_ad_state(
     ad_id: str,
     *,
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider,
 ) -> dict[str, Any]:
-    item = client.get_ad(ad_id, fields=AD_STATE_FIELDS)
+    item = reader.get_ad(ad_id, fields=AD_STATE_FIELDS)
     return {
         "ad_id": item.get("id"),
         "name": item.get("name"),
@@ -307,9 +314,9 @@ def fetch_live_ad_state(
 def fetch_live_adset_state(
     adset_id: str,
     *,
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider,
 ) -> dict[str, Any]:
-    item = client.get_adset(adset_id, fields=ADSET_STATE_FIELDS)
+    item = reader.get_adset(adset_id, fields=ADSET_STATE_FIELDS)
     targeting = item.get("targeting")
     return {
         "adset_id": item.get("id"),
@@ -769,14 +776,14 @@ def _maybe_add_live_adset_state(
     action: dict[str, Any],
     live_state: dict[str, Any],
     checked_at: str,
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider,
 ) -> None:
     target = action.get("target") if isinstance(action.get("target"), dict) else {}
     adset_id = str((target.get("id") if target.get("type") == "adset" else live_state.get("adset_id")) or "").strip()
     if not adset_id:
         return
     try:
-        adset_state = fetch_live_adset_state(adset_id, client=client)
+        adset_state = fetch_live_adset_state(adset_id, reader=reader)
     except MetaApiError as exc:
         action["live_adset_state"] = {
             "checked_at": checked_at,

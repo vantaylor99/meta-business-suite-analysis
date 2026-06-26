@@ -23,6 +23,7 @@ from typing import Any
 from . import account_registry
 from .config import DEFAULT_REPORTS_ROOT
 from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
+from .reader_provider import MetaReaderProvider, as_reader
 from .rotation import _audience_refs, _ids, advantage_audience_enabled
 from .utils import ensure_dir, write_json
 
@@ -85,17 +86,22 @@ def _issue_summaries(ad: dict[str, Any]) -> list[str]:
 
 
 def build_account_snapshot(
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider | MetaMarketingApiClient,
     ad_account_id: str,
     *,
     active_only: bool = False,
 ) -> dict[str, Any]:
-    """Return the full account tree plus rollups, for agent decision-making."""
+    """Return the full account tree plus rollups, for agent decision-making.
+
+    Read-only: ``reader`` is a :class:`MetaReaderProvider` (a raw ``MetaMarketingApiClient`` is
+    accepted and wrapped), so reads route through the provider seam.
+    """
+    reader = as_reader(reader)
     status_filter = ["ACTIVE"] if active_only else None
-    campaigns = client.list_campaigns(ad_account_id, fields=CAMPAIGN_FIELDS, effective_status=status_filter)
-    adsets = client.list_adsets(ad_account_id, fields=ADSET_FIELDS, effective_status=status_filter)
+    campaigns = reader.list_campaigns(ad_account_id, fields=CAMPAIGN_FIELDS, effective_status=status_filter)
+    adsets = reader.list_adsets(ad_account_id, fields=ADSET_FIELDS, effective_status=status_filter)
     ads = list(
-        client.iter_paginated(
+        reader.iter_paginated(
             f"/{ad_account_id}/ads", params={"fields": ",".join(AD_FIELDS), "limit": 200}
         )
     )
@@ -235,12 +241,13 @@ def validate_op(op: dict[str, Any]) -> None:
             raise ValueError("set_placements requires params.automatic=true or a non-empty publisher_platforms list.")
 
 
-def _get_entity(client: MetaMarketingApiClient, level: str, node_id: str, fields: list[str]) -> dict[str, Any]:
+def _get_entity(reader: MetaReaderProvider, level: str, node_id: str, fields: list[str]) -> dict[str, Any]:
+    """Re-read one entity's live state (the read half of a guarded write); goes through the reader."""
     if level == "ad":
-        return client.get_ad(node_id, fields=fields)
+        return reader.get_ad(node_id, fields=fields)
     if level == "adset":
-        return client.get_adset(node_id, fields=fields)
-    return client.get_campaign(node_id, fields=fields)
+        return reader.get_adset(node_id, fields=fields)
+    return reader.get_campaign(node_id, fields=fields)
 
 
 def _update_entity(
@@ -281,8 +288,10 @@ def _apply_targeting_change(op_type: str, params: dict[str, Any], targeting: Any
     return t
 
 
-def _build_request(op: dict[str, Any], client: MetaMarketingApiClient) -> dict[str, Any]:
-    """Translate an op into the Graph API params to POST. May re-read live state (budget cap, targeting)."""
+def _build_request(op: dict[str, Any], reader: MetaReaderProvider) -> dict[str, Any]:
+    """Translate an op into the Graph API params to POST. May re-read live state (budget cap,
+    targeting, current creative) — that re-read is read-only and goes through the reader; the
+    POST itself is done by the caller against the concrete write client."""
     op_type = op["op"]
     params = op.get("params") or {}
     if op_type == "set_status":
@@ -294,7 +303,7 @@ def _build_request(op: dict[str, Any], client: MetaMarketingApiClient) -> dict[s
     if op_type == "set_creative_features":
         # Creatives are immutable; to change enhancement enrollment we re-attach the SAME creative
         # content with a degrees_of_freedom_spec. Read the current creative and rebuild it.
-        ad = client.get_ad(str(op["id"]), fields=["creative{object_story_spec,asset_feed_spec}"])
+        ad = reader.get_ad(str(op["id"]), fields=["creative{object_story_spec,asset_feed_spec}"])
         cr = ad.get("creative") if isinstance(ad.get("creative"), dict) else {}
         new_creative: dict[str, Any] = {}
         if isinstance(cr.get("object_story_spec"), dict):
@@ -315,13 +324,13 @@ def _build_request(op: dict[str, Any], client: MetaMarketingApiClient) -> dict[s
         new_creative["degrees_of_freedom_spec"] = {"creative_features_spec": feats}
         return {"creative": new_creative}
     if op_type in TARGETING_OPS:
-        live = _get_entity(client, "adset", str(op["id"]), ["id", "targeting"])
+        live = _get_entity(reader, "adset", str(op["id"]), ["id", "targeting"])
         return {"targeting": _apply_targeting_change(op_type, params, live.get("targeting"))}
     if op_type == "set_daily_budget":
         new_cents = int(_num(params.get("daily_budget_cents")))
         max_increase = _num(params.get("max_increase_percent"))
         max_increase = 20.0 if max_increase is None else max_increase
-        live = _get_entity(client, op["level"], str(op["id"]), ["id", "daily_budget"])
+        live = _get_entity(reader, op["level"], str(op["id"]), ["id", "daily_budget"])
         current = _num(live.get("daily_budget"))
         if current is None or current <= 0:
             raise ValueError(
@@ -342,9 +351,17 @@ def apply_ops_plan(
     *,
     execute: bool,
     validate_only: bool = False,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
 ) -> list[OpResult]:
-    """Dry-run, validate, or execute approved ops. Only approved ops are sent."""
+    """Dry-run, validate, or execute approved ops. Only approved ops are sent.
+
+    Mixed read+write: ``client`` performs the writes (``update_*``); the live re-reads inside
+    ``_build_request`` (budget cap / targeting / current creative) go through ``reader``. When
+    ``reader`` is not supplied it defaults to reading through the same ``client``, so a future
+    hybrid caller can pass an MCP ``reader`` for the read while the write stays on the client.
+    """
     effective_client = client
+    effective_reader = as_reader(reader)
     results: list[OpResult] = []
     for op in plan.get("ops") or []:
         if not isinstance(op, dict):
@@ -360,8 +377,10 @@ def apply_ops_plan(
             continue
         if effective_client is None:
             effective_client = client_from_env()
+        if effective_reader is None:
+            effective_reader = as_reader(effective_client)
         try:
-            request = _build_request(op, effective_client)
+            request = _build_request(op, effective_reader)
         except ValueError as exc:
             results.append(OpResult(op_id, "blocked", reason=str(exc)))
             continue
@@ -388,7 +407,7 @@ def apply_ops_plan(
 
 
 def build_enable_ads_plan(
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider | MetaMarketingApiClient,
     ad_account_id: str,
     *,
     account_slug: str | None = None,
@@ -397,11 +416,13 @@ def build_enable_ads_plan(
 ) -> dict[str, Any]:
     """Propose set_status=ACTIVE ops for currently-not-active ads, optionally filtered.
 
-    Each op starts ``proposed`` with the ad's current effective_status + delivery issues in its
-    note, so the operator/agent approves only the ads worth turning on.
+    Read-only (reads ads through ``reader``): each op starts ``proposed`` with the ad's current
+    effective_status + delivery issues in its note, so the operator/agent approves only the ads
+    worth turning on.
     """
+    reader = as_reader(reader)
     ads = list(
-        client.iter_paginated(
+        reader.iter_paginated(
             f"/{ad_account_id}/ads",
             params={"fields": ",".join(AD_FIELDS), "limit": 200},
         )
@@ -489,7 +510,7 @@ def extract_creative_copy(creative: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_copy_library(
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider | MetaMarketingApiClient,
     ad_account_id: str,
     *,
     date_from: str,
@@ -499,14 +520,16 @@ def build_copy_library(
 ) -> list[dict[str, Any]]:
     """Rank ads by ROAS over a window and attach their copy — the proven-winner swipe file.
 
-    Includes any ad with spend >= min_spend in the window (active or paused), so historical
-    winners are captured. Ads with no extractable copy are skipped.
+    Read-only (insights + ads via ``reader``). Includes any ad with spend >= min_spend in the
+    window (active or paused), so historical winners are captured. Ads with no extractable copy
+    are skipped.
     """
+    reader = as_reader(reader)
     metrics = {
         str(m["id"]): m
-        for m in fetch_entity_metrics(client, ad_account_id, level="ad", date_from=date_from, date_to=date_to)
+        for m in fetch_entity_metrics(reader, ad_account_id, level="ad", date_from=date_from, date_to=date_to)
     }
-    ads = client.fetch_ads(
+    ads = reader.fetch_ads(
         ad_account_id, fields=["id", "name", "creative{object_story_spec,asset_feed_spec,body,title}"]
     )
     rows: list[dict[str, Any]] = []
@@ -569,7 +592,7 @@ _LEVEL_KEYS = {
 
 
 def fetch_entity_metrics(
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider | MetaMarketingApiClient,
     ad_account_id: str,
     *,
     level: str,
@@ -578,14 +601,16 @@ def fetch_entity_metrics(
 ) -> list[dict[str, Any]]:
     """Live per-entity performance over a window (one aggregated row per entity).
 
-    Returns dicts with id, name, spend, purchase_value, roas, purchases, impressions,
-    cost_per_purchase — sorted by spend desc. ``level`` is account/campaign/adset/ad.
+    Read-only (insights via ``reader``). Returns dicts with id, name, spend, purchase_value,
+    roas, purchases, impressions, cost_per_purchase — sorted by spend desc. ``level`` is
+    account/campaign/adset/ad.
     """
     if level not in _LEVEL_KEYS:
         raise ValueError(f"level must be one of {sorted(_LEVEL_KEYS)}")
+    reader = as_reader(reader)
     idk, namek = _LEVEL_KEYS[level]
     fields = [idk, namek, "spend", "impressions", "actions", "action_values", "purchase_roas"]
-    rows = client.fetch_insights(
+    rows = reader.fetch_insights(
         ad_account_id, fields=fields, date_from=date_from, date_to=date_to,
         level=level, time_increment="all_days",
     )
@@ -610,7 +635,7 @@ def fetch_entity_metrics(
 
 
 def fetch_breakdown_metrics(
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider | MetaMarketingApiClient,
     ad_account_id: str,
     *,
     breakdown: str,
@@ -619,10 +644,12 @@ def fetch_breakdown_metrics(
     level: str = "account",
 ) -> list[dict[str, Any]]:
     """Performance split by a breakdown dimension (age, gender, country, publisher_platform,
-    platform_position, impression_device, device_platform, region, ...). Returns rows with the
-    segment value(s) + spend/value/roas/purchases, sorted by spend desc."""
+    platform_position, impression_device, device_platform, region, ...). Read-only (insights via
+    ``reader``). Returns rows with the segment value(s) + spend/value/roas/purchases, sorted by
+    spend desc."""
+    reader = as_reader(reader)
     breakdowns = [b.strip() for b in breakdown.split(",") if b.strip()]
-    rows = client.fetch_insights(
+    rows = reader.fetch_insights(
         ad_account_id, fields=["spend", "impressions", "actions", "action_values"],
         date_from=date_from, date_to=date_to, level=level, time_increment="all_days", breakdowns=breakdowns,
     )
@@ -651,9 +678,10 @@ ACCOUNT_FIELDS = [
 _ACCOUNT_STATUS = {1: "ACTIVE", 2: "DISABLED", 3: "UNSETTLED", 7: "PENDING_RISK_REVIEW", 9: "IN_GRACE_PERIOD", 101: "CLOSED"}
 
 
-def account_info(client: MetaMarketingApiClient, ad_account_id: str) -> dict[str, Any]:
-    """Account-level status, currency, spend, spend cap, balance, funding source."""
-    a = client.get_account(ad_account_id, fields=ACCOUNT_FIELDS)
+def account_info(reader: MetaReaderProvider | MetaMarketingApiClient, ad_account_id: str) -> dict[str, Any]:
+    """Account-level status, currency, spend, spend cap, balance, funding source (read-only)."""
+    reader = as_reader(reader)
+    a = reader.get_account(ad_account_id, fields=ACCOUNT_FIELDS)
     status_code = a.get("account_status")
     funding = a.get("funding_source_details") or {}
     return {
@@ -674,9 +702,10 @@ def account_info(client: MetaMarketingApiClient, ad_account_id: str) -> dict[str
 # --- Audience sizing / discovery / measurement ------------------------------
 
 
-def estimate_adset_audience(client: MetaMarketingApiClient, adset_id: str) -> dict[str, Any]:
-    """Estimated audience size / reach for an ad set's current targeting."""
-    payload = client.get_delivery_estimate(
+def estimate_adset_audience(reader: MetaReaderProvider | MetaMarketingApiClient, adset_id: str) -> dict[str, Any]:
+    """Estimated audience size / reach for an ad set's current targeting (read-only)."""
+    reader = as_reader(reader)
+    payload = reader.get_delivery_estimate(
         adset_id, fields=["estimate_dau", "estimate_mau_lower_bound", "estimate_mau_upper_bound", "estimate_ready"]
     )
     data = payload.get("data") or []
@@ -690,9 +719,10 @@ def estimate_adset_audience(client: MetaMarketingApiClient, adset_id: str) -> di
     }
 
 
-def search_interests(client: MetaMarketingApiClient, query: str, *, limit: int = 25) -> list[dict[str, Any]]:
-    """Search detailed-targeting interests (id, name, audience size, topic) for use in targeting."""
-    rows = client.search_targeting(query=query, search_type="adinterest", limit=limit)
+def search_interests(reader: MetaReaderProvider | MetaMarketingApiClient, query: str, *, limit: int = 25) -> list[dict[str, Any]]:
+    """Search detailed-targeting interests (id, name, audience size, topic) for use in targeting (read-only)."""
+    reader = as_reader(reader)
+    rows = reader.search_targeting(query=query, search_type="adinterest", limit=limit)
     return [
         {
             "id": r.get("id"),
@@ -706,14 +736,16 @@ def search_interests(client: MetaMarketingApiClient, query: str, *, limit: int =
     ]
 
 
-def list_account_pixels(client: MetaMarketingApiClient, ad_account_id: str) -> list[dict[str, Any]]:
-    """List the Meta pixels on the account (id, name, last fired, availability)."""
-    return client.list_pixels(ad_account_id, fields=["id", "name", "last_fired_time", "is_unavailable"])
+def list_account_pixels(reader: MetaReaderProvider | MetaMarketingApiClient, ad_account_id: str) -> list[dict[str, Any]]:
+    """List the Meta pixels on the account (id, name, last fired, availability) (read-only)."""
+    reader = as_reader(reader)
+    return reader.list_pixels(ad_account_id, fields=["id", "name", "last_fired_time", "is_unavailable"])
 
 
-def list_account_conversions(client: MetaMarketingApiClient, ad_account_id: str) -> list[dict[str, Any]]:
-    """List custom conversions defined on the account."""
-    return client.list_custom_conversions(
+def list_account_conversions(reader: MetaReaderProvider | MetaMarketingApiClient, ad_account_id: str) -> list[dict[str, Any]]:
+    """List custom conversions defined on the account (read-only)."""
+    reader = as_reader(reader)
+    return reader.list_custom_conversions(
         ad_account_id, fields=["id", "name", "custom_event_type", "is_archived", "default_conversion_value"]
     )
 
@@ -721,10 +753,11 @@ def list_account_conversions(client: MetaMarketingApiClient, ad_account_id: str)
 # --- Delivery-issue scan ----------------------------------------------------
 
 
-def scan_issues(client: MetaMarketingApiClient, ad_account_id: str) -> dict[str, Any]:
-    """Account-wide scan of ad delivery issues, grouped by issue summary."""
+def scan_issues(reader: MetaReaderProvider | MetaMarketingApiClient, ad_account_id: str) -> dict[str, Any]:
+    """Account-wide scan of ad delivery issues, grouped by issue summary (read-only)."""
+    reader = as_reader(reader)
     ads = list(
-        client.iter_paginated(f"/{ad_account_id}/ads", params={"fields": ",".join(AD_FIELDS), "limit": 200})
+        reader.iter_paginated(f"/{ad_account_id}/ads", params={"fields": ",".join(AD_FIELDS), "limit": 200})
     )
     groups: dict[str, list[dict[str, Any]]] = {}
     for ad in ads:
@@ -749,9 +782,10 @@ AUDIENCE_FIELDS = [
 ]
 
 
-def list_account_audiences(client: MetaMarketingApiClient, ad_account_id: str) -> list[dict[str, Any]]:
-    """Inventory of custom audiences in the account (id, name, subtype, size, status)."""
-    auds = client.list_custom_audiences(ad_account_id, fields=AUDIENCE_FIELDS)
+def list_account_audiences(reader: MetaReaderProvider | MetaMarketingApiClient, ad_account_id: str) -> list[dict[str, Any]]:
+    """Inventory of custom audiences in the account (id, name, subtype, size, status) (read-only)."""
+    reader = as_reader(reader)
+    auds = reader.list_custom_audiences(ad_account_id, fields=AUDIENCE_FIELDS)
     out = []
     for a in auds:
         op = a.get("operation_status") or {}
@@ -770,7 +804,7 @@ def list_account_audiences(client: MetaMarketingApiClient, ad_account_id: str) -
 
 
 def build_pause_plan(
-    client: MetaMarketingApiClient,
+    reader: MetaReaderProvider | MetaMarketingApiClient,
     ad_account_id: str,
     *,
     account_slug: str | None = None,
@@ -783,11 +817,13 @@ def build_pause_plan(
 ) -> dict[str, Any]:
     """Propose pausing ACTIVE ads, by name/ad-set filter and/or a performance rule.
 
-    If ``roas_below`` is set, pulls live ad-level metrics over [date_from, date_to] and
-    selects ads whose ROAS is below the threshold with spend >= ``min_spend``.
+    Read-only (ads + optional metrics via ``reader``; only proposes ops). If ``roas_below`` is
+    set, pulls live ad-level metrics over [date_from, date_to] and selects ads whose ROAS is
+    below the threshold with spend >= ``min_spend``.
     """
+    reader = as_reader(reader)
     ads = list(
-        client.iter_paginated(f"/{ad_account_id}/ads", params={"fields": ",".join(AD_FIELDS), "limit": 200})
+        reader.iter_paginated(f"/{ad_account_id}/ads", params={"fields": ",".join(AD_FIELDS), "limit": 200})
     )
     scope = set(adset_ids or [])
     candidates = []
@@ -804,7 +840,7 @@ def build_pause_plan(
     if roas_below is not None:
         if not (date_from and date_to):
             raise ValueError("roas_below requires date_from and date_to.")
-        perf = {str(m["id"]): m for m in fetch_entity_metrics(client, ad_account_id, level="ad", date_from=date_from, date_to=date_to)}
+        perf = {str(m["id"]): m for m in fetch_entity_metrics(reader, ad_account_id, level="ad", date_from=date_from, date_to=date_to)}
 
     ops = []
     for ad in candidates:
