@@ -2960,6 +2960,67 @@ def test_apply_advantage_disable_structural_abstain_still_executes() -> None:
     assert params["targeting"]["targeting_automation"]["advantage_audience"] == 0
 
 
+def test_apply_rotation_cited_above_floor_band_executes_through_gate() -> None:
+    # The positive case the gate must NOT over-block: an approved rotation grounded on a real,
+    # above-floor sample computes a non-abstain band, so op_grounding_gap returns None and the write
+    # goes through. Without this, a gate bug that blocked every grounded rotation would slip by.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] != "abstain"  # cited, above the floor
+    plan["rotations"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    assert results[0].status == "executed"
+    assert len(client.updates) == 1
+
+
+def test_apply_rotation_blocks_approved_thin_sample_in_dry_run() -> None:
+    # The grounding gate sits BEFORE the validate_only/dry-run branches (same placement as
+    # apply_ops_plan), so a thin-sample approved rotation is blocked in a dry run too — it never even
+    # reaches the would-write dry_run record. Pins gate-in-all-modes.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_metric_row(a["id"], a["name"], purchases=9, spend=40)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    assert plan["rotations"][0]["confidence"]["band"] == "abstain"
+    plan["rotations"][0]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=False)  # dry run, not execute
+    assert results[0].status == "blocked"
+    assert "insufficient data" in results[0].reason
+    assert results[0].targeting is None  # blocked before compute_new_targeting
+    assert client.updates == []
+
+
+def test_apply_rotation_gate_isolates_per_item_blocked_does_not_stop_allowed() -> None:
+    # A single plan mixing a structural-abstain rotation (no cited sample -> allowed) and a
+    # cited-abstain rotation (thin sample -> blocked), both approved, in one apply call. The blocked
+    # item must not abort the loop: the structural-abstain item still executes. Confirms the gate's
+    # per-item continue isolates findings rather than failing the whole plan.
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=None, **_ROTATION_WINDOW)  # all structural abstains
+    # Both start structural (allowed); promote the SECOND item to a cited thin sample (-> blocked).
+    assert plan["rotations"][0]["evidence"]["sample_purchases"] is None  # structural
+    plan["rotations"][1]["evidence"]["sample_purchases"] = 9.0
+    plan["rotations"][1]["evidence"]["sample_spend"] = 40.0
+    assert plan["rotations"][1]["confidence"]["band"] == "abstain"  # now cited abstain
+    plan["rotations"][0]["status"] = "approved"
+    plan["rotations"][1]["status"] = "approved"
+    client = _FakeClient(adsets)
+    results = apply_rotation_plan(plan, client, execute=True)
+    by_id = {r.adset_id: r for r in results}
+    assert by_id[plan["rotations"][0]["adset_id"]].status == "executed"  # structural -> allowed
+    assert by_id[plan["rotations"][1]["adset_id"]].status == "blocked"   # cited thin -> blocked
+    assert "insufficient data" in by_id[plan["rotations"][1]["adset_id"]].reason
+    # Only the allowed item was written; the blocked one sent nothing.
+    assert [u[0] for u in client.updates] == [plan["rotations"][0]["adset_id"]]
+
+
 # --- Control layer (inspect + guarded ops + enable-ads) ----------------------
 
 from meta_ads_analysis.control import (
