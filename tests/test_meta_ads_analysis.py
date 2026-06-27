@@ -1215,7 +1215,7 @@ def _evidence_for_brief(*, purchases: float | None, spend: float | None) -> Evid
         metric_value=1.20,
         metric_display="ROAS 1.20",
         window="2026-06-10..2026-06-24",
-        sample_purchases=purchases,
+        sample_conversions=purchases,
         sample_spend=spend,
         entity_level="ad",
         entity_id="123",
@@ -1420,7 +1420,7 @@ def test_operator_brief_evidence_without_regen_omits_recheck_line() -> None:
         metric_value=1.20,
         metric_display="ROAS 1.20",
         window="2026-06-10..2026-06-24",
-        sample_purchases=120.0,
+        sample_conversions=120.0,
         sample_spend=2400.0,
         entity_level="ad",
         entity_id="123",
@@ -1504,7 +1504,7 @@ def _review_evidence(
         metric_value=metric_value,
         metric_display=f"ROAS {metric_value:.2f}" if metric_value is not None else "ROAS n/a",
         window=window,
-        sample_purchases=purchases,
+        sample_conversions=purchases,
         sample_spend=spend,
         entity_level="ad",
         entity_id="123",
@@ -2862,7 +2862,7 @@ def test_rotation_fatigued_adset_carries_correlational_capped_confidence() -> No
     plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
                                metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
     op = plan["rotations"][0]
-    assert op["evidence"]["sample_purchases"] == 120.0
+    assert op["evidence"]["sample_conversions"] == 120.0
     assert op["confidence"]["grounding_tier"] == "correlational"
     # 120 purchases would read high on the data axis, but correlational grounding caps it at medium.
     assert op["confidence"]["band"] == "medium"
@@ -2901,7 +2901,7 @@ def test_rotation_review_demotes_overclaimed_band() -> None:
         "rotations": [{
             "adset_id": "as1", "adset_name": "Set 1", "status": "approved",
             "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
-                         "window": "2026-06-10..2026-06-24", "sample_purchases": 30.0,
+                         "window": "2026-06-10..2026-06-24", "sample_conversions": 30.0,
                          "sample_spend": 500.0, "entity_level": "adset", "entity_id": "as1"},
             "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
                            "grounding_tier": "correlational", "factors": [], "would_raise": "",
@@ -2926,7 +2926,7 @@ def test_rotation_causal_claim_is_downgraded() -> None:
         "rotations": [{
             "adset_id": "as1", "status": "approved",
             "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
-                         "window": "2026-06-10..2026-06-24", "sample_purchases": 120.0,
+                         "window": "2026-06-10..2026-06-24", "sample_conversions": 120.0,
                          "sample_spend": 2400.0, "entity_level": "adset", "entity_id": "as1"},
             "confidence": {"band": "high", "data_band": "high", "grounding_band": "medium",
                            "grounding_tier": "correlational", "factors": [], "would_raise": "",
@@ -2948,7 +2948,7 @@ def test_advantage_disable_item_attaches_structural_abstain() -> None:
     item = plan["items"][0]
     assert item["confidence"]["band"] == "abstain"
     assert item["confidence"]["data_band"] == "abstain"
-    assert item["evidence"]["sample_purchases"] is None and item["evidence"]["sample_spend"] is None
+    assert item["evidence"]["sample_conversions"] is None and item["evidence"]["sample_spend"] is None
     # structural abstain (no cited sample) → the gate does not refute it
     assert item["review"]["verdict"] == "stands"
 
@@ -3005,7 +3005,7 @@ def test_rotation_adset_with_no_window_row_cites_zero_sample_and_abstains() -> N
     plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
                                metrics_by_id={}, goal="roas", **_ROTATION_WINDOW)
     op = plan["rotations"][0]
-    assert op["evidence"]["sample_purchases"] == 0.0 and op["evidence"]["sample_spend"] == 0.0
+    assert op["evidence"]["sample_conversions"] == 0.0 and op["evidence"]["sample_spend"] == 0.0
     assert op["confidence"]["band"] == "abstain"
     assert op["review_verdict"] == "insufficient"
 
@@ -3031,7 +3031,7 @@ def test_rotation_install_goal_grounds_on_installs_clears_low() -> None:
                                goal="maximize_in_app_subscriptions", **_ROTATION_WINDOW)
     op = plan["rotations"][0]
     assert op["evidence"]["metric_name"] == "cost_per_app_install"
-    assert op["evidence"]["sample_purchases"] == 120.0  # installs ground the sample, not the 0 purchases
+    assert op["evidence"]["sample_conversions"] == 120.0  # installs ground the sample, not the 0 purchases
     assert Band[op["confidence"]["band"]] > Band.low  # 120 installs clears low/abstain
     assert op["confidence"]["band"] == "medium"  # correlational cap (never high) per ROTATION_EVIDENCE_TIER
     assert op["review"]["verdict"] == "stands"
@@ -3049,7 +3049,7 @@ def test_rotation_roas_goal_ignores_app_installs_decoy() -> None:
                                metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
     op = plan["rotations"][0]
     assert op["evidence"]["metric_name"] == "blended_roas"
-    assert op["evidence"]["sample_purchases"] == 120.0  # purchases, NOT the 999 install decoy
+    assert op["evidence"]["sample_conversions"] == 120.0  # purchases, NOT the 999 install decoy
     assert op["confidence"]["band"] == "medium"
 
 
@@ -3062,7 +3062,7 @@ def test_rotation_install_goal_no_window_row_still_cites_zero_and_abstains() -> 
                                metrics_by_id={},
                                goal="maximize_in_app_subscriptions", **_ROTATION_WINDOW)
     op = plan["rotations"][0]
-    assert op["evidence"]["sample_purchases"] == 0.0 and op["evidence"]["sample_spend"] == 0.0
+    assert op["evidence"]["sample_conversions"] == 0.0 and op["evidence"]["sample_spend"] == 0.0
     assert op["confidence"]["band"] == "abstain"
     assert op["review_verdict"] == "insufficient"
 
@@ -3075,7 +3075,7 @@ def test_rotation_install_goal_structural_abstain_when_no_metrics() -> None:
                                metrics_by_id=None,
                                goal="maximize_in_app_subscriptions", **_ROTATION_WINDOW)
     op = plan["rotations"][0]
-    assert op["evidence"]["sample_purchases"] is None  # structural — no cited sample
+    assert op["evidence"]["sample_conversions"] is None  # structural — no cited sample
     assert op["confidence"]["band"] == "abstain"
 
 
@@ -3092,7 +3092,7 @@ def test_rotation_no_goal_installs_present_keeps_sample_on_purchases() -> None:
                                metrics_by_id=metrics, goal=None, **_ROTATION_WINDOW)
     op = plan["rotations"][0]
     assert op["evidence"]["metric_name"] == "cost_per_app_install"  # no goal + installs present
-    assert op["evidence"]["sample_purchases"] == 30.0  # but the sample stays on purchases
+    assert op["evidence"]["sample_conversions"] == 30.0  # but the sample stays on purchases
 
 
 def test_apply_rotation_blocks_approved_thin_sample_at_execute() -> None:
@@ -3120,7 +3120,7 @@ def test_apply_rotation_blocks_approved_zero_sample_at_execute() -> None:
     adsets = _three_adset_partition()
     plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
                                metrics_by_id={}, goal="roas", **_ROTATION_WINDOW)
-    assert plan["rotations"][0]["evidence"]["sample_purchases"] == 0.0
+    assert plan["rotations"][0]["evidence"]["sample_conversions"] == 0.0
     assert plan["rotations"][0]["confidence"]["band"] == "abstain"
     plan["rotations"][0]["status"] = "approved"
     client = _FakeClient(adsets)
@@ -3158,7 +3158,7 @@ def test_apply_advantage_disable_structural_abstain_still_executes() -> None:
     plan = build_advantage_disable_plan(adsets, account_slug="demo", ad_account_id="act_1")
     assert plan["guardrails"]["requires_grounding"] is True
     assert plan["items"][0]["confidence"]["band"] == "abstain"  # structural abstain
-    assert plan["items"][0]["evidence"]["sample_purchases"] is None
+    assert plan["items"][0]["evidence"]["sample_conversions"] is None
     plan["items"][0]["status"] = "approved"
     client = _FakeClient(adsets)
     results = apply_advantage_disable_plan(plan, client, execute=True)
@@ -3213,8 +3213,8 @@ def test_apply_rotation_gate_isolates_per_item_blocked_does_not_stop_allowed() -
     plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
                                metrics_by_id=None, **_ROTATION_WINDOW)  # all structural abstains
     # Both start structural (allowed); promote the SECOND item to a cited thin sample (-> blocked).
-    assert plan["rotations"][0]["evidence"]["sample_purchases"] is None  # structural
-    plan["rotations"][1]["evidence"]["sample_purchases"] = 9.0
+    assert plan["rotations"][0]["evidence"]["sample_conversions"] is None  # structural
+    plan["rotations"][1]["evidence"]["sample_conversions"] = 9.0
     plan["rotations"][1]["evidence"]["sample_spend"] = 40.0
     assert plan["rotations"][1]["confidence"]["band"] == "abstain"  # now cited abstain
     plan["rotations"][0]["status"] = "approved"
@@ -3395,7 +3395,7 @@ def test_enable_ads_paused_ad_with_strong_sample_carries_computed_band() -> None
     plan = build_enable_ads_plan(_enable_client(insights), "act_1", policy={"primary_goal": "roas"})
     op = next(o for o in plan["ops"] if o["id"] == "ad2")
     assert op["evidence"]["metric_name"] == "blended_roas"
-    assert op["evidence"]["sample_purchases"] == 30.0
+    assert op["evidence"]["sample_conversions"] == 30.0
     # 25 <= 30 < 100 purchases, recent window, direct_observation → medium (matches confidence.assess).
     assert op["confidence"]["band"] == "medium"
     assert op["review"]["verdict"] == "stands"
@@ -3448,7 +3448,7 @@ def test_enable_ads_install_goal_grounds_on_cost_per_install() -> None:
     op = next(o for o in plan["ops"] if o["id"] == "ad2")
     assert op["evidence"]["metric_name"] == "cost_per_app_install"
     assert op["evidence"]["metric_value"] == 12.5  # $500 / 40 installs
-    assert op["evidence"]["sample_purchases"] == 40.0  # the install count grounds the sample, not purchases
+    assert op["evidence"]["sample_conversions"] == 40.0  # the install count grounds the sample, not purchases
     # 25 <= 40 < 100 installs, recent window, direct_observation → medium (pre-fix this read low because
     # the sample was pinned to ~0 purchases).
     assert op["confidence"]["band"] == "medium"
@@ -3462,7 +3462,7 @@ def test_review_ops_plan_demotes_overclaimed_enable() -> None:
         "op_id": "enable_ad_x", "op": "set_status", "level": "ad", "id": "adx", "status": "approved",
         "params": {"status": "ACTIVE"},
         "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
-                     "window": "2026-06-10..2026-06-24", "sample_purchases": 30.0,
+                     "window": "2026-06-10..2026-06-24", "sample_conversions": 30.0,
                      "sample_spend": 500.0, "entity_level": "ad", "entity_id": "adx"},
         "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
                        "grounding_tier": "direct_observation", "factors": [], "would_raise": "",
@@ -3594,7 +3594,7 @@ def test_enable_ads_install_goal_zero_purchases_real_installs_clears_floor() -> 
     )
     op = next(o for o in plan["ops"] if o["id"] == "ad2")
     assert op["evidence"]["metric_name"] == "cost_per_app_install"
-    assert op["evidence"]["sample_purchases"] == 120.0  # installs ground the sample, not the 0 purchases
+    assert op["evidence"]["sample_conversions"] == 120.0  # installs ground the sample, not the 0 purchases
     assert Band[op["confidence"]["band"]] > Band.low  # 120 installs, recent window → clears low/abstain
 
 
@@ -3612,7 +3612,7 @@ def test_enable_ads_roas_goal_ignores_app_installs_decoy() -> None:
     plan = build_enable_ads_plan(_enable_client(insights), "act_1", policy={"primary_goal": "roas"})
     op = next(o for o in plan["ops"] if o["id"] == "ad2")
     assert op["evidence"]["metric_name"] == "blended_roas"
-    assert op["evidence"]["sample_purchases"] == 30.0  # purchases, NOT the 999 install decoy
+    assert op["evidence"]["sample_conversions"] == 30.0  # purchases, NOT the 999 install decoy
     assert op["confidence"]["band"] == "medium"
 
 
@@ -3625,7 +3625,7 @@ def test_enable_ads_install_goal_cold_ad_abstains_and_gate_blocks() -> None:
     )
     op = next(o for o in plan["ops"] if o["id"] == "ad2")
     assert op["confidence"]["band"] == "abstain"
-    assert op["evidence"]["sample_purchases"] == 0.0  # cited zero — the cold branch, not the helper
+    assert op["evidence"]["sample_conversions"] == 0.0  # cited zero — the cold branch, not the helper
     assert op["evidence"]["sample_spend"] == 0.0
     op["status"] = "approved"
     results = apply_ops_plan(plan, _enable_client([]), execute=False)
@@ -3649,7 +3649,7 @@ def test_enable_ads_no_goal_installs_present_keeps_sample_on_purchases() -> None
     plan = build_enable_ads_plan(_enable_client(insights), "act_1", policy={})
     op = next(o for o in plan["ops"] if o["id"] == "ad2")
     assert op["evidence"]["metric_name"] == "cost_per_app_install"  # no goal + installs present
-    assert op["evidence"]["sample_purchases"] == 30.0  # but the sample stays on purchases
+    assert op["evidence"]["sample_conversions"] == 30.0  # but the sample stays on purchases
 
 
 def test_attach_status_grounding_none_row_ignores_sample_conversions() -> None:
@@ -3670,7 +3670,7 @@ def test_attach_status_grounding_none_row_ignores_sample_conversions() -> None:
                 account_slug="demo", date_from="2026-06-01", date_to="2026-06-24",
                 recency_days=1, cold_cites_zero=cites_zero,
             )
-            samples.append(op["evidence"]["sample_purchases"])
+            samples.append(op["evidence"]["sample_conversions"])
         assert samples == [expected, expected, expected]  # sample_conversions had no effect
 
 
@@ -3957,7 +3957,7 @@ def test_pause_roas_below_grounds_on_purchases_regardless_of_installs() -> None:
                             date_from="2026-06-01", date_to="2026-06-24", run_date="2026-06-25")
     op = next(o for o in plan["ops"] if o["id"] == "ad1")
     assert op["evidence"]["metric_name"] == "blended_roas"
-    assert op["evidence"]["sample_purchases"] == 4.0  # purchases, NOT the 999 install decoy
+    assert op["evidence"]["sample_conversions"] == 4.0  # purchases, NOT the 999 install decoy
 
 
 # --- Authoring (create / duplicate / lookalike) + breakdowns + account-info --
@@ -4467,7 +4467,7 @@ def test_attach_op_grounding_computes_band_never_free_types() -> None:
     expected = assess(evidence=strong, tier=EvidenceTier.direct_observation,
                       spend_floor=100.0, conversions_floor=25.0, recency_days=1)
     assert op["confidence"]["band"] == expected.band.name == "high"
-    assert op["evidence"]["sample_purchases"] == 120.0
+    assert op["evidence"]["sample_conversions"] == 120.0
     assert op["evidence"]["window"] == "2026-06-10..2026-06-24"
 
 
@@ -4478,7 +4478,7 @@ def test_attach_op_grounding_abstains_when_evidence_absent() -> None:
                         spend_floor=100.0, conversions_floor=25.0, recency_days=1)
     assert op["confidence"]["band"] == "abstain"
     assert op["confidence"]["data_band"] == "abstain"
-    assert op["evidence"]["sample_purchases"] is None and op["evidence"]["sample_spend"] is None
+    assert op["evidence"]["sample_conversions"] is None and op["evidence"]["sample_spend"] is None
 
 
 def test_attach_op_grounding_no_evidence_keeps_full_evidence_keyset() -> None:
@@ -4510,7 +4510,7 @@ def test_review_ops_plan_demotes_overclaimed_band() -> None:
         "op_id": "oc", "op": "set_daily_budget", "level": "adset", "id": "as3", "status": "approved",
         "params": {"daily_budget_cents": 11000},
         "evidence": {"metric_name": "blended_roas", "metric_value": 1.0,
-                     "window": "2026-06-10..2026-06-24", "sample_purchases": 30.0,
+                     "window": "2026-06-10..2026-06-24", "sample_conversions": 30.0,
                      "sample_spend": 200.0, "entity_level": "adset", "entity_id": "as3"},
         "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
                        "grounding_tier": "direct_observation", "factors": [], "would_raise": "",
@@ -4557,7 +4557,7 @@ def test_review_ops_gate_only_demotes_never_promotes() -> None:
         "op_id": "thin", "op": "set_status", "level": "ad", "id": "ad9", "status": "approved",
         "params": {"status": "ACTIVE"},
         "evidence": {"metric_name": "blended_roas", "metric_value": 2.0,
-                     "window": "2026-06-19..2026-06-24", "sample_purchases": 9.0,
+                     "window": "2026-06-19..2026-06-24", "sample_conversions": 9.0,
                      "sample_spend": 40.0, "entity_level": "ad", "entity_id": "ad9"},
         "confidence": {"band": "high", "data_band": "high", "grounding_band": "high",
                        "grounding_tier": "direct_observation", "factors": [], "would_raise": "",
@@ -4708,7 +4708,7 @@ def test_build_duplicate_ad_plan_grounds_on_proven_winner() -> None:
     )
     op = plan["ops"][0]
     assert op["evidence"]["entity_id"] == "ad1"  # cites the SOURCE ad
-    assert op["evidence"]["sample_purchases"] == 60.0
+    assert op["evidence"]["sample_conversions"] == 60.0
     assert Band[op["confidence"]["band"]] >= Band.medium  # computed from a real sample
     assert op["review"]["verdict"] == "stands"
     op["status"] = "approved"
@@ -4736,7 +4736,7 @@ def test_build_duplicate_ad_plan_abstains_when_source_undelivered() -> None:
     )
     op = plan["ops"][0]
     assert op["evidence"]["entity_id"] == "ad1"  # still names the (undelivered) source
-    assert op["evidence"]["sample_purchases"] == 0.0  # cited zero, not a fabricated band
+    assert op["evidence"]["sample_conversions"] == 0.0  # cited zero, not a fabricated band
     assert op["confidence"]["band"] == "abstain"
     assert op["review"]["verdict"] == "insufficient"
     op["status"] = "approved"
@@ -4771,7 +4771,7 @@ def test_build_duplicate_ad_plan_install_goal_grounds_on_installs() -> None:
     )
     op = plan["ops"][0]
     assert op["evidence"]["metric_name"] == "cost_per_app_install"
-    assert op["evidence"]["sample_purchases"] == 120.0  # installs ground the sample, not the 0 purchases
+    assert op["evidence"]["sample_conversions"] == 120.0  # installs ground the sample, not the 0 purchases
     assert Band[op["confidence"]["band"]] > Band.low  # 120 installs → clears low/abstain
     assert op["review"]["verdict"] == "stands"
 
@@ -4799,7 +4799,7 @@ def test_build_duplicate_ad_plan_roas_goal_ignores_app_installs_decoy() -> None:
     )
     op = plan["ops"][0]
     assert op["evidence"]["metric_name"] == "blended_roas"
-    assert op["evidence"]["sample_purchases"] == 60.0  # purchases, NOT the 999 install decoy
+    assert op["evidence"]["sample_conversions"] == 60.0  # purchases, NOT the 999 install decoy
 
 
 def test_build_duplicate_ad_plan_install_goal_no_row_still_cites_zero_and_abstains() -> None:
@@ -4818,7 +4818,7 @@ def test_build_duplicate_ad_plan_install_goal_no_row_still_cites_zero_and_abstai
         date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
     )
     op = plan["ops"][0]
-    assert op["evidence"]["sample_purchases"] == 0.0  # zero branch is goal-independent
+    assert op["evidence"]["sample_conversions"] == 0.0  # zero branch is goal-independent
     assert op["confidence"]["band"] == "abstain"
     assert op["review_verdict"] == "insufficient"
 
@@ -4847,7 +4847,7 @@ def test_build_duplicate_ad_plan_no_goal_installs_present_keeps_sample_on_purcha
     )
     op = plan["ops"][0]
     assert op["evidence"]["metric_name"] == "cost_per_app_install"  # no goal + installs present
-    assert op["evidence"]["sample_purchases"] == 30.0  # but the sample stays on purchases
+    assert op["evidence"]["sample_conversions"] == 30.0  # but the sample stays on purchases
 
 
 def test_authoring_netnew_create_abstains_insufficient_and_non_executable() -> None:
@@ -4884,7 +4884,7 @@ def test_authoring_lookalike_structural_abstain_is_creatable() -> None:
     )
     op = plan["ops"][0]
     assert op["confidence"]["band"] == "abstain"
-    assert op["evidence"]["sample_purchases"] is None  # structural — no fabricated sample
+    assert op["evidence"]["sample_conversions"] is None  # structural — no fabricated sample
     assert op["evidence"]["entity_id"] == "a1"  # names the seed audience
     assert op["review"]["verdict"] == "stands"  # structural abstain, NOT insufficient
     op["status"] = "approved"
@@ -5268,7 +5268,7 @@ def test_build_budget_plan_install_goal_grounds_sample_on_installs() -> None:
     )
     op = plan["ops"][0]
     assert op["evidence"]["metric_name"] == "cost_per_app_install"
-    assert op["evidence"]["sample_purchases"] == 120.0  # installs ground the sample, not purchases
+    assert op["evidence"]["sample_conversions"] == 120.0  # installs ground the sample, not purchases
     assert Band[op["confidence"]["band"]] > Band.low
     assert op["review"]["verdict"] == "stands"
 
@@ -5285,7 +5285,7 @@ def test_build_budget_plan_roas_goal_ignores_app_installs_decoy() -> None:
     )
     op = plan["ops"][0]
     assert op["evidence"]["metric_name"] == "blended_roas"
-    assert op["evidence"]["sample_purchases"] == 120.0  # purchases, NOT the 999 install decoy
+    assert op["evidence"]["sample_conversions"] == 120.0  # purchases, NOT the 999 install decoy
 
 
 def test_build_budget_plan_install_goal_no_installs_thin_row_abstains_and_blocks() -> None:
@@ -5301,7 +5301,7 @@ def test_build_budget_plan_install_goal_no_installs_thin_row_abstains_and_blocks
         date_from="2026-06-19", date_to="2026-06-24", run_date="2026-06-25",
     )
     op = plan["ops"][0]
-    assert op["evidence"]["sample_purchases"] is None  # app_installs absent → None, but row IS present
+    assert op["evidence"]["sample_conversions"] is None  # app_installs absent → None, but row IS present
     assert op["evidence"]["sample_spend"] == 40.0      # still a cited sample
     assert op["confidence"]["band"] == "abstain"
     op["status"] = "approved"
@@ -5632,7 +5632,7 @@ def test_read_experiment_significant_reads_high_confidence_ab_experiment() -> No
     assert r["confidence"]["grounding_tier"] == "ab_experiment"
     assert r["confidence"]["causal_flag"] is False          # the A/B IS the causal instrument
     ev = r["evidence"]
-    assert ev["entity_level"] == "ad" and ev["sample_purchases"] == 100   # weaker arm governs
+    assert ev["entity_level"] == "ad" and ev["sample_conversions"] == 100   # weaker arm governs
     assert ev["regenerating_query"] == (
         "account_metrics --account demo --level ad --date-from 2026-06-01 --date-to 2026-06-24"
     )
@@ -5769,7 +5769,7 @@ def _recent_evidence(*, purchases: float | None, spend: float | None) -> Evidenc
         metric_value=1.20,
         metric_display="ROAS 1.20",
         window="2026-06-10..2026-06-24",
-        sample_purchases=purchases,
+        sample_conversions=purchases,
         sample_spend=spend,
         entity_level="ad",
         entity_id="123",
@@ -5842,7 +5842,7 @@ def test_below_floor_inputs_abstain_not_low() -> None:
 def test_clearing_only_spend_floor_is_thin_on_conversions() -> None:
     # Spend cleared ($500 > $100) but conversions did not (2 < 25): weak data on the outcome → low.
     band, factors = data_strength(
-        sample_purchases=2.0,
+        sample_conversions=2.0,
         sample_spend=500.0,
         spend_floor=100.0,
         conversions_floor=25.0,
@@ -5922,7 +5922,7 @@ def test_build_regenerating_query_exact_string_and_none_on_missing() -> None:
 
 def test_stale_window_rounds_data_band_down_vs_recent() -> None:
     kwargs = dict(
-        sample_purchases=500.0,
+        sample_conversions=500.0,
         sample_spend=50_000.0,
         spend_floor=100.0,
         conversions_floor=25.0,
@@ -5937,7 +5937,7 @@ def test_stale_window_rounds_data_band_down_vs_recent() -> None:
 
 def test_unknown_recency_rounds_down() -> None:
     band, factors = data_strength(
-        sample_purchases=500.0,
+        sample_conversions=500.0,
         sample_spend=50_000.0,
         spend_floor=100.0,
         conversions_floor=25.0,
@@ -5949,7 +5949,7 @@ def test_unknown_recency_rounds_down() -> None:
 
 def test_non_significant_pvalue_caps_data_at_medium() -> None:
     band, factors = data_strength(
-        sample_purchases=500.0,
+        sample_conversions=500.0,
         sample_spend=50_000.0,
         spend_floor=100.0,
         conversions_floor=25.0,
@@ -6086,7 +6086,43 @@ def test_evidence_and_confidence_dicts_round_trip() -> None:
     assert confidence_from_dict(conf_dict).band is Band.high
     rebuilt = evidence_from_dict(evidence_to_dict(evidence))
     assert rebuilt.metric_display == "ROAS 1.20"
-    assert rebuilt.sample_purchases == 120.0
+    assert rebuilt.sample_conversions == 120.0
+
+
+def test_evidence_from_dict_reads_legacy_sample_purchases_key() -> None:
+    """Older action_plan.json files serialized the conversion sample under the legacy
+    ``sample_purchases`` key. After the rename to ``sample_conversions``, both
+    ``evidence_from_dict`` and the dict-reading grounding guard must still pick it up, so
+    stored plans keep loading. Regression pin for the read-both / write-new back-compat."""
+    legacy = {
+        "metric_name": "roas",
+        "metric_value": 1.2,
+        "metric_display": "ROAS 1.20",
+        "window": "2026-06-10..2026-06-24",
+        "sample_purchases": 120.0,  # legacy key only — no sample_conversions present
+        "sample_spend": 2400.0,
+        "entity_level": "ad",
+        "entity_id": "ad_1",
+        "entity_name": "Ad One",
+        "regenerating_query": None,
+    }
+    # evidence_from_dict falls back to the legacy key when the new one is absent.
+    assert evidence_from_dict(legacy).sample_conversions == 120.0
+
+    # The write-grounding abstain guard reads the serialized dict directly: a legacy cited
+    # sample under an abstain band must still trip the thin-data block (not be treated as a
+    # structural abstain just because the key is the old spelling).
+    assert op_grounding_gap({"band": "abstain"}, legacy) is not None
+    # Structural abstain (neither sample key present) is still allowed through.
+    structural = {k: v for k, v in legacy.items() if k != "sample_purchases"}
+    structural["sample_spend"] = None
+    assert op_grounding_gap({"band": "abstain"}, structural) is None
+
+    # Mixed-key dict: the current key wins over the legacy one...
+    assert evidence_from_dict({**legacy, "sample_conversions": 7.0}).sample_conversions == 7.0
+    # ...and an explicit ``sample_conversions: null`` is honored as None, NOT a fall-through
+    # to the legacy key (zero/None must not be treated as "missing").
+    assert evidence_from_dict({**legacy, "sample_conversions": None}).sample_conversions is None
 
 
 # ---------------------------------------------------------------------------
@@ -6173,7 +6209,7 @@ def test_action_plan_pause_carries_high_confidence_and_direct_observation(tmp_pa
     assert evidence["metric_name"] == "blended_roas"
     assert evidence["metric_display"] == "ROAS 1.20"
     assert evidence["window"] == "2026-06-10..2026-06-24"
-    assert evidence["sample_purchases"] == 120.0
+    assert evidence["sample_conversions"] == 120.0
     assert evidence["sample_spend"] == 2400.0
     assert evidence["entity_level"] == "ad"
     assert evidence["entity_id"] == "123"
@@ -6206,7 +6242,7 @@ def test_action_plan_pause_with_43_purchases_reads_medium_under_calibrated_knee(
     assert pause["confidence"]["band"] == "medium"
     assert pause["confidence"]["grounding_tier"] == "direct_observation"
     assert pause["executable"] is True
-    assert pause["evidence"]["sample_purchases"] == 43.0
+    assert pause["evidence"]["sample_conversions"] == 43.0
     assert pause["evidence"]["regenerating_query"] is not None
 
 
@@ -6276,7 +6312,7 @@ def test_action_plan_install_goal_grounds_significance_on_app_installs(tmp_path,
     assert pause["confidence"]["band"] not in {"low", "abstain"}
     # Significance is grounded on the installs that actually back the call, not the (zero) purchases.
     evidence = pause["evidence"]
-    assert evidence["sample_purchases"] == 100.0
+    assert evidence["sample_conversions"] == 100.0
     assert evidence["metric_name"] == "cost_per_app_install"
     assert pause["executable"] is True
 
@@ -6304,7 +6340,7 @@ def test_action_plan_install_goal_grounds_on_subscriptions_not_installs(tmp_path
 
     pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
     # Grounds on the 3 subscriptions, NOT the 80 installs.
-    assert pause["evidence"]["sample_purchases"] == 3.0
+    assert pause["evidence"]["sample_conversions"] == 3.0
     # 3 conversions is below the 25 floor (spend cleared) → thin-on-conversions → low. Conservative,
     # and exactly the intended behavior: subscriptions are thin, so the call stays thin.
     assert pause["confidence"]["band"] == "low"
@@ -6337,7 +6373,7 @@ def test_action_plan_install_goal_abstains_when_both_signals_and_spend_are_thin(
     assert pause["executable"] is False
     assert pause["approval_required"] is False
     # The sample grounded on installs (5), and the operator-facing rationale says "conversions".
-    assert pause["evidence"]["sample_purchases"] == 5.0
+    assert pause["evidence"]["sample_conversions"] == 5.0
     assert "conversions" in pause["rationale"]
 
 
@@ -6359,7 +6395,7 @@ def test_action_plan_roas_goal_still_grounds_on_purchase_count(tmp_path, monkeyp
     )
 
     pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
-    assert pause["evidence"]["sample_purchases"] == 120.0  # the purchase count, not 999
+    assert pause["evidence"]["sample_conversions"] == 120.0  # the purchase count, not 999
     assert pause["evidence"]["metric_name"] == "blended_roas"
 
 

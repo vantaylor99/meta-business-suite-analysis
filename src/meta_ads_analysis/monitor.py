@@ -113,7 +113,7 @@ def classify_ad(
     metric_display = f"ROAS {roas:.2f}" if roas is not None else "ROAS n/a"
     evidence = Evidence(
         metric_name="roas", metric_value=roas, metric_display=metric_display,
-        window="n/a", sample_purchases=results, sample_spend=spend,
+        window="n/a", sample_conversions=results, sample_spend=spend,
         entity_level="ad", entity_id=None, entity_name=None, regenerating_query=None,
     )
 
@@ -365,7 +365,7 @@ def _early_life_forced_decision(
             metric_value=roas_val,
             metric_display=f"ROAS {roas_val:.2f}" if roas_val is not None else "ROAS n/a",
             window=f"{win_from}..{to}",
-            sample_purchases=m.get("purchases"),
+            sample_conversions=m.get("purchases"),
             sample_spend=round(spend, 2),
             entity_level="ad",
             entity_id=ad_id,
@@ -547,7 +547,7 @@ def _forced_decision_install(
         metric_value=cpi,
         metric_display=f"cost/install ${cpi:.2f}" if cpi is not None else "cost/install n/a",
         window=f"{win_from}..{to}",
-        sample_purchases=own.results,  # installs as the conversion count (assess is metric-agnostic)
+        sample_conversions=own.results,  # installs as the conversion count (assess is metric-agnostic)
         sample_spend=round(spend, 2),
         entity_level="ad",
         entity_id=ad_id,
@@ -830,7 +830,7 @@ def build_watch_report(
         evidence = Evidence(
             metric_name="roas", metric_value=roas_val,
             metric_display=f"ROAS {roas_val:.2f}" if roas_val is not None else "ROAS n/a",
-            window=f"{win_from}..{to}", sample_purchases=m.get("purchases"), sample_spend=round(spend, 2),
+            window=f"{win_from}..{to}", sample_conversions=m.get("purchases"), sample_spend=round(spend, 2),
             entity_level="ad", entity_id=ad_id, entity_name=info.get("name"),
             regenerating_query=build_regenerating_query(account_slug, "ad", win_from, to),
         )

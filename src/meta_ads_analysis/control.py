@@ -699,7 +699,7 @@ def _attach_status_grounding(
             metric_value=None,
             metric_display=metric_display,
             window=f"{date_from}..{date_to}" if (date_from or date_to) else "",
-            sample_purchases=None,
+            sample_conversions=None,
             sample_spend=None,
             entity_level="ad",
             entity_id=_optional_str(ad.get("id")),
@@ -712,7 +712,7 @@ def _attach_status_grounding(
             metric_value=None,
             metric_display=metric_display,
             window=f"{date_from}..{date_to}",
-            sample_purchases=0.0,
+            sample_conversions=0.0,
             sample_spend=0.0,
             entity_level="ad",
             entity_id=_optional_str(ad.get("id")),
@@ -725,7 +725,7 @@ def _attach_status_grounding(
             metric_value=metric_value,
             metric_display=metric_display,
             window=f"{date_from}..{date_to}",
-            sample_purchases=sample_conversions,
+            sample_conversions=sample_conversions,
             sample_spend=_num(metrics_row.get("spend")) or 0.0,
             entity_level="ad",
             entity_id=_optional_str(ad.get("id")),
@@ -1384,14 +1384,14 @@ def _attach_budget_grounding(
     if row is None:
         evidence = Evidence(
             metric_name=metric_name, metric_value=None, metric_display=metric_display, window=window,
-            sample_purchases=0.0, sample_spend=0.0, entity_level=level,
+            sample_conversions=0.0, sample_spend=0.0, entity_level=level,
             entity_id=_optional_str(entity_id), entity_name=None,
             regenerating_query=build_regenerating_query(account_slug, level, date_from, date_to),
         )
     else:
         evidence = Evidence(
             metric_name=metric_name, metric_value=metric_value, metric_display=metric_display,
-            window=window, sample_purchases=_status_sample_conversions(row, goal),
+            window=window, sample_conversions=_status_sample_conversions(row, goal),
             sample_spend=_num(row.get("spend")) or 0.0, entity_level=level,
             entity_id=_optional_str(entity_id), entity_name=row.get("name"),
             regenerating_query=build_regenerating_query(account_slug, level, date_from, date_to),

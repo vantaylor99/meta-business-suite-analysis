@@ -378,7 +378,7 @@ def triage_ad(
         metric_value=metric_value,
         metric_display=_fmt_metric(metric_value, kind),
         window=window,
-        sample_purchases=triaged_sums.results,
+        sample_conversions=triaged_sums.results,
         sample_spend=round(triaged_sums.spend, 2),
         entity_level="ad",
         entity_id=ad_id,

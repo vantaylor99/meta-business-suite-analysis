@@ -28,6 +28,7 @@ from .confidence import (
     build_regenerating_query,
     confidence_to_dict,
     evidence_to_dict,
+    sample_conversions_from_dict,
 )
 from .meta_api import MetaApiError, MetaMarketingApiClient, client_from_env
 from .reader_provider import MetaReaderProvider, as_reader, reader_from_env
@@ -554,7 +555,7 @@ def evaluate_action_confidence(
         metric_value=metric_value,
         metric_display=metric_display,
         window=window,
-        sample_purchases=_select_sample_conversions(ad, goal),
+        sample_conversions=_select_sample_conversions(ad, goal),
         sample_spend=_number(ad.get("total_spend")),
         entity_level="ad",
         entity_id=_optional_str(ad.get("ad_id")),
@@ -612,7 +613,7 @@ def _abstain_action(
     action["approval_required"] = False
     action["verdict"] = "insufficient_data"
     verb = "scaling" if action_type == "increase_adset_budget" else "pausing"
-    conversions = _fmt_sample_count(evidence_block.get("sample_purchases"))
+    conversions = _fmt_sample_count(sample_conversions_from_dict(evidence_block))
     spend = evidence_block.get("sample_spend")
     spend_str = f"${spend:,.0f}" if isinstance(spend, (int, float)) else "n/a"
     window = evidence_block.get("window") or "n/a"
