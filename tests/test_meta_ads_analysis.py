@@ -64,6 +64,11 @@ from meta_ads_analysis.early_triage import (
     AdDailyPoint,
     AdHistory,
     DuckDBHistoryProvider,
+    OWN_SAMPLE_INSUFFICIENT,
+    OWN_SAMPLE_KEEP,
+    OWN_SAMPLE_PAUSE,
+    classify_own_sample,
+    goal_kind,
     group_histories,
     triage_ad,
 )
@@ -7519,6 +7524,75 @@ def _install_ad(ad_id, *, days, daily_spend=5.0, recover_from=None, start=_TRIAG
         else:
             points.append(_point(start + timedelta(days=i), spend=daily_spend))
     return _hist(ad_id, points)
+
+
+# --- classify_own_sample: direct unit coverage of the goal-aware own-window grade -----------------
+# (The monitor's _forced_decision_install exercises this through build_watch_report; these pin the
+# pure-function branches directly — including the ones the monitor tests don't reach.)
+
+_OWN_INSTALL_POLICY = {"primary_goal": "maximize_in_app_subscriptions",
+                       "secondary_cost_per_app_install_target": 3.0}
+
+
+def _own(**kw):
+    base = dict(spend=300.0, purchase_value=None, purchases=None, app_installs=None,
+               policy=_OWN_INSTALL_POLICY, roas_floor=1.5, roas_target=3.0, min_spend=100.0)
+    base.update(kw)
+    return classify_own_sample(**base)
+
+
+def test_classify_own_sample_install_cheap_installs_keeps() -> None:
+    v = _own(app_installs=200.0)  # $300 / 200 = $1.50 <= $3.00 target
+    assert v.verdict == OWN_SAMPLE_KEEP
+    assert v.kind == "install"
+    assert v.metric_name == "cost_per_app_install"
+    assert v.metric_value == 1.5
+    assert v.target == 3.0
+    assert v.results == 200.0
+
+
+def test_classify_own_sample_install_expensive_installs_pauses() -> None:
+    v = _own(app_installs=50.0)  # $300 / 50 = $6.00 > $3.00 target
+    assert v.verdict == OWN_SAMPLE_PAUSE
+    assert v.metric_value == 6.0
+    assert "6.00" in v.reasons[0] and "3.00" in v.reasons[0]
+
+
+def test_classify_own_sample_install_zero_installs_pauses_with_undefined_metric() -> None:
+    # Cleared the spend floor but booked ~0 installs → struggling → pause, and the metric is undefined
+    # (no divide-by-zero); the reason names the zero-result case rather than a cost figure.
+    v = _own(app_installs=0.0)
+    assert v.verdict == OWN_SAMPLE_PAUSE
+    assert v.metric_value is None
+    assert "installs" in v.reasons[0]
+
+
+def test_classify_own_sample_below_min_spend_is_insufficient() -> None:
+    v = _own(spend=60.0, app_installs=200.0)  # < min_spend 100 → defer to analogs
+    assert v.verdict == OWN_SAMPLE_INSUFFICIENT
+    assert v.target is None
+
+
+def test_classify_own_sample_install_no_target_is_insufficient_even_above_floor() -> None:
+    # Install goal but NO cost target configured: above the spend floor it still defers to the analog
+    # path (which degrades such accounts to keep) rather than guessing a threshold. This monitor-side
+    # path is otherwise unexercised — the watch tests only hit the below-floor insufficient branch.
+    v = _own(policy={"primary_goal": "maximize_in_app_subscriptions"}, app_installs=200.0)
+    assert v.verdict == OWN_SAMPLE_INSUFFICIENT
+    assert v.target is None
+
+
+def test_classify_own_sample_roas_kind_grades_on_roas() -> None:
+    # classify_own_sample is public and goal-generic: a ROAS account grades on ROAS, not installs.
+    assert goal_kind({"primary_goal": "roas"}) == "roas"
+    # ROAS = purchase_value / spend; purchases is the result-count gate (zero purchases is struggling
+    # regardless of value), so supply both for a coherent sample.
+    keep = _own(policy={"primary_goal": "roas"}, purchase_value=900.0, purchases=10.0)  # ROAS 3.0 >= 1.5
+    assert keep.verdict == OWN_SAMPLE_KEEP
+    assert keep.kind == "roas"
+    assert keep.metric_name == "blended_roas"
+    pause = _own(policy={"primary_goal": "roas"}, purchase_value=150.0, purchases=10.0)  # ROAS 0.5 < 1.5
+    assert pause.verdict == OWN_SAMPLE_PAUSE
 
 
 def test_early_triage_keep_watch_when_comparable_new_ads_recovered() -> None:
