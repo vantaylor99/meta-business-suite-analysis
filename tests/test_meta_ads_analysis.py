@@ -3618,6 +3618,53 @@ def test_enable_ads_install_goal_above_cost_target_is_refuted() -> None:
     assert op["confidence"]["band"] == "medium"  # refuted is a warning, not a band-cap
 
 
+def test_enable_ads_install_goal_at_target_cost_enable_stands() -> None:
+    # Strict-boundary: cost/install == target ($120 / 40 installs = $3.00, target $3.00).
+    # The branch uses cost > target (strict), so landing exactly on the threshold must stand.
+    # Guards against a future > → >= slip that would silently start refuting cheap re-enables.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Exact", "spend": "120",
+        "actions": [{"action_type": "mobile_app_install", "value": "40"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1",
+        policy={
+            "primary_goal": "maximize_in_app_subscriptions",
+            "secondary_cost_per_app_install_target": 3.0,
+        },
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["metric_value"] == 3.0  # $120 / 40 installs
+    assert op["review"]["verdict"] != "refuted"
+    assert op["review"]["verdict"] == "stands"
+    assert "direction" not in op["review"]["failed_inputs"]
+
+
+def test_enable_ads_install_goal_below_target_cost_enable_stands() -> None:
+    # Clear winner: cost/install ($2.00 = $80 / 40 installs) is well below the $3.00 target.
+    # A genuinely cheap re-enable must not be flagged — the direction gate must not fire.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Winner", "spend": "80",
+        "actions": [{"action_type": "mobile_app_install", "value": "40"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1",
+        policy={
+            "primary_goal": "maximize_in_app_subscriptions",
+            "secondary_cost_per_app_install_target": 3.0,
+        },
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["metric_value"] == 2.0  # $80 / 40 installs
+    assert op["review"]["verdict"] != "refuted"
+    assert op["review"]["verdict"] == "stands"
+    assert "direction" not in op["review"]["failed_inputs"]
+
+
 def test_enable_ads_cold_ad_with_target_stays_insufficient_not_refuted() -> None:
     # A cold ad cites a ZERO sample → metric_value is None → the direction rule can't fire even with a
     # target configured. It must stay `insufficient` (keep observing), never flip to `refuted`, and the
