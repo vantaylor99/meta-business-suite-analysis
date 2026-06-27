@@ -39,6 +39,7 @@ from meta_ads_analysis.confidence import (
     grounding_strength,
     render_confidence_line,
     render_evidence_line,
+    sample_conversions_from_dict,
 )
 from meta_ads_analysis.knowledge_provenance import (
     AUDIT_CONFIRMED,
@@ -6123,6 +6124,27 @@ def test_evidence_from_dict_reads_legacy_sample_purchases_key() -> None:
     # ...and an explicit ``sample_conversions: null`` is honored as None, NOT a fall-through
     # to the legacy key (zero/None must not be treated as "missing").
     assert evidence_from_dict({**legacy, "sample_conversions": None}).sample_conversions is None
+
+
+def test_sample_conversions_from_dict_branches() -> None:
+    """Direct contract pin for the shared read helper that all four serialized-dict read
+    sites route through. ``.get(new, default)`` semantics, not ``or``-chaining, so a cited
+    ``0.0`` is a real value (cited-zero cold branch) and must NOT collapse to "missing" and
+    fall through to the legacy key."""
+    # Current key present.
+    assert sample_conversions_from_dict({"sample_conversions": 42.0}) == 42.0
+    # Legacy-only fallback.
+    assert sample_conversions_from_dict({"sample_purchases": 9.0}) == 9.0
+    # Current key wins over legacy when both present.
+    assert sample_conversions_from_dict({"sample_conversions": 1.0, "sample_purchases": 9.0}) == 1.0
+    # Explicit None on the current key is honored — no fall-through to a present legacy key.
+    assert sample_conversions_from_dict({"sample_conversions": None, "sample_purchases": 9.0}) is None
+    # Cited zero under the current key is a real value, not "missing" — no fall-through.
+    assert sample_conversions_from_dict({"sample_conversions": 0.0, "sample_purchases": 9.0}) == 0.0
+    # Cited zero under the legacy key is likewise preserved.
+    assert sample_conversions_from_dict({"sample_purchases": 0.0}) == 0.0
+    # Neither key present → None.
+    assert sample_conversions_from_dict({}) is None
 
 
 # ---------------------------------------------------------------------------
