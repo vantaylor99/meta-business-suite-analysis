@@ -616,6 +616,29 @@ def _status_metric(
     return "blended_roas", None, _fmt_roas(None)
 
 
+def _status_sample_conversions(
+    metrics_row: dict[str, Any] | None, goal: str | None
+) -> float | None:
+    """Conversion count that grounds a set_status / budget op's significance band — goal-aware so the
+    sample speaks the SAME conversion language as :func:`_status_metric` and
+    ``actions._select_sample_conversions``.
+
+    - install goal (``maximize_in_app_subscriptions``) → ``app_installs`` (the conversion behind the
+      cited ``cost_per_app_install`` metric). The metrics_row built by :func:`fetch_entity_metrics`
+      carries no separate subscription count, so the action plan's subscriptions-first ladder collapses
+      to the install count here.
+    - ROAS / default / unknown goal → ``purchases`` (unchanged behaviour).
+
+    Keys on the literal goal string ONLY — exactly as ``actions._select_sample_conversions`` does. The
+    no-goal-but-installs-present case (where :func:`_status_metric` falls through to
+    ``cost_per_app_install``) deliberately stays on purchases, for parity with the action plan.
+    """
+    row = metrics_row or {}
+    if goal == "maximize_in_app_subscriptions":
+        return _num(row.get("app_installs"))
+    return _num(row.get("purchases"))
+
+
 def _resolve_grounding_window(
     date_from: str | None, date_to: str | None, run_date: str | None
 ) -> tuple[str, str, int | None, str]:
@@ -640,6 +663,7 @@ def _attach_status_grounding(
     metric_name: str,
     metric_value: float | None,
     metric_display: str,
+    sample_conversions: float | None,
     account_slug: str | None,
     date_from: str,
     date_to: str,
@@ -650,10 +674,15 @@ def _attach_status_grounding(
     :func:`write_grounding.attach_op_grounding`. The sample is the entity's own delivery over the
     window; the band is computed (or abstained) — never free-typed.
 
+    ``sample_conversions`` is the conversion count cited as the present-row significance sample, chosen
+    by the CALL SITE so it agrees with the metric that call site picked (goal-aware installs for an
+    install-goal enable; purchases for the ROAS-selected ``roas_below`` pause). It is used only in the
+    present-row branch — the ``metrics_row is None`` branches cite ``None``/zero regardless of goal.
+
     ``cold_cites_zero`` decides what "no recent delivery" means, and this is the whole asymmetry
     between turning an ad ON vs OFF:
 
-    - **enable (True):** an ad with no recent insights cites a *zero* purchases/spend sample — an
+    - **enable (True):** an ad with no recent insights cites a *zero* conversions/spend sample — an
       honest "this ad spent $0 in the window." Below the floor, ``assess`` abstains, and because the
       sample IS cited the apply-time gate BLOCKS the write: you cannot confidently turn ON an ad with
       no evidence it still works (the cold-ad boundary).
@@ -696,7 +725,7 @@ def _attach_status_grounding(
             metric_value=metric_value,
             metric_display=metric_display,
             window=f"{date_from}..{date_to}",
-            sample_purchases=_num(metrics_row.get("purchases")),
+            sample_purchases=sample_conversions,
             sample_spend=_num(metrics_row.get("spend")) or 0.0,
             entity_level="ad",
             entity_id=_optional_str(ad.get("id")),
@@ -793,6 +822,7 @@ def build_enable_ads_plan(
             metric_name=metric_name,
             metric_value=metric_value,
             metric_display=metric_display,
+            sample_conversions=_status_sample_conversions(metrics_row, goal),
             account_slug=account_slug,
             date_from=date_from,
             date_to=date_to,
@@ -1249,6 +1279,9 @@ def build_pause_plan(
             metric_name="blended_roas",
             metric_value=_num((metrics_row or {}).get("roas")),
             metric_display=_fmt_roas(_num((metrics_row or {}).get("roas"))),
+            # ROAS-selected pause → the sample agrees with the hardcoded blended_roas metric, NOT the
+            # account goal (an install-goal account cited ROAS here, so it cites purchases too).
+            sample_conversions=_num((metrics_row or {}).get("purchases")),
             account_slug=account_slug,
             date_from=window_from,
             date_to=window_to,
@@ -1340,7 +1373,9 @@ def _attach_budget_grounding(
     """Attach the budget move's grounding: the entity's OWN metric (ROAS / cost-per-install by goal)
     over the window, as a cited sample, plus a computed band. An entity with no delivery in the window
     cites a ZERO sample → abstain → the apply-time gate blocks the swing (no confident budget move on
-    thin/absent data — the '9 purchases over 5 days' guard). Each op grounds on its own level's metric,
+    thin/absent data — the '9 conversions over 5 days' guard). The cited conversion sample is
+    goal-aware (:func:`_status_sample_conversions`), so it speaks the same language as the goal-aware
+    metric. Each op grounds on its own level's metric,
     so a CBO redirect's campaign op carries CAMPAIGN evidence, never a copy of the ad set's."""
     rows = fetch_entity_metrics(reader, ad_account_id, level=level, date_from=date_from, date_to=date_to)
     row = next((m for m in rows if str(m.get("id")) == str(entity_id)), None)
@@ -1356,7 +1391,7 @@ def _attach_budget_grounding(
     else:
         evidence = Evidence(
             metric_name=metric_name, metric_value=metric_value, metric_display=metric_display,
-            window=window, sample_purchases=_num(row.get("purchases")),
+            window=window, sample_purchases=_status_sample_conversions(row, goal),
             sample_spend=_num(row.get("spend")) or 0.0, entity_level=level,
             entity_id=_optional_str(entity_id), entity_name=row.get("name"),
             regenerating_query=build_regenerating_query(account_slug, level, date_from, date_to),
