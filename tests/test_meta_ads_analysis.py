@@ -3010,6 +3010,75 @@ def test_rotation_adset_with_no_window_row_cites_zero_sample_and_abstains() -> N
     assert op["review_verdict"] == "insufficient"
 
 
+def _rotation_install_row(adset_id, name, *, app_installs, spend, purchases=0.0):
+    """A fetch_entity_metrics-shaped row for an install-goal ad set: real install volume, ~0 purchases
+    (the conversion an install account never produces)."""
+    return {"id": adset_id, "name": name, "spend": float(spend), "roas": None,
+            "purchases": float(purchases), "app_installs": float(app_installs),
+            "cost_per_app_install": round(spend / app_installs, 2) if app_installs else None}
+
+
+def test_rotation_install_goal_grounds_on_installs_clears_low() -> None:
+    # The fix for the rotation write path: an install-goal account has purchases≈0 but real install
+    # volume. The fatigue sample must be the install count (the conversion behind the goal-aware
+    # cost-per-install metric), so the band clears low/abstain instead of being structurally pinned
+    # there. Correlational tier still caps it at medium — never high.
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_install_row(a["id"], a["name"], app_installs=120, spend=2400)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics,
+                               goal="maximize_in_app_subscriptions", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["sample_purchases"] == 120.0  # installs ground the sample, not the 0 purchases
+    assert Band[op["confidence"]["band"]] > Band.low  # 120 installs clears low/abstain
+    assert op["confidence"]["band"] == "medium"  # correlational cap (never high) per ROTATION_EVIDENCE_TIER
+    assert op["review"]["verdict"] == "stands"
+
+
+def test_rotation_roas_goal_ignores_app_installs_decoy() -> None:
+    # Parity guard: on a ROAS/default goal the fatigue sample stays purchases. An app_installs decoy in
+    # the row must be ignored — byte-identical to a purchases-only fixture (band still medium for 120).
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: {"id": a["id"], "name": a["name"], "spend": 2400.0, "roas": 1.0,
+                         "purchases": 120.0, "app_installs": 999.0,  # decoy — must be ignored
+                         "cost_per_app_install": 2.4}
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal="roas", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["evidence"]["metric_name"] == "blended_roas"
+    assert op["evidence"]["sample_purchases"] == 120.0  # purchases, NOT the 999 install decoy
+    assert op["confidence"]["band"] == "medium"
+
+
+def test_rotation_install_goal_no_window_row_still_cites_zero_and_abstains() -> None:
+    # The zero-sample branch (ad set absent from the metrics map) is goal-independent: the goal-aware
+    # selector touches ONLY the present-row branch. An install-goal rotation with no row still cites a
+    # ZERO sample → abstain, exactly as a ROAS-goal one does.
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id={},
+                               goal="maximize_in_app_subscriptions", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["evidence"]["sample_purchases"] == 0.0 and op["evidence"]["sample_spend"] == 0.0
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review_verdict"] == "insufficient"
+
+
+def test_rotation_install_goal_structural_abstain_when_no_metrics() -> None:
+    # The structural (metrics_by_id is None) branch is also goal-independent: no sample is cited at all
+    # regardless of goal, so the goal-aware selector is never reached.
+    adsets = _three_adset_partition()
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=None,
+                               goal="maximize_in_app_subscriptions", **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["evidence"]["sample_purchases"] is None  # structural — no cited sample
+    assert op["confidence"]["band"] == "abstain"
+
+
 def test_apply_rotation_blocks_approved_thin_sample_at_execute() -> None:
     # An operator approves a rotation whose fatigue sample is below the significance floor (cited
     # abstain). The propose-time review already marked it insufficient; the apply-time grounding gate
@@ -4660,6 +4729,82 @@ def test_build_duplicate_ad_plan_abstains_when_source_undelivered() -> None:
     assert results[0].status == "blocked"
     assert "insufficient data" in results[0].reason
     assert client.creates == []  # nothing created from an unproven source
+
+
+def test_build_duplicate_ad_plan_install_goal_grounds_on_installs() -> None:
+    # The fix for the authoring write path: an install-goal source ad has purchases≈0 but real install
+    # volume. The duplicate's significance sample must be the install count (the conversion behind the
+    # goal-aware cost-per-install metric), so the band clears low/abstain instead of being pinned there
+    # by the 0 purchases the account never produces.
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    reader = FakeMetaReader(
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "name": "Installer", "creative": {"id": "cr-1"}},
+        fetch_insights=lambda *a, **k: [
+            {"ad_id": "ad1", "ad_name": "Installer", "spend": "1200",
+             "actions": [
+                 {"action_type": "purchase", "value": "0"},  # ~0 purchases — must be ignored
+                 {"action_type": "mobile_app_install", "value": "120"},
+             ]}
+        ],
+    )
+    plan = build_duplicate_ad_plan(
+        reader, "act_1", source_ad_id="ad1", target_adset_id="as2",
+        policy={"primary_goal": "maximize_in_app_subscriptions"},
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["sample_purchases"] == 120.0  # installs ground the sample, not the 0 purchases
+    assert Band[op["confidence"]["band"]] > Band.low  # 120 installs → clears low/abstain
+    assert op["review"]["verdict"] == "stands"
+
+
+def test_build_duplicate_ad_plan_roas_goal_ignores_app_installs_decoy() -> None:
+    # Parity guard: on a ROAS/default goal the significance sample stays purchases. An app_installs
+    # decoy in the source row must be ignored — byte-identical to a purchases-only fixture.
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    reader = FakeMetaReader(
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "name": "Winner", "creative": {"id": "cr-1"}},
+        fetch_insights=lambda *a, **k: [
+            {"ad_id": "ad1", "ad_name": "Winner", "spend": "1200",
+             "action_values": [{"action_type": "purchase", "value": "5040"}],
+             "actions": [
+                 {"action_type": "purchase", "value": "60"},
+                 {"action_type": "mobile_app_install", "value": "999"},  # decoy — must be ignored
+             ]}
+        ],
+    )
+    plan = build_duplicate_ad_plan(
+        reader, "act_1", source_ad_id="ad1", target_adset_id="as2",
+        policy={"primary_goal": "roas"},
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["metric_name"] == "blended_roas"
+    assert op["evidence"]["sample_purchases"] == 60.0  # purchases, NOT the 999 install decoy
+
+
+def test_build_duplicate_ad_plan_install_goal_no_row_still_cites_zero_and_abstains() -> None:
+    # The no-row (zero-sample) branch is goal-independent: the goal-aware selector touches ONLY the
+    # present-row branch. An install-goal source with no delivery still cites a ZERO sample → abstain,
+    # exactly as a ROAS-goal one does (see test_build_duplicate_ad_plan_abstains_when_source_undelivered).
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    reader = FakeMetaReader(
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "name": "Cold", "creative": {"id": "cr-1"}},
+        fetch_insights=lambda *a, **k: [],  # no delivery → no row for the source ad
+    )
+    plan = build_duplicate_ad_plan(
+        reader, "act_1", source_ad_id="ad1", target_adset_id="as2",
+        policy={"primary_goal": "maximize_in_app_subscriptions"},
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["sample_purchases"] == 0.0  # zero branch is goal-independent
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review_verdict"] == "insufficient"
 
 
 def test_authoring_netnew_create_abstains_insufficient_and_non_executable() -> None:
