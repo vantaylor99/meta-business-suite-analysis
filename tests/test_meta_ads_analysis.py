@@ -26,6 +26,7 @@ from meta_ads_analysis.confidence import (
     Evidence,
     EvidenceTier,
     abstain_confidence,
+    analog_confidence,
     assess,
     build_regenerating_query,
     combine_bands,
@@ -58,6 +59,13 @@ from meta_ads_analysis.knowledge_provenance import (
     plan_edits,
     render_report,
     select_auditable,
+)
+from meta_ads_analysis.early_triage import (
+    AdDailyPoint,
+    AdHistory,
+    DuckDBHistoryProvider,
+    group_histories,
+    triage_ad,
 )
 from meta_ads_analysis.meta_api import MetaApiError, MetaMarketingApiClient
 from meta_ads_analysis.normalize import ingest_raw_exports
@@ -1272,13 +1280,16 @@ def test_operator_brief_renders_high_confidence_evidence_and_recheck_line() -> N
     assert "🟢 High (~80–100%)" in markdown
     assert "ROAS 1.20" in markdown                       # the number
     assert "2026-06-10..2026-06-24" in markdown          # the time window
-    assert "120 purchases" in markdown                   # the sample size
+    assert "120 conversions" in markdown                 # the sample size
     assert "ad:123 'Cody - Copy'" in markdown            # which ad
     assert (
         "Re-check: account_metrics --account divine_designs --level ad "
         "--date-from 2026-06-10 --date-to 2026-06-24"
     ) in markdown
     assert "Would raise:" in markdown and "Would lower:" in markdown
+    # Goal-neutral wording: the assess() would_raise hint reads "conversions", never "purchases",
+    # so an install account (which never has purchases) is not told to get "more purchases".
+    assert "more conversions" in markdown and "more purchases" not in markdown
 
 
 def test_operator_brief_abstain_action_reads_as_keep_running_not_a_percentage() -> None:
@@ -1522,6 +1533,10 @@ def test_review_below_floor_returns_insufficient() -> None:
     assert result.verdict == "insufficient"
     assert "sample_floor" in result.failed_inputs
     assert any("floor" in reason for reason in result.reasons)
+    # Goal-neutral wording: the below-floor reason reads "conversions", never "purchases", so the
+    # review gate matches the action plan for install accounts that never generate purchases.
+    sample_reason = next(r for r in result.reasons if "floor" in r)
+    assert "conversions" in sample_reason and "purchases" not in sample_reason
 
 
 def test_review_short_window_downgrades() -> None:
@@ -1776,6 +1791,109 @@ def test_review_scale_below_target_refutes() -> None:
     assert result.verdict == "refuted"
     assert "direction" in result.failed_inputs
     assert any("below the 3 target" in reason for reason in result.reasons)
+
+
+def _install_direction_result(
+    action_type: str, cost: float, *, target: float | None = 3.0
+):
+    # Run one install-goal recommendation through the gate on a clean, above-floor sample so only the
+    # cost-polarity `direction` check can fire. The policy carries the install target unless `target`
+    # is None (the missing-target guard case).
+    evidence = _review_evidence(
+        window="2026-06-10..2026-06-24",
+        purchases=120.0,
+        spend=2400.0,
+        metric_value=cost,
+        metric_name="cost_per_app_install",
+    )
+    confidence = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        recency_days=1,
+    )
+    policy = {"primary_goal": "maximize_in_app_subscriptions"}
+    if target is not None:
+        policy["secondary_cost_per_app_install_target"] = target
+    return review_recommendation(
+        evidence=evidence_to_dict(evidence),
+        confidence=confidence_to_dict(confidence),
+        action={"action_type": action_type},
+        policy=policy,
+        spend_floor=75.0,
+        conversions_floor=25.0,
+        min_window_days=7,
+        recency_stale_days=14,
+        recency_days=1,
+    )
+
+
+def test_review_install_scale_above_target_refutes() -> None:
+    # Install goal (cost-per-install, lower-is-better): scaling an entity whose cited cost/install
+    # ($5) sits above the $3 target is scaling a loser — the polarity mirror of a ROAS scale below
+    # target. Refuted (a warning, not a band-cap).
+    result = _install_direction_result("consider_scale_budget", 5.0)
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert any("above the $3 target" in reason for reason in result.reasons)
+    assert any("scaling" in reason for reason in result.reasons)
+    assert result.revised_band is None  # refuted carries no corrected band
+
+
+def test_review_install_pause_below_target_refutes() -> None:
+    # Pausing an entity whose cost/install ($1.50) is comfortably below the $3 target (<= 3/1.5 = $2)
+    # is killing a winner — the mirror of pausing a ROAS winner.
+    result = _install_direction_result("pause_ad", 1.5)
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert any("comfortably below the $3 target" in reason for reason in result.reasons)
+
+
+def test_review_install_budget_cut_below_target_refutes_at_margin_boundary() -> None:
+    # Boundary pin: cost/install ($2.00) sits EXACTLY at the inverted margin (3 / 1.5 = 2.0). The
+    # check uses an inclusive `<=`, so a cut at the boundary IS refuted — guards against a future
+    # `<` slip silently letting it stand.
+    result = _install_direction_result("decrease_adset_budget", 2.0)
+    assert result.verdict == "refuted"
+    assert "direction" in result.failed_inputs
+    assert any("cutting the budget" in reason for reason in result.reasons)
+
+
+def test_review_install_scale_agreeing_with_target_stands() -> None:
+    # A genuine winner: cost/install ($2) below the $3 target — scaling it agrees with the goal, so
+    # the direction check does not fire.
+    result = _install_direction_result("consider_scale_budget", 2.0)
+    assert result.verdict == "stands"
+    assert "direction" not in result.failed_inputs
+
+
+def test_review_install_pause_agreeing_with_target_stands() -> None:
+    # A loser worth pausing: cost/install ($5) above target — pausing it agrees with the goal, so the
+    # direction check does not fire.
+    result = _install_direction_result("pause_ad", 5.0)
+    assert result.verdict == "stands"
+    assert "direction" not in result.failed_inputs
+
+
+def test_review_install_scale_at_target_stands() -> None:
+    # Boundary pin: cost/install ($3.00) sits EXACTLY at the $3 target. The scale branch uses a strict
+    # `>`, so an at-target scale is NOT refuted (mirrors the ROAS scale branch's strict `<`).
+    result = _install_direction_result("increase_adset_budget", 3.0)
+    assert result.verdict == "stands"
+    assert "direction" not in result.failed_inputs
+
+
+def test_review_install_missing_target_does_not_fire() -> None:
+    # Conservative guard: with an install goal but NO secondary_cost_per_app_install_target configured,
+    # the cost-polarity direction check cannot fire — a would-be pause-a-winner stands. Pins the guard
+    # that keeps install-goal accounts without a cost target out of the gate.
+    pause = _install_direction_result("pause_ad", 1.5, target=None)
+    scale = _install_direction_result("consider_scale_budget", 5.0, target=None)
+    assert pause.verdict == "stands"
+    assert "direction" not in pause.failed_inputs
+    assert scale.verdict == "stands"
+    assert "direction" not in scale.failed_inputs
 
 
 def test_review_no_claimed_band_is_defensive_noop() -> None:
@@ -3266,6 +3384,193 @@ def test_review_ops_plan_demotes_overclaimed_enable() -> None:
     assert "review" not in plan["ops"][0]  # input plan not mutated
 
 
+def test_enable_ads_below_target_roas_strong_sample_is_refuted() -> None:
+    # Enabling an ad is directionally a scale-up (0 -> live). A re-enable whose own cited ROAS (1.0)
+    # sits below the account target (2.0) on a statistically STRONG sample is turning a known loser back
+    # on — the gate REFUTES it (the same verdict a below-target budget scale-up gets) so it reaches the
+    # operator named as a loser, not dressed up as a genuine performer. The refutation is a warning, not
+    # a band-cap: the computed band is left intact (still medium for 30 purchases).
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_value"] == 1.0  # $500 revenue / $500 spend
+    assert op["review"]["verdict"] == "refuted"
+    assert "direction" in op["review"]["failed_inputs"]
+    reason = " ".join(op["review"]["reasons"])
+    assert "enabling" in reason and "1.00" in reason and "2 target" in reason
+    assert op["review_verdict"] == "refuted"
+    assert op["confidence"]["band"] == "medium"  # refuted is a warning, not a band-cap
+
+
+def test_enable_ads_exactly_at_target_roas_stands() -> None:
+    # Boundary: ROAS (2.0) sits EXACTLY at target (2.0). The enable branch uses a strict `<` (the
+    # scale-up convention), so an at-target re-enable is NOT refuted — it stands. Pins the intentional
+    # strict-`<` semantics so a future `<=` slip can't silently start refuting break-even re-enables.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "1000"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["evidence"]["metric_value"] == 2.0  # $1000 / $500 — exactly at the 2.0 target
+    assert op["review"]["verdict"] == "stands"  # strict `<`: at-target is not below-target
+    assert "direction" not in op["review"]["failed_inputs"]
+
+
+def test_enable_ads_above_target_roas_stands() -> None:
+    # Same policy, but the cited ROAS (5.0) is comfortably above target — a genuine performer. The
+    # direction rule does NOT fire; the band is computed from the sample and the call stands.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "2500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_value"] == 5.0  # $2500 / $500
+    assert op["review"]["verdict"] == "stands"
+    assert op["confidence"]["band"] == "medium"
+
+
+def test_enable_ads_roas_goal_without_target_does_not_refute() -> None:
+    # Guard pin: with a ROAS goal but NO target_roas configured, the direction rule cannot fire — a
+    # below-1.0 ROAS still stands. This is the guard that keeps the existing computed-band tests green;
+    # pin it so a future refactor can't silently start refuting when no target is set.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(_enable_client(insights), "act_1", policy={"primary_goal": "roas"})
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_value"] == 1.0
+    assert op["review"]["verdict"] == "stands"
+
+
+def test_enable_ads_install_goal_no_cost_target_not_direction_refuted() -> None:
+    # Guard pin (NOT a blanket "ROAS-only" deferral): an install-goal enable is judged on
+    # cost-per-install, but this policy carries only a target_roas — no
+    # secondary_cost_per_app_install_target — so the cost-polarity direction check has no target to fire
+    # against and the enable stands (it already caps at low: the conversion sample is purchases, not
+    # installs). The companion test below pins the refute path when a cost target IS configured.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "actions": [{"action_type": "mobile_app_install", "value": "40"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1",
+        policy={"primary_goal": "maximize_in_app_subscriptions", "target_roas": 2.0},
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["review"]["verdict"] != "refuted"
+    assert op["review"]["verdict"] == "stands"
+    assert op["confidence"]["band"] == "low"
+
+
+def test_enable_ads_install_goal_above_cost_target_is_refuted() -> None:
+    # The install-goal enable-op path with a cost target configured: re-enabling an ad whose computed
+    # cost/install ($12.50 = $500 / 40 installs) sits ABOVE the $3 target is turning a known loser back
+    # on (the cost-polarity mirror of a below-target ROAS re-enable). The gate REFUTES it with an
+    # "enabling" reason. Refuted is a warning, not a band-cap — the computed band (low) is left intact.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "actions": [{"action_type": "mobile_app_install", "value": "40"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1",
+        policy={
+            "primary_goal": "maximize_in_app_subscriptions",
+            "secondary_cost_per_app_install_target": 3.0,
+        },
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["metric_value"] == 12.5  # $500 / 40 installs
+    assert op["review"]["verdict"] == "refuted"
+    assert "direction" in op["review"]["failed_inputs"]
+    reason = " ".join(op["review"]["reasons"])
+    assert "enabling" in reason and "12.50" in reason and "$3 target" in reason
+    assert op["review_verdict"] == "refuted"
+    assert op["confidence"]["band"] == "low"  # refuted is a warning, not a band-cap
+
+
+def test_enable_ads_cold_ad_with_target_stays_insufficient_not_refuted() -> None:
+    # A cold ad cites a ZERO sample → metric_value is None → the direction rule can't fire even with a
+    # target configured. It must stay `insufficient` (keep observing), never flip to `refuted`, and the
+    # apply gate still blocks the approved turn-on.
+    plan = build_enable_ads_plan(
+        _enable_client([]), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["action_type"] == "enable_ad"
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review_verdict"] == "insufficient"
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _enable_client([]), execute=False)
+    blocked = next(r for r in results if r.op_id == op["op_id"])
+    assert blocked.status == "blocked"
+
+
+def test_enable_ads_below_target_and_below_floor_is_insufficient_not_refuted() -> None:
+    # Most-conservative-wins for enables: a below-target ROAS (1.0 < 2.0) on a BELOW-FLOOR sample yields
+    # `insufficient` (rank 3) over `refuted` (rank 2). The apply gate still blocks the approved turn-on.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "40",
+        "action_values": [{"action_type": "purchase", "value": "40"}],
+        "actions": [{"action_type": "purchase", "value": "3"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["evidence"]["metric_value"] == 1.0  # below target, but the sample is below the floor
+    assert op["review"]["verdict"] == "insufficient"
+    assert op["review_verdict"] == "insufficient"
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _enable_client(insights), execute=False)
+    blocked = next(r for r in results if r.op_id == op["op_id"])
+    assert blocked.status == "blocked"
+
+
+def test_enable_ads_refuted_can_still_be_operator_approved() -> None:
+    # `refuted` is a loud warning, not a hard block for ops: the apply gate keys on grounding
+    # (op_grounding_gap), not on review_verdict. An operator who genuinely wants the retest can set the
+    # refuted op to `approved` and it is NOT blocked (its band is grounded/non-abstain) — proving the
+    # refutation refuses to PRESENT a loser as a performer without trapping deliberate operator intent.
+    insights = [{
+        "ad_id": "ad2", "ad_name": "Blocked", "spend": "500",
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+        "actions": [{"action_type": "purchase", "value": "30"}],
+    }]
+    plan = build_enable_ads_plan(
+        _enable_client(insights), "act_1", policy={"primary_goal": "roas", "target_roas": 2.0}
+    )
+    op = next(o for o in plan["ops"] if o["id"] == "ad2")
+    assert op["review_verdict"] == "refuted"
+    assert op["confidence"]["band"] != "abstain"  # grounded — the gate has nothing to block on
+    op["status"] = "approved"
+    results = apply_ops_plan(plan, _enable_client(insights), execute=False)
+    result = next(r for r in results if r.op_id == op["op_id"])
+    assert result.status == "dry_run"  # NOT blocked — refusal is a warning, not a gate
+
+
 def test_enable_ads_review_is_idempotent() -> None:
     from meta_ads_analysis.review import review_ops_plan
 
@@ -4540,6 +4845,54 @@ def test_build_budget_plan_review_refutes_cutting_a_clear_winner() -> None:
     assert op["review"]["verdict"] == "refuted"  # cutting the budget of a clear winner
 
 
+def _bud_install_insights(installs: str, spend: str = "2400"):
+    """An install-goal insights row carrying ad-set + campaign ids and app-install actions, so
+    ``fetch_entity_metrics`` computes cost/install = spend / installs. No purchase actions, so the
+    conversion sample is 0 (install ops cap at low band) — but $2400 spend clears MIN_SCALING_SPEND,
+    so the sample-floor abstain does not fire and the direction refutation surfaces as the verdict."""
+    return [{"spend": spend,
+             "actions": [{"action_type": "mobile_app_install", "value": installs}],
+             "adset_id": "as1", "adset_name": "Set 1", "campaign_id": "c1", "campaign_name": "Camp"}]
+
+
+def test_build_budget_plan_install_goal_refutes_scale_up_above_cost_target() -> None:
+    # End-to-end on the control BUDGET-op surface for an install goal (the composition no other test
+    # drives together: _budget_op's action_type + _status_metric's cost_per_app_install + the gate's
+    # install branch). Scaling up an entity whose cited cost/install ($4 = $2400 / 600) sits ABOVE the
+    # $3 target is scaling a loser — the cost-polarity mirror of the ROAS scale-up-below-target test.
+    loser = _bud_install_insights("600")  # 2400 / 600 = $4.00 cost/install, above $3 target
+    plan = build_budget_plan(
+        _adset_level_client(insights=loser), "act_1", new_daily_budget_cents=11000, adset_id="as1",
+        policy={"primary_goal": "maximize_in_app_subscriptions",
+                "secondary_cost_per_app_install_target": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["action_type"] == "increase_adset_budget"  # 11000 > current 10000
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"
+    assert op["evidence"]["metric_value"] == 4.0
+    assert op["review"]["verdict"] == "refuted"
+    assert op["review_verdict"] == "refuted"
+    assert "direction" in op["review"]["failed_inputs"]
+
+
+def test_build_budget_plan_install_goal_refutes_cutting_a_clear_winner() -> None:
+    # The inverted-polarity mirror on the budget surface: cutting the budget of an entity whose cited
+    # cost/install ($1.50 = $2400 / 1600) is comfortably below the $3 target (<= 3/1.5 = $2) is cutting
+    # a winner. Refuted.
+    winner = _bud_install_insights("1600")  # 2400 / 1600 = $1.50 cost/install, below the $2 margin
+    plan = build_budget_plan(
+        _adset_level_client(insights=winner), "act_1", new_daily_budget_cents=8000, adset_id="as1",
+        policy={"primary_goal": "maximize_in_app_subscriptions",
+                "secondary_cost_per_app_install_target": 3.0},
+        date_from="2026-06-10", date_to="2026-06-24", run_date="2026-06-25",
+    )
+    op = plan["ops"][0]
+    assert op["action_type"] == "decrease_adset_budget"  # 8000 < current 10000
+    assert op["evidence"]["metric_value"] == 1.5
+    assert op["review"]["verdict"] == "refuted"  # cutting the budget of a cost-per-install winner
+
+
 def test_actions_ops_cbo_classification_parity() -> None:
     # The ops path (classify_adset_budget) and the action path
     # (_populate_budget_params_from_live_state) must classify an identical fixture identically.
@@ -5290,7 +5643,7 @@ def test_render_helpers_produce_compact_lines() -> None:
     ev_line = render_evidence_line(evidence)
     assert "ROAS 1.20" in ev_line
     assert "2026-06-10..2026-06-24" in ev_line
-    assert "42 purchases" in ev_line
+    assert "42 conversions" in ev_line
     assert "account_metrics --account divine_designs" in ev_line
 
 
@@ -5346,7 +5699,12 @@ def _use_account_policy(tmp_path: Path, monkeypatch, slug: str, policy: dict[str
     )
 
 
-def _pause_ad_payload(*, ad_overrides: dict[str, Any], run_date: str = "2026-06-24") -> dict[str, Any]:
+def _pause_ad_payload(
+    *,
+    ad_overrides: dict[str, Any],
+    run_date: str = "2026-06-24",
+    account_slug: str = "divine_designs",
+) -> dict[str, Any]:
     ad = {
         "ad_id": "123",
         "ad_name": "Cody - Copy",
@@ -5361,7 +5719,7 @@ def _pause_ad_payload(*, ad_overrides: dict[str, Any], run_date: str = "2026-06-
     }
     ad.update(ad_overrides)
     return {
-        "account_slug": "divine_designs",
+        "account_slug": account_slug,
         "run_date": run_date,
         "budget_waste": [ad],
         "fatigue_findings": [],
@@ -5472,6 +5830,120 @@ def test_action_plan_zero_sample_ad_abstains_never_fabricates_pause(tmp_path, mo
     assert pause["verdict"] == "insufficient_data"
     assert pause["executable"] is False
     assert pause["approval_required"] is False
+
+
+def test_action_plan_install_goal_grounds_significance_on_app_installs(tmp_path, monkeypatch) -> None:
+    # The headline fix: an install-goal account reports 0 purchases, so before this change its sample
+    # was 0 and the band was stuck at `low` (spend cleared, "thin on conversions"). Now significance is
+    # grounded on the conversion type that fits the goal — app installs when no subscription results —
+    # so a pause backed by real install volume reads above `low`.
+    _use_account_policy(
+        tmp_path, monkeypatch, "pollen_sense", {"primary_goal": "maximize_in_app_subscriptions"}
+    )
+    payload = _pause_ad_payload(
+        account_slug="pollen_sense",
+        ad_overrides={
+            "total_purchase_count": 0.0,   # install accounts rarely have purchases
+            "total_results": 0.0,          # no in-app subscriptions yet
+            "total_app_installs": 100.0,   # but real install volume (>= 4 * floor of 25)
+            "cost_per_app_install": 2.50,
+            "total_spend": 250.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        },
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    # 100 installs >= 4 * 25 floor + recent + direct_observation ceiling → high (definitely not low).
+    assert pause["confidence"]["band"] == "high"
+    assert pause["confidence"]["band"] not in {"low", "abstain"}
+    # Significance is grounded on the installs that actually back the call, not the (zero) purchases.
+    evidence = pause["evidence"]
+    assert evidence["sample_purchases"] == 100.0
+    assert evidence["metric_name"] == "cost_per_app_install"
+    assert pause["executable"] is True
+
+
+def test_action_plan_install_goal_grounds_on_subscriptions_not_installs(tmp_path, monkeypatch) -> None:
+    # Decision-1 tradeoff, pinned so it is a choice and not an accident: when in-app subscription
+    # results are present at all, significance grounds on THOSE (the account's real commercial signal),
+    # NOT on a richer app-install count. So a handful of subscriptions honestly stays thin/`low` even
+    # though the ad has plenty of installs — the installs fallback is only for "no subscriptions yet".
+    _use_account_policy(
+        tmp_path, monkeypatch, "pollen_sense", {"primary_goal": "maximize_in_app_subscriptions"}
+    )
+    payload = _pause_ad_payload(
+        account_slug="pollen_sense",
+        ad_overrides={
+            "total_purchase_count": 0.0,
+            "total_results": 3.0,          # a few subscriptions present → these are the signal
+            "total_app_installs": 80.0,    # many installs, but NOT used because results > 0
+            "cost_per_app_install": 3.10,
+            "total_spend": 250.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        },
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    # Grounds on the 3 subscriptions, NOT the 80 installs.
+    assert pause["evidence"]["sample_purchases"] == 3.0
+    # 3 conversions is below the 25 floor (spend cleared) → thin-on-conversions → low. Conservative,
+    # and exactly the intended behavior: subscriptions are thin, so the call stays thin.
+    assert pause["confidence"]["band"] == "low"
+
+
+def test_action_plan_install_goal_abstains_when_both_signals_and_spend_are_thin(
+    tmp_path, monkeypatch
+) -> None:
+    # Install ad with no subscriptions, few installs, AND spend below the floor → both axes fail →
+    # abstain. For the guarded pause path that flips to a non-executable "keep running" recommendation.
+    _use_account_policy(
+        tmp_path, monkeypatch, "pollen_sense", {"primary_goal": "maximize_in_app_subscriptions"}
+    )
+    payload = _pause_ad_payload(
+        account_slug="pollen_sense",
+        ad_overrides={
+            "total_purchase_count": 0.0,
+            "total_results": 0.0,
+            "total_app_installs": 5.0,     # below the 25 conversions floor
+            "cost_per_app_install": 8.0,
+            "total_spend": 40.0,           # below the MIN_WASTE_SPEND ($100) spend floor
+            "first_seen": "2026-06-20",
+            "last_seen": "2026-06-23",
+        },
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["confidence"]["band"] == "abstain"
+    assert pause["verdict"] == "insufficient_data"
+    assert pause["executable"] is False
+    assert pause["approval_required"] is False
+    # The sample grounded on installs (5), and the operator-facing rationale says "conversions".
+    assert pause["evidence"]["sample_purchases"] == 5.0
+    assert "conversions" in pause["rationale"]
+
+
+def test_action_plan_roas_goal_still_grounds_on_purchase_count(tmp_path, monkeypatch) -> None:
+    # Non-install goals are byte-identical to before: a ROAS account grounds significance on
+    # total_purchase_count and never leaks the install/subscription fallback, even if those fields
+    # happen to be populated.
+    _use_account_policy(tmp_path, monkeypatch, "divine_designs", {"primary_goal": "roas"})
+    payload = _pause_ad_payload(
+        ad_overrides={
+            "blended_roas": 1.2,
+            "total_purchase_count": 120.0,
+            "total_results": 999.0,        # present, but must be ignored for a ROAS account
+            "total_app_installs": 999.0,   # ditto
+            "total_spend": 2400.0,
+            "first_seen": "2026-06-10",
+            "last_seen": "2026-06-24",
+        },
+    )
+
+    pause = next(a for a in build_action_plan(payload)["actions"] if a["action_type"] == "pause_ad")
+    assert pause["evidence"]["sample_purchases"] == 120.0  # the purchase count, not 999
+    assert pause["evidence"]["metric_name"] == "blended_roas"
 
 
 def test_evaluate_action_confidence_flags_causal_correlational_and_caps_band() -> None:
@@ -5657,6 +6129,73 @@ def test_parse_learnings_extracts_structured_fields() -> None:
     assert ev.tier == "correlational" and ev.account == "divine_designs"
     assert ev.metric_name == "engaged_roas" and ev.metric_value == 3.74
     assert ev.verify_query is not None and ev.verify_query.startswith("account_metrics --account divine_designs")
+    assert ev.metric_selector is None  # no `select:` in the tag → None (token-heuristic fallback)
+
+
+def test_parse_evidence_selector_field() -> None:
+    # A `select:` field parses into a {key: value} dict alongside metric:/src:/acct:.
+    one = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account --breakdown publisher_platform` "
+        "_(src: correlational · acct: d · metric: ig_roas=3.63 · select: publisher_platform=instagram)_",
+        header="single-key select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert one.metric_selector == {"publisher_platform": "instagram"}
+
+    # Multi-key: comma-separated pairs; the commas inside the value don't collide with the `·`
+    # field separator, so both pairs survive.
+    multi = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · acct: d · metric: r=4.5 · select: publisher_platform=instagram,platform_position=stories)_",
+        header="multi-key select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert multi.metric_selector == {"publisher_platform": "instagram", "platform_position": "stories"}
+
+    # Incidental whitespace around commas / pairs is tolerated — a space after the comma must NOT
+    # silently drop the trailing pair (it would otherwise resolve a coarser slice → wrong blend).
+    spaced = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · acct: d · metric: r=4.5 · select: publisher_platform=instagram, platform_position=stories)_",
+        header="spaced select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert spaced.metric_selector == {"publisher_platform": "instagram", "platform_position": "stories"}
+
+    # A `select:` placed BEFORE another tag field stops at the `·` separator (does not swallow acct).
+    mid = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · metric: r=4.5 · select: publisher_platform=instagram · acct: d)_",
+        header="mid select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert mid.metric_selector == {"publisher_platform": "instagram"} and mid.account == "d"
+
+    # Malformed (a bare key with no `=`) → None → falls back to the token heuristic (no crash).
+    bad = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · acct: d · metric: r=4.5 · select: publisher_platform)_",
+        header="malformed select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert bad.metric_selector is None
+
+    # Absent → None.
+    none = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — x. `verify: account_metrics --account d --level account` "
+        "_(src: correlational · acct: d · metric: r=4.5)_",
+        header="no select", rot="fast", verified="2026-01-01",
+    ))[0].evidence[0]
+    assert none.metric_selector is None
+
+
+def test_parse_evidence_selector_does_not_bleed_across_sibling_lines() -> None:
+    # Two evidence bullets in ONE entry parse independently — a `select:` on one must not leak onto
+    # the other (each is its own EvidenceLine).
+    evs = parse_learnings(_entry(
+        "- ➕ 2026-01-01 — a. `verify: account_metrics --account d --level account --breakdown publisher_platform,platform_position` "
+        "_(src: correlational · acct: d · metric: ig_roas=3.63 · select: publisher_platform=instagram)_",
+        "- ➕ 2026-01-01 — b. `verify: account_metrics --account d --level account --breakdown publisher_platform` "
+        "_(src: correlational · acct: d · metric: fb_roas=2.55)_",
+        header="two bullets", rot="fast", verified="2026-01-01",
+    ))[0].evidence
+    assert evs[0].metric_selector == {"publisher_platform": "instagram"}
+    assert evs[1].metric_selector is None
 
 
 def test_lint_clean_vault_has_no_findings() -> None:
@@ -5719,6 +6258,42 @@ def test_lint_errors_external_without_url() -> None:
         "- ➕ 2026-01-01 — practitioner says X, see https://example.com/post . _(src: external · acct: —)_"
     )
     assert "external_without_url" not in _codes(lint(parse_learnings(ok), today=date(2026, 1, 2)), "error")
+
+
+def test_lint_warns_select_recommended_for_multi_breakdown_metric_without_selector() -> None:
+    # A metric sliced by ≥2 breakdowns with no `select:` is the exact class audit-vault's token
+    # heuristic can't resolve → one `select_recommended` WARN (never an error).
+    text = _entry(
+        "- ➕ 2026-01-01 — IG 3.63 vs FB. "
+        "`verify: account_metrics --account divine_designs --level account "
+        "--date-from 2026-02-23 --date-to 2026-06-23 --breakdown publisher_platform,platform_position` "
+        "_(src: correlational · acct: divine_designs · metric: ig_roas=3.63)_",
+        header="two-dim no selector", rot="fast", verified="2026-01-01",
+    )
+    findings = lint(parse_learnings(text), today=date(2026, 1, 2))
+    warns = [f for f in findings if f.code == "select_recommended"]
+    assert len(warns) == 1 and warns[0].severity == "warn"
+    assert _codes(findings, "error") == set()  # warn-not-error keeps the entry lint-clean
+
+
+def test_lint_no_select_warn_when_selector_present_or_single_breakdown() -> None:
+    # With a selector the two-dim metric is resolvable → no nudge.
+    with_sel = _entry(
+        "- ➕ 2026-01-01 — IG 3.63. "
+        "`verify: account_metrics --account divine_designs --level account "
+        "--breakdown publisher_platform,platform_position` "
+        "_(src: correlational · acct: divine_designs · metric: ig_roas=3.63 · select: publisher_platform=instagram)_",
+        header="two-dim with selector", rot="fast", verified="2026-01-01",
+    )
+    assert "select_recommended" not in _codes(lint(parse_learnings(with_sel), today=date(2026, 1, 2)))
+    # A SINGLE-breakdown metric without a selector is fine (the token heuristic resolves it) → no nudge.
+    single = _entry(
+        "- ➕ 2026-01-01 — IG 2.79. "
+        "`verify: account_metrics --account divine_designs --level account --breakdown publisher_platform` "
+        "_(src: correlational · acct: divine_designs · metric: ig_roas=2.79)_",
+        header="single-dim no selector", rot="fast", verified="2026-01-01",
+    )
+    assert "select_recommended" not in _codes(lint(parse_learnings(single), today=date(2026, 1, 2)))
 
 
 def test_lint_staleness_flags_fast_but_never_evergreen() -> None:
@@ -6029,6 +6604,115 @@ def test_resolve_fresh_metric_value_missing_is_unresolved_not_zero() -> None:
     assert value is None and spend == 300
 
 
+# --- explicit `select:` slice resolution (resolve_fresh_metric) ------------
+# A two-dimension `publisher_platform,platform_position` breakdown: many IG cells share the
+# {instagram} name-token, so the token heuristic abstains (ambiguous). An explicit selector resolves
+# the slice exactly — blending several cells, or pinning one — and abstains only on zero matches.
+
+def _two_dim_ig_fb_rows():
+    """IG (feed/stories/reels) + FB (feed) cells. IG blends to 3.63 ROAS (8160/2250); IG Stories
+    alone is 4.50 (2250/500)."""
+    return [
+        {"segment": {"publisher_platform": "instagram", "platform_position": "feed"},
+         "spend": 1000, "purchase_value": 3250, "roas": 3.25, "purchases": 80},
+        {"segment": {"publisher_platform": "instagram", "platform_position": "stories"},
+         "spend": 500, "purchase_value": 2250, "roas": 4.50, "purchases": 40},
+        {"segment": {"publisher_platform": "instagram", "platform_position": "reels"},
+         "spend": 750, "purchase_value": 2660, "roas": 3.55, "purchases": 55},
+        {"segment": {"publisher_platform": "facebook", "platform_position": "feed"},
+         "spend": 900, "purchase_value": 2295, "roas": 2.55, "purchases": 35},
+    ]
+
+
+def test_resolve_fresh_metric_selector_blends_subset_under_finer_breakdown() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # `select: publisher_platform=instagram` under a two-dim breakdown → several IG cells → the
+    # author-specified platform-level blend (8160 value / 2250 spend = 3.63), NOT an abstain.
+    value, purchases, spend = resolve_fresh_metric(
+        _two_dim_ig_fb_rows(), level="account", breakdowns=["publisher_platform", "platform_position"],
+        metric_name="ig_roas", selector={"publisher_platform": "instagram"},
+    )
+    assert value == 3.63 and spend == 2250 and purchases == 175
+
+
+def test_resolve_fresh_metric_selector_pins_a_single_cell() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # A two-key selector names exactly one cell → that row via _row_value (single-cell ROAS 4.50).
+    value, _, spend = resolve_fresh_metric(
+        _two_dim_ig_fb_rows(), level="account", breakdowns=["publisher_platform", "platform_position"],
+        metric_name="ig_stories_roas",
+        selector={"publisher_platform": "instagram", "platform_position": "stories"},
+    )
+    assert value == 4.50 and spend == 500
+
+
+def test_resolve_fresh_metric_selector_zero_match_abstains() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # A vanished/renamed segment value → zero matches → (None, None, None) → could_not_audit.
+    assert resolve_fresh_metric(
+        _two_dim_ig_fb_rows(), level="account", breakdowns=["publisher_platform", "platform_position"],
+        metric_name="threads_roas", selector={"publisher_platform": "threads"},
+    ) == (None, None, None)
+
+
+def test_resolve_fresh_metric_selector_is_case_insensitive_full_value_only() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = [
+        {"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232, "roas": 2.79, "purchases": 50},
+        {"segment": {"publisher_platform": "facebook"}, "spend": 500, "purchase_value": 970, "roas": 1.94, "purchases": 20},
+    ]
+    # Case-insensitive full-value match: `Instagram` selector resolves the `instagram` row.
+    value, _, _ = resolve_fresh_metric(
+        rows, level="account", breakdowns=["publisher_platform"],
+        metric_name="ig_roas", selector={"publisher_platform": "Instagram"},
+    )
+    assert value == 2.79
+    # …but a substring must NOT match (full value only, unlike the token path) → abstain.
+    assert resolve_fresh_metric(
+        rows, level="account", breakdowns=["publisher_platform"],
+        metric_name="ig_roas", selector={"publisher_platform": "insta"},
+    ) == (None, None, None)
+
+
+def test_resolve_fresh_metric_selector_missing_key_does_not_match() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # A selector key absent from the row's segment dict → no match (no crash, no partial match).
+    rows = [{"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232,
+             "roas": 2.79, "purchases": 50}]
+    assert resolve_fresh_metric(
+        rows, level="account", breakdowns=["publisher_platform"],
+        metric_name="ig_roas", selector={"platform_position": "stories"},
+    ) == (None, None, None)
+
+
+def test_resolve_fresh_metric_none_selector_uses_token_heuristic_unchanged() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    rows = [
+        {"segment": {"publisher_platform": "facebook"}, "spend": 500, "purchase_value": 970, "roas": 1.94, "purchases": 20},
+        {"segment": {"publisher_platform": "instagram"}, "spend": 800, "purchase_value": 2232, "roas": 2.79, "purchases": 50},
+    ]
+    # selector=None (the default) falls through to the name-token path: ig_roas → {instagram} → 2.79.
+    assert resolve_fresh_metric(
+        rows, level="account", breakdowns=["publisher_platform"], metric_name="ig_roas",
+    )[0] == 2.79
+
+
+def test_resolve_fresh_metric_account_level_rows_have_no_segment_so_selector_abstains() -> None:
+    from meta_ads_analysis.cli import resolve_fresh_metric
+
+    # Account-level rows carry no `segment` dict → _row_matches_selector is False for all → abstain.
+    assert resolve_fresh_metric(
+        _account_rows(roas=3.21), level="account", breakdowns=[], metric_name="blended_roas",
+        selector={"publisher_platform": "instagram"},
+    ) == (None, None, None)
+
+
 # --- end-to-end orchestration with a fake metrics provider -----------------
 
 
@@ -6085,6 +6769,63 @@ def test_audit_report_only_makes_no_text_changes() -> None:
     report, new_text, counts = _audit(_AUDIT_VAULT, _fixed_fetch(_account_rows(roas=2.10)), apply=False)
     assert new_text is None  # report-only ⇒ nothing to write
     assert counts[AUDIT_REFUTED] == 1  # …but drift is still detected and reported
+
+
+# A two-dimension `publisher_platform,platform_position` claim with an explicit `select:` slice —
+# mirrors the real divine_designs `ig_roas=3.63` entry. The token heuristic alone would abstain
+# (every IG cell matches {instagram}); the selector blends the IG cells so the claim re-verifies.
+_AUDIT_SELECT_VAULT = """# Durable learnings
+
+## Strategy
+
+### Instagram outperforms Facebook across placements
+**Confidence:** 🟢 High →  ·  **Domain:** strategy
+**Rot:** fast  ·  **Verified:** 2026-01-10
+- ➕ 2026-01-10 — 120d split. `verify: account_metrics --account divine_designs --level account --date-from 2025-09-12 --date-to 2026-01-10 --breakdown publisher_platform,platform_position` _(src: correlational · acct: divine_designs · metric: ig_roas=3.63 · select: publisher_platform=instagram)_
+**Apply:** lean Instagram.
+"""
+
+
+def _two_dim_blend_rows(*, ig_roas: float):
+    """Two IG cells (feed+stories) + one FB cell. The IG cells blend to ``ig_roas`` so the selector
+    `publisher_platform=instagram` resolves to it; FB is a decoy the selector must exclude."""
+    half = round(ig_roas * 1000, 2)
+    return [
+        {"segment": {"publisher_platform": "instagram", "platform_position": "feed"},
+         "spend": 1000, "purchase_value": half, "roas": ig_roas, "purchases": 80},
+        {"segment": {"publisher_platform": "instagram", "platform_position": "stories"},
+         "spend": 1000, "purchase_value": half, "roas": ig_roas, "purchases": 80},
+        {"segment": {"publisher_platform": "facebook", "platform_position": "feed"},
+         "spend": 1000, "purchase_value": 2000, "roas": 2.0, "purchases": 40},
+    ]
+
+
+def test_audit_selector_resolves_two_dim_claim_end_to_end_and_is_idempotent() -> None:
+    # Fresh IG blend 5.00 drifts 38% from stored 3.63 (both above target 3.0 → no policy cross →
+    # contradicted, not refuted). The selector blends only the IG cells; without it the audit would
+    # abstain (could_not_audit). Band drops one level 🟢→🟡, a dated ➖ is logged.
+    fetch = _fixed_fetch(_two_dim_blend_rows(ig_roas=5.00))
+    _, t1, counts = _audit(_AUDIT_SELECT_VAULT, fetch, apply=True)
+    assert counts[AUDIT_CONTRADICTED] == 1 and counts[AUDIT_COULD_NOT] == 0
+    assert "🟡 Medium" in t1 and "(contested)" not in t1
+    assert "➖ 2026-06-25 — vault audit: ig_roas now 5.00 vs stored 3.63" in t1
+    assert "**Verified:** 2026-06-25" in t1
+    # The logged ➖ carries metric: but no select: — and is_audit_line skips it, so a second --apply
+    # on the same --as-of stays byte-identical even for a selector-resolved claim.
+    _, t2, _ = _audit(t1, fetch, apply=True)
+    assert t2 == t1
+
+
+def test_audit_selector_abstains_when_segment_vanished_band_unchanged() -> None:
+    # The IG cells are gone from the fresh pull (only FB remains) → selector matches zero rows →
+    # could_not_audit. The safe-direction invariant: band untouched, no ➖, Verified unmoved.
+    fetch = _fixed_fetch([
+        {"segment": {"publisher_platform": "facebook", "platform_position": "feed"},
+         "spend": 1000, "purchase_value": 2000, "roas": 2.0, "purchases": 40},
+    ])
+    _, new_text, counts = _audit(_AUDIT_SELECT_VAULT, fetch, apply=True)
+    assert counts[AUDIT_COULD_NOT] == 1
+    assert new_text == _AUDIT_SELECT_VAULT  # zero file changes — a vanished segment must not refute
 
 
 # --- CLI: file I/O path (report-only never writes; --apply writes) ---------
@@ -6724,3 +7465,713 @@ def test_mcp_reader_aborts_runaway_pagination_at_max_pages() -> None:
         assert "runaway" in str(exc)
     else:
         raise AssertionError("expected the MAX_PAGES runaway guard to fire")
+
+
+# ---------------------------------------------------------------------------
+# Early-life ad triage (early_triage.py) — mocks only; no live Meta.
+# ---------------------------------------------------------------------------
+
+_TRIAGE_START = date(2026, 6, 24)
+_ROAS_POLICY = {"primary_goal": "roas"}
+_INSTALL_POLICY = {
+    "primary_goal": "maximize_in_app_subscriptions",
+    "secondary_cost_per_app_install_target": 3.0,
+}
+
+
+def _point(d, *, spend=0.0, purchases=0.0, purchase_value=0.0, installs=0.0):
+    return AdDailyPoint(
+        report_date=d,
+        spend=spend,
+        results=purchases,
+        purchase_count=purchases,
+        purchase_value=purchase_value,
+        app_installs=installs,
+    )
+
+
+def _hist(ad_id, points, name=None):
+    return AdHistory(ad_id=ad_id, ad_name=name or f"ad {ad_id}", points=points)
+
+
+def _roas_ad(ad_id, *, days, daily_spend=15.0, recover_from=None, start=_TRIAGE_START):
+    """A ROAS-goal ad: zero-purchase (struggling) early; if ``recover_from`` (an age index) is set,
+    later days book purchases/value that clear the 3.0 ROAS target over the recovery window."""
+    points = []
+    for i in range(days):
+        if recover_from is not None and i >= recover_from:
+            points.append(
+                _point(start + timedelta(days=i), spend=daily_spend, purchases=5.0,
+                       purchase_value=daily_spend * 5)
+            )
+        else:
+            points.append(_point(start + timedelta(days=i), spend=daily_spend))
+    return _hist(ad_id, points)
+
+
+def _install_ad(ad_id, *, days, daily_spend=5.0, recover_from=None, start=_TRIAGE_START):
+    """An install-goal ad: zero installs (struggling) early; if ``recover_from`` is set, later days
+    book cheap installs that clear the $3.00 cost-per-install target over the recovery window."""
+    points = []
+    for i in range(days):
+        if recover_from is not None and i >= recover_from:
+            points.append(_point(start + timedelta(days=i), spend=daily_spend, installs=5.0))
+        else:
+            points.append(_point(start + timedelta(days=i), spend=daily_spend))
+    return _hist(ad_id, points)
+
+
+def test_early_triage_keep_watch_when_comparable_new_ads_recovered() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)  # age 2 (day 3)
+    triaged = _roas_ad("T", days=3)  # struggling, zero-result, $45 life-to-date
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=3) for i in range(3)]  # 3 recovered
+    analogs += [_roas_ad(f"B{i}", days=10) for i in range(2)]  # 2 stayed bad
+
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "keep_watch"
+    assert v.age == 2
+    assert v.analog_basis["analogs"] == 5
+    assert v.analog_basis["recovered"] == 3
+    assert v.analog_basis["matched_ids"] == sorted(v.analog_basis["matched_ids"])  # deterministic
+    # Correlational grounding (cross-sectional), so the call can never read High.
+    assert v.confidence["grounding_tier"] == "correlational"
+    # 5 analogs < EARLY_LIFE_STRONG_ANALOGS (6) -> the cross-sectional data band is `low`. (The source
+    # ticket narrative loosely said "medium" for 5; the authoritative knee is strong_analogs=6.)
+    assert v.confidence["band"] == "low"
+    # Evidence cites the ad's own thin life-to-date window first_seen..as_of.
+    assert v.evidence["window"] == f"{_TRIAGE_START.isoformat()}..{as_of.isoformat()}"
+
+
+def test_early_triage_strong_population_reads_medium() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]  # 4 recovered
+    analogs += [_roas_ad(f"B{i}", days=10) for i in range(2)]  # 2 stayed bad -> 6 total
+
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "keep_watch"
+    assert v.analog_basis["analogs"] == 6
+    assert v.confidence["band"] == "medium"  # >= strong_analogs; capped at medium by correlational
+
+
+def test_early_triage_survivorship_one_of_twenty_is_pause_candidate() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad("R0", days=10, recover_from=3)]  # 1 lucky recovery
+    analogs += [_roas_ad(f"B{i}", days=10) for i in range(19)]  # 19 stayed bad
+
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    # Survivorship guard works on the population RATE (1/20 = 5%), not "any recovery".
+    assert v.verdict == "pause_candidate"
+    assert v.analog_basis["analogs"] == 20
+    assert v.analog_basis["recovered"] == 1
+    assert v.analog_basis["rate"] == 0.05
+    assert any("5%" in reason for reason in v.reasons)  # reasons name the rate
+    assert Band[v.confidence["band"]] <= Band.medium
+
+
+def test_early_triage_too_few_analogs_abstains_keep() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad(f"B{i}", days=10) for i in range(2)]  # only 2 comparable
+
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "abstain_keep"
+    # Uses the existing abstain_confidence: data axis abstains, so the combined verdict abstains.
+    assert v.confidence["data_band"] == "abstain"
+    assert v.confidence["band"] == "abstain"
+
+
+def test_early_triage_not_struggling_short_circuits_before_analog_work() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    # Healthy early ad: ROAS well above floor.
+    healthy = _hist("OK", [
+        _point(_TRIAGE_START + timedelta(days=i), spend=15.0, purchases=5.0, purchase_value=150.0)
+        for i in range(3)
+    ])
+    analogs = [_roas_ad(f"B{i}", days=10) for i in range(10)]
+
+    v = triage_ad(
+        ad_id="OK", account_slug="divine_designs", as_of=as_of,
+        histories=[healthy] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "not_struggling"
+    assert v.analog_basis["analogs"] == 0  # no analog work was done
+    assert v.analog_basis["matched_ids"] == []
+
+
+def test_early_triage_install_goal_grades_on_cost_per_install() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _install_ad("TI", days=3)  # $15, zero installs -> struggling on cost-per-install
+    analogs = [_install_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]  # recover to $1/install
+    analogs += [_install_ad(f"B{i}", days=10) for i in range(2)]  # stayed bad
+
+    v = triage_ad(
+        ad_id="TI", account_slug="pollen_sense", as_of=as_of,
+        histories=[triaged] + analogs, policy=_INSTALL_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "keep_watch"
+    assert v.analog_basis["analogs"] == 6
+    assert v.analog_basis["recovered"] == 4
+    assert v.evidence["metric_name"] == "cost_per_app_install"
+
+
+def test_early_triage_install_goal_without_target_degrades_to_abstain() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _install_ad("TI", days=3)
+    analogs = [_install_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]
+
+    v = triage_ad(
+        ad_id="TI", account_slug="pollen_sense", as_of=as_of,
+        histories=[triaged] + analogs,
+        policy={"primary_goal": "maximize_in_app_subscriptions"},  # no install-cost target
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.verdict == "abstain_keep"  # graceful, not a crash
+    assert v.confidence["band"] == "abstain"
+
+
+def test_early_triage_excludes_too_short_to_judge_from_population() -> None:
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)
+    long_stayed_bad = [_roas_ad(f"L{i}", days=10) for i in range(3)]  # last_age 9 >= horizon
+    short_lived = _roas_ad("SHORT", days=5)  # last_age 4 < horizon (7) -> too short to judge
+
+    only_long = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + long_stayed_bad, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    with_short = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + long_stayed_bad + [short_lived], policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    # The too-short ad does NOT swell the "stayed bad" population: same count, and it is not matched.
+    assert only_long.analog_basis["analogs"] == 3
+    assert with_short.analog_basis["analogs"] == 3
+    assert "SHORT" not in with_short.analog_basis["matched_ids"]
+    assert with_short.verdict == "pause_candidate"  # 0/3 recovered
+
+
+def test_early_triage_age_is_deterministic_from_as_of() -> None:
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]
+
+    def run(as_of):
+        return triage_ad(
+            ad_id="T", account_slug="divine_designs", as_of=as_of,
+            histories=[triaged] + analogs, policy=_ROAS_POLICY,
+            roas_floor=1.5, roas_target=3.0,
+        )
+
+    assert run(_TRIAGE_START).age == 0  # day 1 == age 0
+    assert run(_TRIAGE_START + timedelta(days=2)).age == 2
+    # Identical inputs -> identical verdict (no clock, no randomness).
+    assert run(_TRIAGE_START + timedelta(days=2)) == run(_TRIAGE_START + timedelta(days=2))
+
+
+def test_early_triage_clock_skew_before_first_seen_clamps_age_zero() -> None:
+    triaged = _roas_ad("T", days=3)
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=3) for i in range(4)]
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs",
+        as_of=_TRIAGE_START - timedelta(days=4),  # as_of predates first_seen
+        histories=[triaged] + analogs, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v.age == 0
+
+
+def test_early_triage_returns_none_when_missing_or_past_early_life() -> None:
+    triaged = _roas_ad("T", days=10)
+    # Not found.
+    assert triage_ad(
+        ad_id="NOPE", account_slug="x", as_of=_TRIAGE_START + timedelta(days=2),
+        histories=[triaged], policy=_ROAS_POLICY, roas_floor=1.5, roas_target=3.0,
+    ) is None
+    # Past the early-life window (age 5 > EARLY_LIFE_MAX_AGE).
+    assert triage_ad(
+        ad_id="T", account_slug="x", as_of=_TRIAGE_START + timedelta(days=5),
+        histories=[triaged], policy=_ROAS_POLICY, roas_floor=1.5, roas_target=3.0,
+    ) is None
+
+
+def test_early_triage_result_presence_mismatch_is_not_an_analog() -> None:
+    # Magnitude can only be compared like-for-like: an ad WITH conversions and one with none are not
+    # comparable in either direction, so neither becomes an analog of the other (engine returns no
+    # matches -> abstain_keep). Covers the _is_analog branch the implement handoff flagged as untested.
+    as_of = _TRIAGE_START + timedelta(days=2)
+
+    def _with_results(ad_id, days):  # struggling (ROAS 0.67 < floor) but has conversions every day
+        return _hist(ad_id, [
+            _point(_TRIAGE_START + timedelta(days=i), spend=15.0, purchases=2.0, purchase_value=10.0)
+            for i in range(days)
+        ])
+
+    # (a) triaged HAS results, every candidate has none.
+    triaged_has = _with_results("T", 3)
+    zero_result_candidates = [_roas_ad(f"B{i}", days=10) for i in range(5)]
+    v_a = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged_has] + zero_result_candidates, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v_a.verdict == "abstain_keep"
+    assert v_a.analog_basis["analogs"] == 0
+    assert v_a.analog_basis["matched_ids"] == []
+
+    # (b) mirror: triaged has NO results, every candidate does.
+    triaged_zero = _roas_ad("T", days=3)
+    has_result_candidates = [_with_results(f"R{i}", 10) for i in range(5)]
+    v_b = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged_zero] + has_result_candidates, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    assert v_b.verdict == "abstain_keep"
+    assert v_b.analog_basis["analogs"] == 0
+    assert v_b.analog_basis["matched_ids"] == []
+
+
+def test_early_triage_ratio_tolerance_band_is_inclusive() -> None:
+    # ANALOG_RATIO_TOLERANCE=0.5 -> the comparable band is the CLOSED interval [0.5x, 2.0x] of the
+    # triaged ad's cumulative spend (the zero-result day-1 fallback). Confirms the boundary is
+    # inclusive: an analog exactly at 2.0x / 0.5x matches; a hair past it does not.
+    as_of = _TRIAGE_START + timedelta(days=2)
+    triaged = _roas_ad("T", days=3)  # spend 45 through age 2, zero-result -> spend-magnitude match
+    candidates = [
+        _roas_ad("HIGH_AT", days=10, daily_spend=30.0),    # 90 == 2.0x  -> inclusive match
+        _roas_ad("HIGH_OVER", days=10, daily_spend=31.0),  # 93 > 2.0x   -> excluded
+        _roas_ad("LOW_AT", days=10, daily_spend=7.5),      # 22.5 == 0.5x -> inclusive match
+        _roas_ad("LOW_OVER", days=10, daily_spend=7.0),    # 21 < 0.5x   -> excluded
+    ]
+    v = triage_ad(
+        ad_id="T", account_slug="divine_designs", as_of=as_of,
+        histories=[triaged] + candidates, policy=_ROAS_POLICY,
+        roas_floor=1.5, roas_target=3.0,
+    )
+    matched = set(v.analog_basis["matched_ids"])
+    assert matched == {"HIGH_AT", "LOW_AT"}
+
+
+def test_analog_confidence_is_capped_at_medium() -> None:
+    strong = analog_confidence(analogs=50, recovered=50, min_analogs=3, strong_analogs=6, factors=[])
+    assert strong.grounding_tier == "correlational"
+    assert strong.data_band == Band.medium
+    assert strong.band == Band.medium  # never High, regardless of analog count
+    # Ladder: below strong -> low; below min -> abstain.
+    assert analog_confidence(analogs=4, recovered=4, min_analogs=3, strong_analogs=6, factors=[]).band == Band.low
+    assert analog_confidence(analogs=2, recovered=0, min_analogs=3, strong_analogs=6, factors=[]).band == Band.abstain
+
+
+def test_group_histories_parses_dates_and_sorts() -> None:
+    rows = [
+        {"ad_id": "A", "ad_name": "Ad A", "report_date": "2026-06-26", "spend": 5.0,
+         "purchase_count": 0.0, "purchase_value": 0.0, "app_installs": 0.0, "results": 0.0},
+        {"ad_id": "A", "ad_name": "Ad A", "report_date": date(2026, 6, 24), "spend": 5.0,
+         "purchase_count": 0.0, "purchase_value": 0.0, "app_installs": 0.0, "results": 0.0},
+        {"ad_id": "", "ad_name": "no id", "report_date": "2026-06-24", "spend": 1.0},  # dropped
+    ]
+    histories = group_histories(rows)
+    assert [h.ad_id for h in histories] == ["A"]
+    history = histories[0]
+    assert [p.report_date for p in history.points] == [date(2026, 6, 24), date(2026, 6, 26)]
+    assert history.first_seen == date(2026, 6, 24)
+    assert history.last_seen == date(2026, 6, 26)
+
+
+def test_duckdb_history_provider_uses_latest_ingestion_run(tmp_path: Path) -> None:
+    db_path = tmp_path / "meta_ads.duckdb"
+
+    def row(run_date, slug, ad_id, ad_name, report_date, spend):
+        return {
+            "ingestion_run_date": run_date, "account_slug": slug, "report_date": report_date,
+            "ad_id": ad_id, "ad_name": ad_name, "spend": spend, "purchase_count": 0.0,
+            "purchase_value": 0.0, "app_installs": 0.0, "results": 0.0,
+        }
+
+    old_run = "2026-06-01"
+    new_run = "2026-06-26"
+    old_rows = [row(old_run, "acct", "OLD", "Old Ad", "2026-05-31", 1.0)]
+    new_rows = [
+        row(new_run, "acct", "A1", "Ad One", "2026-06-24", 10.0),
+        row(new_run, "acct", "A1", "Ad One", "2026-06-25", 11.0),
+        row(new_run, "acct", "A2", "Ad Two", "2026-06-25", 20.0),
+    ]
+    other_rows = [row(new_run, "other", "X", "Other Ad", "2026-06-25", 99.0)]
+
+    with connect(db_path) as con:
+        replace_run_rows(con, "acct", old_run, old_rows, [])
+        replace_run_rows(con, "acct", new_run, new_rows, [])
+        replace_run_rows(con, "other", new_run, other_rows, [])
+
+    histories = DuckDBHistoryProvider(db_path).ad_histories("acct")
+    # Latest run only (A1, A2) — the older run's "OLD" ad is not included.
+    assert sorted(h.ad_id for h in histories) == ["A1", "A2"]
+    a1 = next(h for h in histories if h.ad_id == "A1")
+    assert [p.report_date for p in a1.points] == [date(2026, 6, 24), date(2026, 6, 25)]
+    assert a1.ad_name == "Ad One"
+
+
+def test_duckdb_history_provider_empty_for_unknown_account(tmp_path: Path) -> None:
+    db_path = tmp_path / "meta_ads.duckdb"
+    assert DuckDBHistoryProvider(db_path).ad_histories("nobody") == []
+
+
+# ---------------------------------------------------------------------------
+# Early-life triage ↔ watch-scan integration (monitor.build_watch_report + cli
+# follow-up application). Mocks only: a fake reader for live metrics/meta, a fake
+# HistoryProvider for analog histories, and a tmp followups root. No live Meta,
+# no DuckDB, no account writes.
+# ---------------------------------------------------------------------------
+
+_WATCH_AS_OF = date(2026, 6, 26)
+_ROAS_GOAL_POLICY = {"primary_goal": "roas"}
+
+
+def _watch_insight(ad_id, *, spend, value=0.0, purchases=0.0, name=None):
+    """One ad's aggregated insight blob in the shape ``fetch_entity_metrics`` parses (ad-level keys,
+    string-valued actions/action_values like the live API)."""
+    row = {"ad_id": ad_id, "ad_name": name or f"ad {ad_id}", "spend": str(spend)}
+    if value:
+        row["action_values"] = [{"action_type": "purchase", "value": str(value)}]
+    row["actions"] = [{"action_type": "purchase", "value": str(purchases)}] if purchases else []
+    return row
+
+
+def _watch_meta(ad_id, *, status="ACTIVE", updated="2026-06-25", adset="as1", name=None):
+    return {"id": ad_id, "name": name or f"ad {ad_id}", "effective_status": status,
+            "adset_id": adset, "updated_time": f"{updated}T00:00:00+0000"}
+
+
+class _FakeHistoryProvider:
+    def __init__(self, histories):
+        self._histories = list(histories)
+
+    def ad_histories(self, account_slug):
+        return list(self._histories)
+
+
+def _run_watch(*, insights, meta, histories, open_followups=None, **kw):
+    base = dict(
+        account_slug="acct", as_of=_WATCH_AS_OF,
+        roas_floor=1.5, roas_target=3.0, min_spend=100.0, grace_days=5,
+        policy=_ROAS_GOAL_POLICY, history_provider=_FakeHistoryProvider(histories),
+        open_followups=open_followups or [],
+    )
+    base.update(kw)
+    return build_watch_report(_WatchFakeClient(insights, meta), "act_1", **base)
+
+
+def _apply_followup_actions(report, *, as_of_iso, root):
+    """Mirror cli.watch_main's apply loop: file (deduped) / close (idempotent), with an explicit
+    root so the test never touches the real followups tree."""
+    filed = closed = 0
+    for action in report.get("followup_actions", []):
+        if action["action"] == "file":
+            _, created = _fu.add_followup_if_absent(
+                account=action["account"], slug=action["slug"], title=action["title"],
+                due=action["due"], note=action["note"], created=as_of_iso,
+                marker=action.get("marker", _fu.EARLY_LIFE_MARKER), ad_id=action.get("ad_id", ""),
+                root=root,
+            )
+            filed += int(created)
+        elif action["action"] == "close":
+            if _fu.mark_done(account=action["account"], task_id=action["task_id"],
+                             completed=as_of_iso, missing_ok=True, root=root) is not None:
+                closed += 1
+    return filed, closed
+
+
+def test_watch_early_life_keep_watch_files_day3_followup_no_write() -> None:
+    # Brand-new struggling ad (age 1) whose comparable past ads recovered → keep on probation and
+    # file a day-3 follow-up at first_seen + decision_age. The scan itself writes nothing.
+    triaged = _roas_ad("T", days=2, start=date(2026, 6, 25))  # first_seen 6/25 -> age 1
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=2) for i in range(3)]  # 3 recovered
+    report = _run_watch(
+        insights=[_watch_insight("T", spend=30)],
+        meta=[_watch_meta("T")],
+        histories=[triaged] + analogs,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "T")
+    assert row["early_life"] is True
+    assert row["age"] == 1
+    assert row["verdict"] == "keep_watch"
+    assert row["classification"] == "watch"
+    # Cross-sectional grounding, capped low (3 analogs < strong_analogs).
+    assert row["confidence"]["grounding_tier"] == "correlational"
+    assert row["confidence"]["band"] == "low"
+    assert row["analog_basis"]["analogs"] == 3 and row["analog_basis"]["recovered"] == 3
+
+    files = [a for a in report["followup_actions"] if a["action"] == "file" and a["ad_id"] == "T"]
+    assert len(files) == 1
+    assert files[0]["slug"] == "early-life-triage-T"
+    assert files[0]["due"] == "2026-06-27"  # first_seen 6/25 + decision_age 2
+    assert files[0]["marker"] == _fu.EARLY_LIFE_MARKER
+    # Flag-only: no close action, schema bumped, never an account write/op on the report.
+    assert [a for a in report["followup_actions"] if a["action"] == "close"] == []
+    assert report["schema_version"] == 2
+    assert "ops" not in report and "plan" not in report
+
+
+def test_watch_early_life_pause_candidate_carries_evidence_no_write() -> None:
+    # Brand-new struggling ad whose comparable past ads stayed bad → early pause candidate carrying
+    # the analog confidence (≤ medium) + evidence; flag-only, nothing filed, no account write.
+    triaged = _roas_ad("T", days=2, start=date(2026, 6, 25))  # age 1
+    analogs = [_roas_ad(f"B{i}", days=10) for i in range(3)]  # 0 recovered
+    report = _run_watch(
+        insights=[_watch_insight("T", spend=30)],
+        meta=[_watch_meta("T")],
+        histories=[triaged] + analogs,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "T")
+    assert row["verdict"] == "pause_candidate"
+    assert row["classification"] == "pause_candidate"
+    assert row["confidence"]["grounding_tier"] == "correlational"
+    assert row["confidence"]["band"] in ("abstain", "low", "medium")  # never high
+    assert row["evidence"]["entity_id"] == "T"
+    assert row["analog_basis"]["analogs"] == 3 and row["analog_basis"]["recovered"] == 0
+    # pause_candidate never auto-writes and never files a follow-up — it is surfaced for the operator
+    # to route through propose-pause-ads.
+    assert [a for a in report["followup_actions"] if a["ad_id"] == "T"] == []
+
+
+def test_watch_early_life_install_goal_keep_watch_is_goal_aware() -> None:
+    # Install-goal account: a brand-new struggling ad (zero installs on non-trivial spend) graded
+    # against comparable new install ads that later booked cheap installs → keep on probation. Proves
+    # the policy threads through so the analog grading uses cost-per-install, NOT ROAS (the ad has no
+    # purchases at all, so a ROAS-only path would mis-judge it).
+    triaged = _install_ad("T", days=2, start=date(2026, 6, 25))  # first_seen 6/25 -> age 1, $10, 0 installs
+    analogs = [_install_ad(f"R{i}", days=10, recover_from=2) for i in range(3)]  # 3 recovered (cheap installs)
+    report = _run_watch(
+        insights=[_watch_insight("T", spend=30)],
+        meta=[_watch_meta("T")],
+        histories=[triaged] + analogs,
+        policy=_INSTALL_POLICY,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "T")
+    assert row["early_life"] is True
+    assert row["verdict"] == "keep_watch"
+    assert row["classification"] == "watch"
+    assert row["analog_basis"]["analogs"] == 3 and row["analog_basis"]["recovered"] == 3
+    # Goal-aware: the engine's evidence cites the install metric, not ROAS.
+    assert row["evidence"]["metric_name"] == "cost_per_app_install"
+    files = [a for a in report["followup_actions"] if a["action"] == "file" and a["ad_id"] == "T"]
+    assert len(files) == 1
+
+
+def test_watch_age_from_first_seen_not_updated_time() -> None:
+    # An ad edited yesterday (updated_time) but launched two weeks ago (first_seen) is NOT early-life:
+    # age must come from first_seen. It falls through to the normal grace-protected path.
+    old = _roas_ad("OLD", days=15, start=date(2026, 6, 12))  # first_seen 6/12 -> age 14
+    report = _run_watch(
+        insights=[_watch_insight("OLD", spend=200)],
+        meta=[_watch_meta("OLD", updated="2026-06-25")],  # edited yesterday -> days_since_change 1
+        histories=[old],
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "OLD")
+    assert not row.get("early_life")
+    assert row["classification"] == "watch"  # grace-protected, not triaged
+    assert row["days_since_change"] == 1
+    assert report["followup_actions"] == []
+
+
+def test_watch_no_history_falls_back_to_classify_ad() -> None:
+    # The provider has no history for a delivering ad (not yet synced) → triage returns nothing and the
+    # ad takes today's normal classify_ad path. No crash.
+    report = _run_watch(
+        insights=[_watch_insight("M", spend=300)],  # mature loser, zero purchases
+        meta=[_watch_meta("M", updated="2026-06-01")],  # days_since_change 25 -> unprotected
+        histories=[_roas_ad("SOMEONE_ELSE", days=10)],  # M absent from histories
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "M")
+    assert not row.get("early_life")
+    assert row["classification"] == "urgent"  # mature + below floor -> normal flow
+    assert report["followup_actions"] == []
+
+
+def test_watch_day3_probation_own_sample_clears_floor_keep_and_close(tmp_path: Path) -> None:
+    # Age-3 ad on probation whose OWN window now clears the significance floor → a real classify_ad
+    # decision (direct observation, grace deliberately overridden), follow-up closed.
+    root = tmp_path / "followups"
+    _fu.add_followup_if_absent(
+        account="acct", slug=_fu.early_life_slug("P"),
+        title="day-3 decision", due="2026-06-25", created="2026-06-23",
+        marker=_fu.EARLY_LIFE_MARKER, ad_id="P", root=root,
+    )
+    open_followups = _fu.iter_followups("acct", root=root)
+    triaged = _roas_ad("P", days=4, start=date(2026, 6, 23))  # first_seen 6/23 -> age 3
+    report = _run_watch(
+        insights=[_watch_insight("P", spend=300, value=600, purchases=30)],  # ROAS 2.0, clears floor
+        meta=[_watch_meta("P", updated="2026-06-24")],  # young (grace) — must be overridden
+        histories=[triaged],
+        open_followups=open_followups,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "P")
+    assert row["age"] == 3
+    assert row["verdict"] == "keep"
+    assert row["classification"] == "watch"
+    # Grace abstain overridden: a REAL direct-observation call, not the "too young to judge" abstain.
+    assert row["confidence"]["grounding_tier"] == "direct_observation"
+    assert row["confidence"]["band"] != "abstain"
+    close = [a for a in report["followup_actions"] if a["action"] == "close" and a["ad_id"] == "P"]
+    assert len(close) == 1
+    # Applying the close archives the probation follow-up (it stops looping).
+    _apply_followup_actions(report, as_of_iso=_WATCH_AS_OF.isoformat(), root=root)
+    assert _fu.iter_followups("acct", root=root) == []
+
+
+def test_watch_day3_probation_own_sample_below_floor_pauses_and_closes(tmp_path: Path) -> None:
+    # Age-3 ad on probation whose own window clears the floor but sits BELOW the pause floor → forced
+    # to a pause candidate (not another protective watch), follow-up closed.
+    root = tmp_path / "followups"
+    _fu.add_followup_if_absent(
+        account="acct", slug=_fu.early_life_slug("P"), title="day-3 decision",
+        due="2026-06-25", created="2026-06-23", marker=_fu.EARLY_LIFE_MARKER, ad_id="P", root=root,
+    )
+    report = _run_watch(
+        insights=[_watch_insight("P", spend=300, value=60, purchases=4)],  # ROAS 0.20 < pause floor
+        meta=[_watch_meta("P", updated="2026-06-24")],
+        histories=[_roas_ad("P", days=4, start=date(2026, 6, 23))],
+        open_followups=_fu.iter_followups("acct", root=root),
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "P")
+    assert row["classification"] == "pause_candidate"
+    assert row["confidence"]["grounding_tier"] == "direct_observation"
+    assert any(a["action"] == "close" and a["ad_id"] == "P" for a in report["followup_actions"])
+
+
+def test_watch_day3_probation_still_below_floor_analog_governs(tmp_path: Path) -> None:
+    # Age-3 ad on probation whose own sample is STILL below the significance floor → the analog verdict
+    # governs the keep-vs-pause call (no indefinite abstain). Recovering analogs -> keep; non-recovering
+    # -> pause. Either way the follow-up closes.
+    def run(analogs):
+        root = tmp_path / _fu.slugify_name("acct_" + analogs[0].ad_id)  # isolate the two sub-cases
+        _fu.add_followup_if_absent(
+            account="acct", slug=_fu.early_life_slug("P"), title="day-3 decision",
+            due="2026-06-25", created="2026-06-23", marker=_fu.EARLY_LIFE_MARKER, ad_id="P", root=root,
+        )
+        triaged = _roas_ad("P", days=4, start=date(2026, 6, 23))  # spend 60 through age 3, struggling
+        report = _run_watch(
+            insights=[_watch_insight("P", spend=60)],  # < min_spend 100 -> classify_ad insufficient
+            meta=[_watch_meta("P", updated="2026-06-24")],
+            histories=[triaged] + analogs,
+            open_followups=_fu.iter_followups("acct", root=root),
+        )
+        row = next(r for r in report["rows"] if r["ad_id"] == "P")
+        closed = [a for a in report["followup_actions"] if a["action"] == "close" and a["ad_id"] == "P"]
+        return row, closed
+
+    keep_row, keep_close = run([_roas_ad(f"R{i}", days=10, recover_from=4) for i in range(3)])
+    assert keep_row["verdict"] == "keep_watch"
+    assert keep_row["classification"] == "watch"
+    assert keep_row["confidence"]["grounding_tier"] == "correlational"  # analog-grounded
+    assert len(keep_close) == 1
+
+    pause_row, pause_close = run([_roas_ad(f"B{i}", days=10) for i in range(3)])
+    assert pause_row["verdict"] == "pause_candidate"
+    assert pause_row["classification"] == "pause_candidate"
+    assert len(pause_close) == 1
+
+
+def test_watch_running_scan_twice_files_one_followup(tmp_path: Path) -> None:
+    # Re-running the scan while the ad is still on probation must not spawn a second follow-up: the
+    # dedupe holds at both the scan level (already on probation -> no file action) and the file level.
+    root = tmp_path / "followups"
+    triaged = _roas_ad("T", days=2, start=date(2026, 6, 25))  # age 1
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=2) for i in range(3)]
+    insights = [_watch_insight("T", spend=30)]
+    meta = [_watch_meta("T")]
+
+    report1 = _run_watch(insights=insights, meta=meta, histories=[triaged] + analogs)
+    filed1, _ = _apply_followup_actions(report1, as_of_iso=_WATCH_AS_OF.isoformat(), root=root)
+    assert filed1 == 1
+
+    # Second run feeds back the now-open follow-up — the scan returns no new file action.
+    open_followups = _fu.iter_followups("acct", root=root)
+    report2 = _run_watch(insights=insights, meta=meta, histories=[triaged] + analogs,
+                         open_followups=open_followups)
+    assert [a for a in report2["followup_actions"] if a["action"] == "file"] == []
+    filed2, _ = _apply_followup_actions(report2, as_of_iso=_WATCH_AS_OF.isoformat(), root=root)
+    assert filed2 == 0
+
+    open_files = list(_fu.account_dir("acct", root).glob("*.md"))
+    assert len(open_files) == 1
+
+
+def test_watch_build_report_performs_no_followup_writes(tmp_path, monkeypatch) -> None:
+    # The pure scan returns followup_actions but writes nothing to the followups tree itself
+    # (the CLI applies them). Point the followups root at an empty tmp dir and confirm it stays empty.
+    monkeypatch.setattr(_fu, "FOLLOWUPS_ROOT", tmp_path / "followups")
+    triaged = _roas_ad("T", days=2, start=date(2026, 6, 25))
+    analogs = [_roas_ad(f"R{i}", days=10, recover_from=2) for i in range(3)]
+    report = _run_watch(
+        insights=[_watch_insight("T", spend=30)],
+        meta=[_watch_meta("T")],
+        histories=[triaged] + analogs,
+    )
+    assert any(a["action"] == "file" for a in report["followup_actions"])
+    assert not (tmp_path / "followups").exists()  # scan touched no files
+
+
+def test_followups_add_if_absent_dedupes_and_marker_roundtrips(tmp_path: Path) -> None:
+    root = tmp_path / "followups"
+    slug = _fu.early_life_slug("123")
+    assert slug == "early-life-triage-123"
+
+    path1, created1 = _fu.add_followup_if_absent(
+        account="acct", slug=slug, title="t", due="2026-06-27", created="2026-06-26",
+        marker=_fu.EARLY_LIFE_MARKER, ad_id="123", root=root,
+    )
+    assert created1 is True
+    # A second call with the same slug is a no-op (same path, created False) even on a different due.
+    path2, created2 = _fu.add_followup_if_absent(
+        account="acct", slug=slug, title="t", due="2026-07-01", created="2026-06-30",
+        marker=_fu.EARLY_LIFE_MARKER, ad_id="123", root=root,
+    )
+    assert created2 is False and path2 == path1
+    assert len(list(_fu.account_dir("acct", root).glob("*.md"))) == 1
+
+    found = _fu.find_open_followup("acct", slug=slug, root=root)
+    assert found is not None
+    assert _fu.early_life_ad_id(found) == "123"  # ad_id round-trips out of the filename slug
+    # A non-early-life follow-up yields None.
+    other = _fu.add_followup(account="acct", title="quarterly refresh", due="2026-09-01",
+                             created="2026-06-26", root=root)
+    assert _fu.early_life_ad_id(_fu._parse(other)) is None
+
+
+def test_followups_mark_done_missing_ok_is_idempotent(tmp_path: Path) -> None:
+    import pytest
+
+    root = tmp_path / "followups"
+    path, _ = _fu.add_followup_if_absent(
+        account="acct", slug=_fu.early_life_slug("9"), title="t", due="2026-06-27",
+        created="2026-06-26", marker=_fu.EARLY_LIFE_MARKER, ad_id="9", root=root,
+    )
+    task_id = path.stem
+    assert _fu.mark_done(account="acct", task_id=task_id, completed="2026-06-28", root=root) is not None
+    # Closing an already-archived follow-up must not raise when missing_ok.
+    assert _fu.mark_done(account="acct", task_id=task_id, completed="2026-06-29",
+                         missing_ok=True, root=root) is None
+    with pytest.raises(FileNotFoundError):
+        _fu.mark_done(account="acct", task_id=task_id, completed="2026-06-29", root=root)

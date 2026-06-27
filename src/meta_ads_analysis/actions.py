@@ -554,7 +554,7 @@ def evaluate_action_confidence(
         metric_value=metric_value,
         metric_display=metric_display,
         window=window,
-        sample_purchases=_number(ad.get("total_purchase_count")),
+        sample_purchases=_select_sample_conversions(ad, goal),
         sample_spend=_number(ad.get("total_spend")),
         entity_level="ad",
         entity_id=_optional_str(ad.get("ad_id")),
@@ -612,12 +612,12 @@ def _abstain_action(
     action["approval_required"] = False
     action["verdict"] = "insufficient_data"
     verb = "scaling" if action_type == "increase_adset_budget" else "pausing"
-    purchases = _fmt_sample_count(evidence_block.get("sample_purchases"))
+    conversions = _fmt_sample_count(evidence_block.get("sample_purchases"))
     spend = evidence_block.get("sample_spend")
     spend_str = f"${spend:,.0f}" if isinstance(spend, (int, float)) else "n/a"
     window = evidence_block.get("window") or "n/a"
     action["rationale"] = (
-        f"Insufficient data to recommend {verb} yet — only {purchases} purchases / {spend_str} spend "
+        f"Insufficient data to recommend {verb} yet — only {conversions} conversions / {spend_str} spend "
         f"over {window} is below the significance floor. Treat as a promising test: keep running and "
         f"re-check as more data accrues."
     )
@@ -640,6 +640,27 @@ def _select_action_metric(
     if cost_per_install is not None:
         return "cost_per_app_install", cost_per_install, _fmt_cost_per_install(cost_per_install)
     return "blended_roas", None, _fmt_roas(None)
+
+
+def _select_sample_conversions(ad: dict[str, Any], goal: str | None) -> float | None:
+    """Pick the conversion count that grounds significance, by account goal.
+
+    Mirrors the prioritization the rest of the goal logic already uses, so significance grounding,
+    pause detection (``_should_pause_ad``), and the chosen metric (``_select_action_metric``) all
+    speak one language about what the account's conversion signal is:
+
+    - install-goal accounts (``maximize_in_app_subscriptions``) → in-app subscription ``total_results``
+      when present, else ``total_app_installs`` — the exact ``total_results in (None, 0, 0.0)`` fallback
+      ``_should_pause_ad`` applies. An install ad with a *few* subscriptions grounds on those (and may
+      stay thin), not on a richer install count: subscriptions are the real commercial signal; the
+      installs fallback is for "no subscription volume yet".
+    - ROAS / default / unknown goals → ``total_purchase_count`` (unchanged behavior).
+    """
+    if goal == "maximize_in_app_subscriptions":
+        if ad.get("total_results") in (None, 0, 0.0):
+            return _number(ad.get("total_app_installs"))
+        return _number(ad.get("total_results"))
+    return _number(ad.get("total_purchase_count"))
 
 
 def _fmt_roas(value: float | None) -> str:

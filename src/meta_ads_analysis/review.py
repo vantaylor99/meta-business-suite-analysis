@@ -77,19 +77,34 @@ _ACTION_SPEND_FLOOR: dict[str, float] = {
     "refresh_creative": MIN_WASTE_SPEND,
 }
 
-# Action types whose *direction* is a scale-up. For a ROAS-goal account, scaling an entity whose cited
-# ROAS is below the goal target contradicts its own number. (Budget ops set ``action_type`` so this
-# check can fire on them — see ``control._budget_op``.)
+# Action types whose *direction* is a scale-up. Scaling an entity whose own cited goal metric is on the
+# losing side of target (ROAS below target, or cost-per-install above target) contradicts its own
+# number. Both polarity branches consume this set. (Budget ops set ``action_type`` so this check can
+# fire on them — see ``control._budget_op``.)
 _SCALE_ACTIONS = {"increase_adset_budget", "increase_campaign_budget", "consider_scale_budget"}
 
 # Action types whose *direction* is a budget scale-DOWN. Cutting the budget of a clear winner (cited
-# ROAS comfortably above target) contradicts the account goal, the mirror of pausing a winner.
+# ROAS comfortably above target, or cost-per-install comfortably below it) contradicts the account goal,
+# the mirror of pausing a winner. Both polarity branches consume this set.
 _SCALE_DOWN_BUDGET_ACTIONS = {"decrease_adset_budget", "decrease_campaign_budget"}
+
+# Enabling an ad is directionally a scale-up (0 → live). Turning ON an ad whose own cited goal metric
+# is on the losing side of target (ROAS below target, or cost-per-install above target) contradicts the
+# goal the same way a budget scale-up does, so it is refuted with an enable-specific reason (kept
+# distinct from ``_SCALE_ACTIONS`` so the operator message reads as "enabling", not "scaling"). The
+# enable op sets this ``action_type`` — see ``control.build_enable_ads_plan``.
+_ENABLE_ACTIONS = {"enable_ad"}
 
 # How far above target a paused ad's cited ROAS must sit before pausing it reads as "pausing a winner"
 # (a clear self-contradiction). A generous margin keeps borderline pauses — which may be justified for
-# reasons outside the cited metric — from being falsely refuted.
+# reasons outside the cited metric — from being falsely refuted. For the install-goal (lower-is-better)
+# polarity the same margin is applied inverted: a pause/cut reads as "killing a winner" only when the
+# cited cost-per-install is at or below ``target / _PAUSE_WINNER_MARGIN``.
 _PAUSE_WINNER_MARGIN = 1.5
+
+# The install-goal ``primary_goal`` value (cost-per-install, lower-is-better) — the opposite polarity to
+# a ROAS goal. The ``direction`` check dispatches on this to its inverted sibling.
+_INSTALL_GOAL = "maximize_in_app_subscriptions"
 
 
 @dataclass(slots=True)
@@ -231,8 +246,8 @@ def review_recommendation(
                     verdict=VERDICT_INSUFFICIENT,
                     failed_input="sample_floor",
                     reason=(
-                        f"sample of {_fmt_count(purchases)} purchases / {_fmt_spend(spend)} spend is "
-                        f"below the {conversions_floor:g}-purchase floor — should abstain"
+                        f"sample of {_fmt_count(purchases)} conversions / {_fmt_spend(spend)} spend is "
+                        f"below the {conversions_floor:g}-conversion floor — should abstain"
                     ),
                 )
             )
@@ -394,11 +409,28 @@ def _direction_contradiction(
     evidence: dict[str, Any],
     policy: dict[str, Any],
 ) -> str | None:
-    """For a ROAS-goal account, return a reason string when the action's direction contradicts its own
-    cited ROAS vs the account target, else ``None``. Conservative: only fires on a ROAS goal with a
-    numeric target and a cited ROAS metric (install-goal direction is intentionally not judged here)."""
-    if policy.get("primary_goal") != "roas":
-        return None
+    """Return a reason string when the action's direction contradicts its own cited goal metric vs the
+    account target, else ``None``. Dispatches on the account ``primary_goal`` to one of two
+    polarity-specific siblings — ROAS (higher-is-better) or install (cost-per-install, lower-is-better)
+    — and returns ``None`` for every other goal (or no goal). Conservative throughout: each branch
+    fires only with a numeric goal target and the matching cited metric."""
+    goal = policy.get("primary_goal")
+    if goal == "roas":
+        return _roas_direction_contradiction(action=action, evidence=evidence, policy=policy)
+    if goal == _INSTALL_GOAL:
+        return _install_direction_contradiction(action=action, evidence=evidence, policy=policy)
+    return None
+
+
+def _roas_direction_contradiction(
+    *,
+    action: dict[str, Any],
+    evidence: dict[str, Any],
+    policy: dict[str, Any],
+) -> str | None:
+    """ROAS goal (higher-is-better): refute a scale/enable whose cited ROAS is *below* target, or a
+    pause/budget-cut of an entity whose cited ROAS is comfortably *above* target. Only fires with a
+    numeric ``target_roas`` and a cited ``blended_roas`` metric."""
     target = _num(policy.get("target_roas"))
     if target is None:
         return None
@@ -413,6 +445,11 @@ def _direction_contradiction(
             f"recommendation contradicts its cited metric vs the account goal: scaling an entity "
             f"whose ROAS {roas:.2f} is below the {target:g} target"
         )
+    if action_type in _ENABLE_ACTIONS and roas < target:
+        return (
+            f"recommendation contradicts its cited metric vs the account goal: enabling an ad "
+            f"whose ROAS {roas:.2f} is below the {target:g} target"
+        )
     if action_type in _SCALE_DOWN_BUDGET_ACTIONS and roas >= target * _PAUSE_WINNER_MARGIN:
         return (
             f"recommendation contradicts its cited metric vs the account goal: cutting the budget of "
@@ -422,6 +459,51 @@ def _direction_contradiction(
         return (
             f"recommendation contradicts its cited metric vs the account goal: pausing an entity "
             f"whose ROAS {roas:.2f} is comfortably above the {target:g} target"
+        )
+    return None
+
+
+def _install_direction_contradiction(
+    *,
+    action: dict[str, Any],
+    evidence: dict[str, Any],
+    policy: dict[str, Any],
+) -> str | None:
+    """Install goal (cost-per-install, lower-is-better): the polarity-inverted mirror of
+    :func:`_roas_direction_contradiction`. Refute a scale/enable whose cited cost-per-install is *above*
+    target (scaling/enabling a loser), or a pause/budget-cut whose cited cost-per-install is comfortably
+    *below* ``target / _PAUSE_WINNER_MARGIN`` (killing a winner). Only fires with a numeric, positive
+    ``secondary_cost_per_app_install_target`` (the goal-target analogue of ``target_roas``, NOT the pause
+    threshold ``pause_if_no_primary_and_secondary_cost_above``) and a cited ``cost_per_app_install``
+    metric; otherwise silent."""
+    target = _num(policy.get("secondary_cost_per_app_install_target"))
+    if target is None or target <= 0:  # missing / non-positive target → never refute on an ambiguous goal
+        return None
+    if evidence.get("metric_name") != "cost_per_app_install":
+        return None
+    cost = _num(evidence.get("metric_value"))
+    if cost is None:
+        return None
+    action_type = str(action.get("action_type") or "")
+    if action_type in _SCALE_ACTIONS and cost > target:
+        return (
+            f"recommendation contradicts its cited metric vs the account goal: scaling an entity "
+            f"whose cost/install ${cost:.2f} is above the ${target:g} target"
+        )
+    if action_type in _ENABLE_ACTIONS and cost > target:
+        return (
+            f"recommendation contradicts its cited metric vs the account goal: enabling an ad "
+            f"whose cost/install ${cost:.2f} is above the ${target:g} target"
+        )
+    if action_type in _SCALE_DOWN_BUDGET_ACTIONS and cost <= target / _PAUSE_WINNER_MARGIN:
+        return (
+            f"recommendation contradicts its cited metric vs the account goal: cutting the budget of "
+            f"an entity whose cost/install ${cost:.2f} is comfortably below the ${target:g} target"
+        )
+    if action_type == "pause_ad" and cost <= target / _PAUSE_WINNER_MARGIN:
+        return (
+            f"recommendation contradicts its cited metric vs the account goal: pausing an entity "
+            f"whose cost/install ${cost:.2f} is comfortably below the ${target:g} target"
         )
     return None
 
@@ -543,10 +625,13 @@ def review_ops_plan(
     never mutated), reviews only ops carrying a ``confidence`` block (informational / structural ops
     with no band pass through untouched), and is idempotent (an op already carrying a ``review`` block
     is left as-is). Most op dicts carry no ``action_type``, so the ``direction`` check no-ops for them;
-    the exception is budget ops, which set one (``increase_*``/``decrease_*_budget`` — see
-    ``control._budget_op``) so the direction-contradiction check fires on them (refuting a scale-up
-    below target / a budget cut of a clear winner). The gate stays **demote-only**: it may lower a band
-    and demote ``status`` approved→proposed, never raise a band or promote a status.
+    the exceptions are budget ops (``increase_*``/``decrease_*_budget`` — see ``control._budget_op``)
+    and enable ops (``enable_ad`` — see ``control.build_enable_ads_plan``), which set one so the
+    direction-contradiction check fires on them: refuting a budget scale-up onto a losing entity / a
+    budget cut of a clear winner, and a re-enable of a known loser — measured against the account goal
+    target in either polarity (ROAS above/below ``target_roas``, or cost-per-install below/above
+    ``secondary_cost_per_app_install_target``). The gate stays **demote-only**: it may lower a band and
+    demote ``status`` approved→proposed, never raise a band or promote a status.
     """
     return _review_plan_ops(
         plan,
@@ -671,8 +756,10 @@ def _review_plan_ops(
     recency_stale_days: int,
 ) -> dict[str, Any]:
     """Shared driver for :func:`review_ops_plan` / :func:`review_authoring_plan`. Both control ops
-    (keyed ``op``) and authoring ops (keyed ``kind``) live under ``plan["ops"]``; neither carries an
-    ``action_type``, so review is identical for both shapes."""
+    (keyed ``op``) and authoring ops (keyed ``kind``) live under ``plan["ops"]``. Most ops carry no
+    ``action_type`` (the ``direction`` check no-ops for them); the exceptions are budget ops
+    (``increase_*``/``decrease_*_budget``) and enable ops (``enable_ad``), which set one so the
+    direction-contradiction check fires. Review is otherwise identical for both shapes."""
     reviewed = _deepcopy_plan(plan)
     policy = reviewed.get("account_action_policy") if isinstance(reviewed.get("account_action_policy"), dict) else {}
     run_date = reviewed.get("run_date")
@@ -689,7 +776,7 @@ def _review_plan_ops(
         result = review_recommendation(
             evidence=evidence,
             confidence=confidence,
-            action=op,  # most ops carry no action_type (direction no-ops); budget ops set one and do fire
+            action=op,  # most ops carry no action_type (direction no-ops); budget + enable ops set one and do fire
             policy=policy,
             spend_floor=spend_floor,
             conversions_floor=conversions_floor,

@@ -89,7 +89,7 @@ def _coerce_tier(tier: EvidenceTier | str) -> EvidenceTier:
         raise ValueError(f"Unknown evidence tier {tier!r}; expected one of: {valid}") from exc
 
 
-def _fmt_purchases(value: float | None) -> str:
+def _fmt_conversions(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{int(value)}" if float(value).is_integer() else f"{value:g}"
@@ -181,7 +181,7 @@ def data_strength(
 
     if not cleared_conversions and not cleared_spend:
         return Band.abstain, [
-            f"below significance floor: {_fmt_purchases(sample_purchases)} purchases "
+            f"below significance floor: {_fmt_conversions(sample_purchases)} conversions "
             f"< {conversions_floor:g} and {_fmt_spend(sample_spend)} spend "
             f"< ${spend_floor:,.0f} — insufficient data, abstain"
         ]
@@ -196,14 +196,14 @@ def data_strength(
         else:
             base = Band.medium
         factors.append(
-            f"sample: {_fmt_purchases(sample_purchases)} purchases / "
+            f"sample: {_fmt_conversions(sample_purchases)} conversions / "
             f"{_fmt_spend(sample_spend)} spend (over floor)"
         )
     else:
         base = Band.low
         factors.append(
             f"sample: {_fmt_spend(sample_spend)} spend cleared but only "
-            f"{_fmt_purchases(sample_purchases)} purchases (< {conversions_floor:g}) — thin on conversions"
+            f"{_fmt_conversions(sample_purchases)} conversions (< {conversions_floor:g}) — thin on conversions"
         )
 
     band = base
@@ -294,7 +294,7 @@ def assess(
         grounding_band=grounding_band,
         grounding_tier=resolved_tier.name,
         factors=factors,
-        would_raise="more purchases / a more recent window / a completed A/B",
+        would_raise="more conversions / a more recent window / a completed A/B",
         would_lower="smaller sample / a stale or contradicting window / a refuting A/B",
         causal_flag=causal_flag,
     )
@@ -328,6 +328,60 @@ def abstain_confidence(
         would_raise=would_raise,
         would_lower="",
         causal_flag=causal_claim,
+    )
+
+
+def analog_confidence(
+    *,
+    analogs: int,
+    recovered: int,
+    min_analogs: int,
+    strong_analogs: int,
+    factors: list[str],
+) -> Confidence:
+    """Confidence for an analog-grounded early-life triage call (see :mod:`early_triage`).
+
+    The call grades a brand-new, still-sub-floor ad against how *other* comparable ads on the same
+    account behaved at the same age — a cross-sectional comparison, so grounding is pinned to
+    ``correlational`` (ceiling ``medium``). An analog-grounded call can therefore never read
+    ``high`` no matter how many analogs back it, exactly like the scale-candidate / trajectory calls
+    in :mod:`actions`.
+
+    Routing this through :func:`assess` would be wrong: the triaged ad's *own* sample is below the
+    significance floor by definition (that is the whole reason early triage exists), so ``assess``
+    would abstain on every ad. Instead the data axis here is computed deterministically from the
+    **analog population size** — never a number the caller types:
+
+    - ``analogs < min_analogs`` → ``abstain`` (too little comparable history to trust the cross-section)
+    - ``analogs >= strong_analogs`` → ``medium``
+    - otherwise → ``low``
+
+    The combined band is the weaker axis (:func:`combine_bands`), so the verdict is at most
+    ``medium``. ``recovered`` is part of the call's basis (the caller folds it into ``factors``); it
+    does not move the band, which depends only on how much comparable history exists, not on the
+    direction of the verdict. Like :func:`abstain_confidence`, this keeps every :class:`Confidence`
+    construction inside this module and preserves the "a band is never a value the caller supplies"
+    invariant.
+    """
+    grounding, _ = grounding_strength(EvidenceTier.correlational, causal_claim=False)
+    if analogs < min_analogs:
+        data_band = Band.abstain
+    elif analogs >= strong_analogs:
+        data_band = Band.medium
+    else:
+        data_band = Band.low
+    return Confidence(
+        band=combine_bands(data_band, grounding),
+        data_band=data_band,
+        grounding_band=grounding,
+        grounding_tier=EvidenceTier.correlational.name,
+        factors=list(factors),
+        would_raise=(
+            f"more comparable analogs (≥{strong_analogs} for medium) / "
+            "a completed A/B vs this creative direction"
+        ),
+        would_lower="fewer comparable analogs / account history that contradicts the comparison",
+        causal_flag=False,
     )
 
 
@@ -414,7 +468,7 @@ def render_evidence_line(evidence: Evidence, *, include_regen: bool = True) -> s
     otherwise print it twice."""
     parts = [evidence.metric_display or evidence.metric_name, f"window {evidence.window}"]
     parts.append(
-        f"n={_fmt_purchases(evidence.sample_purchases)} purchases / "
+        f"n={_fmt_conversions(evidence.sample_purchases)} conversions / "
         f"{_fmt_spend(evidence.sample_spend)} spend"
     )
     if evidence.entity_id or evidence.entity_name:

@@ -28,6 +28,7 @@ from .cli import (
     metrics_main,
     search_interests_main,
     operator_brief_main,
+    propose_budget_main,
     propose_disable_advantage_main,
     propose_duplicate_ad_main,
     propose_enable_ads_main,
@@ -51,7 +52,7 @@ def main() -> None:
             "list-audiences|account-info|estimate|search-interests|list-pixels|copy-library|watch|experiment|followups|propose-actions|"
             "apply-actions|propose-rotation|apply-rotation|propose-disable-advantage|"
             "apply-disable-advantage|propose-renames|apply-renames|propose-enable-ads|propose-pause-ads|"
-            "apply-ops|propose-creative-features|propose-duplicate-ad|propose-lookalike|apply-authoring|intake-video|"
+            "propose-budget|apply-ops|propose-creative-features|propose-duplicate-ad|propose-lookalike|apply-authoring|intake-video|"
             "upload-video|propose-video-ad|operator-brief> [args]\n"
             "Example: python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-21"
         )
@@ -150,6 +151,9 @@ def main() -> None:
     if command in {"propose_creative_features", "creative_features"}:
         propose_creative_features_main()
         return
+    if command in {"propose_budget", "budget"}:
+        propose_budget_main()
+        return
     if command in {"apply_ops", "ops"}:
         apply_ops_main()
         return
@@ -176,7 +180,7 @@ def main() -> None:
         "`copy-library`, `watch`, `experiment`, `followups`, "
         "`propose-actions`, `apply-actions`, `propose-rotation`, `apply-rotation`, "
         "`propose-disable-advantage`, `apply-disable-advantage`, `propose-renames`, `apply-renames`, "
-        "`propose-enable-ads`, `propose-pause-ads`, `apply-ops`, `propose-duplicate-ad`, "
+        "`propose-enable-ads`, `propose-pause-ads`, `propose-budget`, `apply-ops`, `propose-duplicate-ad`, "
         "`propose-lookalike`, `apply-authoring`, `intake-video`, `upload-video`, "
         "`propose-video-ad`, or `operator-brief`."
     )

@@ -1035,27 +1035,58 @@ def _row_identifier_text(row: dict[str, object]) -> str:
     return str(row.get("name") or "").lower()
 
 
+def _row_matches_selector(row: dict[str, object], selector: dict[str, str]) -> bool:
+    """True if EVERY selector key/value is present in the row's ``segment`` dict (full-value,
+    case-insensitive — NOT token/substring overlap). A missing key, or a row with no ``segment``
+    dict (e.g. an account-level pull), → no match — the safe-abstain direction."""
+    seg = row.get("segment")
+    if not isinstance(seg, dict):
+        return False
+    return all(str(seg.get(k, "")).lower() == v.lower() for k, v in selector.items())
+
+
 def resolve_fresh_metric(
     rows: list[dict[str, object]],
     *,
     level: str,
     breakdowns: list[str],
     metric_name: str | None,
+    selector: dict[str, str] | None = None,
 ) -> tuple[float | None, float | None, float | None]:
     """Resolve the named metric's fresh ``(value, purchases, spend)`` out of the fetched rows.
 
-    Two cases:
+    Resolution order:
 
-    - **Account aggregate** (``level == account`` with no breakdown): the metric is the blended
-      account ROAS — :func:`_aggregate_value` over the (single) row(s).
-    - **Segment / entity scoped** (a breakdown, or a campaign/adset/ad level): the metric names a
-      *specific* row (e.g. ``ig_roas`` → the ``instagram`` segment). The row is matched by token
+    - **Explicit ``selector``** (a parsed ``select: key=value,…`` tag) — the author named the exact
+      breakdown slice this metric summarizes, so resolve against it *first*, by full-value
+      (case-insensitive) match on each row's ``segment`` dict, never name-token overlap:
+
+      - **zero** matches → ``(None, None, None)`` → ``could_not_audit`` (a renamed/vanished segment;
+        the safe-abstain direction is preserved).
+      - **exactly one** match → that row via :func:`_row_value` (keeps the roas-or-derived path).
+      - **several** matches → :func:`_aggregate_value` over them — the **intentional, author-
+        specified blend** (e.g. ``select: publisher_platform=instagram`` under a
+        ``publisher_platform,platform_position`` breakdown blends all IG cells → the platform-level
+        number). With an explicit selector, "several" is the author's coarser slice, NOT ambiguity.
+
+    - **Account aggregate** (no selector, ``level == account``, no breakdown): the blended account
+      ROAS — :func:`_aggregate_value` over the (single) row(s).
+    - **Segment / entity scoped** (no selector; a breakdown, or a campaign/adset/ad level): the
+      metric names a *specific* row (e.g. ``ig_roas`` → the ``instagram`` segment), matched by token
       overlap between the metric name and the row's segment/entity identity. **Exactly one** match
       resolves; zero or several → ``(None, None, None)`` so the verdict is ``could_not_audit`` and
-      the claim is never silently confirmed (AGENTS.md: don't collapse missing into zeros).
+      the claim is never silently confirmed (AGENTS.md: don't collapse missing into zeros). This
+      "several → abstain" heuristic applies ONLY on the no-selector path.
     """
     if not rows:
         return None, None, None
+    if selector:
+        matches = [r for r in rows if _row_matches_selector(r, selector)]
+        if not matches:
+            return None, None, None  # vanished/renamed segment → could_not_audit
+        if len(matches) == 1:
+            return _row_value(matches[0])  # single cell — keep roas-or-derived path
+        return _aggregate_value(matches)  # author-specified slice — blend the subset
     if not breakdowns and level == "account":
         return _aggregate_value(rows)
     tokens = _metric_identifier_tokens(metric_name)
@@ -1136,7 +1167,11 @@ def run_vault_audit(
         date_from, date_to = resolve_date_window(as_of, lookback_days=window_len)
         rows = fetch_metrics(level, breakdowns, date_from, date_to)
         value, purchases, spend = resolve_fresh_metric(
-            rows, level=level, breakdowns=breakdowns, metric_name=ev.metric_name
+            rows,
+            level=level,
+            breakdowns=breakdowns,
+            metric_name=ev.metric_name,
+            selector=ev.metric_selector,
         )
         fresh = FreshSample(
             value=value, purchases=purchases, spend=spend, window=f"{date_from}..{date_to}"
@@ -1872,6 +1907,17 @@ def experiment_main() -> None:
 def watch_main() -> None:
     from datetime import date as _date
 
+    from .config import (
+        DEFAULT_DB_PATH,
+        EARLY_LIFE_DECISION_AGE,
+        EARLY_LIFE_MAX_AGE,
+        EARLY_LIFE_MIN_ANALOGS,
+        EARLY_LIFE_RECOVERY_HORIZON,
+        EARLY_LIFE_RECOVERY_RATE,
+        EARLY_LIFE_STRONG_ANALOGS,
+    )
+    from .early_triage import DuckDBHistoryProvider
+    from .followups import EARLY_LIFE_MARKER, add_followup_if_absent, iter_followups, mark_done
     from .meta_api import client_from_env
     from .monitor import build_watch_report, default_watch_report_path, load_watchlist, save_watchlist
 
@@ -1889,6 +1935,23 @@ def watch_main() -> None:
     parser.add_argument("--run-date", help="Folder date under reports/<account>/. Defaults to today.")
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
     parser.add_argument("--api-version", help="Override the pinned Meta Graph API version.")
+    parser.add_argument(
+        "--no-early-life", dest="early_life", action="store_false",
+        help="Disable the early-life triage of brand-new struggling ads (on by default).",
+    )
+    parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="DuckDB path for ad histories (early-life triage).")
+    parser.add_argument("--early-life-max-age", type=int, default=EARLY_LIFE_MAX_AGE,
+                        help=f"Triage applies only to ads this young (default {EARLY_LIFE_MAX_AGE}).")
+    parser.add_argument("--early-life-decision-age", type=int, default=EARLY_LIFE_DECISION_AGE,
+                        help=f"Force a keep/kill by this age (default {EARLY_LIFE_DECISION_AGE}).")
+    parser.add_argument("--early-life-recovery-horizon", type=int, default=EARLY_LIFE_RECOVERY_HORIZON,
+                        help=f"An analog must have lived this long to judge recovery (default {EARLY_LIFE_RECOVERY_HORIZON}).")
+    parser.add_argument("--early-life-min-analogs", type=int, default=EARLY_LIFE_MIN_ANALOGS,
+                        help=f"Fewer comparable analogs than this → abstain & keep (default {EARLY_LIFE_MIN_ANALOGS}).")
+    parser.add_argument("--early-life-strong-analogs", type=int, default=EARLY_LIFE_STRONG_ANALOGS,
+                        help=f"Analog count at/above which the correlational band reads medium (default {EARLY_LIFE_STRONG_ANALOGS}).")
+    parser.add_argument("--early-life-recovery-rate", type=float, default=EARLY_LIFE_RECOVERY_RATE,
+                        help=f"Keep only if the analog recovery rate clears this (default {EARLY_LIFE_RECOVERY_RATE}).")
     args = parser.parse_args()
 
     account_slug = _resolve_account_slug(args.account)
@@ -1900,23 +1963,58 @@ def watch_main() -> None:
 
     client = client_from_env(args.api_version)
     ad_account_id = resolve_ad_account_id(account_slug)
+
+    history_provider = DuckDBHistoryProvider(Path(args.db_path)) if args.early_life else None
+    open_followups = (
+        [f for f in iter_followups(account_slug) if EARLY_LIFE_MARKER in f.path.stem]
+        if args.early_life else []
+    )
     report = build_watch_report(
         client, ad_account_id, account_slug=account_slug, as_of=as_of,
         window_days=args.window_days, recent_days=args.recent_days, min_spend=args.min_spend,
         grace_days=args.grace_days, roas_floor=args.roas_floor, roas_target=args.roas_target,
         prior_watchlist=load_watchlist(account_slug, reports_root),
+        early_life=args.early_life, history_provider=history_provider, open_followups=open_followups,
+        early_life_max_age=args.early_life_max_age, early_life_decision_age=args.early_life_decision_age,
+        early_life_recovery_horizon=args.early_life_recovery_horizon,
+        early_life_min_analogs=args.early_life_min_analogs,
+        early_life_strong_analogs=args.early_life_strong_analogs,
+        early_life_recovery_rate=args.early_life_recovery_rate,
     )
     write_plan(report, default_watch_report_path(account_slug, run_date, reports_root))
     save_watchlist(account_slug, report["watchlist"], reports_root)
 
+    # Apply the follow-up file/close actions the (filesystem-free) scan returned. Filing is deduped by
+    # the deterministic per-ad slug; closing an already-archived follow-up is a no-op (missing_ok).
+    filed = closed = 0
+    for action in report.get("followup_actions", []):
+        if action["action"] == "file":
+            _, created = add_followup_if_absent(
+                account=action["account"], slug=action["slug"], title=action["title"],
+                due=action["due"], note=action["note"], created=as_of.isoformat(),
+                marker=action.get("marker", EARLY_LIFE_MARKER), ad_id=action.get("ad_id", ""),
+            )
+            filed += int(created)
+        elif action["action"] == "close":
+            if mark_done(account=action["account"], task_id=action["task_id"],
+                         completed=as_of.isoformat(), missing_ok=True) is not None:
+                closed += 1
+
     rows = report["rows"]
-    urgent = [r for r in rows if r["classification"] == "urgent"]
-    under = [r for r in rows if r["classification"] == "underperforming"]
-    watch = [r for r in rows if r["classification"] == "watch"]
+    early = [r for r in rows if r.get("early_life")]
+    urgent = [r for r in rows if r["classification"] == "urgent" and not r.get("early_life")]
+    under = [r for r in rows if r["classification"] == "underperforming" and not r.get("early_life")]
+    watch = [r for r in rows if r["classification"] == "watch" and not r.get("early_life")]
+    early_pause = [r for r in early if r["classification"] == "pause_candidate"]
+    early_keep = [r for r in early if r["classification"] != "pause_candidate"]
     p = report["params"]
     print(f"{account_slug} watch — window {report['window']} | floor {p['roas_floor']} target {p['roas_target']} "
           f"| min-spend ${p['min_spend']:.0f} | grace {p['grace_days']}d")
-    print(f"URGENT {len(urgent)} · underperforming {len(under)} · watch(protected/learning) {len(watch)}\n")
+    print(f"URGENT {len(urgent)} · underperforming {len(under)} · watch(protected/learning) {len(watch)}")
+    if p.get("early_life"):
+        print(f"early-life: kept-on-probation {len(early_keep)} · early-pause-candidate {len(early_pause)} "
+              f"(follow-ups filed {filed}, closed {closed})")
+    print()
 
     def line(r):
         flags = []
@@ -1926,17 +2024,23 @@ def watch_main() -> None:
             flags.append(f"{r['times_flagged']}x running")
         tag = (" [" + ", ".join(flags) + "]") if flags else ""
         roas = f"{r['roas']:.2f}" if r["roas"] is not None else "0.00"
-        print(f"  {r['classification'].upper():<15} {str(r['ad_name'])[:26]:<27} ROAS {roas} | ${r['spend']:.0f} "
-              f"| ${r['dollars_at_risk']:.0f} at risk | age {r['days_since_change']}d{tag}")
+        if r.get("early_life"):
+            basis = r.get("analog_basis") or {}
+            age_disp = f"age {r.get('age')}d (early-life)"
+            tag = f" [{basis.get('analogs', 0)} analogs at age {basis.get('age')}, {basis.get('recovered', 0)} recovered]"
+        else:
+            age_disp = f"age {r['days_since_change']}d"
+        print(f"  {r['classification'].upper():<16} {str(r['ad_name'])[:26]:<27} ROAS {roas} | ${r['spend']:.0f} "
+              f"| ${(r.get('dollars_at_risk') or 0.0):.0f} at risk | {age_disp}{tag}")
         for reason in r["reasons"]:
             print(f"        - {reason}")
 
-    for r in urgent + under + watch:
+    for r in urgent + early_pause + under + early_keep + watch:
         line(r)
     if not rows:
         print("  Nothing flagged. (No delivering ad is past the significance floor and below target.)")
     print(f"\nReport: {default_watch_report_path(account_slug, run_date, reports_root)}")
-    print("Flag-only — review the urgent ones case-by-case, then pause via propose-pause-ads / apply-ops if warranted.")
+    print("Flag-only — review the urgent / early-pause ones case-by-case, then pause via propose-pause-ads / apply-ops if warranted.")
 
 
 def propose_creative_features_main() -> None:

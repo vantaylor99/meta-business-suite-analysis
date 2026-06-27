@@ -26,6 +26,12 @@ from .utils import slugify_name
 
 FOLLOWUPS_ROOT = PROJECT_ROOT / "followups"
 
+# Marker for early-life-triage probation follow-ups (filed by the watch scan; see monitor.py).
+# An OPEN follow-up bearing this marker for an ad == that ad is on early-life probation, so the
+# day-3 keep/kill decision is owed. Embedded in the deterministic per-ad slug so re-runs collide on
+# the same file instead of spamming new ones.
+EARLY_LIFE_MARKER = "early-life-triage"
+
 
 @dataclass(slots=True)
 class Followup:
@@ -111,10 +117,95 @@ def add_followup(
     return path
 
 
-def mark_done(*, account: str, task_id: str, completed: str, root: Path = FOLLOWUPS_ROOT) -> Path:
+def early_life_slug(ad_id: str) -> str:
+    """Deterministic per-ad slug for an early-life probation follow-up. Meta ad ids are numeric
+    strings (filename-safe), so they are kept RAW (not slugified) so :func:`early_life_ad_id`
+    round-trips exactly. The shared slug makes a re-scanned ad collide on the same file (dedupe)."""
+    return f"{EARLY_LIFE_MARKER}-{ad_id}"
+
+
+def early_life_ad_id(followup: "Followup") -> str | None:
+    """The ad_id embedded in an early-life follow-up's filename slug, or ``None`` if this is not an
+    early-life follow-up. Inverse of :func:`early_life_slug` (filename is ``{due}-{slug}``)."""
+    needle = f"-{EARLY_LIFE_MARKER}-"
+    stem = followup.path.stem
+    idx = stem.find(needle)
+    if idx == -1:
+        return None
+    return stem[idx + len(needle):] or None
+
+
+def find_open_followup(account: str, *, slug: str, root: Path = FOLLOWUPS_ROOT) -> "Followup | None":
+    """The single OPEN follow-up for ``account`` whose filename matches ``slug`` (ignoring the
+    leading ``{due}-`` date prefix), or ``None``. Backs the cross-run dedupe for the deterministic
+    per-ad early-life follow-ups."""
+    for f in iter_followups(account, root=root):
+        if f.status != "open":
+            continue
+        stem = f.path.stem
+        candidate = stem
+        if f.due is not None:
+            prefix = f"{f.due.isoformat()}-"
+            if stem.startswith(prefix):
+                candidate = stem[len(prefix):]
+        if candidate == slug:
+            return f
+    return None
+
+
+def add_followup_if_absent(
+    *,
+    account: str,
+    slug: str,
+    title: str,
+    due: str,
+    note: str = "",
+    created: str,
+    marker: str = "",
+    ad_id: str = "",
+    root: Path = FOLLOWUPS_ROOT,
+) -> tuple[Path, bool]:
+    """Like :func:`add_followup` but (a) uses a caller-supplied deterministic ``slug`` for the
+    filename and (b) is a NO-OP when an open follow-up with that slug already exists — returns the
+    existing path with ``created=False``. This is the cross-run dedupe the early-life triage relies on
+    so a re-scanned probation ad never spawns a second follow-up. ``marker``/``ad_id`` are recorded in
+    the frontmatter for the human reader (matching is by ``slug``)."""
+    existing = find_open_followup(account, slug=slug, root=root)
+    if existing is not None:
+        return existing.path, False
+    base = account_dir(account, root)
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / f"{due}-{slug}.md"
+    if path.exists():
+        return path, False
+    extra = ""
+    if marker:
+        extra += f"marker: {marker}\n"
+    if ad_id:
+        extra += f"ad_id: {ad_id}\n"
+    content = (
+        "---\n"
+        f"title: {title}\n"
+        f"account: {slugify_name(account)}\n"
+        f"due: {due}\n"
+        "status: open\n"
+        f"created: {created}\n"
+        f"{extra}"
+        "---\n\n"
+        f"{note}\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    return path, True
+
+
+def mark_done(
+    *, account: str, task_id: str, completed: str, root: Path = FOLLOWUPS_ROOT, missing_ok: bool = False
+) -> Path | None:
     base = account_dir(account, root)
     src = base / f"{task_id}.md"
     if not src.exists():
+        if missing_ok:
+            return None  # already done / moved — closing it again is a no-op, not an error
         raise FileNotFoundError(f"Follow-up not found: {src}")
     text = src.read_text(encoding="utf-8")
     if "status:" in text:

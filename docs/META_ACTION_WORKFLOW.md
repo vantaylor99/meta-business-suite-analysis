@@ -97,8 +97,15 @@ Only executable actions with `status: "approved"` are sent to the Meta Graph API
 
 Each recommendation-bearing action (`pause_ad`, `increase_adset_budget`, `consider_scale_budget`, `refresh_creative`) carries two structured blocks:
 
-- `evidence`: the deterministic facts behind the call — the metric the decision rests on (ROAS for ROAS-goal accounts, cost-per-install for install-goal accounts), the window, the sample (purchases / spend), the entity, and a `regenerating_query` that reproduces the metric.
+- `evidence`: the deterministic facts behind the call — the metric the decision rests on (ROAS for ROAS-goal accounts, cost-per-install for install-goal accounts), the window, the sample (conversions / spend), the entity, and a `regenerating_query` that reproduces the metric.
 - `confidence`: a computed band (`high` / `medium` / `low` / `abstain`) from the shared confidence engine. The band is never free-typed; it is derived from sample size, recency, and how causal the evidence is. Grounding caps data strength, so a large-sample correlational call can never read `high`.
+
+The sample that grounds significance is **goal-aware**, mirroring the metric selection and pause logic so all three agree on what the account's conversion signal is:
+
+- **install-goal accounts** (`maximize_in_app_subscriptions`): in-app subscription results (`total_results`) when present, otherwise app installs (`total_app_installs`). This is why an install account that reports zero purchases is no longer stuck at `low` — its significance now rests on the installs/subscriptions that actually back the call. A handful of subscriptions still grounds on those few (and may honestly stay thin) rather than falling back to a richer install count; the installs fallback is only for "no subscription volume yet".
+- **ROAS / default accounts**: purchases (`total_purchase_count`), unchanged.
+
+The operator-facing sample wording is **"conversions"** (goal-neutral — a purchase, a subscription, and an install are all conversions). The serialized JSON key remains `sample_purchases` for back-compatibility with stored `action_plan.json` files; renaming it to `sample_conversions` is tracked separately.
 
 For the executable pause/budget paths, a sample below the significance floor (too few conversions and too little spend) does **not** become a confident pause or scale. The action is flipped to a non-executable `verdict: "insufficient_data"` recommendation — "promising test, keep running and re-check as more data accrues" — with `executable: false` and `approval_required: false`, so thin data can never be approved into a write.
 
@@ -126,8 +133,8 @@ Shared scaffolding lets each of these carry grounding uniformly:
   they may lower a band and demote an op's `status` from `approved` back to `proposed`, but never raise
   a band, promote a status, or touch PAUSED-by-default. They use the op's own vocabulary
   (`status` + a `review_verdict` marker) rather than the action plan's `executable`/`rationale` keys.
-  Because an op carries no `action_type`, the gate's `direction` check (scale-vs-ROAS-target) cannot
-  fire here — op-level direction-contradiction is the per-capability ticket's job, since it knows the
+  Because an op carries no `action_type`, the gate's `direction` check (scale/pause-vs-goal-target)
+  cannot fire here — op-level direction-contradiction is the per-capability ticket's job, since it knows the
   op's semantic. Rotation plans use `plan["rotations"]` / `plan["items"]` / `plan["renames"]` rather
   than `plan["ops"]`, so they have their own key-aware wrapper, `review.review_rotation_plan`, **not**
   `review_ops_plan` (routing a rotation plan through the `ops` iterator would silently review nothing).
@@ -186,10 +193,21 @@ and turning it OFF carry opposite risk:
   band.
 
 A high-spend ad that happens to be paused still grounds normally: its real window sample computes a
-real band (e.g. `medium`), so re-enabling it is an evidence-backed, reviewable proposal. Ops carry no
-`action_type`, so the review gate's `direction` check (scale-vs-ROAS-target) does not fire on an
-enable; the protection against an enable whose metric contradicts the goal is that its band is computed
-from sample strength alone and can never be *over*-confident. Enabling a campaign or ad set toggles only
+real band (e.g. `medium`), so re-enabling it is an evidence-backed, reviewable proposal. Enabling an ad
+is directionally a **scale-up** (0 → live), so each enable op sets `action_type: enable_ad` — which lets
+the review gate's `direction` check fire on it. On a ROAS-goal account with a numeric `target_roas`, a
+re-enable whose own cited ROAS sits below target is **refuted** (the same verdict a below-target budget
+scale-up gets), so a known loser cannot reach the operator looking as trustworthy as a genuine performer.
+This complements the band protection above (which caps over-confidence): the band guards *how* confident
+the claim is, the direction check guards *which way* it points. The refutation is a loud, evidence-named
+warning, **not** a hard block — `apply_ops_plan`'s gate keys on grounding, not on `review_verdict`, so an
+operator who genuinely wants the retest can still set the op to `approved` and execute it. The check is
+goal-aware and runs in both polarities: on a ROAS-goal account it keys on `target_roas` (higher is
+better); on an install-goal account it keys on `secondary_cost_per_app_install_target` and inverts —
+turning ON an ad whose cited cost-per-install sits *above* target is refuted as enabling a loser (and,
+on the action/budget surfaces, pausing or cutting an entity whose cost-per-install is comfortably
+*below* target is refuted as killing a winner). Each branch fires only with a numeric goal target and
+the matching cited metric, so an account with no configured target is never direction-judged. Enabling a campaign or ad set toggles only
 that node — it does **not** un-pause PAUSED children — so evidence is attached at the level being
 toggled. The ad list is read once at propose time, so live `effective_status` may drift before execute;
 re-applying `ACTIVE` to an ad that is already ACTIVE is idempotent on Meta's side (and `--validate-only`
@@ -308,13 +326,6 @@ Those can be added later, but they need tighter account-specific controls becaus
 `review.review_ops_plan`; `apply-ops` then validates/executes it under the same
 propose → approve → validate_only → execute gate.
 
-> **Invocation note:** the budget proposer currently ships **only** as the `propose_budget` console
-> script (available after `pip install -e .`). Unlike the sibling write commands it is **not** wired
-> into the `python -m meta_ads_analysis` dispatcher, so `python -m meta_ads_analysis propose-budget`
-> fails with "Unknown command". Use the `propose_budget` console script until
-> `tickets/backlog/wire-propose-budget-into-m-dispatch` lands. `apply-ops` (which executes the plan) is
-> reachable both ways.
-
 **CBO detection.** Under Meta's campaign-budget-optimization the **campaign** holds the budget and the
 ad sets inherit it. When a `set_daily_budget` op (or the action-plan `increase_adset_budget`) finds the
 ad set has no `daily_budget`, the code re-reads the **parent campaign** (`classify_adset_budget`) and
@@ -351,8 +362,11 @@ the window, with sample + `regenerating_query`) and a computed `confidence` band
 sample abstains into a non-executable "keep running" recommendation (the "9 purchases over 5 days"
 guard). Budget ops set an `action_type` (`increase_adset_budget` / `increase_campaign_budget` /
 `decrease_adset_budget` / `decrease_campaign_budget`) so the review gate's `direction` check fires on an
-op: it **refutes** scaling up an entity whose cited ROAS is below the account target, and **refutes**
-cutting the budget of a clear winner (ROAS comfortably above target).
+op: on a ROAS-goal account it **refutes** scaling up an entity whose cited ROAS is below the account
+target, and **refutes** cutting the budget of a clear winner (ROAS comfortably above target). On an
+install-goal account the same check runs inverted against `secondary_cost_per_app_install_target`:
+scaling up an entity whose cost-per-install is above target, or cutting one whose cost-per-install is
+comfortably below it, is refuted.
 
 ## Meta AI / Advantage+ Policy
 

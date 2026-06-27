@@ -55,10 +55,6 @@ The end-to-end workflow + diagram is in
 [docs/META_ACTION_WORKFLOW.md](docs/META_ACTION_WORKFLOW.md), and MCP/token setup is in
 [docs/META_API_SETUP.md](docs/META_API_SETUP.md).
 
-> One command caveat: the budget proposer ships only as the `propose_budget` console script (after
-> `pip install -e .`); it is not yet wired into `python -m meta_ads_analysis` (tracked in
-> `tickets/backlog/wire-propose-budget-into-m-dispatch`). All other write commands work both ways.
-
 ## API Sync
 
 To pull data directly from Meta for one configured account:

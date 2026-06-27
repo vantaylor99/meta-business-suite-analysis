@@ -736,6 +736,11 @@ def build_enable_ads_plan(
     ad) cites a zero sample → abstains → the apply-time grounding gate refuses to turn it on (keep
     observing). The plan is run through :func:`review.review_ops_plan` before it is returned, so an
     over-claimed or below-floor enable is demoted/marked insufficient before it reaches the operator.
+    Each enable op is tagged ``action_type="enable_ad"`` (enabling is directionally a scale-up), so on
+    a ROAS-goal account a re-enable whose own cited ROAS sits below ``target_roas`` is **refuted** by
+    the gate — it reaches the operator named as a known loser rather than as a genuine performer (the
+    refutation is a loud warning, not a hard block: it does not delete the op, and an operator can still
+    approve and execute the retest).
     """
     reader = as_reader(reader)
     policy = policy if policy is not None else resolve_action_policy(account_slug)
@@ -773,6 +778,10 @@ def build_enable_ads_plan(
             "level": "ad",
             "id": ad.get("id"),
             "name": ad.get("name"),
+            # Enabling an ad is directionally a scale-up (0 → live), so it carries an action_type the
+            # same way budget ops do (see ``_budget_op``) — it lets ``review._direction_contradiction``
+            # refute a re-enable whose own cited ROAS sits below the account target.
+            "action_type": "enable_ad",
             "params": {"status": "ACTIVE"},
             "status": PROPOSED_STATUS,
             "note": f"currently {ad.get('effective_status')}; issues: {'; '.join(issues) or 'none'}",

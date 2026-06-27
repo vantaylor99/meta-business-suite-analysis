@@ -2,6 +2,29 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-26 (action) — scaled 100K campaign +20% ($280→$336) to feed the Engaged Audience winner
+
+**Account change executed (via Meta's official MCP write tool — NOT the repo guarded flow):**
+- **Raised the `100K` campaign daily budget $280 → $336 (+20%, CBO)** (campaign 120241587361240733).
+  Verified after: `daily_budget $336.00`, `effective_status ACTIVE`; Engaged Audience + High Value
+  Customers ad sets both ACTIVE.
+  - *Why:* Engaged Audience (inside 100K) is the account's best ad set — **3.39 ROAS** (above the 3.0
+    target) — and underfunded vs the Low Value Customers drag (2.00 ROAS on ~$8k/30d). +20% stays
+    within the guardrail cap and the ~20% "safe zone" that avoids a learning reset. Trusting CBO to
+    push the extra toward Engaged. This is a **before/after directional test, not a clean A/B.**
+  - *Gotcha logged:* Meta's MCP connector **force-paused the campaign on edit**
+    (`status_forced_to_paused: true` — its safety default for any edit). Reactivated immediately via
+    `ads_activate_entity`; a brief pause does not reset learning (needs ~7 days off). Net downtime: seconds.
+  - *Caveat:* executed via the Meta MCP, which **bypasses the repo's propose→approve→validate→audit
+    guardrails** (the repo's own budget tool can't do CBO campaign budgets yet — see the CBO backlog
+    gap). Operator-approved manually.
+- **Considered but deliberately NOT done:** an Engaged Audience min-spend (would reset that ad set's
+  learning — defeats the short test) and cutting the `White BG V2` drag in Low Value Customers
+  ($3,833 @ 1.78 — the bigger leak, to handle separately).
+
+**Follow-up:** 3-day check (due 2026-06-29) — read Engaged Audience + 100K ROAS/spend; confirm CBO
+fed the winner (not the 1.75 High Value drag); directional read, confirm over ~a week.
+
 ## 2026-06-25 (action) — paused Sisters First Test - Copy; diagnosed Mission Call bait failure; scaling deferred
 
 **Account changes executed (Graph API):**
