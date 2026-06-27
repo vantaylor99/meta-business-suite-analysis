@@ -667,7 +667,7 @@ def classify_drift(
         return AUDIT_COULD_NOT, None, [why]
 
     data_band, data_factors = data_strength(
-        sample_purchases=fresh.purchases,
+        sample_conversions=fresh.purchases,
         sample_spend=fresh.spend,
         spend_floor=spend_floor,
         conversions_floor=conversions_floor,

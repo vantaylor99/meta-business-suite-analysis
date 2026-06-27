@@ -41,6 +41,7 @@ from .control import (
     FORBIDDEN_FRAGMENTS,
     _resolve_grounding_window,
     _status_metric,
+    _status_sample_conversions,
     fetch_entity_metrics,
     resolve_action_policy,
 )
@@ -307,7 +308,7 @@ def _attach_netnew_grounding(
         metric_value=None,
         metric_display=metric_display,
         window=f"{date_from}..{date_to}",
-        sample_purchases=0.0,
+        sample_conversions=0.0,
         sample_spend=0.0,
         entity_level=entity_level,
         entity_id=None,
@@ -340,7 +341,13 @@ def _attach_duplicate_grounding(
     """Ground a duplicate / scale-out on the **source ad's** own metric over the window (read-only via
     the reader). A proven winner computes a real band; a source with no delivery cites a zero sample →
     abstain → blocked. The evidence reflects the *propose-time* justification, not a live precondition:
-    the create copies the source creative regardless of any later drift in the source's metrics."""
+    the create copies the source creative regardless of any later drift in the source's metrics.
+
+    The present-row sample is the **goal-aware** conversion count (:func:`_status_sample_conversions`),
+    so it speaks the same conversion language as the goal-aware metric: ``app_installs`` for an
+    install-goal account, ``purchases`` otherwise. Grounding the sample on purchases unconditionally
+    would pin an install account — which produces ~0 purchases — at a spurious low/abstain band even
+    when backed by real install volume."""
     rows = fetch_entity_metrics(reader, ad_account_id, level="ad", date_from=date_from, date_to=date_to)
     row = next((m for m in rows if str(m.get("id")) == str(source_ad_id)), None)
     metric_name, metric_value, metric_display = _status_metric(row, goal)
@@ -349,13 +356,13 @@ def _attach_duplicate_grounding(
     if row is None:
         evidence = Evidence(
             metric_name=metric_name, metric_value=None, metric_display=metric_display, window=window,
-            sample_purchases=0.0, sample_spend=0.0, entity_level="ad",
+            sample_conversions=0.0, sample_spend=0.0, entity_level="ad",
             entity_id=_optional_str(source_ad_id), entity_name=source_name, regenerating_query=regen,
         )
     else:
         evidence = Evidence(
             metric_name=metric_name, metric_value=metric_value, metric_display=metric_display,
-            window=window, sample_purchases=_num(row.get("purchases")),
+            window=window, sample_conversions=_status_sample_conversions(row, goal),
             sample_spend=_num(row.get("spend")) or 0.0, entity_level="ad",
             entity_id=_optional_str(source_ad_id), entity_name=row.get("name") or source_name,
             regenerating_query=regen,
@@ -389,7 +396,7 @@ def _attach_lookalike_grounding(
         metric_value=None,
         metric_display=f"seed audience {origin_audience_id} (size/quality — not a performance metric)",
         window=f"{date_from}..{date_to}" if (date_from or date_to) else "",
-        sample_purchases=None,
+        sample_conversions=None,
         sample_spend=None,
         entity_level="audience",
         entity_id=_optional_str(origin_audience_id),

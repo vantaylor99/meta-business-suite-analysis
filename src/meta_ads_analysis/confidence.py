@@ -109,7 +109,7 @@ class Evidence:
     metric_value: float | None
     metric_display: str
     window: str
-    sample_purchases: float | None
+    sample_conversions: float | None
     sample_spend: float | None
     entity_level: str  # ad | adset | campaign | account
     entity_id: str | None
@@ -158,7 +158,7 @@ def detect_causal_language(text: str | None) -> bool:
 
 def data_strength(
     *,
-    sample_purchases: float | None,
+    sample_conversions: float | None,
     sample_spend: float | None,
     spend_floor: float,
     conversions_floor: float,
@@ -173,7 +173,7 @@ def data_strength(
     window and, when a ``pvalue`` is supplied for a comparative claim, cap at medium unless p<0.05.
     Every ambiguous/missing input rounds DOWN — the anti-fabrication invariant.
     """
-    purchases = sample_purchases if sample_purchases is not None else 0.0
+    purchases = sample_conversions if sample_conversions is not None else 0.0
     spend = sample_spend if sample_spend is not None else 0.0
 
     cleared_conversions = purchases >= conversions_floor
@@ -181,7 +181,7 @@ def data_strength(
 
     if not cleared_conversions and not cleared_spend:
         return Band.abstain, [
-            f"below significance floor: {_fmt_conversions(sample_purchases)} conversions "
+            f"below significance floor: {_fmt_conversions(sample_conversions)} conversions "
             f"< {conversions_floor:g} and {_fmt_spend(sample_spend)} spend "
             f"< ${spend_floor:,.0f} — insufficient data, abstain"
         ]
@@ -196,14 +196,14 @@ def data_strength(
         else:
             base = Band.medium
         factors.append(
-            f"sample: {_fmt_conversions(sample_purchases)} conversions / "
+            f"sample: {_fmt_conversions(sample_conversions)} conversions / "
             f"{_fmt_spend(sample_spend)} spend (over floor)"
         )
     else:
         base = Band.low
         factors.append(
             f"sample: {_fmt_spend(sample_spend)} spend cleared but only "
-            f"{_fmt_conversions(sample_purchases)} conversions (< {conversions_floor:g}) — thin on conversions"
+            f"{_fmt_conversions(sample_conversions)} conversions (< {conversions_floor:g}) — thin on conversions"
         )
 
     band = base
@@ -270,7 +270,7 @@ def assess(
     causal_flag = detect_causal_language(causal_text)
 
     data_band, data_factors = data_strength(
-        sample_purchases=evidence.sample_purchases,
+        sample_conversions=evidence.sample_conversions,
         sample_spend=evidence.sample_spend,
         spend_floor=spend_floor,
         conversions_floor=conversions_floor,
@@ -404,7 +404,7 @@ def evidence_to_dict(evidence: Evidence) -> dict[str, Any]:
         "metric_value": evidence.metric_value,
         "metric_display": evidence.metric_display,
         "window": evidence.window,
-        "sample_purchases": evidence.sample_purchases,
+        "sample_conversions": evidence.sample_conversions,
         "sample_spend": evidence.sample_spend,
         "entity_level": evidence.entity_level,
         "entity_id": evidence.entity_id,
@@ -428,6 +428,14 @@ def confidence_to_dict(conf: Confidence) -> dict[str, Any]:
     }
 
 
+def sample_conversions_from_dict(ev: dict[str, Any]) -> float | None:
+    """Read the conversion-count sample from a serialized evidence dict, preferring the
+    current ``sample_conversions`` key and falling back to the legacy ``sample_purchases``
+    key so older action_plan.json files still load. An explicit ``sample_conversions: null``
+    is honored as ``None`` (it does NOT fall through to the legacy key)."""
+    return ev.get("sample_conversions", ev.get("sample_purchases"))
+
+
 def evidence_from_dict(data: dict[str, Any]) -> Evidence:
     """Rebuild :class:`Evidence` from :func:`evidence_to_dict` output (for downstream renderers)."""
     return Evidence(
@@ -435,7 +443,7 @@ def evidence_from_dict(data: dict[str, Any]) -> Evidence:
         metric_value=data.get("metric_value"),
         metric_display=data.get("metric_display", ""),
         window=data.get("window", ""),
-        sample_purchases=data.get("sample_purchases"),
+        sample_conversions=sample_conversions_from_dict(data),
         sample_spend=data.get("sample_spend"),
         entity_level=data.get("entity_level", ""),
         entity_id=data.get("entity_id"),
@@ -468,7 +476,7 @@ def render_evidence_line(evidence: Evidence, *, include_regen: bool = True) -> s
     otherwise print it twice."""
     parts = [evidence.metric_display or evidence.metric_name, f"window {evidence.window}"]
     parts.append(
-        f"n={_fmt_conversions(evidence.sample_purchases)} conversions / "
+        f"n={_fmt_conversions(evidence.sample_conversions)} conversions / "
         f"{_fmt_spend(evidence.sample_spend)} spend"
     )
     if evidence.entity_id or evidence.entity_name:

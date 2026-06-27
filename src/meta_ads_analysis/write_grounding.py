@@ -36,6 +36,7 @@ from .confidence import (
     confidence_to_dict,
     detect_causal_language,
     evidence_to_dict,
+    sample_conversions_from_dict,
 )
 
 # Band name (stored on the confidence block) that marks the explicit absence of a score.
@@ -51,7 +52,7 @@ def _empty_evidence_dict() -> dict[str, Any]:
         "metric_value": None,
         "metric_display": "",
         "window": "",
-        "sample_purchases": None,
+        "sample_conversions": None,
         "sample_spend": None,
         "entity_level": "",
         "entity_id": None,
@@ -74,7 +75,7 @@ def attach_op_grounding(
 
     The band is computed by :func:`confidence.assess` when a sample is present, and by
     :func:`confidence.abstain_confidence` when ``evidence`` is ``None`` or carries no sample
-    (``sample_purchases`` and ``sample_spend`` both ``None``) — never free-typed. ``assess`` itself
+    (``sample_conversions`` and ``sample_spend`` both ``None``) — never free-typed. ``assess`` itself
     abstains when a present sample is below the significance floor, so a thin sample yields an
     ``abstain`` band rather than a fabricated ``low``/``medium``.
 
@@ -84,7 +85,7 @@ def attach_op_grounding(
     """
     causal_claim = detect_causal_language(causal_text)
     has_sample = evidence is not None and (
-        evidence.sample_purchases is not None or evidence.sample_spend is not None
+        evidence.sample_conversions is not None or evidence.sample_spend is not None
     )
     if has_sample:
         conf = assess(
@@ -136,7 +137,7 @@ def op_grounding_gap(
         return "approved write missing required evidence/confidence."
     if str(confidence.get("band")) == ABSTAIN_BAND:
         ev = evidence if isinstance(evidence, dict) else {}
-        sample_cited = ev.get("sample_purchases") is not None or ev.get("sample_spend") is not None
+        sample_cited = sample_conversions_from_dict(ev) is not None or ev.get("sample_spend") is not None
         if sample_cited:
             return (
                 "approved write rests on insufficient data (abstain band) — keep running; do not "

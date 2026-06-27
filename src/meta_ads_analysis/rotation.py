@@ -151,8 +151,11 @@ def _attach_rotation_grounding(
       an honest abstention rather than a thin-data overclaim.
     - the ad set has no row in the window: cite a **zero** sample → ``assess`` abstains → review marks
       it insufficient (keep observing; do not rotate on no evidence of fatigue).
-    - the ad set has a row: cite its real purchases/spend sample → the band is computed and
-      correlational-capped (:data:`ROTATION_EVIDENCE_TIER`).
+    - the ad set has a row: cite its real **goal-aware** conversion sample
+      (:func:`control._status_sample_conversions` — ``app_installs`` for an install-goal account,
+      ``purchases`` otherwise, so the sample speaks the same conversion language as the goal-aware
+      metric) plus its spend → the band is computed and correlational-capped
+      (:data:`ROTATION_EVIDENCE_TIER`).
     """
     adset_id = rotation.get("adset_id")
     adset_name = rotation.get("adset_name")
@@ -165,7 +168,7 @@ def _attach_rotation_grounding(
             metric_value=None,
             metric_display="audience fatigue inference (no performance sample supplied)",
             window=window,
-            sample_purchases=None,
+            sample_conversions=None,
             sample_spend=None,
             entity_level="adset",
             entity_id=str(adset_id) if adset_id else None,
@@ -177,7 +180,7 @@ def _attach_rotation_grounding(
         # Imported at call-time: ``control`` imports ``rotation`` at module load, so a top-level import
         # here would be circular — a function-body import is the standard break and is safe because
         # both modules are fully loaded by the time this runs.
-        from .control import _status_metric
+        from .control import _status_metric, _status_sample_conversions
 
         row = metrics_by_id.get(str(adset_id))
         metric_name, metric_value, metric_display = _status_metric(row, goal)
@@ -187,7 +190,7 @@ def _attach_rotation_grounding(
                 metric_value=None,
                 metric_display=metric_display,
                 window=window,
-                sample_purchases=0.0,
+                sample_conversions=0.0,
                 sample_spend=0.0,
                 entity_level="adset",
                 entity_id=str(adset_id) if adset_id else None,
@@ -200,7 +203,7 @@ def _attach_rotation_grounding(
                 metric_value=metric_value,
                 metric_display=metric_display,
                 window=window,
-                sample_purchases=_num(row.get("purchases")),
+                sample_conversions=_status_sample_conversions(row, goal),
                 sample_spend=_num(row.get("spend")) or 0.0,
                 entity_level="adset",
                 entity_id=str(adset_id) if adset_id else None,
@@ -612,7 +615,7 @@ def _attach_advantage_disable_grounding(item: dict[str, Any]) -> None:
         metric_value=None,
         metric_display="Advantage Audience automation toggle (safety op — no performance metric)",
         window="",
-        sample_purchases=None,
+        sample_conversions=None,
         sample_spend=None,
         entity_level="adset",
         entity_id=str(item.get("adset_id")) if item.get("adset_id") else None,

@@ -170,12 +170,12 @@ def read_experiment(
     # (the weaker arm governs) + the p-value; spend is kept off the data axis. Below the
     # ``min_conversions`` gate the sample is below the conversion floor → ⚪ abstain, while the human
     # ``verdict`` string (INSUFFICIENT DATA) is preserved unchanged.
-    sample_purchases = min(control["purchases"], variant["purchases"])
+    sample_conversions = min(control["purchases"], variant["purchases"])
     evidence = Evidence(
         metric_name="roas_lift_pct", metric_value=roas_lift,
         metric_display=f"ROAS lift {roas_lift:+.1f}%" if roas_lift is not None else "ROAS lift n/a",
         window=f"{exp.start_date}..{as_of.isoformat()}",
-        sample_purchases=sample_purchases,
+        sample_conversions=sample_conversions,
         sample_spend=None,  # the A/B's significance rests on conversions, not spend
         entity_level=exp.level,
         entity_id=",".join(exp.control_ids + exp.variant_ids) or None, entity_name=exp.id,

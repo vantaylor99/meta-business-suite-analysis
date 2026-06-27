@@ -105,7 +105,7 @@ The sample that grounds significance is **goal-aware**, mirroring the metric sel
 - **install-goal accounts** (`maximize_in_app_subscriptions`): in-app subscription results (`total_results`) when present, otherwise app installs (`total_app_installs`). This is why an install account that reports zero purchases is no longer stuck at `low` — its significance now rests on the installs/subscriptions that actually back the call. A handful of subscriptions still grounds on those few (and may honestly stay thin) rather than falling back to a richer install count; the installs fallback is only for "no subscription volume yet".
 - **ROAS / default accounts**: purchases (`total_purchase_count`), unchanged.
 
-The operator-facing sample wording is **"conversions"** (goal-neutral — a purchase, a subscription, and an install are all conversions). The serialized JSON key remains `sample_purchases` for back-compatibility with stored `action_plan.json` files; renaming it to `sample_conversions` is tracked separately.
+The operator-facing sample wording is **"conversions"** (goal-neutral — a purchase, a subscription, and an install are all conversions). The serialized JSON key is now `sample_conversions`; the legacy `sample_purchases` key is still accepted on read, so older stored `action_plan.json` files continue to load.
 
 For the executable pause/budget paths, a sample below the significance floor (too few conversions and too little spend) does **not** become a confident pause or scale. The action is flipped to a non-executable `verdict: "insufficient_data"` recommendation — "promising test, keep running and re-check as more data accrues" — with `executable: false` and `approval_required: false`, so thin data can never be approved into a write.
 

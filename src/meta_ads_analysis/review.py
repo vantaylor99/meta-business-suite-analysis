@@ -47,6 +47,7 @@ from .confidence import (
     combine_bands,
     evidence_from_dict,
     grounding_strength,
+    sample_conversions_from_dict,
 )
 
 # Verdicts, most-conservative → least. The integer rank drives the most-conservative-wins tie-break
@@ -231,7 +232,7 @@ def review_recommendation(
         return ReviewResult(verdict=VERDICT_STANDS, original_band=str(confidence.get("band") or ""))
 
     findings: list[_Finding] = []
-    purchases = _num(evidence.get("sample_purchases"))
+    purchases = _num(sample_conversions_from_dict(evidence))
     spend = _num(evidence.get("sample_spend"))
     sample_cited = purchases is not None or spend is not None
     tier = confidence.get("grounding_tier")

@@ -56,6 +56,13 @@ VERDICT_ABSTAIN_KEEP = "abstain_keep"
 VERDICT_KEEP_WATCH = "keep_watch"
 VERDICT_PAUSE_CANDIDATE = "pause_candidate"
 
+# Own-sample (life-to-date observed window) verdicts — distinct from the analog VERDICT_* values above.
+# Used by the monitor's day-3 forced decision so the keep/kill is graded on the ACCOUNT GOAL metric,
+# not ROAS. classify_own_sample is the goal-aware analog of monitor.classify_ad.
+OWN_SAMPLE_INSUFFICIENT = "insufficient"  # below the significance floor — caller defers to analogs
+OWN_SAMPLE_KEEP = "keep"  # cleared the floor and is at/above the goal bar
+OWN_SAMPLE_PAUSE = "pause_candidate"  # cleared the floor and is below/over the goal bar
+
 # "≥1 result" threshold. Purchases / installs are integer counts, so a small epsilon below 1 cleanly
 # separates "has a conversion" from the (common day-1) zero-result case without float-noise surprises.
 _MIN_RESULT = 1.0
@@ -132,6 +139,21 @@ class EarlyTriageVerdict:
     evidence: dict[str, Any]
 
 
+@dataclass(slots=True)
+class OwnSampleVerdict:
+    """Goal-aware grade of an ad's OWN observed window (life-to-date), NOT analogs. Returned by
+    :func:`classify_own_sample` so the monitor's day-3 forced decision grades the keep/kill on the
+    account-goal metric (cost-per-install on an install account) instead of ROAS."""
+
+    verdict: str  # OWN_SAMPLE_*
+    kind: str  # "roas" | "install"
+    metric_name: str  # "blended_roas" | "cost_per_app_install"
+    metric_value: float | None
+    target: float | None  # the goal floor/target used (None when the install target is unknown)
+    results: float  # goal-aware result count (purchases for ROAS, installs for install)
+    reasons: list[str]
+
+
 # --------------------------------------------------------------------------------------------------
 # Goal-aware metric selection — consistent with actions._select_action_metric / monitor._policy_floors
 # (the same goal→metric mapping and the same floors/targets; no threshold numbers are duplicated).
@@ -155,6 +177,12 @@ class _Sums:
 
 def _goal_kind(policy: dict[str, Any]) -> str:
     return "install" if policy.get("primary_goal") == INSTALL_GOAL else "roas"
+
+
+def goal_kind(policy: dict[str, Any]) -> str:
+    """Public wrapper for the goal→metric-kind mapping (``"roas"`` | ``"install"``), so callers (the
+    monitor's forced decision) can branch on the account goal without reaching into a private helper."""
+    return _goal_kind(policy)
 
 
 def _goal_thresholds(
@@ -350,7 +378,7 @@ def triage_ad(
         metric_value=metric_value,
         metric_display=_fmt_metric(metric_value, kind),
         window=window,
-        sample_purchases=triaged_sums.results,
+        sample_conversions=triaged_sums.results,
         sample_spend=round(triaged_sums.spend, 2),
         entity_level="ad",
         entity_id=ad_id,
@@ -474,6 +502,101 @@ def triage_ad(
         analog_basis=basis,
         confidence=confidence,
         evidence=evidence_dict,
+    )
+
+
+def classify_own_sample(
+    *,
+    spend: float,
+    purchase_value: float | None,
+    purchases: float | None,
+    app_installs: float | None,
+    policy: dict[str, Any],
+    roas_floor: float,
+    roas_target: float,
+    min_spend: float,
+) -> OwnSampleVerdict:
+    """Goal-aware grade of an ad's OWN observed window (NOT analogs).
+
+    Below ``min_spend`` → :data:`OWN_SAMPLE_INSUFFICIENT` (the caller falls through to the analog
+    verdict). Above it, build a :class:`_Sums` from the window and reuse
+    :func:`_goal_kind`/:func:`_goal_thresholds`/:class:`_GoalProfile`/:func:`_is_struggling` so the
+    bar is identical to the analog engine: ROAS below the pause floor / install cost over target (or
+    zero results on the spend) → :data:`OWN_SAMPLE_PAUSE`; otherwise :data:`OWN_SAMPLE_KEEP`.
+
+    ``min_spend`` is also threaded into :func:`_is_struggling` as its ``non_trivial_spend`` floor, so
+    the ``spend >= min_spend`` gate is the single significance threshold (no second, conflicting
+    floor). When ``kind == "install"`` and the policy carries no target install cost, returns
+    :data:`OWN_SAMPLE_INSUFFICIENT` so the caller defers to the analog path (which degrades to keep)."""
+    kind = _goal_kind(policy)
+    spend = spend or 0.0
+    results = (app_installs if kind == "install" else purchases) or 0.0
+    sums = _Sums(spend=spend, results=results, purchase_value=purchase_value or 0.0)
+    metric_name = _metric_name(kind)
+    metric_value = _metric_value(sums, kind)
+
+    if spend < min_spend:
+        return OwnSampleVerdict(
+            verdict=OWN_SAMPLE_INSUFFICIENT,
+            kind=kind,
+            metric_name=metric_name,
+            metric_value=metric_value,
+            target=None,
+            results=results,
+            reasons=[
+                f"own sample ${spend:.0f} < ${min_spend:.0f} significance floor — defer to analogs"
+            ],
+        )
+
+    thresholds = _goal_thresholds(kind, policy, roas_floor, roas_target)
+    if thresholds is None:
+        # Install-goal account with no target install cost in policy: defer to the analog path rather
+        # than guess a threshold (the analog engine degrades such accounts to keep).
+        return OwnSampleVerdict(
+            verdict=OWN_SAMPLE_INSUFFICIENT,
+            kind=kind,
+            metric_name=metric_name,
+            metric_value=metric_value,
+            target=None,
+            results=results,
+            reasons=[
+                "account goal 'maximize_in_app_subscriptions' has no target install cost in policy — "
+                "defer to analogs"
+            ],
+        )
+
+    profile = _GoalProfile(
+        kind=kind,
+        struggling_threshold=thresholds[0],
+        recovery_threshold=thresholds[1],
+        metric_name=metric_name,
+    )
+    target = thresholds[0]
+    display = _fmt_metric(metric_value, kind)
+
+    if _is_struggling(sums, profile, non_trivial_spend=min_spend):
+        if not _has_result(sums):
+            reason = f"~0 {'installs' if kind == 'install' else 'purchases'} on ${spend:.0f}"
+        elif kind == "install":
+            reason = f"{display} over the ${target:.2f} target on ${spend:.0f}"
+        else:
+            reason = f"{display} below the {target:.2f} pause floor on ${spend:.0f}"
+        verdict = OWN_SAMPLE_PAUSE
+    else:
+        if kind == "install":
+            reason = f"{display} at/under the ${target:.2f} target on ${spend:.0f}"
+        else:
+            reason = f"{display} at/above the {target:.2f} pause floor on ${spend:.0f}"
+        verdict = OWN_SAMPLE_KEEP
+
+    return OwnSampleVerdict(
+        verdict=verdict,
+        kind=kind,
+        metric_name=metric_name,
+        metric_value=metric_value,
+        target=target,
+        results=results,
+        reasons=[reason],
     )
 
 
