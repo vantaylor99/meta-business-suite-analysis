@@ -47,8 +47,12 @@ from .control import fetch_entity_metrics
 from .early_triage import (
     AdHistory,
     HistoryProvider,
+    OWN_SAMPLE_INSUFFICIENT,
+    OWN_SAMPLE_PAUSE,
     VERDICT_NOT_STRUGGLING,
     VERDICT_PAUSE_CANDIDATE,
+    classify_own_sample,
+    goal_kind,
     triage_ad,
 )
 from .followups import EARLY_LIFE_MARKER, Followup, early_life_ad_id, early_life_slug
@@ -298,10 +302,14 @@ def _early_life_forced_decision(
     The grace-window abstain is EXPLICITLY overridden here (``days_since_change=None`` → unprotected):
     we chose to probate this ad, so it is owed a decision, not another protective abstain.
 
-    - Own life-to-date sample clears the significance floor → a real ``classify_ad`` (direct
-      observation, real confidence) governs: below the pause floor ⇒ pause candidate, else keep.
+    The own-sample grade is GOAL-AWARE: a ROAS-goal account grades on ROAS (``classify_ad``); an
+    install-goal account grades on cost-per-install (:func:`_forced_decision_install`), since an
+    install ad books ~0 purchases by design and a ROAS-only grade would wrongly force-pause it.
+
+    - Own life-to-date sample clears the significance floor → a real direct-observation decision
+      governs: below the goal bar (ROAS pause floor / install cost target) ⇒ pause candidate, else keep.
     - Still below the floor → the correlational analog verdict governs (no indefinite abstain):
-      ``pause_candidate`` ⇒ pause candidate, otherwise keep.
+      ``pause_candidate`` ⇒ pause candidate, otherwise keep (shared :func:`_forced_decision_analog`).
     """
     close_action = {
         "action": "close",
@@ -311,6 +319,30 @@ def _early_life_forced_decision(
     }
     m = window_metrics
     spend = m.get("spend") or 0.0
+
+    # Goal-aware own-sample grade. ROAS goals keep the ROAS classify_ad path below (correct for ROAS,
+    # and covered by the existing forced-decision tests); install goals grade the OWN sample on
+    # cost-per-install so a healthy install ad (few/zero purchases by design) is not force-paused on a
+    # ~0 ROAS. Both kinds fall through to the SAME analog path when the own sample is below the floor.
+    if goal_kind(policy) == "install":
+        return _forced_decision_install(
+            ad_id=ad_id,
+            info=info,
+            window_metrics=m,
+            histories=histories,
+            as_of=as_of,
+            account_slug=account_slug,
+            policy=policy,
+            roas_floor=roas_floor,
+            roas_target=roas_target,
+            min_spend=min_spend,
+            el=el,
+            age=age,
+            win_from=win_from,
+            to=to,
+            close_action=close_action,
+        )
+
     # Direct call with grace DELIBERATELY disabled (see docstring). For a genuinely young ad the
     # trailing window ≈ its life-to-date sample, so this is its own observed performance.
     direct = classify_ad(
@@ -367,8 +399,46 @@ def _early_life_forced_decision(
         )
         return row, close_action
 
-    # Still below the significance floor at the decision age → the analog verdict governs. Override the
-    # engine's age gate (max_age=age) so a late scan still grades instead of returning None.
+    # Own sample still below the significance floor at the decision age → the analog verdict governs.
+    return _forced_decision_analog(
+        ad_id=ad_id,
+        info=info,
+        window_metrics=m,
+        histories=histories,
+        as_of=as_of,
+        account_slug=account_slug,
+        policy=policy,
+        roas_floor=roas_floor,
+        roas_target=roas_target,
+        el=el,
+        age=age,
+        close_action=close_action,
+    )
+
+
+def _forced_decision_analog(
+    *,
+    ad_id: str,
+    info: dict[str, Any],
+    window_metrics: dict[str, Any],
+    histories: list[AdHistory],
+    as_of: date,
+    account_slug: str,
+    policy: dict[str, Any],
+    roas_floor: float,
+    roas_target: float,
+    el: dict[str, Any],
+    age: int,
+    close_action: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The own-sample-insufficient tail of :func:`_early_life_forced_decision`, shared by both the
+    ROAS and install branches. The probated ad's own sample is below the significance floor, so the
+    correlational analog verdict governs the keep-vs-pause call (no indefinite abstain):
+    ``pause_candidate`` ⇒ pause candidate, otherwise keep. Always returns the ``close_action`` — a
+    probation is owed a decision regardless of verdict."""
+    m = window_metrics
+    spend = m.get("spend") or 0.0
+    # Override the engine's age gate (max_age=age) so a late scan still grades instead of returning None.
     v = triage_ad(
         ad_id=ad_id,
         account_slug=account_slug,
@@ -417,6 +487,107 @@ def _early_life_forced_decision(
         evidence=v.evidence,
         analog_basis=v.analog_basis,
         dollars_at_risk=_dollars_at_risk(spend, m.get("roas"), roas_target),
+    )
+    return row, close_action
+
+
+def _forced_decision_install(
+    *,
+    ad_id: str,
+    info: dict[str, Any],
+    window_metrics: dict[str, Any],
+    histories: list[AdHistory],
+    as_of: date,
+    account_slug: str,
+    policy: dict[str, Any],
+    roas_floor: float,
+    roas_target: float,
+    min_spend: float,
+    el: dict[str, Any],
+    age: int,
+    win_from: str,
+    to: str,
+    close_action: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Install-goal forced decision: grade the probated ad's OWN window on cost-per-install (NOT ROAS,
+    which an install ad books ~0 of by design). Below the significance floor → defer to the analog
+    path; above it → a direct-observation keep/kill on the install metric. Always returns the
+    ``close_action`` (a probation is owed a decision regardless of verdict)."""
+    m = window_metrics
+    spend = m.get("spend") or 0.0
+    own = classify_own_sample(
+        spend=spend,
+        purchase_value=m.get("purchase_value"),
+        purchases=m.get("purchases"),
+        app_installs=m.get("app_installs"),
+        policy=policy,
+        roas_floor=roas_floor,
+        roas_target=roas_target,
+        min_spend=min_spend,
+    )
+    if own.verdict == OWN_SAMPLE_INSUFFICIENT:
+        return _forced_decision_analog(
+            ad_id=ad_id,
+            info=info,
+            window_metrics=m,
+            histories=histories,
+            as_of=as_of,
+            account_slug=account_slug,
+            policy=policy,
+            roas_floor=roas_floor,
+            roas_target=roas_target,
+            el=el,
+            age=age,
+            close_action=close_action,
+        )
+
+    cpi = own.metric_value
+    evidence = Evidence(
+        metric_name="cost_per_app_install",
+        metric_value=cpi,
+        metric_display=f"cost/install ${cpi:.2f}" if cpi is not None else "cost/install n/a",
+        window=f"{win_from}..{to}",
+        sample_purchases=own.results,  # installs as the conversion count (assess is metric-agnostic)
+        sample_spend=round(spend, 2),
+        entity_level="ad",
+        entity_id=ad_id,
+        entity_name=info.get("name"),
+        regenerating_query=build_regenerating_query(account_slug, "ad", win_from, to),
+    )
+    if own.verdict == OWN_SAMPLE_PAUSE:
+        classification = verdict = EARLY_PAUSE_CANDIDATE
+        head = (
+            f"day-{el['decision_age'] + 1} decision (age {age}): own sample cleared the "
+            "significance floor and is over the cost-per-install target — pause candidate"
+        )
+        dollars_at_risk = round(spend, 2)  # the whole window spend is the waste estimate (no ROAS)
+    else:
+        classification, verdict = "watch", "keep"
+        head = (
+            f"day-{el['decision_age'] + 1} decision (age {age}): own sample cleared the "
+            "significance floor and held at/under the cost-per-install target — keep"
+        )
+        dollars_at_risk = 0.0
+    conf = assess(
+        evidence=evidence,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=min_spend,
+        conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=0,
+        causal_text="; ".join(own.reasons) or None,
+    )
+    row = _early_life_row(
+        ad_id=ad_id,
+        info=info,
+        window_metrics=m,
+        classification=classification,
+        verdict=verdict,
+        age=age,
+        reasons=[head, *own.reasons],
+        confidence=confidence_to_dict(conf),
+        evidence=evidence_to_dict(evidence),
+        analog_basis={"analogs": 0, "decision": "direct_observation"},
+        dollars_at_risk=dollars_at_risk,
     )
     return row, close_action
 

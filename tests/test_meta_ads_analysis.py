@@ -7848,13 +7848,19 @@ _WATCH_AS_OF = date(2026, 6, 26)
 _ROAS_GOAL_POLICY = {"primary_goal": "roas"}
 
 
-def _watch_insight(ad_id, *, spend, value=0.0, purchases=0.0, name=None):
+def _watch_insight(ad_id, *, spend, value=0.0, purchases=0.0, installs=0.0, name=None):
     """One ad's aggregated insight blob in the shape ``fetch_entity_metrics`` parses (ad-level keys,
-    string-valued actions/action_values like the live API)."""
+    string-valued actions/action_values like the live API). ``installs`` emits a ``mobile_app_install``
+    action (an ``APP_INSTALL_KEYS`` type) so install-goal accounts can be exercised end-to-end."""
     row = {"ad_id": ad_id, "ad_name": name or f"ad {ad_id}", "spend": str(spend)}
     if value:
         row["action_values"] = [{"action_type": "purchase", "value": str(value)}]
-    row["actions"] = [{"action_type": "purchase", "value": str(purchases)}] if purchases else []
+    actions = []
+    if purchases:
+        actions.append({"action_type": "purchase", "value": str(purchases)})
+    if installs:
+        actions.append({"action_type": "mobile_app_install", "value": str(installs)})
+    row["actions"] = actions
     return row
 
 
@@ -8088,6 +8094,92 @@ def test_watch_day3_probation_still_below_floor_analog_governs(tmp_path: Path) -
     assert len(keep_close) == 1
 
     pause_row, pause_close = run([_roas_ad(f"B{i}", days=10) for i in range(3)])
+    assert pause_row["verdict"] == "pause_candidate"
+    assert pause_row["classification"] == "pause_candidate"
+    assert len(pause_close) == 1
+
+
+def test_watch_day3_probation_install_goal_cheap_installs_keep_and_close(tmp_path: Path) -> None:
+    # The reported bug: an install-goal probated ad whose OWN window clears the significance floor with
+    # 0 purchases (ROAS ~0 by design) but CHEAP installs (cost/install ≤ target) must be graded a KEEP
+    # on cost-per-install, NOT force-paused on ROAS. follow-up closed.
+    root = tmp_path / "followups"
+    _fu.add_followup_if_absent(
+        account="acct", slug=_fu.early_life_slug("P"), title="day-3 decision",
+        due="2026-06-25", created="2026-06-23", marker=_fu.EARLY_LIFE_MARKER, ad_id="P", root=root,
+    )
+    report = _run_watch(
+        # $300 / 200 installs = $1.50 cost-per-install — well under the $3.00 target; ZERO purchases.
+        insights=[_watch_insight("P", spend=300, installs=200)],
+        meta=[_watch_meta("P", updated="2026-06-24")],  # young (grace) — must be overridden
+        histories=[_install_ad("P", days=4, start=date(2026, 6, 23))],  # first_seen 6/23 -> age 3
+        open_followups=_fu.iter_followups("acct", root=root),
+        policy=_INSTALL_POLICY,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "P")
+    assert row["age"] == 3
+    assert row["verdict"] == "keep"
+    assert row["classification"] == "watch"
+    assert row["classification"] != "pause_candidate"  # the bug: ROAS-only grading paused this ad
+    # Graded on the goal metric (cost-per-install) via a real direct-observation call, not ROAS.
+    assert row["evidence"]["metric_name"] == "cost_per_app_install"
+    assert row["confidence"]["grounding_tier"] == "direct_observation"
+    assert row["confidence"]["band"] != "abstain"
+    close = [a for a in report["followup_actions"] if a["action"] == "close" and a["ad_id"] == "P"]
+    assert len(close) == 1
+
+
+def test_watch_day3_probation_install_goal_expensive_installs_pauses_and_closes(tmp_path: Path) -> None:
+    # Same setup but cost/install OVER target → forced to a pause candidate on the install metric.
+    root = tmp_path / "followups"
+    _fu.add_followup_if_absent(
+        account="acct", slug=_fu.early_life_slug("P"), title="day-3 decision",
+        due="2026-06-25", created="2026-06-23", marker=_fu.EARLY_LIFE_MARKER, ad_id="P", root=root,
+    )
+    report = _run_watch(
+        # $300 / 50 installs = $6.00 cost-per-install — over the $3.00 target.
+        insights=[_watch_insight("P", spend=300, installs=50)],
+        meta=[_watch_meta("P", updated="2026-06-24")],
+        histories=[_install_ad("P", days=4, start=date(2026, 6, 23))],
+        open_followups=_fu.iter_followups("acct", root=root),
+        policy=_INSTALL_POLICY,
+    )
+    row = next(r for r in report["rows"] if r["ad_id"] == "P")
+    assert row["classification"] == "pause_candidate"
+    assert row["evidence"]["metric_name"] == "cost_per_app_install"
+    assert row["confidence"]["grounding_tier"] == "direct_observation"
+    assert any(a["action"] == "close" and a["ad_id"] == "P" for a in report["followup_actions"])
+
+
+def test_watch_day3_probation_install_goal_below_floor_analog_governs(tmp_path: Path) -> None:
+    # Install analog of test_watch_day3_probation_still_below_floor_analog_governs: own sample below the
+    # significance floor → defer to the analog verdict (graded goal-aware on cost-per-install).
+    # Recovering install analogs -> keep; non-recovering -> pause. Either way the follow-up closes.
+    def run(analogs):
+        root = tmp_path / _fu.slugify_name("acct_" + analogs[0].ad_id)  # isolate the two sub-cases
+        _fu.add_followup_if_absent(
+            account="acct", slug=_fu.early_life_slug("P"), title="day-3 decision",
+            due="2026-06-25", created="2026-06-23", marker=_fu.EARLY_LIFE_MARKER, ad_id="P", root=root,
+        )
+        triaged = _install_ad("P", days=4, start=date(2026, 6, 23))  # $20 through age 3, 0 installs
+        report = _run_watch(
+            insights=[_watch_insight("P", spend=60)],  # < min_spend 100 -> own sample insufficient
+            meta=[_watch_meta("P", updated="2026-06-24")],
+            histories=[triaged] + analogs,
+            open_followups=_fu.iter_followups("acct", root=root),
+            policy=_INSTALL_POLICY,
+        )
+        row = next(r for r in report["rows"] if r["ad_id"] == "P")
+        closed = [a for a in report["followup_actions"] if a["action"] == "close" and a["ad_id"] == "P"]
+        return row, closed
+
+    keep_row, keep_close = run([_install_ad(f"R{i}", days=10, recover_from=4) for i in range(3)])
+    assert keep_row["verdict"] == "keep_watch"
+    assert keep_row["classification"] == "watch"
+    assert keep_row["confidence"]["grounding_tier"] == "correlational"  # analog-grounded
+    assert len(keep_close) == 1
+
+    pause_row, pause_close = run([_install_ad(f"B{i}", days=10) for i in range(3)])
     assert pause_row["verdict"] == "pause_candidate"
     assert pause_row["classification"] == "pause_candidate"
     assert len(pause_close) == 1
