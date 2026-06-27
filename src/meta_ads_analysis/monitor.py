@@ -156,6 +156,109 @@ def classify_ad(
             "confidence": confidence_to_dict(conf)}
 
 
+def _classify_ad_install(
+    *,
+    spend: float,
+    window_metrics: dict[str, Any],
+    days_since_change: int | None,
+    accelerating: bool,
+    min_spend: float,
+    grace_days: int,
+    policy: dict[str, Any],
+    roas_floor: float,
+    roas_target: float,
+    recency_days: int | None = 0,
+) -> dict[str, Any]:
+    """Install-goal sibling of :func:`classify_ad` for the steady-state (non-early-life) path.
+
+    Grades a mature install ad on **cost-per-install** — the account's own pause bar — instead of
+    ROAS, which an install ad books ~0 of by design (a ROAS-only grade wrongly forces a healthy
+    cheap-install ad to ``urgent``). It does NOT re-implement the install bar: it reuses the goal-aware
+    machinery (:func:`classify_own_sample`, which threads through ``_goal_thresholds``), so the bar is
+    byte-identical to the analog engine and the early-life install sibling
+    (:func:`_forced_decision_install`). ``classify_ad`` stays ROAS-only and unchanged; this is the
+    parallel grader the steady-state branch picks when ``goal_kind(policy) == "install"``.
+
+    **Single-bar rationale (urgent, not underperforming).** Install exposes ONE effective threshold
+    through ``_goal_thresholds`` (the ``secondary_cost_per_app_install_target`` →
+    ``pause_if_no_primary_and_secondary_cost_above`` ladder, returned as ``(target, target)`` with no
+    floor/target split), and that bar IS the account's "too expensive to keep" pause threshold. So
+    there is no ``underperforming`` middle tier; over-bar maps to ``urgent`` (the steady-state
+    strong-pause class), matching ``_forced_decision_install``, which already treats over-bar as a
+    pause candidate with the full window spend at risk.
+
+    Returns the SAME dict shape as :func:`classify_ad`
+    (``classification`` / ``dollars_at_risk`` / ``reasons`` / ``confidence``), mapping the
+    ``OWN_SAMPLE_*`` verdict onto the steady-state taxonomy:
+
+    - ``OWN_SAMPLE_INSUFFICIENT`` (spend < ``min_spend`` **or** no install target in policy) →
+      ``insufficient`` (skipped downstream; abstains) — graceful degradation, never a crash or a
+      guessed threshold.
+    - in the grace window (``days_since_change`` < ``grace_days``) → ``watch`` (learning, protected
+      from kill), goal-agnostic exactly like :func:`classify_ad` — checked AFTER the significance
+      floor, again mirroring :func:`classify_ad`.
+    - ``OWN_SAMPLE_KEEP`` (cost ≤ target) → ``ok`` (skipped downstream) — the core fix: a healthy
+      cheap-install ad is no longer flagged.
+    - ``OWN_SAMPLE_PAUSE`` (cost > target, or ~0 installs on the spend) → ``urgent``;
+      ``dollars_at_risk`` is the full window spend (no ROAS waste estimate exists), mirroring
+      :func:`_forced_decision_install`.
+    """
+    m = window_metrics
+    own = classify_own_sample(
+        spend=spend,
+        purchase_value=m.get("purchase_value"),
+        purchases=m.get("purchases"),
+        app_installs=m.get("app_installs"),
+        policy=policy,
+        roas_floor=roas_floor,
+        roas_target=roas_target,
+        min_spend=min_spend,
+    )
+
+    # Significance floor (and the no-target degrade) — mirrors classify_ad's `spend < min_spend` gate,
+    # which it also checks before the grace window.
+    if own.verdict == OWN_SAMPLE_INSUFFICIENT:
+        return {"classification": "insufficient", "dollars_at_risk": 0.0, "reasons": own.reasons,
+                "confidence": confidence_to_dict(_abstain_confidence(own.reasons))}
+
+    over_target = own.verdict == OWN_SAMPLE_PAUSE
+    dollars_at_risk = round(spend, 2) if over_target else 0.0  # whole window spend is the waste (no ROAS)
+
+    # Grace: a recently created/changed ad is still learning → watch, NEVER urgent — exactly as
+    # classify_ad protects an over-floor ROAS ad. Goal-agnostic protection.
+    protected = days_since_change is not None and days_since_change < grace_days
+    if protected:
+        reasons = [f"created/changed {days_since_change}d ago (< {grace_days}d) — learning, protected from kill"]
+        if over_target:
+            reasons.append(f"{own.reasons[0]} but it's too young to judge")
+        conf = _abstain_confidence(reasons + ["too young to judge — abstain, keep running"])
+        return {"classification": "watch", "dollars_at_risk": dollars_at_risk, "reasons": reasons,
+                "confidence": confidence_to_dict(conf)}
+
+    if not over_target:  # OWN_SAMPLE_KEEP — cheap install, mature: keep (skipped downstream).
+        return {"classification": "ok", "dollars_at_risk": 0.0, "reasons": own.reasons,
+                "confidence": confidence_to_dict(_abstain_confidence(own.reasons))}
+
+    # OWN_SAMPLE_PAUSE, mature: a real direct-observation pause graded on the install metric.
+    reasons = list(own.reasons)
+    if accelerating:
+        reasons.append("spend accelerating vs its recent average")
+    cpi = own.metric_value
+    evidence = Evidence(
+        metric_name="cost_per_app_install", metric_value=cpi,
+        metric_display=f"cost/install ${cpi:.2f}" if cpi is not None else "cost/install n/a",
+        window="n/a", sample_conversions=own.results, sample_spend=round(spend, 2),
+        entity_level="ad", entity_id=None, entity_name=None, regenerating_query=None,
+    )
+    conf = assess(
+        evidence=evidence, tier=EvidenceTier.direct_observation,
+        spend_floor=min_spend, conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=recency_days, causal_text="; ".join(reasons) or None,
+    )
+    return {"classification": "urgent", "dollars_at_risk": dollars_at_risk, "reasons": reasons,
+            "confidence": confidence_to_dict(conf)}
+
+
 def _resolve_policy(account_slug: str) -> dict[str, Any]:
     """The account's action policy (``primary_goal``, ROAS floors, install-cost target, …), or ``{}``
     when unknown. Shared by :func:`_policy_floors` and the early-life triage so the watch scan and the
@@ -814,26 +917,48 @@ def build_watch_report(
                     followup_actions.append(el_action)
                 continue  # the triage is the single source of truth for this early-life ad
 
-        verdict = classify_ad(
-            spend=spend, roas=m.get("roas"), results=m.get("purchases"),
-            days_since_change=days_since_change, accelerating=accelerating,
-            min_spend=min_spend, grace_days=grace_days, roas_floor=roas_floor, roas_target=roas_target,
-            recency_days=0,  # window ends at as_of, so the data is maximally fresh (deterministic)
-        )
+        # Goal-aware steady-state grade. ROAS goals take the unchanged classify_ad path; install goals
+        # grade on cost-per-install (a mature install ad books ~0 purchases by design, so a ROAS-only
+        # grade wrongly flags a healthy cheap-install ad). Both return the SAME dict shape.
+        goal = goal_kind(policy)
+        if goal == "install":
+            verdict = _classify_ad_install(
+                spend=spend, window_metrics=m, days_since_change=days_since_change,
+                accelerating=accelerating, min_spend=min_spend, grace_days=grace_days,
+                policy=policy, roas_floor=roas_floor, roas_target=roas_target,
+                recency_days=0,  # window ends at as_of, so the data is maximally fresh (deterministic)
+            )
+        else:
+            verdict = classify_ad(
+                spend=spend, roas=m.get("roas"), results=m.get("purchases"),
+                days_since_change=days_since_change, accelerating=accelerating,
+                min_spend=min_spend, grace_days=grace_days, roas_floor=roas_floor, roas_target=roas_target,
+                recency_days=0,  # window ends at as_of, so the data is maximally fresh (deterministic)
+            )
         cls = verdict["classification"]
         if cls in ("insufficient", "ok"):
             continue
-        flaggable = cls in ("urgent", "underperforming")
+        flaggable = cls in ("urgent", "underperforming")  # install never emits underperforming
         prior_entry = prior.get(ad_id, {})
         times = (prior_entry.get("times_flagged", 0) + 1) if flaggable else prior_entry.get("times_flagged", 0)
-        roas_val = m.get("roas")
-        evidence = Evidence(
-            metric_name="roas", metric_value=roas_val,
-            metric_display=f"ROAS {roas_val:.2f}" if roas_val is not None else "ROAS n/a",
-            window=f"{win_from}..{to}", sample_conversions=m.get("purchases"), sample_spend=round(spend, 2),
-            entity_level="ad", entity_id=ad_id, entity_name=info.get("name"),
-            regenerating_query=build_regenerating_query(account_slug, "ad", win_from, to),
-        )
+        if goal == "install":
+            cpi = m.get("cost_per_app_install")
+            evidence = Evidence(
+                metric_name="cost_per_app_install", metric_value=cpi,
+                metric_display=f"cost/install ${cpi:.2f}" if cpi is not None else "cost/install n/a",
+                window=f"{win_from}..{to}", sample_conversions=m.get("app_installs"), sample_spend=round(spend, 2),
+                entity_level="ad", entity_id=ad_id, entity_name=info.get("name"),
+                regenerating_query=build_regenerating_query(account_slug, "ad", win_from, to),
+            )
+        else:
+            roas_val = m.get("roas")
+            evidence = Evidence(
+                metric_name="roas", metric_value=roas_val,
+                metric_display=f"ROAS {roas_val:.2f}" if roas_val is not None else "ROAS n/a",
+                window=f"{win_from}..{to}", sample_conversions=m.get("purchases"), sample_spend=round(spend, 2),
+                entity_level="ad", entity_id=ad_id, entity_name=info.get("name"),
+                regenerating_query=build_regenerating_query(account_slug, "ad", win_from, to),
+            )
         row = {
             "ad_id": ad_id, "ad_name": info.get("name"), "adset_id": info.get("adset_id"),
             "classification": cls, "spend": round(spend, 2), "roas": m.get("roas"),
