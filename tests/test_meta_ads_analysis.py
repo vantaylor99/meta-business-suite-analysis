@@ -3079,6 +3079,22 @@ def test_rotation_install_goal_structural_abstain_when_no_metrics() -> None:
     assert op["confidence"]["band"] == "abstain"
 
 
+def test_rotation_no_goal_installs_present_keeps_sample_on_purchases() -> None:
+    # Intentional asymmetry (parity with control + actions._select_sample_conversions): with NO goal
+    # set, _status_metric falls through to cost_per_app_install when installs are present, but the
+    # significance sample stays on purchases — the selector keys ONLY on the explicit install-goal
+    # string. Metric and sample can legitimately disagree here; this pins that it is NOT "fixed".
+    adsets = _three_adset_partition()
+    metrics = {a["id"]: _rotation_install_row(a["id"], a["name"], app_installs=120, spend=2400,
+                                              purchases=30.0)
+               for a in adsets}
+    plan = build_rotation_plan(adsets, account_slug="demo", ad_account_id="act_1",
+                               metrics_by_id=metrics, goal=None, **_ROTATION_WINDOW)
+    op = plan["rotations"][0]
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"  # no goal + installs present
+    assert op["evidence"]["sample_purchases"] == 30.0  # but the sample stays on purchases
+
+
 def test_apply_rotation_blocks_approved_thin_sample_at_execute() -> None:
     # An operator approves a rotation whose fatigue sample is below the significance floor (cited
     # abstain). The propose-time review already marked it insufficient; the apply-time grounding gate
@@ -4805,6 +4821,33 @@ def test_build_duplicate_ad_plan_install_goal_no_row_still_cites_zero_and_abstai
     assert op["evidence"]["sample_purchases"] == 0.0  # zero branch is goal-independent
     assert op["confidence"]["band"] == "abstain"
     assert op["review_verdict"] == "insufficient"
+
+
+def test_build_duplicate_ad_plan_no_goal_installs_present_keeps_sample_on_purchases() -> None:
+    # Intentional asymmetry (parity with control + actions._select_sample_conversions): with NO goal
+    # set, _status_metric falls through to cost_per_app_install when installs are present, but the
+    # significance sample stays on purchases — the selector keys ONLY on the explicit install-goal
+    # string. Metric and sample can legitimately disagree here; this pins that it is NOT "fixed".
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    reader = FakeMetaReader(
+        get_ad=lambda ad_id, *, fields: {"id": ad_id, "name": "Mixed", "creative": {"id": "cr-1"}},
+        fetch_insights=lambda *a, **k: [
+            {"ad_id": "ad1", "ad_name": "Mixed", "spend": "1200",
+             "actions": [
+                 {"action_type": "purchase", "value": "30"},
+                 {"action_type": "mobile_app_install", "value": "120"},
+             ]}
+        ],
+    )
+    plan = build_duplicate_ad_plan(
+        reader, "act_1", source_ad_id="ad1", target_adset_id="as2",
+        policy={},  # no primary_goal
+        date_from="2026-05-26", date_to="2026-06-24", run_date="2026-06-24",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["metric_name"] == "cost_per_app_install"  # no goal + installs present
+    assert op["evidence"]["sample_purchases"] == 30.0  # but the sample stays on purchases
 
 
 def test_authoring_netnew_create_abstains_insufficient_and_non_executable() -> None:
