@@ -10,7 +10,10 @@ Protective by design:
 - **Recently-created-or-changed grace**: an ad created/edited within `grace_days` is "learning" →
   classified `watch`, NEVER `urgent`. Using `updated_time` means a just-re-enabled/edited ad (the
   mid-relearn case) is protected automatically, no decision-log parsing needed.
-- **Account goal anchored**: ROAS floor / target come from the account's action policy.
+- **Account goal anchored**: each ad is graded on its account's goal metric — ROAS floor / target for
+  a purchase/ROAS account, cost-per-install target for an install account (a mature install ad books
+  ~0 ROAS by design, so it is graded on cost-per-install, not ROAS). Both the early-life and the
+  steady-state paths branch on the policy's `primary_goal`. Thresholds come from the action policy.
 
 Persistence: a watchlist tracks how many consecutive scans an ad has been flagged, so a *consistent*
 underperformer is distinguishable from a one-day blip.

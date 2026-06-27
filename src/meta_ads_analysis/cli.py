@@ -1904,6 +1904,20 @@ def experiment_main() -> None:
             print(f"Wrote readout JSON: {out}")
 
 
+def _watch_row_metric_display(row: dict) -> str:
+    """The header metric for one watch row — the goal metric the row was actually graded on.
+
+    Install-goal rows are graded on cost-per-install and carry a ``cost_per_app_install`` evidence
+    metric; they book ~0 ROAS by design, so a ``ROAS 0.00`` header would misrepresent the basis. Show
+    their cost/install instead. Every other row (ROAS-goal, and any row without install evidence) keeps
+    the ROAS header unchanged."""
+    ev = row.get("evidence") or {}
+    if ev.get("metric_name") == "cost_per_app_install":
+        return ev.get("metric_display") or "cost/install n/a"
+    roas = row.get("roas")
+    return f"ROAS {roas:.2f}" if roas is not None else "ROAS 0.00"
+
+
 def watch_main() -> None:
     from datetime import date as _date
 
@@ -2023,14 +2037,14 @@ def watch_main() -> None:
         if r["times_flagged"] >= 2:
             flags.append(f"{r['times_flagged']}x running")
         tag = (" [" + ", ".join(flags) + "]") if flags else ""
-        roas = f"{r['roas']:.2f}" if r["roas"] is not None else "0.00"
+        metric_disp = _watch_row_metric_display(r)
         if r.get("early_life"):
             basis = r.get("analog_basis") or {}
             age_disp = f"age {r.get('age')}d (early-life)"
             tag = f" [{basis.get('analogs', 0)} analogs at age {basis.get('age')}, {basis.get('recovered', 0)} recovered]"
         else:
             age_disp = f"age {r['days_since_change']}d"
-        print(f"  {r['classification'].upper():<16} {str(r['ad_name'])[:26]:<27} ROAS {roas} | ${r['spend']:.0f} "
+        print(f"  {r['classification'].upper():<16} {str(r['ad_name'])[:26]:<27} {metric_disp} | ${r['spend']:.0f} "
               f"| ${(r.get('dollars_at_risk') or 0.0):.0f} at risk | {age_disp}{tag}")
         for reason in r["reasons"]:
             print(f"        - {reason}")

@@ -8600,6 +8600,20 @@ def test_watch_steady_install_expensive_cpi_flagged_urgent_on_install_metric() -
     assert report["watchlist"]["ads"]["EXP"]["times_flagged"] == 1
 
 
+def test_watch_steady_install_zero_installs_flagged_urgent_no_crash() -> None:
+    # ~0 installs on non-trivial spend is a pause candidate. cost_per_app_install is undefined (None),
+    # so the row evidence must degrade to a clean "n/a" display (not crash on the f-string) while the
+    # full window spend is still at risk and the ad lands on the watchlist.
+    report = _run_steady_install(ad_id="ZERO", spend=300, installs=0, policy=_INSTALL_POLICY)
+    row = next(r for r in report["rows"] if r["ad_id"] == "ZERO")
+    assert row["classification"] == "urgent"
+    assert row["evidence"]["metric_name"] == "cost_per_app_install"
+    assert row["evidence"]["metric_value"] is None
+    assert row["evidence"]["metric_display"] == "cost/install n/a"
+    assert row["dollars_at_risk"] == 300.0
+    assert "ZERO" in report["watchlist"]["ads"]
+
+
 def test_watch_steady_install_no_target_degrades_gracefully() -> None:
     # Install goal but the policy carries NO target install cost: classify_own_sample degrades to
     # insufficient, so the ad is skipped (no crash, no guessed threshold) rather than flagged.
@@ -8641,6 +8655,25 @@ def test_classify_ad_install_buckets_and_protection() -> None:
     assert _cls_install(installs=0)["classification"] == "urgent"
     # urgent puts the whole window spend at risk (no ROAS waste estimate for install).
     assert _cls_install(installs=10)["dollars_at_risk"] == 300.0
+
+
+def test_watch_row_metric_display_is_goal_aware() -> None:
+    # The CLI header metric follows the metric the row was graded on. Install-goal rows carry
+    # cost_per_app_install evidence and book ~0 ROAS by design, so a "ROAS 0.00" header would
+    # misrepresent the basis — they render their cost/install instead. ROAS rows are unchanged.
+    from meta_ads_analysis.cli import _watch_row_metric_display
+
+    install_row = {"roas": None, "evidence": {"metric_name": "cost_per_app_install",
+                                              "metric_display": "cost/install $30.00"}}
+    assert _watch_row_metric_display(install_row) == "cost/install $30.00"
+    # Install urgent on ~0 installs: cpi is undefined → n/a, never a crash or a bogus "ROAS 0.00".
+    install_na = {"roas": None, "evidence": {"metric_name": "cost_per_app_install",
+                                             "metric_display": None}}
+    assert _watch_row_metric_display(install_na) == "cost/install n/a"
+    # ROAS rows: byte-identical to the prior header (value, and 0.00 fallback when roas is None).
+    assert _watch_row_metric_display({"roas": 1.5, "evidence": {"metric_name": "roas"}}) == "ROAS 1.50"
+    assert _watch_row_metric_display({"roas": None, "evidence": {"metric_name": "roas"}}) == "ROAS 0.00"
+    assert _watch_row_metric_display({"roas": None}) == "ROAS 0.00"  # no evidence (early-life keep) → ROAS
 
 
 def test_watch_day3_probation_own_sample_clears_floor_keep_and_close(tmp_path: Path) -> None:
