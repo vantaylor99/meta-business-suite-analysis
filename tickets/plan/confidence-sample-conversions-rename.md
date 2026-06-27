@@ -1,5 +1,5 @@
 description: A field in the recommendation-evidence record is named "sample_purchases", but it now holds whatever conversion the account optimizes for (subscriptions or app installs, not just purchases). Rename it so the name stops implying purchases-only — a repo-wide change to keep for a deliberate, well-tested pass.
-prereq: confidence-install-goal-significance
+prereq: confidence-install-goal-significance-ops, enable-wrong-direction-install-goal, goal-aware-grounding-other-producers
 files: src/meta_ads_analysis/confidence.py, src/meta_ads_analysis/actions.py, src/meta_ads_analysis/control.py, src/meta_ads_analysis/write_grounding.py, src/meta_ads_analysis/review.py, src/meta_ads_analysis/monitor.py, src/meta_ads_analysis/authoring.py, src/meta_ads_analysis/rotation.py, src/meta_ads_analysis/experiment.py, src/meta_ads_analysis/knowledge_provenance.py, tests/test_meta_ads_analysis.py
 ----
 
