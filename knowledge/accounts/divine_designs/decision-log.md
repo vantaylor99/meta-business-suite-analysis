@@ -2,6 +2,31 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-29 (diagnosis) — account ROAS tank: severe self-inflicted re-learning, not breakage
+
+Investigated the post-Jun-22 ROAS collapse (operator asked whether our agent-driven changes broke the
+account). Daily trend: blended ROAS held a ~2.2x average (range 1.5-4.5) through Jun 22, then cliffed —
+Jun 23 0.94x on collapsed $140 spend (delivery choked, ~1/4 of normal), Jun 24 0.17x, and 0.36-0.81x
+through Jun 28. The cliff is coincident with our first changes (Jun 22 Advantage+ Audience disabled;
+Jun 22-23 ~18-ad mass re-enable after the dev-mode fix; Jun 24 placement policy + Mission Call enable).
+
+**Most likely a severe, self-inflicted RE-LEARNING episode — not permanent breakage.** Evidence:
+- **High Value Customers got the SAME Advantage+-off treatment and IMPROVED** (30d 1.72x -> 7d 2.10x) —
+  so this is not a structural ceiling drop from AA-off alone; the config can still convert.
+- **Purchases still track** (High Value records conversions) -> NOT a pixel/attribution break.
+- **No campaign/ad set was turned off by mistake** -> the active core three are intact.
+- Damage is concentrated in the **most-churned** ad sets: Engaged (2.89x -> 0.64x) and Low Value
+  (1.99x -> 0.91x), both hit with AA-off + mass re-enable + (Engaged) a new ad + a budget scale at once.
+  High Value got a single clean change (placement fix) and bounced fastest.
+
+Read: root cause was **too many simultaneous edits** throwing the big ad sets into deep, overlapping
+learning resets; Advantage+-off is the most consequential and most reversible lever in that stack.
+Caveat: not yet visibly recovering (6 days sub-1.0; the last 1-2 days are understated by attribution lag).
+
+**Plan:** watch via the daily overview; decision owed 2026-07-01 (see follow-up) — if Engaged/Low Value
+aren't climbing toward ~1.5x+, test re-enabling Advantage+ Audience on Engaged via the CLI flow. One
+change at a time; no mass-pausing mid-relearn.
+
 ## 2026-06-29 (verification + escalation) — Influencer Test pause confirmed; ad-set escalation after a stuck IN_PROCESS write
 
 Follow-through on the 2026-06-27 IFA Base kill (below). The original ad-level pause was a Meta MCP write
