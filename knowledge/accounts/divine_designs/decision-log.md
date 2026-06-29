@@ -2,6 +2,20 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-29 (verification + escalation) — Influencer Test pause confirmed; ad-set escalation after a stuck IN_PROCESS write
+
+Follow-through on the 2026-06-27 IFA Base kill (below). The original ad-level pause was a Meta MCP write
+that **stuck in `IN_PROCESS` and kept delivering ~$312/day** — the 06-28 daily showed Influencer Test
+still the account's #1 spender. Because IFA Base was the only ad in the set, the **ad set itself**
+(`Influencer Test`, 120246399173100733) was paused ~06-27 ~9pm to actually stop delivery.
+- **Verified 2026-06-29:** `Influencer Test` effective_status = **PAUSED**, `IFA Base` = **PAUSED**, and
+  **$0 spend on 06-29** while the active ad sets (Engaged, Low/High Value) spent normally. The 06-28 $312
+  was a near-full day of spend *before* the ~9pm pause — not a failed pause. (Lesson: a "PAUSED" status
+  is not proof delivery stopped; next-day spend = $0 is.)
+- **Systemic fix shipped:** the MCP write that caused this bypassed every guardrail. The settings.json
+  deny-list (PR #6, merged) now makes Meta MCP writes impossible — all account writes go through the CLI
+  guarded flow.
+
 ## 2026-06-27 (action) — killed influencer ad "IFA Base" (clicky, non-converting)
 
 **Account change executed (via Meta MCP write tool — guarded-flow exception, hand-logged):**
