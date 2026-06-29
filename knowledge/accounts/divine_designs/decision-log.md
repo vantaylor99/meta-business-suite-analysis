@@ -2,6 +2,28 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-29 (action) — restricted Engaged + Low Value to manual placements (Feed+Reels+Stories), matching High Value
+
+**Account change executed via the repo CLI guarded flow (`apply_ops` `set_placements`, validate-only → execute — NOT the MCP):**
+- Set `Engaged Audience` (120241592681330733) and `Low Value Customers` (120242997920660733) to manual
+  placements **publisher_platforms=[facebook, instagram]; facebook_positions=[feed, story, facebook_reels];
+  instagram_positions=[stream, story, reels]** — the exact set `High Value Customers` already runs.
+  Placements-only (read-modify-write preserved audiences, AA-off, age). Validate-only passed 2/2; executed
+  2/2, 0 failed; verified by independent re-read (both now match High Value).
+  - *Why:* the 2026-06-29 inspect found these two were on **automatic / Advantage+ Placements** (all
+    inventory, incl. low-ROAS Audience Network / Messenger / in-stream) while High Value — *identical* 1%
+    lookalike audience, AA off — was on manual Feed+Reels+Stories and recovered (1.72x → 2.10x). With AA
+    off (no audience optimization to compensate), the automatic-placement ad sets were bleeding into junk
+    inventory. High Value is the in-account proof the restricted set works.
+  - *Operator call (Van):* fix now rather than wait for the 2026-07-01 read — the account was bleeding
+    ~$900/day at sub-1.0 ROAS, so the cost of acting outweighed the value of a clean self-recovery read.
+    High Value still stands as the proof regardless.
+  - *Expected:* the edit re-enters both ad sets into learning (effective_status IN_PROCESS post-edit) —
+    expect a couple soft days before any lift. NOT done: the Engaged 5%→1% lookalike change (separate;
+    needs a 1% engaged lookalike created first) — held to keep the placement test clean.
+- **Verify next (2026-06-30 / daily overview):** confirm both ad sets resume DELIVERING (spend > $0, not
+  stuck IN_PROCESS), then watch ROAS direction over ~a week vs the ~2x baseline.
+
 ## 2026-06-29 (diagnosis) — account ROAS tank: severe self-inflicted re-learning, not breakage
 
 Investigated the post-Jun-22 ROAS collapse (operator asked whether our agent-driven changes broke the
