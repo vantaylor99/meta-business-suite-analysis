@@ -2,6 +2,39 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-06-27 (action) — killed influencer ad "IFA Base" (clicky, non-converting)
+
+**Account change executed (via Meta MCP write tool — guarded-flow exception, hand-logged):**
+- **Paused ad `IFA Base`** (120246473310000733, Influencer Test ad set, May Lower Spend campaign).
+  `status=PAUSED` (effective_status IN_PROCESS, propagating). The ad set is left intact for future
+  influencer tests; only the ad was paused.
+  - *Why:* over Jun 24–27 it ran **9.26% CTR / 3,513 clicks but only 4 purchases on $693** (ROAS 0.65) —
+    the single source of the account-wide CTR spike (1.1% → 5.5%) the operator noticed. Classic
+    influencer pattern: magnetic content, curiosity clicks, no purchase intent. A ~$175/day leak at
+    ~0 conversion. Not an early-life "needs more data" case — the traffic demonstrably doesn't convert.
+  - *Heads-up (not yet acted on):* Influencer Test sits in the **May Lower Spend** CBO campaign, so its
+    freed budget will redistribute to **Low Value Customers** (also weak, ~0.35 ROAS over the same
+    window). Stopping the influencer bleed alone doesn't fix May Lower Spend — that campaign's budget
+    may need attention separately.
+- *Caveat:* MCP write bypasses the repo guardrails (status change; reversible) — operator-approved,
+  logged per the MCP-write-exception rule.
+
+## 2026-06-27 (action) — rolled 100K budget back $336 → $280 (account ROAS slump)
+
+**Account change executed (via Meta MCP write tool — guarded-flow exception, hand-logged):**
+- **Reverted the `100K` campaign daily budget $336 → $280 (CBO)** (campaign 120241587361240733).
+  Verified after: `daily_budget $280.00`, `effective_status ACTIVE`. Connector force-paused on edit
+  again (`status_forced_to_paused: true`); reactivated via `ads_activate_entity`, ~seconds downtime.
+  - *Why:* the daily trend showed the account dropped to **sub-1.0 ROAS starting ~Jun 23–24**
+    (purchases ~25/day → 2–6/day) — **before** the Jun 26 scale, so the scale did not cause it.
+    Most likely re-learning from the earlier Jun 22 (Advantage Audience disabled) + Jun 24 (placement
+    policy) changes, plus attribution lag understating the latest 1–2 days. With ROAS weak, the +20%
+    was overspending into the dip, so we undid it. No point scaling into a slump.
+  - *Not done:* did not cut below $280 or pause — just reverted the scale. Re-evaluate once the account
+    exits re-learning (watch the 6/29 follow-up).
+- *Caveat:* MCP write bypasses the repo's propose→approve→validate→execute guardrails (CLI can't do CBO
+  budgets yet) — operator-approved one-off, logged here per the MCP-write-exception rule.
+
 ## 2026-06-26 (action) — scaled 100K campaign +20% ($280→$336) to feed the Engaged Audience winner
 
 **Account change executed (via Meta's official MCP write tool — NOT the repo guarded flow):**

@@ -5509,6 +5509,7 @@ def test_build_watch_report_rows_carry_confidence_and_reproducible_evidence() ->
     assert row["confidence"]["grounding_tier"] == "direct_observation"
     assert row["confidence"]["causal_flag"] is False
     ev = row["evidence"]
+    assert ev["metric_name"] == "roas"  # ROAS-goal regression: install branch must not bleed through
     assert ev["entity_level"] == "ad" and ev["entity_id"] == "m1"
     assert ev["window"] == "2026-06-18..2026-06-24"
     # A flagged ad traces back to a reproducible account_metrics command.
@@ -8557,6 +8558,122 @@ def test_watch_no_history_falls_back_to_classify_ad() -> None:
     assert not row.get("early_life")
     assert row["classification"] == "urgent"  # mature + below floor -> normal flow
     assert report["followup_actions"] == []
+
+
+# --- Goal-aware STEADY-STATE grading (install accounts) ----------------------------------------
+# A mature, non-probation install ad takes the steady-state path (early_life=False here so no
+# DuckDB/history is needed). It must be graded on cost-per-install, NOT ROAS — a healthy cheap-install
+# ad books ~0 ROAS by design and must not be flagged urgent.
+
+from meta_ads_analysis.monitor import _classify_ad_install
+
+_INSTALL_POLICY_NO_TARGET = {"primary_goal": "maximize_in_app_subscriptions"}
+
+
+def _run_steady_install(*, ad_id, spend, installs, policy, updated="2026-06-01"):
+    return _run_watch(
+        insights=[_watch_insight(ad_id, spend=spend, installs=installs)],
+        meta=[_watch_meta(ad_id, updated=updated)],
+        histories=[], policy=policy, early_life=False,
+    )
+
+
+def test_watch_steady_install_cheap_cpi_not_flagged() -> None:
+    # THE CORE FIX: a mature install ad with cheap cost-per-install ($300 / 200 installs = $1.50 <
+    # $3.00 target) and ~0 ROAS is `ok` — absent from rows and the watchlist. Before goal-awareness this
+    # ad was wrongly graded ROAS-only and surfaced as urgent.
+    report = _run_steady_install(ad_id="CHEAP", spend=300, installs=200, policy=_INSTALL_POLICY)
+    assert "CHEAP" not in {r["ad_id"] for r in report["rows"]}
+    assert "CHEAP" not in report["watchlist"]["ads"]
+
+
+def test_watch_steady_install_expensive_cpi_flagged_urgent_on_install_metric() -> None:
+    # A mature install ad with expensive cost-per-install ($300 / 10 installs = $30 > $3.00 target) is
+    # urgent, graded on the install metric, with the whole window spend at risk and on the watchlist.
+    report = _run_steady_install(ad_id="EXP", spend=300, installs=10, policy=_INSTALL_POLICY)
+    row = next(r for r in report["rows"] if r["ad_id"] == "EXP")
+    assert row["classification"] == "urgent"
+    assert row["evidence"]["metric_name"] == "cost_per_app_install"
+    assert row["evidence"]["metric_value"] == 30.0
+    assert row["dollars_at_risk"] == 300.0
+    assert "EXP" in report["watchlist"]["ads"]
+    assert report["watchlist"]["ads"]["EXP"]["times_flagged"] == 1
+
+
+def test_watch_steady_install_zero_installs_flagged_urgent_no_crash() -> None:
+    # ~0 installs on non-trivial spend is a pause candidate. cost_per_app_install is undefined (None),
+    # so the row evidence must degrade to a clean "n/a" display (not crash on the f-string) while the
+    # full window spend is still at risk and the ad lands on the watchlist.
+    report = _run_steady_install(ad_id="ZERO", spend=300, installs=0, policy=_INSTALL_POLICY)
+    row = next(r for r in report["rows"] if r["ad_id"] == "ZERO")
+    assert row["classification"] == "urgent"
+    assert row["evidence"]["metric_name"] == "cost_per_app_install"
+    assert row["evidence"]["metric_value"] is None
+    assert row["evidence"]["metric_display"] == "cost/install n/a"
+    assert row["dollars_at_risk"] == 300.0
+    assert "ZERO" in report["watchlist"]["ads"]
+
+
+def test_watch_steady_install_no_target_degrades_gracefully() -> None:
+    # Install goal but the policy carries NO target install cost: classify_own_sample degrades to
+    # insufficient, so the ad is skipped (no crash, no guessed threshold) rather than flagged.
+    report = _run_steady_install(ad_id="NOTGT", spend=300, installs=10, policy=_INSTALL_POLICY_NO_TARGET)
+    assert "NOTGT" not in {r["ad_id"] for r in report["rows"]}
+    assert "NOTGT" not in report["watchlist"]["ads"]
+
+
+def test_watch_steady_install_grace_protects_over_target_ad() -> None:
+    # A recently-changed install ad over target is `watch` (learning, protected), never `urgent`. Grace
+    # is goal-agnostic, exactly as classify_ad protects an over-floor ROAS ad. as_of is 6/26, updated
+    # 6/24 -> days_since_change 2 < grace_days 5.
+    report = _run_steady_install(ad_id="GRACE", spend=300, installs=10, policy=_INSTALL_POLICY,
+                                 updated="2026-06-24")
+    row = next(r for r in report["rows"] if r["ad_id"] == "GRACE")
+    assert row["classification"] == "watch"
+    assert row["classification"] != "urgent"
+    assert "GRACE" not in report["watchlist"]["ads"]  # watch is not flaggable
+
+
+def _cls_install(*, spend=300, installs=100, days_since_change=30, policy=None, accelerating=False):
+    """Pure-unit harness for _classify_ad_install, mirroring the _cls helper for classify_ad."""
+    m = {"app_installs": float(installs), "purchases": 0.0, "purchase_value": 0.0, "roas": None,
+         "cost_per_app_install": round(spend / installs, 2) if installs else None}
+    return _classify_ad_install(
+        spend=spend, window_metrics=m, days_since_change=days_since_change, accelerating=accelerating,
+        min_spend=100, grace_days=5, policy=policy if policy is not None else _INSTALL_POLICY,
+        roas_floor=1.5, roas_target=3.0, recency_days=0,
+    )
+
+
+def test_classify_ad_install_buckets_and_protection() -> None:
+    assert _cls_install(spend=50)["classification"] == "insufficient"             # below significance floor
+    assert _cls_install(installs=200)["classification"] == "ok"                   # cheap CPI ($1.50) -> keep
+    assert _cls_install(installs=10)["classification"] == "urgent"                # expensive CPI ($30) -> pause
+    assert _cls_install(installs=10, days_since_change=2)["classification"] == "watch"  # young -> protected
+    assert _cls_install(installs=10, policy=_INSTALL_POLICY_NO_TARGET)["classification"] == "insufficient"
+    # ~0 installs on non-trivial spend is also a pause candidate (zero results on the spend).
+    assert _cls_install(installs=0)["classification"] == "urgent"
+    # urgent puts the whole window spend at risk (no ROAS waste estimate for install).
+    assert _cls_install(installs=10)["dollars_at_risk"] == 300.0
+
+
+def test_watch_row_metric_display_is_goal_aware() -> None:
+    # The CLI header metric follows the metric the row was graded on. Install-goal rows carry
+    # cost_per_app_install evidence and book ~0 ROAS by design, so a "ROAS 0.00" header would
+    # misrepresent the basis — they render their cost/install instead. ROAS rows are unchanged.
+    from meta_ads_analysis.cli import _watch_row_metric_display
+
+    install_row = {"roas": None, "evidence": {"metric_name": "cost_per_app_install",
+                                              "metric_display": "cost/install $30.00"}}
+    assert _watch_row_metric_display(install_row) == "cost/install $30.00"
+    # Install urgent on ~0 installs: cpi is undefined → n/a, never a crash or a bogus "ROAS 0.00".
+    install_na = {"roas": None, "evidence": {"metric_name": "cost_per_app_install",
+                                             "metric_display": None}}
+    assert _watch_row_metric_display(install_na) == "cost/install n/a"
+    # ROAS rows: byte-identical to the prior header (value, and 0.00 fallback when roas is None).
+    assert _watch_row_metric_display({"roas": 1.5, "evidence": {"metric_name": "roas"}}) == "ROAS 1.50"
+    assert _watch_row_metric_display({"roas": None, "evidence": {"metric_name": "roas"}}) == "ROAS 0.00"
+    assert _watch_row_metric_display({"roas": None}) == "ROAS 0.00"  # no evidence (early-life keep) → ROAS
 
 
 def test_watch_day3_probation_own_sample_clears_floor_keep_and_close(tmp_path: Path) -> None:
