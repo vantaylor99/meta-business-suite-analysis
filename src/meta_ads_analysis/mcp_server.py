@@ -1,15 +1,17 @@
-"""Custom Meta MCP server — thin entrypoint (scaffold; no live Meta tools yet).
+"""Custom Meta MCP server — thin entrypoint over the read library.
 
-This is the foundation of our own Meta MCP server: a process that starts, reports health,
-and can be connected to from an MCP client over HTTP. It exposes exactly **one** tool,
-``server_info``, and makes **zero live Meta calls** — it has no Meta read/write tools yet.
-Those land in the ``mcp-read-tools`` / ``mcp-guarded-write-tools`` follow-on tickets.
+This is our own Meta MCP server: a process that starts, reports health, and can be connected
+to from an MCP client over HTTP. Alongside the ``server_info`` health tool it exposes the live
+Meta **read** surface — one tool per :data:`READ_TOOL_METHODS` entry (13 reads), each bound to a
+shared :class:`~meta_ads_analysis.reader_provider.DirectMetaReader`. Guarded **write** tools land
+in the ``mcp-guarded-write-tools`` follow-on ticket; writes never travel through this server today.
 
 The module is a **thin entrypoint over the existing library**: it embeds no Meta/business
 logic and only imports and exposes package functions, so the CLI and the server stay two
 frontends over one library. The ``mcp`` SDK import is guarded at module load (mirroring the
 ``requests``-missing pattern in :mod:`meta_ads_analysis.meta_api`) so a missing ``server``
-extra produces an actionable ``SystemExit`` at use site, never a bare ``ImportError``.
+extra produces an actionable ``SystemExit`` at use site, never a bare ``ImportError``; a missing
+``META_ACCESS_TOKEN`` at startup likewise surfaces as an actionable ``SystemExit``.
 """
 
 from __future__ import annotations
@@ -242,7 +244,17 @@ def build_server(host: str, port: int):
         return build_server_info()
 
     # One shared direct reader (NOT reader_from_env — see docstring). Live reads flow through it.
-    reader = DirectMetaReader.from_env()
+    # from_env() builds the client eagerly, so a missing META_ACCESS_TOKEN (or a missing `requests`)
+    # raises MetaApiError here at startup. Convert it to an actionable SystemExit — mirroring the
+    # SDK-missing branch above — so a mis-configured launch prints guidance instead of leaking a bare
+    # MetaApiError traceback out of main() (which only wraps OSError).
+    try:
+        reader = DirectMetaReader.from_env()
+    except MetaApiError as exc:
+        raise SystemExit(
+            f"Cannot start the Meta MCP server: {exc} "
+            "Set META_ACCESS_TOKEN (a token with the ads_read scope) before launching."
+        ) from exc
     for name, func in build_read_tools(reader).items():
         mcp.add_tool(
             _wrap_tool_errors(func),

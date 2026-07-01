@@ -163,19 +163,25 @@ The MCP backend is consumed by the **agent runtime**, which injects the MCP tool
 CLI command with `META_READER_BACKEND=mcp` raises a clear error rather than silently degrading — keep
 CLI/sync runs on `direct`.
 
-### Our custom Meta MCP server (local, scaffold)
+### Our custom Meta MCP server (local)
 
 Separate from the community `meta-ads-read` **read** candidate above, this repo also ships **our own**
-custom Meta MCP server — the long-term home for reads *and* guarded writes behind one connector. Today
-it is only a **scaffold**: it exposes a single `server_info` health tool and makes **zero live Meta
-calls** (it has no Meta read/write tools yet — those land in the `mcp-read-tools` /
-`mcp-guarded-write-tools` follow-on tickets). It runs as its own HTTP process, distinct from the parked
-community candidate.
+custom Meta MCP server — the long-term home for reads *and* guarded writes behind one connector. It now
+exposes the full live Meta **read** surface: the `server_info` health tool plus one tool per read (13
+tools — `fetch_insights`, `fetch_ads`, `list_campaigns`, `get_account`, `search_targeting`,
+`list_pixels`, … — a superset of what the parked community candidate could serve). Each read tool is a
+1:1 wrapper over the direct reader; a bad token or insufficient scope comes back as a clean tool error,
+not a crash. **Guarded writes** are still CLI-only and land in the `mcp-guarded-write-tools` follow-on
+ticket — no write travels through this server today. It runs as its own HTTP process, distinct from the
+parked community candidate.
 
-Install the server extra (kept optional so the CSV/analysis install stays lean) and launch it:
+Install the server extra (kept optional so the CSV/analysis install stays lean) and launch it. A valid
+`META_ACCESS_TOKEN` (with the `ads_read` scope) must be set — the server builds its reader at startup
+and exits with an actionable message if the token is missing:
 
 ```powershell
 pip install -e .[server]
+$env:META_ACCESS_TOKEN="<your token>"
 meta_mcp_server --host 127.0.0.1 --port 8765
 ```
 
@@ -189,12 +195,14 @@ meta_mcp_server
 ```
 
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
-`server_info`, which returns the server name/version, the configured Meta API version, the selected
-read backend, and `live_calls_enabled: false`. If the `server` extra is not installed, launching prints
-an actionable error (`pip install -e .[server]`) rather than a traceback.
+`server_info` (server name/version, configured Meta API version, selected read backend, and
+`live_calls_enabled: true` now that the read tools are live) plus any of the 13 read tools. If the
+`server` extra is not installed, launching prints an actionable error (`pip install -e .[server]`)
+rather than a traceback.
 
-Its config lives in `.mcp.json` under `_candidateMcpServers` as the **`meta-suite`** entry — **parked
-and not launched** until the read/write tool tickets land (only `code-search` runs). Its tools carry
+Its config lives in `.mcp.json` under `_candidateMcpServers` as the **`meta-suite`** entry — the read
+tools have landed, but it stays **parked and not launched** pending the guarded-write ticket and the
+rollout decision (only `code-search` runs). Its tools carry
 the `mcp__meta-suite__*` prefix, deliberately distinct from the community server's `mcp__meta-ads__*`
 prefix (whose write tools are deny-listed in `.claude/settings.json`). Multi-user/hosted role headers
 are a later concern; local single-operator use needs no header.

@@ -255,14 +255,17 @@ Meta's **official hosted OAuth MCP server is a documented drop-in for later** �
 **no code change** (see `docs/META_API_SETUP.md`). It is **not wired or tested here**; only the seam is
 proven to support it.
 
-**Our own custom Meta MCP server (scaffold).** Separate from the community read candidate, this repo
-also ships the skeleton of *our own* Meta MCP server — the long-term single connector for reads +
-guarded writes. Today it is a **scaffold only**: console script `meta_mcp_server` (install the `server`
-extra), an HTTP process exposing just the `server_info` health tool, **mocks-only / zero live Meta
-calls**. Config is the parked `meta-suite` entry in `.mcp.json` (key distinct from the community
-`meta-ads` prefix so our sanctioned gated tools dodge that deny-list); it is **not launched** until the
-follow-on tickets add reads (`mcp-read-tools`) and guarded writes (`mcp-guarded-write-tools`). Setup and
-launch details are in `docs/META_API_SETUP.md`; the write catalog table below stays the source of truth.
+**Our own custom Meta MCP server.** Separate from the community read candidate, this repo also ships
+*our own* Meta MCP server — the long-term single connector for reads + guarded writes. Console script
+`meta_mcp_server` (install the `server` extra) runs an HTTP process that now exposes the live Meta
+**read** surface: `server_info` plus one tool per `READ_TOOL_METHODS` entry (13 reads, a superset of
+the community candidate), each a 1:1 wrapper over a shared `DirectMetaReader` with `MetaApiError`
+mapped to a clean `ToolError`. It builds its reader at startup, so a missing `META_ACCESS_TOKEN` exits
+with an actionable message. **Guarded writes are still CLI-only** (`mcp-guarded-write-tools` follow-on);
+no write travels through this server. Config is the `meta-suite` entry in `.mcp.json` (key distinct from
+the community `meta-ads` prefix so our sanctioned gated tools dodge that deny-list); it stays **parked /
+not launched** pending the guarded-write ticket and rollout decision. Setup and launch details are in
+`docs/META_API_SETUP.md`; the write catalog table below stays the source of truth.
 
 **Writes are deliberately not part of this seam.** `create_*` / `update_*` / `upload_*` always use the
 direct Graph client and stay behind the propose → approve → validate_only → execute gate, so the MCP

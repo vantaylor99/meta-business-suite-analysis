@@ -9353,3 +9353,31 @@ def test_read_tools_register_on_real_fastmcp_and_map_errors(monkeypatch) -> None
     # MetaApiError -> ToolError conversion on the real registered tool.
     with pytest.raises(ToolError):
         tool_manager.get_tool("get_account").fn("act_1", fields=["name"])
+
+
+def test_build_server_missing_token_raises_actionable_systemexit(monkeypatch) -> None:
+    # build_server constructs DirectMetaReader.from_env() eagerly, so a missing META_ACCESS_TOKEN
+    # must surface as an actionable SystemExit (guidance to set the token), NOT a bare MetaApiError
+    # traceback leaking out of main() (which wraps only OSError). A fake FastMCP keeps this test off
+    # the `server` extra and binds no socket.
+    import pytest
+
+    _clear_scaffold_env(monkeypatch)  # clears META_ACCESS_TOKEN (among others)
+
+    class _FakeMcp:
+        def __init__(self, name, host, port):
+            pass
+
+        def tool(self):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+        def add_tool(self, func, name=None, description=None):  # pragma: no cover - never reached
+            raise AssertionError("add_tool must not run when the token is missing")
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", _FakeMcp)
+    with pytest.raises(SystemExit) as excinfo:
+        _mcp_server.build_server("127.0.0.1", 8765)
+    assert "META_ACCESS_TOKEN" in str(excinfo.value)
