@@ -2,6 +2,36 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-07-01 (action) — bleed-control: paused May Lower Spend, halved 100K budget ($280→$140)
+
+**Operator (Van) directed a "massive budget cut" — account had bled sub-1.0 ROAS for 9 straight days
+(Jun 23–30). Both executed via the repo CLI guarded flow (NOT the MCP):**
+- **Paused campaign `May Lower Spend` (120242997920670733)** — `set_status PAUSED`. It was the account's
+  dead weight: last-3d **0.20 ROAS**, its only live ad set (Low Value Customers, 13 active ads) at
+  **0.08 ROAS / 1 purchase on $374**. Structural safety pause (no cited sample → gate-allowed).
+  Verified by independent re-read: `effective_status = PAUSED`. *Note:* budget field still reads $280
+  but the campaign is off — **confirm $0 spend on the 2026-07-02 daily** before calling it stopped
+  (the "PAUSED ≠ delivery-stopped, next-day $0 = proof" lesson from the Influencer Test kill).
+  - *Tooling gap:* no first-class campaign-pause proposer exists (`propose-pause-ads` is ad-level only,
+    though `set_status` supports campaign level). Hand-authored a grounded campaign `set_status` plan
+    via the repo's own `write_grounding.attach_op_grounding` (structural abstain) so it passed the
+    apply-time grounding gate. Worth adding a `propose-pause` campaign/adset proposer.
+- **Cut `100K` (120241587361240733) daily budget $280 → $140 (−50%, CBO)** via `propose-budget`
+  `--campaign-id ... --daily-budget-cents 14000`. −50% is the built-in **decrease** cap
+  (`MAX_BUDGET_DECREASE_PERCENT = 50`); the 20% cap is increase-only. Grounded band **high**
+  (100K 30d ROAS 1.71 on 309 conv / $8,307 — below the 3.0 target, so the cut is goal-aligned and
+  review returned `stands`, not refuted). Validate-only 1/1 → executed 1/1, 0 failed. Verified by
+  re-read: `daily_budget $140.00`, still ACTIVE.
+  - *Why −50% and not deeper:* two floors — (1) Meta wants ~50 conv/ad set/wk to exit learning and
+    Engaged is already at ~30/wk, so halving keeps a pulse without starving it; (2) climb-back is
+    capped at +20%/step, so overcutting is slow to unwind. One decisive cut, not stepped (stepping =
+    repeated learning resets = the exact thrash that caused the tank).
+- **Deliberately NOT done:** the "restore to pre-Jun-22 config" that Van also raised — see the open
+  follow-up. A literal rollback would re-enable Advantage+ Audience (removed for cause: it overrode the
+  custom audiences) and revert to automatic placements (the Jun 29 diagnosis found these bled
+  Engaged/Low Value into junk inventory while manual placements RECOVERED High Value). Held for
+  operator decision — no more simultaneous edits mid-relearn.
+
 ## 2026-06-29 (action) — restricted Engaged + Low Value to manual placements (Feed+Reels+Stories), matching High Value
 
 **Account change executed via the repo CLI guarded flow (`apply_ops` `set_placements`, validate-only → execute — NOT the MCP):**

@@ -2,7 +2,8 @@
 title: Verify the 2026-06-29 placement fix lifted Engaged/Low Value (else consider Advantage+ re-enable)
 account: divine_designs
 due: 2026-07-01
-status: open
+status: done
+completed: 2026-07-01
 created: 2026-06-29
 ---
 
