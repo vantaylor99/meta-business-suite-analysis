@@ -9002,3 +9002,68 @@ def test_build_server_without_sdk_raises_actionable_systemexit(monkeypatch) -> N
     with pytest.raises(SystemExit) as excinfo:
         _mcp_server.build_server("127.0.0.1", 8765)
     assert ".[server]" in str(excinfo.value)
+
+
+def test_build_server_info_does_not_raise_on_unknown_backend(monkeypatch) -> None:
+    # End-to-end health-probe path (not just the helper): a bogus backend is reported
+    # verbatim-normalized and NEVER raises — server_info is a probe, not a constructor.
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_READER_BACKEND", "garbage")
+    assert _mcp_server.build_server_info()["read_backend"] == "garbage"
+
+
+class _FakeMcp:
+    """Records the run() call without binding a socket."""
+
+    def __init__(self) -> None:
+        self.ran_with = None
+
+    def run(self, transport: str) -> None:
+        self.ran_with = transport
+
+
+def test_main_host_port_precedence_flag_over_env_over_default(monkeypatch) -> None:
+    # flag > MCP_SERVER_HOST/PORT env > default, verified without a socket bind.
+    captured: dict = {}
+
+    def _fake_build_server(host, port):
+        captured["host"], captured["port"] = host, port
+        return _FakeMcp()
+
+    monkeypatch.setattr(_mcp_server, "build_server", _fake_build_server)
+
+    # default when nothing set
+    monkeypatch.delenv("MCP_SERVER_HOST", raising=False)
+    monkeypatch.delenv("MCP_SERVER_PORT", raising=False)
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
+    _mcp_server.main()
+    assert (captured["host"], captured["port"]) == (_mcp_server.DEFAULT_HOST, _mcp_server.DEFAULT_PORT)
+
+    # env overrides default
+    monkeypatch.setenv("MCP_SERVER_HOST", "0.0.0.0")
+    monkeypatch.setenv("MCP_SERVER_PORT", "9001")
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
+    _mcp_server.main()
+    assert (captured["host"], captured["port"]) == ("0.0.0.0", 9001)
+
+    # flag overrides env
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server", "--host", "10.0.0.5", "--port", "7000"])
+    _mcp_server.main()
+    assert (captured["host"], captured["port"]) == ("10.0.0.5", 7000)
+
+
+def test_main_wraps_oserror_as_actionable_systemexit(monkeypatch) -> None:
+    # Port-in-use / bad-bind path: OSError from run() becomes an actionable SystemExit.
+    import pytest
+
+    class _RaisingMcp:
+        def run(self, transport: str) -> None:
+            raise OSError("address already in use")
+
+    monkeypatch.setattr(_mcp_server, "build_server", lambda host, port: _RaisingMcp())
+    monkeypatch.delenv("MCP_SERVER_HOST", raising=False)
+    monkeypatch.delenv("MCP_SERVER_PORT", raising=False)
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server", "--host", "127.0.0.1", "--port", "8765"])
+    with pytest.raises(SystemExit) as excinfo:
+        _mcp_server.main()
+    assert "127.0.0.1:8765" in str(excinfo.value)
