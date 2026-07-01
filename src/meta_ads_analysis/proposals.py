@@ -20,8 +20,15 @@ entrypoint so it is unit-testable with no ``mcp`` SDK and no live Meta call:
   audit artifact, and re-read each touched entity to verify the outcome landed.
 - :func:`preview_plan` — a local, write-free dry run of what each approved op *would* send.
 
-The dispatch map :data:`PLAN_APPLIERS` wires the ``"ops"`` plan type here; the authoring + rotation
-branches register in the ``mcp-guarded-write-authoring-rotation`` follow-on ticket.
+The dispatch map :data:`PLAN_APPLIERS` wires all four executable plan families — ``"ops"`` (control),
+``"authoring"`` (PAUSED-by-default creates), ``"audience_rotation"``, and ``"advantage_disable"`` — each
+to the existing library applier for its ``plan_type``. Two facts make the map correct rather than a bag
+of lambdas: (1) the **reader-kwarg split** — ``apply_authoring_plan`` reads nothing at apply time (it
+POSTs creates), so the authoring wrapper drops the ``reader`` kwarg, while ops/rotation appliers keep it
+for their live re-reads; (2) the **items-key split** — a rotation plan carries **no** ``plan["ops"]``
+(its approvable items live under ``"rotations"`` / ``"items"``), so :data:`PLAN_ITEMS_KEY` tells the
+approval count and result serialization where to look. A ``plan_type`` that does not match its builder's
+stamped type would silently apply/approve nothing — the map keys ARE those stamped types.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from . import control
+from . import authoring, control, rotation
 from .config import DEFAULT_REPORTS_ROOT
 from .meta_api import MetaApiError, client_from_env
 from .reader_provider import MetaReaderProvider, as_reader
@@ -160,12 +167,61 @@ def _apply_ops(plan, client, *, execute, validate_only, reader):
     )
 
 
-# plan_type -> applier. The wrapper absorbs the signature split: ``apply_ops_plan`` /
-# ``apply_rotation_plan`` / ``apply_advantage_disable_plan`` take a ``reader=`` kwarg; the authoring
-# applier does not — so the authoring/rotation branches (next ticket) each adapt their own call here.
+def _apply_authoring(plan, client, *, execute, validate_only, reader=None):
+    """Authoring-plan applier. ``apply_authoring_plan`` reads nothing live at apply time (it POSTs
+    creates), so it has **no** ``reader`` parameter — the accepted-and-dropped ``reader`` kwarg keeps a
+    uniform applier signature without passing an argument the callee would reject with a ``TypeError``.
+    Created entities are forced PAUSED inside ``authoring._build_create``, independent of this wiring."""
+    return authoring.apply_authoring_plan(
+        plan, client, execute=execute, validate_only=validate_only
+    )
+
+
+def _apply_rotation(plan, client, *, execute, validate_only, reader):
+    """Audience-rotation applier: keeps ``reader`` for the pre-write live-targeting drift re-read."""
+    return rotation.apply_rotation_plan(
+        plan, client, execute=execute, validate_only=validate_only, reader=reader
+    )
+
+
+def _apply_advantage_disable(plan, client, *, execute, validate_only, reader):
+    """Advantage-Audience-disable applier: keeps ``reader`` for the pre-write live re-read."""
+    return rotation.apply_advantage_disable_plan(
+        plan, client, execute=execute, validate_only=validate_only, reader=reader
+    )
+
+
+# plan_type -> applier. The wrapper absorbs the reader-kwarg split: ``apply_ops_plan`` /
+# ``apply_rotation_plan`` / ``apply_advantage_disable_plan`` take a ``reader=`` kwarg for their live
+# re-reads; ``apply_authoring_plan`` does not (authoring POSTs creates and reads nothing at apply time),
+# so ``_apply_authoring`` accepts-and-drops the kwarg. Each key MUST equal the ``plan_type`` its builder
+# stamps (``control`` → ``"ops"``, ``authoring`` → ``"authoring"``, rotation builders → their two keys),
+# or execute_plan would find no applier and raise. (The parity check in the tests guards this.)
 PLAN_APPLIERS: dict[str, Any] = {
     "ops": _apply_ops,
+    "authoring": _apply_authoring,
+    "audience_rotation": _apply_rotation,
+    "advantage_disable": _apply_advantage_disable,
 }
+
+# plan_type -> the plan key holding its approvable items. Rotation plans carry NO ``plan["ops"]`` — their
+# reviewable items live under their own keys — so the approval count and result serialization consult
+# this map rather than assuming ``"ops"``. Routing a rotation plan through the ``ops`` key would count
+# zero approved items and refuse a genuinely-approved plan (the #1 rotation failure mode).
+PLAN_ITEMS_KEY: dict[str, str] = {
+    "ops": "ops",
+    "authoring": "ops",
+    "audience_rotation": "rotations",
+    "advantage_disable": "items",
+}
+
+
+def plan_items(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """The list of approvable/reviewable items for ``plan``, keyed by its ``plan_type`` (defaulting to
+    ``plan["ops"]``). Shared by the approval count, the proposal summary, and result serialization so
+    all three agree on where a plan's items live."""
+    key = PLAN_ITEMS_KEY.get(str(plan.get("plan_type")), "ops")
+    return [it for it in (plan.get(key) or []) if isinstance(it, dict)]
 
 # Substrings in a Meta error that signal a missing write scope (a read-only token). Kept in one place
 # so both the validate-pass surfacing and any future pre-check map identically.
@@ -204,20 +260,94 @@ def _result_to_dict(r) -> dict[str, Any]:
     }
 
 
+def _authoring_result_to_dict(r) -> dict[str, Any]:
+    """Serialize an ``authoring.AuthoringResult`` (has ``kind`` + ``created_id``, no ``level``/``id``)."""
+    return {
+        "op_id": r.op_id,
+        "kind": r.kind,
+        "status": r.status,
+        "created_id": r.created_id,
+        "request": r.request,
+        "response": r.response,
+        "reason": r.reason,
+    }
+
+
+def _rotation_result_to_dict(r) -> dict[str, Any]:
+    """Serialize a ``rotation.RotationResult`` (keyed by ``adset_id``, carries ``targeting``, no
+    ``op_id``/``request`` — so the ops serializer would ``AttributeError`` on it)."""
+    return {
+        "adset_id": r.adset_id,
+        "status": r.status,
+        "targeting": r.targeting,
+        "response": r.response,
+        "reason": r.reason,
+    }
+
+
+def _serialize_results(
+    plan: dict[str, Any], exec_results: list, verifications: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Serialize execute-pass results to plain dicts, plan-type-aware. Each result type carries a
+    different attribute set (``OpResult``/``AuthoringResult`` key by ``op_id``; ``RotationResult`` keys
+    by ``adset_id``), so both the serializer and the verification key are chosen by ``plan_type``. A
+    matching outcome verification (built by :func:`_verify_outcomes`) is attached under ``verify``."""
+    plan_type = str(plan.get("plan_type"))
+    out: list[dict[str, Any]] = []
+    for r in exec_results:
+        if plan_type == "authoring":
+            entry = _authoring_result_to_dict(r)
+            key = str(r.op_id)
+        elif plan_type in ("audience_rotation", "advantage_disable"):
+            entry = _rotation_result_to_dict(r)
+            key = str(r.adset_id)
+        else:
+            entry = _result_to_dict(r)
+            key = str(r.op_id)
+        if key in verifications:
+            entry["verify"] = verifications[key]
+        out.append(entry)
+    return out
+
+
 # Fields re-read to confirm a write's outcome. ``effective_status`` is the honest signal (``status`` is
 # what we set; ``effective_status`` is what Meta actually reports after processing).
 _VERIFY_FIELDS = ["id", "status", "effective_status"]
+
+# authoring create kind -> the entity level to re-read for the created-then-verify PAUSED check.
+# ``create_lookalike`` is absent on purpose: an audience has no status/effective_status (inert, never in
+# ``authoring.PAUSED_KINDS``), so there is nothing to read back and no PAUSED to assert.
+_AUTHORING_VERIFY_LEVEL: dict[str, str] = {
+    "create_campaign": "campaign",
+    "create_adset": "adset",
+    "create_ad": "ad",
+    "create_video_ad": "ad",
+}
 
 
 def _verify_outcomes(
     plan: dict[str, Any], exec_results: list, reader: MetaReaderProvider
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-    """Re-read each executed entity's live state and build (per-op-verification, follow-up-markers).
+    """Re-read each executed entity's live state, dispatched by ``plan_type``. Each family verifies a
+    different thing (ops → status landed + next-day-spend follow-up; authoring → created-and-PAUSED;
+    rotation → the targeting write registered), and the result objects differ in shape, so a single
+    ops-shaped loop would ``AttributeError`` on a rotation result. A re-read failure is always recorded
+    (never raised) — the writes already landed and a failed *confirmation* read must not mask that."""
+    plan_type = str(plan.get("plan_type"))
+    if plan_type == "authoring":
+        return _verify_authoring_outcomes(exec_results, reader)
+    if plan_type in ("audience_rotation", "advantage_disable"):
+        return _verify_rotation_outcomes(exec_results, reader)
+    return _verify_ops_outcomes(plan, exec_results, reader)
 
-    Carries the pausing lesson: a ``set_status``→PAUSED that registered is necessary but NOT sufficient
-    proof delivery stopped — same-day spend can still post. Each such op emits a structured
-    ``verify_next_day_spend`` follow-up marker. A re-read failure is recorded per op (never raised — the
-    writes already landed; a failed confirmation read must not mask that)."""
+
+def _verify_ops_outcomes(
+    plan: dict[str, Any], exec_results: list, reader: MetaReaderProvider
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Ops outcome verify. Carries the pausing lesson: a ``set_status``→PAUSED that registered is
+    necessary but NOT sufficient proof delivery stopped — same-day spend can still post. Each such op
+    emits a structured ``verify_next_day_spend`` follow-up marker. A re-read failure is recorded per op
+    (never raised — the writes already landed; a failed confirmation read must not mask that)."""
     ops_by_id = {
         str(op.get("op_id")): op for op in (plan.get("ops") or []) if isinstance(op, dict)
     }
@@ -256,6 +386,116 @@ def _verify_outcomes(
     return verifications, follow_ups
 
 
+def _verify_authoring_outcomes(
+    exec_results: list, reader: MetaReaderProvider
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Create-then-verify: re-read each created entity's ``effective_status`` and confirm it is NOT
+    ACTIVE. ``authoring._build_create`` forces PAUSED on every spending create, so a created entity that
+    comes back ACTIVE is a red flag (a create that silently spends) — surfaced both in the per-op
+    ``verify`` block and as a ``created_active`` follow-up marker. A created **lookalike** has no status
+    (inert audience, not in ``_AUTHORING_VERIFY_LEVEL``) so it is skipped — asserting PAUSED on it would
+    be wrong. The created id comes from the store's recorded ``created_id`` (not the op body)."""
+    verifications: dict[str, dict[str, Any]] = {}
+    follow_ups: list[dict[str, Any]] = []
+    for r in exec_results:
+        if r.status != authoring.CREATED_STATUS:  # only entities we actually created
+            continue
+        created_id = str(getattr(r, "created_id", "") or "")
+        kind = str(getattr(r, "kind", "") or "")
+        level = _AUTHORING_VERIFY_LEVEL.get(kind)
+        if not created_id or level is None:
+            continue  # inert audience (lookalike) or no id returned — nothing to read back
+        try:
+            live = control._get_entity(reader, level, created_id, _VERIFY_FIELDS)
+        except MetaApiError as exc:
+            verifications[str(r.op_id)] = {"created_id": created_id, "verify_error": str(exc)}
+            continue
+        effective = live.get("effective_status")
+        entry: dict[str, Any] = {
+            "created_id": created_id,
+            "effective_status": effective,
+            "status": live.get("status"),
+        }
+        # PAUSED-by-default: a spending create must never come back ACTIVE. (A paused entity anywhere in
+        # the hierarchy reads PAUSED / CAMPAIGN_PAUSED / ADSET_PAUSED — never ACTIVE — so keying on
+        # exactly "ACTIVE" avoids false positives from the paused-parent variants.)
+        if str(effective or "").upper() == "ACTIVE":
+            reason = (
+                f"created {kind} {created_id} came back effective_status=ACTIVE — authoring forces "
+                "PAUSED, so an ACTIVE create is a red flag (it may already be spending). Pause it."
+            )
+            entry["red_flag"] = reason
+            follow_ups.append(
+                {"type": "created_active", "kind": kind, "created_id": created_id, "reason": reason}
+            )
+        verifications[str(r.op_id)] = entry
+    return verifications, follow_ups
+
+
+def _verify_rotation_outcomes(
+    exec_results: list, reader: MetaReaderProvider
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Rotation outcome verify: ``apply_rotation_plan`` already did the pre-write live-targeting drift
+    re-read, so here we re-read each executed ad set once and record that the targeting write registered
+    — the new included audiences and the (now-off, for a disable) ``advantage_audience`` flag. Keyed by
+    ``adset_id`` to match the rotation result serialization; a re-read failure is recorded, never
+    raised."""
+    verifications: dict[str, dict[str, Any]] = {}
+    for r in exec_results:
+        if r.status != rotation.EXECUTED_STATUS:
+            continue
+        adset_id = str(getattr(r, "adset_id", "") or "")
+        if not adset_id:
+            continue
+        try:
+            live = reader.get_adset(adset_id, fields=rotation.ADSET_FIELDS)
+        except MetaApiError as exc:
+            verifications[adset_id] = {"verify_error": str(exc)}
+            continue
+        targeting = live.get("targeting") if isinstance(live.get("targeting"), dict) else {}
+        verifications[adset_id] = {
+            "effective_status": live.get("effective_status"),
+            "advantage_audience": rotation.advantage_audience_enabled(targeting),
+            "included": rotation._ids(rotation._audience_refs(targeting.get("custom_audiences"))),
+        }
+    return verifications, []
+
+
+def _write_audit(
+    plan: dict[str, Any], exec_results: list, account_slug: str, run_date: str, reports_root: Path
+) -> Path | None:
+    """Write the timestamped results log for this execute pass, dispatched by ``plan_type`` to the
+    existing per-family writer (each embeds ``plan.get("plan_id")`` so the audit ties back to the
+    proposal). Keeps the "every execute appends an audit trail" invariant uniform across all four
+    families; an unrecognized ``plan_type`` writes nothing."""
+    plan_type = str(plan.get("plan_type"))
+    if plan_type == "ops":
+        return control.write_ops_results(
+            plan=plan, results=exec_results,
+            output_path=control.default_ops_results_path(account_slug, run_date, reports_root),
+            execute=True,
+        )
+    if plan_type == "authoring":
+        return authoring.write_authoring_results(
+            plan=plan, results=exec_results,
+            output_path=authoring.default_authoring_results_path(account_slug, run_date, reports_root),
+            execute=True,
+        )
+    if plan_type == "audience_rotation":
+        return rotation.write_rotation_results(
+            plan=plan, results=exec_results,
+            output_path=rotation.default_rotation_results_path(account_slug, run_date, reports_root),
+            execute=True,
+        )
+    if plan_type == "advantage_disable":
+        return rotation.write_advantage_disable_results(
+            plan=plan, results=exec_results,
+            output_path=rotation.default_advantage_disable_results_path(account_slug, run_date, reports_root),
+            execute=True,
+        )
+    return None
+
+
 def _mark_executed(plan_id: str, reports_root: Path, *, audit_path: Path | None) -> None:
     """Stamp the persisted proposal as executed (the idempotency guard). Called only after the execute
     pass has run — a second :func:`execute_plan` then refuses rather than double-applying."""
@@ -276,31 +516,45 @@ def preview_plan(
     reports_root: Path = DEFAULT_REPORTS_ROOT,
 ) -> dict[str, Any]:
     """Local, **write-free** dry run: load the persisted proposal and report the request each approved
-    op *would* send (exactly what :func:`execute_plan` builds). No write is performed. The reader may
-    do read-only re-reads (a budget cap, current targeting, the current creative) to build a request —
-    a non-approved op reports no request, and a build error is reported inline rather than raised."""
+    item *would* send. No write is performed.
+
+    For an **ops** plan this rebuilds the exact Graph request :func:`execute_plan` would send via
+    ``control._build_request`` (the reader may do read-only re-reads — a budget cap, current targeting,
+    the current creative). Authoring/rotation items are not ops-shaped (``control._build_request`` keys
+    on ``op["op"]``, which they lack), so for those families the preview reports the item's stored
+    intent (authoring ``params`` / the rotation ``diff`` + new audience ids) rather than re-deriving a
+    request — still write-free and non-raising. A non-approved item reports no request; a build error is
+    reported inline rather than raised."""
     reader = as_reader(reader)
     plan = load_proposal(plan_id, reports_root)
+    plan_type = str(plan.get("plan_type"))
+    ops_plan = plan_type in ("ops", "")
     previews: list[dict[str, Any]] = []
-    for op in plan.get("ops") or []:
-        if not isinstance(op, dict):
-            continue
+    for item in plan_items(plan):
         entry: dict[str, Any] = {
-            "op_id": op.get("op_id"),
-            "op": op.get("op"),
-            "level": op.get("level"),
-            "id": op.get("id"),
-            "status": op.get("status"),
+            "op_id": item.get("op_id") or item.get("adset_id"),
+            "op": item.get("op") or item.get("kind"),
+            "level": item.get("level"),
+            "id": item.get("id") or item.get("adset_id"),
+            "status": item.get("status"),
         }
-        if op.get("status") != control.APPROVED_STATUS:
+        if item.get("status") != control.APPROVED_STATUS:
             entry["would_send"] = None
             entry["note"] = "not approved — would be skipped at execute (approval required)."
-        else:
+        elif ops_plan:
             try:
-                entry["would_send"] = control._build_request(op, reader)
+                entry["would_send"] = control._build_request(item, reader)
             except ValueError as exc:
                 entry["would_send"] = None
                 entry["error"] = str(exc)
+        else:
+            # Non-ops item: report the stored intent, not a re-derived Graph request.
+            entry["would_send"] = {
+                k: item.get(k)
+                for k in ("params", "diff", "new_included", "new_excluded", "advantage_audience",
+                          "disable_advantage_audience")
+                if item.get(k) is not None
+            } or None
         previews.append(entry)
     return {
         "plan_id": plan_id,
@@ -327,10 +581,12 @@ def execute_plan(
     1. Load the persisted proposal by id.
     2. Idempotency: refuse if it was already executed (Meta writes are not transactional).
     3. Consult the approval gate (default no-op — see :class:`PlanStatusApprovalGate`).
-    4. Refuse if zero ops are approved — the core safety refusal for a freshly-proposed plan.
+    4. Refuse if zero items are approved — the core safety refusal for a freshly-proposed plan. The
+       approvable items live under the plan-type's key (:func:`plan_items`), NOT always ``plan["ops"]``:
+       a rotation plan's items are under ``"rotations"`` / ``"items"``.
     5. Build a write client lazily (never the reader's hidden client — writes keep an explicit client).
     6. **Validate pass** (real ``validate_only`` round-trip, nothing persisted). A read-only token
-       surfaces here as a clear scope error. If any approved op fails validation, abort before writing.
+       surfaces here as a clear scope error. If any approved item fails validation, abort before writing.
     7. **Execute pass** (only reached when the whole validate pass is clean).
     8. Write the audit artifact, stamp the proposal executed, and re-read each entity to verify outcome.
     """
@@ -349,12 +605,9 @@ def execute_plan(
     # (3) approval gate (default no-op; ticket 13 swaps in an un-forgeable source behind this seam)
     approval_gate.assert_approved(plan_id, plan)
 
-    # (4) core refusal: nothing approved -> nothing to send
-    approved = [
-        op
-        for op in (plan.get("ops") or [])
-        if isinstance(op, dict) and op.get("status") == control.APPROVED_STATUS
-    ]
+    # (4) core refusal: nothing approved -> nothing to send. plan_items() finds the approvable items
+    # under the plan-type's key (rotation plans keep theirs under "rotations"/"items", not "ops").
+    approved = [it for it in plan_items(plan) if it.get("status") == control.APPROVED_STATUS]
     if not approved:
         return {
             "refused": True,
@@ -391,32 +644,20 @@ def execute_plan(
             "plan_type": plan_type,
             "intent": plan.get("intent"),
             "reason": "one or more approved ops failed validation — no writes performed.",
-            "ops": [_result_to_dict(r) for r in validate_results],
+            "ops": _serialize_results(plan, validate_results, {}),
         }
 
     # (7) execute pass — reached only when the whole validate pass is clean
     exec_results = applier(plan, client, execute=True, validate_only=False, reader=reader)
 
-    # (8) audit + idempotency stamp + outcome verification
+    # (8) audit + idempotency stamp + outcome verification (all plan-type-aware)
     account_slug = plan.get("account_slug") or "account"
     run_date = plan.get("run_date") or datetime.now(UTC).date().isoformat()
-    audit_path: Path | None = None
-    if str(plan_type) == "ops":
-        audit_path = control.write_ops_results(
-            plan=plan,
-            results=exec_results,
-            output_path=control.default_ops_results_path(account_slug, run_date, Path(reports_root)),
-            execute=True,
-        )
+    audit_path = _write_audit(plan, exec_results, account_slug, run_date, Path(reports_root))
     _mark_executed(plan_id, reports_root, audit_path=audit_path)
 
     verifications, follow_ups = _verify_outcomes(plan, exec_results, reader)
-    ops_out: list[dict[str, Any]] = []
-    for r in exec_results:
-        entry = _result_to_dict(r)
-        if str(r.op_id) in verifications:
-            entry["verify"] = verifications[str(r.op_id)]
-        ops_out.append(entry)
+    ops_out = _serialize_results(plan, exec_results, verifications)
 
     return {
         "executed": True,

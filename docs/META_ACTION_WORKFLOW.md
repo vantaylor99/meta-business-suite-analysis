@@ -74,12 +74,33 @@ The same guarded flow is now reachable over our **own** MCP server (`meta_mcp_se
 ### The tool surface
 
 - **`propose_*`** — build a grounded, reviewed plan and persist it. Returns only a **`plan_id`
-  reference** plus a per-op summary (status / confidence band / review verdict / note) — never an
-  approvable plan body. Control-ops: `propose_set_status`, `propose_set_daily_budget`, `propose_rename`,
-  `propose_set_creative`, `propose_set_creative_features`, `propose_set_age_range`,
-  `propose_set_genders`, `propose_set_geo_locations`, `propose_set_placements`, plus the bulk
-  `propose_enable_ads` / `propose_pause_ads`. Each op comes back `proposed` (or demoted by review) —
-  **no propose tool ever emits an `approved` op.**
+  reference** plus a per-item summary (status / confidence band / review verdict / note) — never an
+  approvable plan body. Each item comes back `proposed` (or demoted by review) — **no propose tool ever
+  emits an `approved` item.** The propose surface spans all four write families, and every one routes
+  through the same `execute_plan` gate:
+  - **Control-ops** (`plan_type: ops`): `propose_set_status`, `propose_set_daily_budget`,
+    `propose_rename`, `propose_set_creative`, `propose_set_creative_features`, `propose_set_age_range`,
+    `propose_set_genders`, `propose_set_geo_locations`, `propose_set_placements`, plus the bulk
+    `propose_enable_ads` / `propose_pause_ads`.
+  - **Authoring** (`plan_type: authoring`, create-only, **every created spending entity forced PAUSED**):
+    `propose_create_campaign`, `propose_create_adset`, `propose_create_ad`, `propose_create_video_ad`,
+    `propose_duplicate_ad`, `propose_lookalike`. A **net-new** create (campaign / ad set / ad / video ad)
+    cites a zero sample → `abstain`, so an approved net-new create is **blocked at apply** until a
+    conscious operator override — creating PAUSED is fine, auto-executing a create on no evidence is not.
+    `propose_duplicate_ad` instead grounds on the **source ad's** own metric (a proven winner is
+    executable). `propose_lookalike` is a **structural abstain** — an audience is inert (no status, never
+    PAUSED, never spends), so the gate allows it. **No delete / archive.**
+  - **Rotation** (`plan_type: audience_rotation` / `advantage_disable`, reversible): `propose_audience_
+    rotation` reads the account's ACTIVE ad sets, rotates each ad set's included custom audience forward
+    by `offset`, and recomputes exclusions (grounded on each ad set's fatigue signal at the correlational
+    tier); `propose_advantage_disable` turns Advantage Audience **off** on each ad set that has it
+    enabled, preserving audiences verbatim (only ever off, never on — a structural abstain the gate
+    allows). Bulk ad-set rename is intentionally **not** an MCP tool — the ops `rename` already covers it.
+  - **Outcome verification is family-aware.** After execute, `execute_plan` re-reads each touched
+    entity: an ops `set_status→PAUSED` emits a `verify_next_day_spend` follow-up; an **authoring** create
+    is read back to confirm its `effective_status` is not ACTIVE (a created-ACTIVE entity is a red flag,
+    since authoring forces PAUSED); a **rotation** write is read back to confirm the new audiences (and,
+    for a disable, `advantage_audience=off`) registered.
 - **`preview_plan(plan_id)`** — a local, **write-free** dry run: shows the request each *approved* op
   would send. No Meta write (the reader may re-read live state to build a budget/targeting request).
 - **`execute_plan(plan_id)`** — the **only** tool that writes. It loads the plan **by id** (never a
@@ -102,7 +123,8 @@ the `mcp-local-approval-gate` ticket replaces it, behind this same seam, with an
 `upload_video` / `upload_image` create inert, **unreferenced** assets and bypass the gate, so they are
 **not** MCP tools — the MCP write surface stays 100% gated. The operator uploads via the CLI
 (`upload_video` / `upload_image`), obtains asset ids, then the agent proposes
-`create_video_ad` / `create_ad` with those ids (authoring ticket).
+`propose_create_video_ad` / `propose_create_ad` with those already-uploaded asset ids (the `video_id` /
+`creative_id` argument). The authoring propose tools accept an id; they never upload.
 
 ### PAUSED ≠ delivery stopped — verify next-day spend
 

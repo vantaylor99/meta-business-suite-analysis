@@ -39,7 +39,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only without the `se
 
 from datetime import UTC, datetime
 
-from . import __version__, account_registry, control, proposals
+from . import __version__, account_registry, authoring, control, proposals, rotation
 from .meta_api import MetaApiError, meta_api_version_from_env
 from .reader_provider import (
     READ_METHODS,
@@ -232,6 +232,40 @@ WRITE_TOOL_DESCRIPTIONS: dict[str, str] = {
     "propose_set_placements": "Propose an ad set's placements (automatic, or explicit publisher platforms).",
     "propose_enable_ads": "Propose enabling currently-inactive ads (optionally filtered), each grounded on its own recent performance.",
     "propose_pause_ads": "Propose pausing active ads by filter and/or a ROAS-below-threshold rule.",
+    # Authoring (create-only; every created spending entity is forced PAUSED).
+    "propose_create_campaign": (
+        "Propose creating a campaign (name + objective; created PAUSED). Net-new → no performance "
+        "evidence → abstains, so an approved create is blocked at apply until a conscious override."
+    ),
+    "propose_create_adset": (
+        "Propose creating an ad set under a campaign (created PAUSED). Pass the rest of the ad set body "
+        "(optimization_goal, billing_event, targeting, daily_budget, …) in params. Net-new → abstains."
+    ),
+    "propose_create_ad": (
+        "Propose creating an ad in an ad set from an existing creative id (created PAUSED). To recreate "
+        "a proven ad's creative instead, use propose_duplicate_ad (grounded on the source's metric)."
+    ),
+    "propose_create_video_ad": (
+        "Propose creating a video ad (created PAUSED) from an ALREADY-UPLOADED video_id (uploads are "
+        "CLI-only). Net-new → abstains → approved create blocked until a conscious override."
+    ),
+    "propose_duplicate_ad": (
+        "Propose duplicating an existing ad's creative into a target ad set (created PAUSED), grounded "
+        "on the SOURCE ad's own recent metric — a proven winner is executable, an undelivered source abstains."
+    ),
+    "propose_lookalike": (
+        "Propose creating a lookalike audience from a seed audience. An audience is inert (no status, "
+        "never PAUSED, never spends) — a structural abstain that the apply-time gate allows."
+    ),
+    # Audience rotation (reversible targeting experiment) + Advantage-Audience disable.
+    "propose_audience_rotation": (
+        "Propose rotating each active ad set's included custom audience forward by offset (exclusions "
+        "recomputed to preserve target-one/exclude-the-rest). Grounded on each ad set's fatigue signal."
+    ),
+    "propose_advantage_disable": (
+        "Propose turning Advantage Audience OFF on each active ad set that has it enabled, preserving "
+        "included/excluded audiences verbatim. Only ever disables automation — never enables it."
+    ),
     "preview_plan": "Local, write-free dry run: show the request each APPROVED op in a proposal would send. No Meta write.",
     "execute_plan": (
         "Execute an approved proposal by plan_id — the ONLY tool that writes. Validates first, aborts on "
@@ -263,25 +297,29 @@ def _resolve_account(account: str) -> tuple[str | None, str]:
 
 
 def _proposal_summary(plan_id: str, plan: dict[str, Any]) -> dict[str, Any]:
-    """A review-ready digest the agent relays to a human: the ``plan_id`` reference + per-op status /
+    """A review-ready digest the agent relays to a human: the ``plan_id`` reference + per-item status /
     confidence band / review verdict / note. Deliberately NOT the approvable plan body — the agent
-    approves out-of-band and then calls ``execute_plan`` by id."""
+    approves out-of-band and then calls ``execute_plan`` by id.
+
+    Plan-type-aware via ``proposals.plan_items`` so authoring (``plan["ops"]`` keyed by ``op_id`` +
+    ``kind``) and rotation (``plan["rotations"]`` / ``plan["items"]`` keyed by ``adset_id``) produce the
+    **same** summary shape as the control ops — the field names are normalized (``op`` shows the op-type
+    or the create ``kind``; ``id`` shows the entity id or the ad set id; ``note`` falls back to the
+    rotation ``diff``)."""
     ops: list[dict[str, Any]] = []
-    for op in plan.get("ops") or []:
-        if not isinstance(op, dict):
-            continue
-        conf = op.get("confidence") if isinstance(op.get("confidence"), dict) else {}
-        review = op.get("review") if isinstance(op.get("review"), dict) else {}
+    for item in proposals.plan_items(plan):
+        conf = item.get("confidence") if isinstance(item.get("confidence"), dict) else {}
+        review = item.get("review") if isinstance(item.get("review"), dict) else {}
         ops.append(
             {
-                "op_id": op.get("op_id"),
-                "op": op.get("op"),
-                "level": op.get("level"),
-                "id": op.get("id"),
-                "status": op.get("status"),
+                "op_id": item.get("op_id") or item.get("adset_id"),
+                "op": item.get("op") or item.get("kind"),
+                "level": item.get("level"),
+                "id": item.get("id") or item.get("adset_id"),
+                "status": item.get("status"),
                 "confidence_band": conf.get("band"),
-                "review_verdict": op.get("review_verdict") or review.get("verdict"),
-                "note": op.get("note"),
+                "review_verdict": item.get("review_verdict") or review.get("verdict"),
+                "note": item.get("note") or item.get("diff"),
             }
         )
     return {
@@ -296,20 +334,28 @@ def _proposal_summary(plan_id: str, plan: dict[str, Any]) -> dict[str, Any]:
 def build_write_tools(
     reader: MetaReaderProvider, approval_gate: proposals.ApprovalGate
 ) -> dict[str, Callable[..., Any]]:
-    """Return ``{tool_name: callable}`` for the guarded control-ops write surface.
+    """Return ``{tool_name: callable}`` for the full guarded write surface — control ops, authoring
+    (create-only, PAUSED by default), and audience rotation / Advantage-Audience disable.
 
     PURE: no FastMCP import, no socket — unit-testable with a ``FakeMetaReader``/fake gate. Each
-    ``propose_*`` wraps an existing ``control`` builder (which attaches evidence + a computed
-    confidence band and runs the plan through ``review.review_ops_plan``), then persists the reviewed
-    plan via :mod:`meta_ads_analysis.proposals` and returns a review-ready **summary** (a ``plan_id``
-    reference + per-op digest) — never an approvable body. ``execute_plan`` is the only writer; it
-    loads by id and builds its own write client lazily (never the reader's hidden client).
+    ``propose_*`` wraps an existing library builder (``control`` / ``authoring`` / ``rotation``) that
+    attaches evidence + a computed confidence band and runs the plan through the matching review pass
+    (``review_ops_plan`` / ``review_authoring_plan`` / ``review_rotation_plan``), then persists the
+    reviewed plan via :mod:`meta_ads_analysis.proposals` and returns a review-ready **summary** (a
+    ``plan_id`` reference + per-item digest) — never an approvable body. ``execute_plan`` is the only
+    writer; it loads by id, dispatches on ``plan_type`` (``proposals.PLAN_APPLIERS``), and builds its own
+    write client lazily (never the reader's hidden client).
 
     Grounding note: the single-op ``set_status`` here abstains **structurally** (a direct operator
     instruction on a named entity, no metric) — the safety-PAUSE treatment the gate allows. The
     data-driven bulk paths ``propose_enable_ads`` / ``propose_pause_ads`` carry per-ad metric evidence
     (so ``propose_enable_ads`` enforces the cold-ad boundary), which a single explicit status change
-    deliberately does not.
+    deliberately does not. Authoring net-new creates cite a zero sample → ``abstain`` (blocked at apply
+    until a conscious override), while a ``propose_duplicate_ad`` grounds on the source ad's own metric
+    and a ``propose_lookalike`` is a structural abstain (an audience is inert). Every created spending
+    entity is forced PAUSED by ``authoring._build_create`` regardless of any review verdict. Media
+    uploads (video/image) stay CLI-only and are NOT exposed here — the asset id is passed to
+    ``propose_create_video_ad`` / ``propose_create_ad``.
     """
 
     def _finalize(plan: dict[str, Any]) -> dict[str, Any]:
@@ -416,6 +462,118 @@ def build_write_tools(
         )
         return _finalize(plan)
 
+    # --- Authoring (create-only; PAUSED by default). Each wraps an authoring builder that grounds the
+    # create, runs review.review_authoring_plan, and — for spending creates — forces PAUSED regardless of
+    # verdict. No delete/archive. Media uploads stay CLI-only: the video/image asset id is passed in. ---
+
+    def propose_create_campaign(
+        account: str, name: str, objective: str, special_ad_categories: list[str] | None = None,
+        params: dict[str, Any] | None = None, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = authoring.build_create_campaign_plan(
+            ad_account_id, name=name, objective=objective,
+            special_ad_categories=special_ad_categories, params=params,
+            account_slug=account_slug, run_date=run_date,
+        )
+        return _finalize(plan)
+
+    def propose_create_adset(
+        account: str, name: str, campaign_id: str,
+        params: dict[str, Any] | None = None, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = authoring.build_create_adset_plan(
+            ad_account_id, name=name, campaign_id=campaign_id, params=params,
+            account_slug=account_slug, run_date=run_date,
+        )
+        return _finalize(plan)
+
+    def propose_create_ad(
+        account: str, name: str, adset_id: str, creative_id: str, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = authoring.build_create_ad_plan(
+            ad_account_id, name=name, adset_id=adset_id, creative_id=creative_id,
+            account_slug=account_slug, run_date=run_date,
+        )
+        return _finalize(plan)
+
+    def propose_create_video_ad(
+        account: str, name: str, adset_id: str, video_id: str, page_id: str, link: str,
+        message: str | None = None, title: str | None = None, description: str | None = None,
+        primary_texts: list[str] | None = None, headlines: list[str] | None = None,
+        descriptions: list[str] | None = None, call_to_action_type: str = "SHOP_NOW",
+        image_hash: str | None = None, image_url: str | None = None, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = authoring.build_video_ad_plan(
+            ad_account_id, name=name, adset_id=adset_id, video_id=video_id, page_id=page_id, link=link,
+            message=message, title=title, description=description, primary_texts=primary_texts,
+            headlines=headlines, descriptions=descriptions, call_to_action_type=call_to_action_type,
+            image_hash=image_hash, image_url=image_url, account_slug=account_slug, run_date=run_date,
+        )
+        return _finalize(plan)
+
+    def propose_duplicate_ad(
+        account: str, source_ad_id: str, target_adset_id: str, name: str | None = None,
+        date_from: str | None = None, date_to: str | None = None, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = authoring.build_duplicate_ad_plan(
+            reader, ad_account_id, source_ad_id=source_ad_id, target_adset_id=target_adset_id,
+            name=name, account_slug=account_slug, date_from=date_from, date_to=date_to, run_date=run_date,
+        )
+        return _finalize(plan)
+
+    def propose_lookalike(
+        account: str, name: str, origin_audience_id: str, country: str, ratio: float,
+        date_from: str | None = None, date_to: str | None = None, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = authoring.build_lookalike_plan(
+            ad_account_id, name=name, origin_audience_id=origin_audience_id, country=country,
+            ratio=ratio, account_slug=account_slug, date_from=date_from, date_to=date_to, run_date=run_date,
+        )
+        return _finalize(plan)
+
+    # --- Audience rotation (reversible) + Advantage-Audience disable. Read the account's ACTIVE ad sets
+    # live, then build a reviewed plan (rotation grounds on each ad set's fatigue metric; disable is a
+    # structural abstain). Bulk ad-set rename is intentionally OUT OF SCOPE — the ops `rename` (ticket 12)
+    # already covers renames. ---
+
+    def _active_adsets(ad_account_id: str) -> list[dict[str, Any]]:
+        return reader.list_adsets(ad_account_id, fields=rotation.ADSET_FIELDS, effective_status=["ACTIVE"])
+
+    def propose_audience_rotation(
+        account: str, offset: int = 1, disable_advantage_audience: bool = False,
+        date_from: str | None = None, date_to: str | None = None, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        adsets = _active_adsets(ad_account_id)
+        policy = control.resolve_action_policy(account_slug)
+        df, dt, recency_days, run_date_iso = control._resolve_grounding_window(date_from, date_to, run_date)
+        # Each ad set's recent performance is the fatigue signal that grounds its swap (correlational).
+        metrics_by_id = {
+            str(m["id"]): m
+            for m in control.fetch_entity_metrics(reader, ad_account_id, level="adset", date_from=df, date_to=dt)
+        }
+        plan = rotation.build_rotation_plan(
+            adsets, account_slug=account_slug or "account", ad_account_id=ad_account_id,
+            offset=int(offset), disable_advantage_audience=bool(disable_advantage_audience),
+            metrics_by_id=metrics_by_id, goal=policy.get("primary_goal"), policy=policy,
+            date_from=df, date_to=dt, recency_days=recency_days, run_date=run_date_iso,
+        )
+        return _finalize(plan)
+
+    def propose_advantage_disable(account: str) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        adsets = _active_adsets(ad_account_id)
+        plan = rotation.build_advantage_disable_plan(
+            adsets, account_slug=account_slug or "account", ad_account_id=ad_account_id,
+        )
+        return _finalize(plan)
+
     def preview_plan(plan_id: str) -> dict[str, Any]:
         return proposals.preview_plan(plan_id, reader=reader)
 
@@ -434,6 +592,14 @@ def build_write_tools(
         "propose_set_placements": propose_set_placements,
         "propose_enable_ads": propose_enable_ads,
         "propose_pause_ads": propose_pause_ads,
+        "propose_create_campaign": propose_create_campaign,
+        "propose_create_adset": propose_create_adset,
+        "propose_create_ad": propose_create_ad,
+        "propose_create_video_ad": propose_create_video_ad,
+        "propose_duplicate_ad": propose_duplicate_ad,
+        "propose_lookalike": propose_lookalike,
+        "propose_audience_rotation": propose_audience_rotation,
+        "propose_advantage_disable": propose_advantage_disable,
         "preview_plan": preview_plan,
         "execute_plan": execute_plan,
     }

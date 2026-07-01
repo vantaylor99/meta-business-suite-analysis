@@ -9654,13 +9654,25 @@ def test_mcp_load_proposal_missing_id_raises_clear_error(tmp_path):
 def test_build_write_tools_exposes_full_gated_surface():
     tools = _mcp_server.build_write_tools(FakeMetaReader(), _proposals.PlanStatusApprovalGate())
     assert set(tools) == {
+        # control ops
         "propose_set_status", "propose_set_daily_budget", "propose_rename", "propose_set_creative",
         "propose_set_creative_features", "propose_set_age_range", "propose_set_genders",
         "propose_set_geo_locations", "propose_set_placements", "propose_enable_ads",
-        "propose_pause_ads", "preview_plan", "execute_plan",
+        "propose_pause_ads",
+        # authoring (create-only, PAUSED by default)
+        "propose_create_campaign", "propose_create_adset", "propose_create_ad",
+        "propose_create_video_ad", "propose_duplicate_ad", "propose_lookalike",
+        # rotation family
+        "propose_audience_rotation", "propose_advantage_disable",
+        # shared
+        "preview_plan", "execute_plan",
     }
     # execute_plan is the ONLY tool whose name signals a write; propose_* are read-then-persist.
     assert "execute_plan" in tools
+    # Every write tool carries a human description (surfaced to the MCP client / calling LLM).
+    assert all(name in _mcp_server.WRITE_TOOL_DESCRIPTIONS for name in tools)
+    # No upload/create-audience raw-media tool leaked onto the surface (uploads stay CLI-only).
+    assert not any("upload" in name for name in tools)
 
 
 def test_build_write_tools_propose_never_emits_approved_op(monkeypatch):
@@ -9708,3 +9720,291 @@ def test_mcp_scaffold_note_writes_stay_gated_no_upload_tool():
     # Media uploads are intentionally NOT exposed over MCP (they create unreferenced, ungated assets).
     tools = _mcp_server.build_write_tools(FakeMetaReader(), _proposals.PlanStatusApprovalGate())
     assert not any("upload" in name for name in tools)
+
+
+# --- MCP guarded-write: authoring (create, PAUSED-by-default) + audience rotation ------------
+# MOCKS ONLY: every test here drives a fake client/reader; no live Meta call is ever made.
+
+from meta_ads_analysis import authoring as _authoring  # noqa: E402
+from meta_ads_analysis import rotation as _rotation  # noqa: E402
+
+
+def _authrot_adsets():
+    """Two ACTIVE ad sets in a target-one/exclude-the-other partition; as1 has Advantage Audience on."""
+    return [
+        {"id": "as1", "name": "Set 1", "status": "ACTIVE", "effective_status": "ACTIVE", "campaign_id": "c1",
+         "targeting": {"custom_audiences": [{"id": "A", "name": "aud-A"}],
+                       "excluded_custom_audiences": [{"id": "B", "name": "aud-B"}],
+                       "targeting_automation": {"advantage_audience": 1}}},
+        {"id": "as2", "name": "Set 2", "status": "ACTIVE", "effective_status": "ACTIVE", "campaign_id": "c1",
+         "targeting": {"custom_audiences": [{"id": "B", "name": "aud-B"}],
+                       "excluded_custom_audiences": [{"id": "A", "name": "aud-A"}]}},
+    ]
+
+
+class _AuthRotFakeClient:
+    """Combined fake for the MCP authoring + rotation flow: it creates entities, reads back the created
+    ids (so the outcome-verify PAUSED read-back has something to read), lists/reads ad sets, and applies
+    ad-set updates. MOCKS ONLY — no method touches the network."""
+
+    def __init__(self, *, source_ad=None, ad_insights=None, adsets=None, created_ad_effective="PAUSED"):
+        self.creates: list = []
+        self.updates: list = []
+        self._ad_insights = ad_insights or []
+        self._source_ad = source_ad or {"id": "src", "name": "Winner", "creative": {"id": "cr_src"}}
+        self._adsets = adsets if adsets is not None else _authrot_adsets()
+        # Created entities become readable at their new id; a create is forced PAUSED, so the read-back
+        # reports PAUSED (the `created_ad_effective` knob lets a test simulate an unexpected ACTIVE).
+        self._by_id = {
+            "new_camp": {"id": "new_camp", "status": "PAUSED", "effective_status": "PAUSED"},
+            "new_adset": {"id": "new_adset", "status": "PAUSED", "effective_status": "PAUSED"},
+            "new_ad": {"id": "new_ad", "status": created_ad_effective, "effective_status": created_ad_effective},
+            "new_lal": {"id": "new_lal"},  # an audience has no status/effective_status
+        }
+        for a in self._adsets:
+            self._by_id[a["id"]] = a
+
+    # reads
+    def get_ad(self, node_id, *, fields):
+        return self._source_ad if node_id == self._source_ad["id"] else self._by_id[node_id]
+
+    def get_adset(self, node_id, *, fields):
+        return self._by_id[node_id]
+
+    def get_campaign(self, node_id, *, fields):
+        return self._by_id[node_id]
+
+    def list_adsets(self, ad_account_id, *, fields, effective_status=None):
+        return self._adsets
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1, breakdowns=None):
+        return self._ad_insights if level == "ad" else []
+
+    def iter_paginated(self, path, *, params=None):
+        return []
+
+    # creates (create-only authoring surface)
+    def create_campaign(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("campaign", params, validate_only))
+        return {"id": "new_camp"}
+
+    def create_adset(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("adset", params, validate_only))
+        return {"id": "new_adset"}
+
+    def create_ad(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("ad", params, validate_only))
+        return {"id": "new_ad"}
+
+    def create_custom_audience(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("audience", params, validate_only))
+        return {"id": "new_lal"}
+
+    # writes (rotation / advantage disable)
+    def update_adset(self, node_id, *, params, validate_only=False):
+        self.updates.append((node_id, params, validate_only))
+        return {"id": node_id, "success": True}
+
+
+def _approve_items(plan, *, drop_grounding=False):
+    """Approve every reviewable item under the plan-type's key (ops / rotations / items). ``drop_grounding``
+    simulates the conscious operator override that lets an approved net-new (abstaining) create execute."""
+    p = _copy.deepcopy(plan)
+    for it in _proposals.plan_items(p):
+        it["status"] = "approved"
+    if drop_grounding and isinstance(p.get("guardrails"), dict):
+        p["guardrails"]["requires_grounding"] = False
+    return p
+
+
+def test_mcp_authoring_create_executes_paused_and_verifies(tmp_path):
+    # create campaign / ad set / ad ⇒ approved (with the conscious override, since net-new abstains) ⇒
+    # validate-then-execute ⇒ created, forced PAUSED, and the outcome read-back confirms PAUSED.
+    client = _AuthRotFakeClient()
+    gate = _proposals.PlanStatusApprovalGate()
+    builders = [
+        ("campaign", _authoring.build_create_campaign_plan("act_1", name="C", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-01")),
+        ("adset", _authoring.build_create_adset_plan("act_1", name="S", campaign_id="c1", account_slug=None, run_date="2026-07-01")),
+        ("ad", _authoring.build_create_ad_plan("act_1", name="A", adset_id="as1", creative_id="cr1", account_slug=None, run_date="2026-07-01")),
+    ]
+    for _label, plan in builders:
+        assert plan["plan_type"] == "authoring"
+        assert plan["ops"][0]["confidence"]["band"] == "abstain"  # net-new cites a zero sample
+        pid = _proposals.save_proposal(_approve_items(plan, drop_grounding=True),
+                                       account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+        res = _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+        assert res["executed"] is True
+        op = res["ops"][0]
+        assert op["status"] == "created" and op["created_id"] in ("new_camp", "new_adset", "new_ad")
+        # outcome read-back confirms the created entity came back PAUSED (never ACTIVE)
+        assert op["verify"]["effective_status"] == "PAUSED" and "red_flag" not in op["verify"]
+    # every create the client received (validate pass + execute pass) was forced PAUSED
+    assert all(params.get("status") == "PAUSED" for _kind, params, _vo in client.creates)
+    # a validate pass (validate_only=True) preceded each execute pass (validate_only=False)
+    assert any(vo for *_r, vo in client.creates) and any(not vo for *_r, vo in client.creates)
+
+
+def test_mcp_authoring_created_active_is_red_flagged(tmp_path):
+    # Defense-in-depth: if a created ad somehow comes back ACTIVE, the outcome verify surfaces a red flag
+    # and a `created_active` follow-up (authoring forces PAUSED, so ACTIVE means it may be spending).
+    client = _AuthRotFakeClient(created_ad_effective="ACTIVE")
+    plan = _authoring.build_create_ad_plan("act_1", name="A", adset_id="as1", creative_id="cr1", account_slug=None, run_date="2026-07-01")
+    pid = _proposals.save_proposal(_approve_items(plan, drop_grounding=True),
+                                   account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert "red_flag" in res["ops"][0]["verify"]
+    assert any(f["type"] == "created_active" for f in res["follow_ups"])
+
+
+def test_mcp_authoring_lookalike_executes_without_paused_assertion(tmp_path):
+    # A lookalike is a structural abstain (seed size/quality is not a ROAS/conversions metric) → the gate
+    # ALLOWS it even under requires_grounding, and an audience is inert: no status, so no PAUSED read-back.
+    client = _AuthRotFakeClient()
+    plan = _authoring.build_lookalike_plan("act_1", name="LAL", origin_audience_id="seed1", country="US",
+                                           ratio=0.05, account_slug=None, run_date="2026-07-01")
+    assert plan["ops"][0]["confidence"]["band"] == "abstain"
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    op = res["ops"][0]
+    assert res["executed"] is True and op["status"] == "created" and op["created_id"] == "new_lal"
+    assert "verify" not in op  # inert audience: nothing to read back, no PAUSED to assert
+    # the create request is a LOOKALIKE audience (no forced status — audiences have none)
+    _kind, params, _vo = client.creates[-1]
+    assert params["subtype"] == "LOOKALIKE" and "status" not in params
+
+
+def test_mcp_authoring_duplicate_ad_recreates_source_creative_paused(tmp_path):
+    # A duplicate grounds on the SOURCE ad's own strong metric (executable), copies the source creative
+    # id into the target ad set, and is forced PAUSED.
+    ad_insights = [{"ad_id": "src", "ad_name": "Winner", "spend": "2400", "impressions": "100000",
+                    "actions": [{"action_type": "purchase", "value": "120"}],
+                    "action_values": [{"action_type": "purchase", "value": "9600"}],
+                    "purchase_roas": [{"value": "4.0"}]}]
+    client = _AuthRotFakeClient(source_ad={"id": "src", "name": "Winner", "creative": {"id": "cr_src"}},
+                                ad_insights=ad_insights)
+    plan = _authoring.build_duplicate_ad_plan(client, "act_1", source_ad_id="src", target_adset_id="as2",
+                                              account_slug=None, date_from="2026-06-01", date_to="2026-06-30",
+                                              run_date="2026-07-01")
+    assert plan["ops"][0]["confidence"]["band"] != "abstain"  # proven winner → real band, not blocked
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True and res["ops"][0]["status"] == "created"
+    # execute-pass create copies the source creative id into the target ad set, forced PAUSED
+    ad_create = [(p, vo) for kind, p, vo in client.creates if kind == "ad" and not vo][0][0]
+    assert ad_create["adset_id"] == "as2"
+    assert ad_create["creative"] == {"creative_id": "cr_src"}
+    assert ad_create["status"] == "PAUSED"
+
+
+def test_mcp_rotation_validates_then_executes(tmp_path):
+    # An approved rotation runs a validate pass then an execute pass; the ad-set targeting write lands and
+    # the outcome read-back confirms it registered. metrics_by_id=None ⇒ structural abstain ⇒ gate-allowed.
+    client = _AuthRotFakeClient()
+    plan = _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1",
+                                         offset=1, disable_advantage_audience=True)
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True
+    # validate pass (validate_only=True) preceded the execute pass (validate_only=False) for as1
+    modes = [vo for aid, _params, vo in client.updates if aid == "as1"]
+    assert modes[:2] == [True, False]
+    # results keyed by adset_id and carry an outcome-verify read-back
+    by_adset = {o["adset_id"]: o for o in res["ops"]}
+    assert by_adset["as1"]["status"] == "executed" and "verify" in by_adset["as1"]
+
+
+def test_mcp_advantage_disable_writes_only_off_and_cannot_invert(tmp_path):
+    # advantage_disable turns Advantage Audience OFF in place: it writes advantage_audience=0 and
+    # preserves the included/excluded audiences verbatim. The direction can NEVER invert to ON.
+    client = _AuthRotFakeClient()
+    plan = _rotation.build_advantage_disable_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1")
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True
+    statuses = {o["adset_id"]: o["status"] for o in res["ops"]}
+    assert statuses["as1"] == "executed"    # as1 had it enabled
+    assert statuses["as2"] == "skipped"     # as2 already off — nothing to write
+    # the as1 execute write set advantage_audience=0 and preserved the audiences verbatim
+    write = [(p, vo) for aid, p, vo in client.updates if aid == "as1" and not vo][0][0]
+    t = write["targeting"]
+    assert t["targeting_automation"]["advantage_audience"] == 0
+    assert [r["id"] for r in t["custom_audiences"]] == ["A"]
+    assert [r["id"] for r in t["excluded_custom_audiences"]] == ["B"]
+    # compute_new_targeting only ever writes 0 for the automation flag — there is no path that sets 1.
+    off = _rotation.compute_new_targeting({"targeting_automation": {"advantage_audience": 1}},
+                                          new_included_ids=["A"], new_excluded_ids=["B"],
+                                          disable_advantage_audience=True)
+    assert off["targeting_automation"]["advantage_audience"] == 0
+
+
+def test_mcp_dispatch_plan_type_matches_applier_and_items_key():
+    # The #1 rotation failure mode: a plan whose plan_type doesn't match its applier / items key reviews
+    # and applies NOTHING. Assert each builder stamps a plan_type that is wired in BOTH maps and that its
+    # items live under the mapped key (non-empty), so no family routes to a silent no-op.
+    plans = [
+        _authoring.build_create_campaign_plan("act_1", name="C", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-01"),
+        _authoring.build_lookalike_plan("act_1", name="L", origin_audience_id="s1", country="US", ratio=0.05, account_slug=None, run_date="2026-07-01"),
+        _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1", offset=1),
+        _rotation.build_advantage_disable_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1"),
+    ]
+    for plan in plans:
+        pt = plan["plan_type"]
+        assert pt in _proposals.PLAN_APPLIERS, f"{pt} has no applier — execute would raise"
+        assert pt in _proposals.PLAN_ITEMS_KEY, f"{pt} has no items key — approval/serialize would miss it"
+        assert _proposals.plan_items(plan), f"{pt} items not found under its mapped key"
+
+
+def test_mcp_dispatch_reader_kwarg_split_no_typeerror():
+    # The reader-kwarg split: authoring apply must NOT receive `reader` (it has no such param); rotation
+    # apply MUST. Both applier wrappers accept the uniform reader= kwarg without a TypeError.
+    client = _AuthRotFakeClient()
+    authoring_plan = {"plan_type": "authoring", "ad_account_id": "act_1",
+                      "guardrails": {"requires_grounding": False},
+                      "ops": [{"op_id": "c", "kind": "create_campaign",
+                               "params": {"name": "C", "objective": "OUTCOME_SALES"}, "status": "approved"}]}
+    rotation_plan = _approve_items(
+        _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1", offset=1)
+    )
+    # authoring applier: reader kwarg is accepted-and-dropped (no TypeError), create executes.
+    a = _proposals.PLAN_APPLIERS["authoring"](authoring_plan, client, execute=True, validate_only=False, reader=client)
+    assert a[0].status == "created"
+    # rotation applier: reader kwarg is used for the live-drift re-read (no TypeError), write executes.
+    r = _proposals.PLAN_APPLIERS["audience_rotation"](rotation_plan, client, execute=True, validate_only=False, reader=client)
+    assert any(res.status == "executed" for res in r)
+
+
+def test_mcp_create_video_ad_missing_video_id_blocks_at_execute(tmp_path):
+    # A create_video_ad missing its (uploaded) video_id fails validate_authoring_op — surfaced as a clear
+    # per-op block at the execute validate pass (no write performed), never a silent create.
+    client = _AuthRotFakeClient()
+    plan = _authoring.build_video_ad_plan("act_1", name="V", adset_id="as1", video_id="", page_id="p1",
+                                          link="https://x/y", message="hi", account_slug=None, run_date="2026-07-01")
+    pid = _proposals.save_proposal(_approve_items(plan, drop_grounding=True),
+                                   account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is False and res["validated"] is False
+    assert "video_id" in (res["ops"][0]["reason"] or "")
+    assert client.creates == []  # nothing was created
+
+
+def test_mcp_no_approval_refusal_for_authoring_and_rotation(tmp_path):
+    # THE core safety refusal, for a fresh authoring plan AND a fresh rotation plan (whose approvable
+    # items live under "rotations", not "ops" — plan_items must route there or this would crash/mis-count).
+    client = _AuthRotFakeClient()
+    gate = _proposals.PlanStatusApprovalGate()
+    for plan in (
+        _authoring.build_create_campaign_plan("act_1", name="C", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-01"),
+        _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1", offset=1),
+    ):
+        assert all(it["status"] != "approved" for it in _proposals.plan_items(plan))  # propose never approves
+        pid = _proposals.save_proposal(plan, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+        res = _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+        assert res["refused"] is True and res["executed"] is False
+        assert "no approved ops" in res["reason"]
+    assert client.creates == [] and client.updates == []  # nothing sent, not even a validate round-trip
