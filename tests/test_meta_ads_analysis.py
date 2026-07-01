@@ -8973,7 +8973,7 @@ def test_build_server_info_defaults_when_env_unset(monkeypatch) -> None:
         "version": __version__,
         "meta_api_version": DEFAULT_META_API_VERSION,
         "read_backend": "direct",
-        "live_calls_enabled": False,
+        "live_calls_enabled": True,
     }
 
 
@@ -8986,12 +8986,14 @@ def test_build_server_info_reflects_backend_and_version_overrides(monkeypatch) -
     assert info["meta_api_version"] == "v99.0"
 
 
-def test_build_server_info_live_calls_always_false(monkeypatch) -> None:
-    # MOCKS-ONLY guardrail made explicit: the scaffold makes ZERO live Meta calls.
+def test_build_server_info_live_calls_enabled_true(monkeypatch) -> None:
+    # Capability flag flipped now that the server exposes live Meta read tools. It reports the
+    # capability regardless of env — build_server_info stays token-free, so the token value here
+    # must not matter (and no live call is ever made just to answer the health probe).
     _clear_scaffold_env(monkeypatch)
     monkeypatch.setenv("META_READER_BACKEND", "mcp")
     monkeypatch.setenv("META_ACCESS_TOKEN", "should-not-matter")
-    assert _mcp_server.build_server_info()["live_calls_enabled"] is False
+    assert _mcp_server.build_server_info()["live_calls_enabled"] is True
 
 
 def test_build_server_without_sdk_raises_actionable_systemexit(monkeypatch) -> None:
@@ -9067,3 +9069,287 @@ def test_main_wraps_oserror_as_actionable_systemexit(monkeypatch) -> None:
     with pytest.raises(SystemExit) as excinfo:
         _mcp_server.main()
     assert "127.0.0.1:8765" in str(excinfo.value)
+
+
+# --- Meta MCP server read tools (MOCKS ONLY: no live Meta call anywhere; no socket bound) ---
+#
+# All read-tool *logic* is exercised through the pure build_read_tools(reader) seam with a
+# FakeMetaReader / a canned-client DirectMetaReader. The FastMCP glue (real mcp.add_tool
+# registration + real MetaApiError->ToolError mapping) runs only when the `server` extra is
+# installed; the one test that touches it is guarded with pytest.importorskip so it skips in an
+# env without `mcp` (see the "known gap" note in the review handoff).
+
+
+class _CannedClient:
+    """Client stand-in whose every method returns a per-name canned value.
+
+    MOCKS ONLY: wrapped by DirectMetaReader to prove the read tools pass results through 1:1
+    without ever touching the network.
+    """
+
+    def __init__(self, canned: dict) -> None:
+        self._canned = canned
+
+    def __getattr__(self, name):
+        def _method(*args, **kwargs):
+            return self._canned[name]
+
+        return _method
+
+
+def test_every_read_tool_round_trips_to_direct_reader_shape() -> None:
+    # Distinct canned value per read so a wrapper that delegates to the wrong reader method fails.
+    canned = {
+        "fetch_insights": [{"spend": "1.00"}],
+        "fetch_ads": [{"id": "ad1"}],
+        "list_campaigns": [{"id": "c1"}],
+        "get_campaign": {"id": "c1", "name": "C1"},
+        "list_adsets": [{"id": "as1"}],
+        "get_adset": {"id": "as1", "name": "AS1"},
+        "get_ad": {"id": "ad1", "name": "AD1"},
+        "list_custom_audiences": [{"id": "aud1"}],
+        "get_account": {"name": "Acme", "currency": "USD"},
+        "get_delivery_estimate": {"estimate_dau": 1000},
+        "search_targeting": [{"id": "int1", "name": "Jewelry"}],
+        "list_pixels": [{"id": "px1"}],
+        "list_custom_conversions": [{"id": "cc1"}],
+    }
+    direct = DirectMetaReader(_CannedClient(canned))
+    tools = _mcp_server.build_read_tools(direct)
+    # Iterating READ_TOOL_METHODS makes a newly added read that is not wired fail here (parallel
+    # to test_reader_call_specs_cover_every_read_method).
+    assert set(tools) == set(_mcp_server.READ_TOOL_METHODS)
+    for name in _mcp_server.READ_TOOL_METHODS:
+        args, kwargs = _READER_CALL_SPECS[name]
+        via_tool = tools[name](*args, **kwargs)
+        via_reader = getattr(direct, name)(*args, **kwargs)
+        assert via_tool == via_reader == canned[name], f"{name} tool did not match the direct reader"
+
+
+def test_iter_paginated_not_exposed_and_server_tool_map_is_identity() -> None:
+    tools = _mcp_server.build_read_tools(FakeMetaReader())
+    # The raw pagination escape hatch has no natural tool shape and is not exposed.
+    assert "iter_paginated" not in tools
+    assert "iter_paginated" not in _mcp_server.SERVER_TOOL_MAP
+    # READ_TOOL_METHODS is exactly the read surface minus that escape hatch.
+    assert set(_mcp_server.READ_TOOL_METHODS) == set(READ_METHODS) - {"iter_paginated"}
+    assert set(tools) == set(_mcp_server.READ_TOOL_METHODS)
+    # SERVER_TOOL_MAP covers every read tool and is an identity map (tool name == reader method).
+    assert set(_mcp_server.SERVER_TOOL_MAP) == set(_mcp_server.READ_TOOL_METHODS)
+    assert all(name == tool for name, tool in _mcp_server.SERVER_TOOL_MAP.items())
+
+
+def test_superset_reads_present_beyond_community_candidate() -> None:
+    # The five reads DEFAULT_MCP_TOOL_MAP marks None (the parked candidate could not serve) are
+    # the deliberate delta our own server adds — assert them explicitly.
+    tools = _mcp_server.build_read_tools(FakeMetaReader())
+    superset = {
+        "list_custom_audiences",
+        "get_delivery_estimate",
+        "search_targeting",
+        "list_pixels",
+        "list_custom_conversions",
+    }
+    assert superset <= set(tools)
+
+
+def test_read_tool_empty_result_is_not_an_error() -> None:
+    # An empty page comes back as [] (not an error) and is distinguishable from a raised error.
+    reader = FakeMetaReader(fetch_ads=[])
+    tools = _mcp_server.build_read_tools(reader)
+    assert tools["fetch_ads"]("act_1", fields=["id"]) == []
+
+
+def test_read_tool_propagates_meta_api_error_from_reader() -> None:
+    # Insufficient token scope surfaces cleanly: the pure wrapper propagates MetaApiError unchanged
+    # (the MetaApiError->ToolError mapping is the FastMCP layer's job, tested separately).
+    import pytest
+
+    def _denied(ad_account_id, *, fields):
+        raise MetaApiError("(#200) The user does not have permission (requires ads_management)")
+
+    reader = FakeMetaReader(list_pixels=_denied)
+    tools = _mcp_server.build_read_tools(reader)
+    with pytest.raises(MetaApiError) as excinfo:
+        tools["list_pixels"]("act_1", fields=["id"])
+    assert "ads_management" in str(excinfo.value)
+
+
+def test_read_tools_drain_multiple_pages_without_truncation() -> None:
+    # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
+    # returns every page's items in order (reuses the session-mock pattern from
+    # test_meta_api_client_paginates).
+    def _three_page_session():
+        p1, p2, p3 = Mock(), Mock(), Mock()
+        p1.status_code = p2.status_code = p3.status_code = 200
+        p1.json.return_value = {"data": [{"id": "1"}], "paging": {"next": "https://example.com/page-2"}}
+        p2.json.return_value = {"data": [{"id": "2"}], "paging": {"next": "https://example.com/page-3"}}
+        p3.json.return_value = {"data": [{"id": "3"}], "paging": {}}
+        session = Mock()
+        session.get.side_effect = [p1, p2, p3]
+        return session
+
+    # fetch_ads (account-scoped list read)
+    ads_session = _three_page_session()
+    ads_tools = _mcp_server.build_read_tools(DirectMetaReader(MetaMarketingApiClient("token", session=ads_session)))
+    assert ads_tools["fetch_ads"]("act_123", fields=["id"]) == [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+    assert ads_session.get.call_count == 3
+
+    # list_adsets (a second list read, to prove pagination isn't fetch_ads-specific)
+    adsets_session = _three_page_session()
+    adsets_tools = _mcp_server.build_read_tools(DirectMetaReader(MetaMarketingApiClient("token", session=adsets_session)))
+    assert adsets_tools["list_adsets"]("act_123", fields=["id"]) == [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+    assert adsets_session.get.call_count == 3
+
+
+def test_search_targeting_tool_signature_is_account_independent() -> None:
+    # search_targeting(query, search_type, limit) — no ad_account_id, list result.
+    reader = FakeMetaReader(
+        search_targeting=lambda *, query, search_type, limit: [
+            {"query": query, "type": search_type, "limit": limit}
+        ]
+    )
+    tools = _mcp_server.build_read_tools(reader)
+    assert tools["search_targeting"]("jewelry", "adinterest", 5) == [
+        {"query": "jewelry", "type": "adinterest", "limit": 5}
+    ]
+    # Defaults apply when only the query is supplied.
+    assert tools["search_targeting"]("running") == [
+        {"query": "running", "type": "adinterest", "limit": 25}
+    ]
+
+
+def test_get_delivery_estimate_tool_signature_returns_node() -> None:
+    # get_delivery_estimate(adset_id, fields) — node/dict result, adset-scoped (not account-scoped).
+    reader = FakeMetaReader(
+        get_delivery_estimate=lambda adset_id, *, fields: {"adset": adset_id, "fields": fields}
+    )
+    tools = _mcp_server.build_read_tools(reader)
+    assert tools["get_delivery_estimate"]("as1", ["estimate_dau"]) == {
+        "adset": "as1",
+        "fields": ["estimate_dau"],
+    }
+
+
+def test_no_write_tool_reachable_from_build_read_tools() -> None:
+    # Read-only-by-construction seam: no wrapper name looks like a write...
+    tools = _mcp_server.build_read_tools(FakeMetaReader())
+    for name in tools:
+        assert not name.startswith(("create_", "update_", "upload_")), f"{name} looks like a write"
+    # ...and the reader interface itself defines no write methods.
+    for write in (
+        "create_campaign",
+        "create_adset",
+        "create_ad",
+        "update_campaign",
+        "update_ad",
+        "update_adset",
+        "upload_video",
+        "upload_image",
+    ):
+        assert not hasattr(MetaReaderProvider, write)
+
+
+def test_build_server_uses_direct_reader_not_recursive_mcp_backend(monkeypatch) -> None:
+    # With META_READER_BACKEND=mcp, build_server must STILL build a DirectMetaReader (not recurse
+    # into an MCPMetaReader that needs a tool-executor) and must not raise reader_from_env's
+    # "no tool-executor" RuntimeError. A fake FastMCP keeps this portable (no live socket, no
+    # dependency on the `server` extra) and a spy on build_read_tools captures the reader built.
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    monkeypatch.setenv("META_ACCESS_TOKEN", "tok")  # DirectMetaReader.from_env needs a token
+
+    captured: dict = {}
+
+    class _SpyMcp:
+        def __init__(self, name, host, port):
+            captured["init"] = (name, host, port)
+
+        def tool(self):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+        def add_tool(self, func, name=None, description=None):
+            captured.setdefault("registered", []).append(name)
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", _SpyMcp)
+
+    real_build_read_tools = _mcp_server.build_read_tools
+
+    def _spy(reader):
+        captured["reader"] = reader
+        return real_build_read_tools(reader)
+
+    monkeypatch.setattr(_mcp_server, "build_read_tools", _spy)
+
+    _mcp_server.build_server("127.0.0.1", 8765)  # must not raise the reader_from_env RuntimeError
+    assert isinstance(captured["reader"], DirectMetaReader)
+    assert set(captured["registered"]) == set(_mcp_server.READ_TOOL_METHODS)
+    # server_info still reports the configured backend verbatim, decoupled from the reader used.
+    assert _mcp_server.build_server_info()["read_backend"] == "mcp"
+
+
+def test_wrap_tool_errors_maps_meta_api_error_to_tool_error(monkeypatch) -> None:
+    # The FastMCP glue converts a MetaApiError into a clean ToolError so the server keeps serving.
+    # Exercised with a fake ToolError so it runs even without the `server` extra installed.
+    import pytest
+
+    class _FakeToolError(Exception):
+        pass
+
+    monkeypatch.setattr(_mcp_server, "ToolError", _FakeToolError)
+
+    def _scope_denied(ad_account_id, fields):
+        raise MetaApiError("(#200) Requires ads_management permission")
+
+    wrapped = _mcp_server._wrap_tool_errors(_scope_denied)
+    with pytest.raises(_FakeToolError) as excinfo:
+        wrapped("act_1", fields=["id"])
+    assert "ads_management" in str(excinfo.value)
+
+    # Non-error path returns the reader's result straight through (no wrapping, no mutation).
+    passthrough = _mcp_server._wrap_tool_errors(lambda ad_account_id, fields: [{"id": ad_account_id}])
+    assert passthrough("act_9", fields=["id"]) == [{"id": "act_9"}]
+
+
+def test_read_tools_register_on_real_fastmcp_and_map_errors(monkeypatch) -> None:
+    # Integration coverage of the FastMCP glue (real mcp.add_tool + real ToolError). Skips where
+    # the `server` extra is absent (e.g. CI without mcp). Pokes FastMCP internals deliberately —
+    # there is no sync public tool-enumeration API. Still MOCKS ONLY: the reader is a canned
+    # DirectMetaReader, so no live Meta call is made.
+    import pytest
+
+    pytest.importorskip("mcp")
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    _clear_scaffold_env(monkeypatch)
+
+    class _MixedClient:
+        # MOCKS ONLY: one method returns data, one raises a scope error; nothing hits the network.
+        def fetch_ads(self, ad_account_id, *, fields):
+            return [{"id": "ad1"}]
+
+        def get_account(self, ad_account_id, *, fields):
+            raise MetaApiError("(#190) Invalid OAuth access token")
+
+    monkeypatch.setattr(
+        _mcp_server.DirectMetaReader,
+        "from_env",
+        classmethod(lambda cls, api_version=None: _mcp_server.DirectMetaReader(_MixedClient())),
+    )
+
+    mcp = _mcp_server.build_server("127.0.0.1", 8765)
+    tool_manager = mcp._tool_manager
+    names = {t.name for t in tool_manager.list_tools()}
+    # server_info plus all 13 reads registered; the escape hatch is not.
+    assert names == {"server_info", *_mcp_server.READ_TOOL_METHODS}
+    assert "iter_paginated" not in names
+    # Schema derived from the wrapper's real signature (functools.wraps preserved it).
+    assert set(tool_manager.get_tool("fetch_ads").parameters["properties"]) == {"ad_account_id", "fields"}
+    # Happy path returns the reader's data through the registered (wrapped) callable.
+    assert tool_manager.get_tool("fetch_ads").fn("act_1", fields=["id"]) == [{"id": "ad1"}]
+    # MetaApiError -> ToolError conversion on the real registered tool.
+    with pytest.raises(ToolError):
+        tool_manager.get_tool("get_account").fn("act_1", fields=["name"])
