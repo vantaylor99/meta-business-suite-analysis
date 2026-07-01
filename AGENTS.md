@@ -261,16 +261,24 @@ proven to support it.
 **read** surface: `server_info` plus one tool per `READ_TOOL_METHODS` entry (13 reads, a superset of
 the community candidate), each a 1:1 wrapper over a shared `DirectMetaReader` with `MetaApiError`
 mapped to a clean `ToolError`. It builds its reader at startup, so a missing `META_ACCESS_TOKEN` exits
-with an actionable message. **Guarded writes are still CLI-only** (`mcp-guarded-write-tools` follow-on);
-no write travels through this server. Config is the `meta-suite` entry in `.mcp.json` (key distinct from
-the community `meta-ads` prefix so our sanctioned gated tools dodge that deny-list); it stays **parked /
-not launched** pending the guarded-write ticket and rollout decision. Setup and launch details are in
-`docs/META_API_SETUP.md`; the write catalog table below stays the source of truth.
+with an actionable message. It **also now exposes the guarded write surface**: `propose_*` (grounded,
+reviewed, persisted as a proposal — returns only a `plan_id` reference), `preview_plan` (write-free dry
+run), and `execute_plan` (the *only* writer — mandatory validate pass, aborts on any validation
+failure, refuses a plan with zero approved ops, then applies + verifies). Every write routes through the
+same propose → human-approve → validate → execute → verify gate as the CLI (see
+`src/meta_ads_analysis/proposals.py` and `docs/META_ACTION_WORKFLOW.md`); the guardrail is a capability
+boundary enforced *in the server*, not a prompt rule. Config is the `meta-suite` entry in `.mcp.json`
+(key distinct from the community `meta-ads` prefix so our sanctioned gated tools dodge that deny-list).
+Launch it locally with `meta_mcp_server` after installing the `server` extra; setup and launch details
+are in `docs/META_API_SETUP.md`; the write catalog table below stays the source of truth.
 
-**Writes are deliberately not part of this seam.** `create_*` / `update_*` / `upload_*` always use the
-direct Graph client and stay behind the propose → approve → validate_only → execute gate, so the MCP
-read path is reads-only and the existing `ads_read` token is enough for it (writes still need
-`ads_management` + `--execute`).
+**Writes never travel through the *reader* seam.** `create_*` / `update_*` / `upload_*` always use the
+direct Graph client and stay behind the propose → approve → validate_only → execute gate — including
+when triggered over MCP, where `execute_plan` builds its own write client rather than borrowing the
+reader's. So the `MetaReaderProvider` read path is reads-only and the existing `ads_read` token is
+enough for reads (writes still need `ads_management` + an approved proposal). Media uploads
+(`upload_*`) are deliberately **not** exposed over MCP — they create ungated, unreferenced assets — so
+the operator uploads via the CLI and the agent proposes `create_*` with the resulting asset ids.
 
 ### Auth posture (single operator now; multi-user later, not built)
 

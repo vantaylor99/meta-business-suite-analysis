@@ -171,9 +171,13 @@ exposes the full live Meta **read** surface: the `server_info` health tool plus 
 tools — `fetch_insights`, `fetch_ads`, `list_campaigns`, `get_account`, `search_targeting`,
 `list_pixels`, … — a superset of what the parked community candidate could serve). Each read tool is a
 1:1 wrapper over the direct reader; a bad token or insufficient scope comes back as a clean tool error,
-not a crash. **Guarded writes** are still CLI-only and land in the `mcp-guarded-write-tools` follow-on
-ticket — no write travels through this server today. It runs as its own HTTP process, distinct from the
-parked community candidate.
+not a crash. It **also now exposes the guarded write surface**: `propose_*` (grounded, reviewed,
+persisted as a proposal returning only a `plan_id`), `preview_plan` (write-free dry run), and
+`execute_plan` (the only writer — validate-then-execute, refuses a plan with zero approved ops).
+Every write routes through the same propose → human-approve → validate → execute → verify gate as the
+CLI; the guardrail is enforced *in the server*, not by prompt. It runs as its own HTTP process, distinct
+from the parked community candidate. (Writes still need an `ads_management`-scoped token; the read-only
+`ads_read` token fails the mandatory `validate_only` pass with a clear scope error.)
 
 Install the server extra (kept optional so the CSV/analysis install stays lean) and launch it. A valid
 `META_ACCESS_TOKEN` (with the `ads_read` scope) must be set — the server builds its reader at startup
@@ -195,14 +199,15 @@ meta_mcp_server
 ```
 
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
-`server_info` (server name/version, configured Meta API version, selected read backend, and
-`live_calls_enabled: true` now that the read tools are live) plus any of the 13 read tools. If the
-`server` extra is not installed, launching prints an actionable error (`pip install -e .[server]`)
-rather than a traceback.
+`server_info` (server name/version, configured Meta API version, selected read backend,
+`live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
+plus any of the 13 read tools and the guarded write tools (`propose_*` / `preview_plan` /
+`execute_plan`). If the `server` extra is not installed, launching prints an actionable error
+(`pip install -e .[server]`) rather than a traceback.
 
-Its config lives in `.mcp.json` under `_candidateMcpServers` as the **`meta-suite`** entry — the read
-tools have landed, but it stays **parked and not launched** pending the guarded-write ticket and the
-rollout decision (only `code-search` runs). Its tools carry
+Its config lives in `.mcp.json` under `_candidateMcpServers` as the **`meta-suite`** entry — reads and
+gated writes have landed, but it stays **parked and not launched** pending the rollout decision (only
+`code-search` runs). Its tools carry
 the `mcp__meta-suite__*` prefix, deliberately distinct from the community server's `mcp__meta-ads__*`
 prefix (whose write tools are deny-listed in `.claude/settings.json`). Multi-user/hosted role headers
 are a later concern; local single-operator use needs no header.
