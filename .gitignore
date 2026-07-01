@@ -6,6 +6,9 @@ __pycache__/
 *.pyc
 *.egg-info/
 
+.DS_Store
+.codex/
+
 data/raw/meta_ads/*
 !data/raw/meta_ads/.gitkeep
 
