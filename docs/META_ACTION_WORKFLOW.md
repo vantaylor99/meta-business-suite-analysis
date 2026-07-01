@@ -108,15 +108,52 @@ The same guarded flow is now reachable over our **own** MCP server (`meta_mcp_se
   or has **zero approved ops**, runs a mandatory **`validate_only` pass first**, aborts on any validation
   failure, then applies the approved ops, writes the audit artifact, and re-reads each entity to verify.
 
-### Approval seam (why a fresh proposal refuses)
+### Approval seam — the human signs, the agent cannot
 
-`execute_plan` consults an `ApprovalGate` before applying. The gate shipped today
-(`PlanStatusApprovalGate`) is a **no-op** that leans on the invariant that only `status == "approved"`
-ops are ever sent. Since **no MCP tool promotes an op to approved**, a freshly-proposed plan has zero
-approved ops → `execute_plan` returns `{refused: true, reason: "no approved ops — approval required"}`.
-That default is **forgeable** by an agent that can write the filesystem (it could hand-edit `status`);
-the `mcp-local-approval-gate` ticket replaces it, behind this same seam, with an un-forgeable source
-(out-of-band CLI stamp / confirmation token / HMAC over the plan).
+`execute_plan` consults an `ApprovalGate` before applying. The gate the running server wires
+(`proposals.select_approval_gate_from_env`) is the **local, single-operator** approval gate:
+
+- **`HmacApprovalGate`** (when `META_APPROVAL_SECRET` is set): approval is an **HMAC-SHA256 signature
+  over the plan's approved content**, keyed by a secret the agent's MCP tool surface never holds. It is
+  produced **out-of-band** by the human-run `approve_plan` CLI and verified (constant-time) inside
+  `execute_plan`. The agent can freely edit the persisted proposal JSON — but any edit to the approved
+  set (adding/removing an approved op, changing a param/target/level, or stripping the
+  confidence/evidence the grounding gate needs) changes the recompute and is rejected, and the agent
+  cannot produce a matching signature without the secret. The signed payload binds the `plan_id` (blocks
+  copying an approval block from plan A onto plan B) and the `approved_at` timestamp (blocks
+  forward-dating to defeat the TTL). Approvals expire after `META_APPROVAL_TTL_SECONDS` (default 24 h;
+  empty/`0` disables).
+- **`DeniedApprovalGate`** (when no secret is set): the seam **fails closed** — `execute_plan` refuses
+  every write with setup guidance, while reads (never gated) keep working. This is the deliberate
+  opposite of the old forgeable-open default.
+
+Since **no `propose_*` tool ever emits an `approved` item**, a freshly-proposed plan also has zero
+approved ops — so even before the gate runs, `execute_plan` would refuse. The gate is what makes a
+*hand-edited* `status: approved` unforgeable.
+
+**The local loop is: propose (agent) → review + `approve_plan` (you) → `execute_plan` (agent).**
+
+```powershell
+# One-time: generate a secret and set it in BOTH the server shell and your approve shell.
+python -c "import secrets; print(secrets.token_hex(32))"   # -> META_APPROVAL_SECRET
+# (export META_APPROVAL_SECRET=<hex>   — or point META_APPROVAL_SECRET_FILE at a file holding it.)
+# Keep it OUT of the repo. It must never be returned by a tool or written into a proposal/audit.
+
+# Agent proposes over MCP; it hands you a plan_id. You review and approve out-of-band:
+approve_plan --plan-id <plan_id> --all          # or one/more --op-id <id> to approve a subset
+approve_plan --plan-id <plan_id> --all --yes    # skip the confirm prompt (scripting); security is the secret
+
+# The agent then calls execute_plan(plan_id) over MCP — HmacApprovalGate verifies your signature.
+```
+
+`server_info` exposes `approval_required: true` and `approval_configured` (a token-free health signal:
+whether a usable secret is set) so an operator can see at a glance whether the gate is armed.
+
+**Residual local limitation (accepted tradeoff, not a bug).** On a single-user machine an actor that can
+read the MCP server process's environment or the secret file could forge a signature. That is exactly
+what the multi-user, role-based ticket (`mcp-role-based-access-tiers`, Entra ID + server-side approval
+state in Azure) removes — and it drops in behind this **same** `ApprovalGate` seam, without rewriting
+`execute_plan`.
 
 ### Media uploads are NOT exposed (documented exception)
 

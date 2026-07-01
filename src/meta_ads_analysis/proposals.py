@@ -7,13 +7,19 @@ entrypoint so it is unit-testable with no ``mcp`` SDK and no live Meta call:
 - a **proposal store** — ``save_proposal`` persists a built+reviewed plan and returns a ``plan_id``
   *reference*; ``load_proposal`` resolves that id back to the persisted artifact. The agent is handed
   the id, never an approvable plan body — the anti-forgery seam :func:`execute_plan` relies on.
-- an **approval seam** — :class:`ApprovalGate` (Protocol) + the default :class:`PlanStatusApprovalGate`.
-  The default is a no-op that leans on the ``apply_*_plan`` invariant (only ``status=="approved"`` ops
-  are sent). Because **no tool in this ticket flips an op to approved**, a freshly-proposed plan has
-  zero approved ops, so :func:`execute_plan` applies nothing and refuses. That default is **forgeable**
-  by a local filesystem-write agent (it could hand-edit an op's ``status``); the ``mcp-local-approval-
-  gate`` ticket replaces it, behind this same seam, with an un-forgeable source (out-of-band CLI stamp /
-  confirmation token / HMAC over the plan).
+- an **approval seam** — :class:`ApprovalGate` (Protocol) with three implementations. The shipped local
+  default (wired by ``mcp_server.build_server`` via :func:`select_approval_gate_from_env`) is
+  :class:`HmacApprovalGate`: it verifies an HMAC-SHA256 signature over the plan's approved content,
+  keyed by a secret (``META_APPROVAL_SECRET``) the agent's MCP tool surface never holds and produced
+  out-of-band by the human-run ``approve_plan`` CLI (:func:`approve_proposal`). The agent may freely edit
+  the persisted proposal JSON, but any edit to the approved set changes the recompute and fails the
+  constant-time compare, and it cannot forge a matching signature without the secret. With **no** secret
+  configured the seam fails **closed** via :class:`DeniedApprovalGate` (execute refused; reads
+  unaffected) — the opposite of the old forgeable-open behavior. :class:`PlanStatusApprovalGate` stays as
+  an explicit no-op used by the execute tests (which supply their own already-approved plans). Local
+  limitation (accepted tradeoff): an actor that can read the server's environment or secret file could
+  still forge — moving approval state server-side behind Entra ID is the ``mcp-role-based-access-tiers``
+  backlog ticket, which drops in behind this same seam without touching :func:`execute_plan`.
 - :func:`execute_plan` — the only entry point that writes. It loads by id (never a caller body),
   refuses a re-execute, consults the gate, then runs a **validate_only pass first** (real round-trip,
   nothing persisted); only if every approved op validates does it run the **execute pass**, write the
@@ -33,6 +39,11 @@ stamped type would silently apply/approve nothing — the map keys ARE those sta
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -78,6 +89,207 @@ class PlanStatusApprovalGate:
 
     def assert_approved(self, plan_id: str, plan: dict[str, Any]) -> None:  # noqa: D401 - see class doc
         return None
+
+
+# --- HMAC-signed approval (the shipped local, single-operator gate) ---------
+
+# The plan key holding the human-produced approval block ({approved_at, signature, ...}). NEVER part of
+# the signed payload (``plan_items`` reads neither this nor ``execution``), so the signature is not
+# self-referential.
+APPROVAL_KEY = "approval"
+
+# Secret resolution + TTL env, mirroring the reader-provider ``*_from_env`` selection seam. The secret
+# lives in the operator's approve-CLI shell AND the MCP server process; it is never returned by a tool,
+# written into an artifact, or reachable through the agent's tool surface.
+APPROVAL_SECRET_ENV = "META_APPROVAL_SECRET"
+APPROVAL_SECRET_FILE_ENV = "META_APPROVAL_SECRET_FILE"
+APPROVAL_TTL_ENV = "META_APPROVAL_TTL_SECONDS"
+# A too-guessable secret is a misconfig, not a default — reject it loudly rather than pretend to protect.
+MIN_APPROVAL_SECRET_LEN = 16
+# Approvals age out: an approved plan left unexecuted for a day is stale (the account may have moved on).
+DEFAULT_APPROVAL_TTL_SECONDS = 86400  # 24h; override via META_APPROVAL_TTL_SECONDS (empty/0 disables).
+
+APPROVAL_ALGORITHM = "HMAC-SHA256"
+
+
+def canonical_approval_payload(plan: dict[str, Any], approved_at: str) -> str:
+    """Deterministic JSON over the plan's **approved** content — the single canonicalization used by
+    BOTH the signer (:func:`approve_proposal`) and the verifier (:class:`HmacApprovalGate`). If the two
+    sides canonicalized differently, every real approval would fail verification; keeping it in one
+    function is the parity contract (mirroring the repo's CBO / review re-derivation parity patterns).
+
+    Round-trip-stable: signing the in-memory plan and verifying the JSON-reloaded plan produce
+    byte-identical payloads (all values originate from JSON, so ``sort_keys`` + compact separators +
+    ``ensure_ascii`` are enough — no ``default=`` coercion needed).
+
+    - Uses :func:`plan_items` (the plan-type-aware accessor), so it binds ops **and** rotation items — a
+      rotation plan's approved items live under ``"rotations"`` / ``"items"``, not ``"ops"``.
+    - Signs the **full approved item dicts**, so mutating any material field of an approved op (params,
+      target ``id``, ``level``) — or stripping its ``confidence``/``evidence`` to dodge the separate
+      write-grounding gate — changes the signature and is rejected.
+    - ``plan_id`` binds the signature to this specific plan (blocks copying an ``approval`` block from
+      plan A onto plan B — B's payload carries B's id, A's signature was over A's).
+    - ``approved_at`` is inside the signed payload, so the agent cannot forward-date it to defeat the TTL.
+    """
+    approved = [it for it in plan_items(plan) if it.get("status") == control.APPROVED_STATUS]
+    doc = {
+        "plan_id": plan.get("plan_id"),
+        "plan_type": plan.get("plan_type"),
+        "approved_at": approved_at,
+        "approved_items": approved,
+    }
+    return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def compute_approval_signature(plan: dict[str, Any], approved_at: str, secret: bytes) -> str:
+    """HMAC-SHA256 hex digest over :func:`canonical_approval_payload`, keyed by ``secret``."""
+    payload = canonical_approval_payload(plan, approved_at).encode("utf-8")
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+class HmacApprovalGate:
+    """Un-forgeable local approval. Verifies ``plan['approval'].signature`` against a fresh recompute of
+    the HMAC over the plan's **current** approved items, keyed by a secret the agent never holds; the
+    compare is constant-time.
+
+    Failure modes it closes:
+
+    - a freshly-proposed plan (no ``approval`` block) → "no human approval" :class:`ApprovalError`;
+    - an agent that flips a status to ``approved`` but can't sign → recompute over the new approved set
+      ≠ stored signature → mismatch;
+    - a mutated / added / removed approved op, or a stripped ``confidence``/``evidence`` → mismatch;
+    - a cross-plan replay (an ``approval`` block copied onto another plan) → ``plan_id`` differs → mismatch;
+    - an approval older than the TTL → expired.
+
+    Local limitation (accepted tradeoff, not a bug): on a single-user box an actor that can read the
+    server process's environment or the secret file could forge. Moving approval state server-side behind
+    Entra ID is exactly what the ``mcp-role-based-access-tiers`` backlog ticket does — dropping in behind
+    this same :class:`ApprovalGate` seam without touching :func:`execute_plan`.
+    """
+
+    def __init__(
+        self,
+        secret: bytes,
+        *,
+        ttl_seconds: int | None = DEFAULT_APPROVAL_TTL_SECONDS,
+        now_fn: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not secret:
+            raise ValueError("HmacApprovalGate requires a non-empty secret.")
+        self._secret = secret
+        self._ttl_seconds = ttl_seconds
+        self._now_fn = now_fn or (lambda: datetime.now(UTC))
+
+    def assert_approved(self, plan_id: str, plan: dict[str, Any]) -> None:
+        approval = plan.get(APPROVAL_KEY)
+        if not isinstance(approval, dict) or not approval.get("signature"):
+            raise ApprovalError(
+                "no human approval on this plan — approve it out-of-band with "
+                "`approve_plan --plan-id <id>` before executing."
+            )
+        approved_at = str(approval.get("approved_at") or "")
+        expected = compute_approval_signature(plan, approved_at, self._secret)
+        if not hmac.compare_digest(expected, str(approval.get("signature"))):
+            raise ApprovalError(
+                "approval signature does not match the plan's approved ops — the plan was modified after "
+                "approval, or the approval is forged. Re-approve with `approve_plan`."
+            )
+        if self._ttl_seconds:  # 0 / None disables expiry
+            age = self._approval_age_seconds(approved_at)
+            if age is None:
+                raise ApprovalError(
+                    "approval timestamp is missing or unparseable — re-approve with `approve_plan`."
+                )
+            if age > self._ttl_seconds:
+                raise ApprovalError(
+                    f"approval expired ({int(age)}s old > {self._ttl_seconds}s TTL) — re-approve with "
+                    "`approve_plan`."
+                )
+
+    def _approval_age_seconds(self, approved_at: str) -> float | None:
+        try:
+            ts = datetime.fromisoformat(approved_at)
+        except ValueError:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        return (self._now_fn() - ts).total_seconds()
+
+
+class DeniedApprovalGate:
+    """Fail-**closed** gate selected when no approval secret is configured: every ``assert_approved``
+    raises :class:`ApprovalError` naming :data:`APPROVAL_SECRET_ENV`. The deliberate opposite of the old
+    forgeable-open default — with no secret, no write ever executes — while reads (never gated) keep
+    working. Set ``META_APPROVAL_SECRET`` to switch to :class:`HmacApprovalGate`."""
+
+    def assert_approved(self, plan_id: str, plan: dict[str, Any]) -> None:
+        raise ApprovalError(
+            f"approval is not configured: set {APPROVAL_SECRET_ENV} (a shared secret, "
+            f">= {MIN_APPROVAL_SECRET_LEN} bytes) in the MCP server environment and approve plans "
+            "out-of-band with `approve_plan`. Reads work without it; execute is refused until it is set "
+            "(fail-closed)."
+        )
+
+
+def approval_secret_from_env() -> bytes | None:
+    """Resolve the raw approval secret: :data:`APPROVAL_SECRET_ENV` first, else the file at
+    :data:`APPROVAL_SECRET_FILE_ENV` (bytes, trailing newline stripped). ``None`` if neither is set.
+
+    Raises a clear :class:`ValueError` if a configured secret is shorter than
+    :data:`MIN_APPROVAL_SECRET_LEN` — a too-guessable secret is a misconfiguration, not a silent default.
+    """
+    raw = os.environ.get(APPROVAL_SECRET_ENV)
+    secret: bytes | None = None
+    if raw:
+        secret = raw.encode("utf-8")
+    else:
+        file_path = os.environ.get(APPROVAL_SECRET_FILE_ENV)
+        if file_path:
+            try:
+                secret = Path(file_path).read_bytes().rstrip(b"\r\n")
+            except OSError as exc:
+                raise ValueError(
+                    f"{APPROVAL_SECRET_FILE_ENV}={file_path!r} could not be read: {exc}"
+                ) from exc
+    if secret is None:
+        return None
+    if len(secret) < MIN_APPROVAL_SECRET_LEN:
+        raise ValueError(
+            f"The configured approval secret is only {len(secret)} bytes; it must be at least "
+            f"{MIN_APPROVAL_SECRET_LEN}. Generate one with "
+            '`python -c "import secrets; print(secrets.token_hex(32))"`.'
+        )
+    return secret
+
+
+def approval_ttl_from_env() -> int | None:
+    """Approval TTL in seconds from :data:`APPROVAL_TTL_ENV`; :data:`DEFAULT_APPROVAL_TTL_SECONDS` when
+    unset, and ``None`` (expiry disabled) for an empty value or ``0``. A non-integer is a clear error."""
+    raw = os.environ.get(APPROVAL_TTL_ENV)
+    if raw is None:
+        return DEFAULT_APPROVAL_TTL_SECONDS
+    raw = raw.strip()
+    if raw in ("", "0"):
+        return None
+    try:
+        seconds = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{APPROVAL_TTL_ENV}={raw!r} must be an integer number of seconds (empty or 0 disables expiry)."
+        ) from exc
+    if seconds < 0:
+        raise ValueError(f"{APPROVAL_TTL_ENV} must not be negative (got {seconds}).")
+    return seconds or None
+
+
+def select_approval_gate_from_env() -> ApprovalGate:
+    """The single selection point for ``build_server``. A configured secret → :class:`HmacApprovalGate`
+    (with the env TTL); no secret → :class:`DeniedApprovalGate` (fail-closed — execute refuses with setup
+    guidance, reads still work)."""
+    secret = approval_secret_from_env()
+    if secret is None:
+        return DeniedApprovalGate()
+    return HmacApprovalGate(secret, ttl_seconds=approval_ttl_from_env())
 
 
 # --- Proposal store ---------------------------------------------------------
@@ -149,8 +361,6 @@ def find_proposal_path(plan_id: str, reports_root: Path = DEFAULT_REPORTS_ROOT) 
 def load_proposal(plan_id: str, reports_root: Path = DEFAULT_REPORTS_ROOT) -> dict[str, Any]:
     """Load a persisted proposal by id. Raises a clear :class:`MetaApiError` if missing/unreadable."""
     path = find_proposal_path(plan_id, reports_root)
-    import json
-
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -580,7 +790,8 @@ def execute_plan(
 
     1. Load the persisted proposal by id.
     2. Idempotency: refuse if it was already executed (Meta writes are not transactional).
-    3. Consult the approval gate (default no-op — see :class:`PlanStatusApprovalGate`).
+    3. Consult the approval gate (``build_server`` wires :class:`HmacApprovalGate`; a missing secret
+       fails closed via :class:`DeniedApprovalGate`; the execute tests pass their own no-op gate).
     4. Refuse if zero items are approved — the core safety refusal for a freshly-proposed plan. The
        approvable items live under the plan-type's key (:func:`plan_items`), NOT always ``plan["ops"]``:
        a rotation plan's items are under ``"rotations"`` / ``"items"``.
@@ -602,7 +813,9 @@ def execute_plan(
             "reason": "proposal already executed — refusing to re-apply (Meta writes are not transactional).",
         }
 
-    # (3) approval gate (default no-op; ticket 13 swaps in an un-forgeable source behind this seam)
+    # (3) approval gate — HmacApprovalGate in the running server (fail-closed DeniedApprovalGate with no
+    # secret). Raises ApprovalError on an absent/forged/expired approval; the server maps that to a clean
+    # ToolError. Runs BEFORE the step-4 zero-approved refusal, which stays as a second layer.
     approval_gate.assert_approved(plan_id, plan)
 
     # (4) core refusal: nothing approved -> nothing to send. plan_items() finds the approvable items
@@ -668,3 +881,57 @@ def execute_plan(
         "ops": ops_out,
         "follow_ups": follow_ups,
     }
+
+
+# --- Out-of-band approval (the human-run `approve_plan` CLI stands on this) --
+
+
+def approve_proposal(
+    plan_id: str,
+    *,
+    secret: bytes,
+    op_ids: list[str] | None = None,
+    reports_root: Path = DEFAULT_REPORTS_ROOT,
+    now_fn: Callable[[], datetime] | None = None,
+) -> dict[str, Any]:
+    """Approve a persisted proposal **out-of-band** and HMAC-sign it so :class:`HmacApprovalGate` will
+    let :func:`execute_plan` run it.
+
+    Loads the proposal by id, flips the selected items to ``approved`` (all proposed items when
+    ``op_ids`` is ``None``; items match by ``op_id`` **or** ``adset_id`` so rotation items are
+    selectable), signs the approved content with ``secret``, writes ``plan['approval']``, persists, and
+    returns the approval block. Refuses (:class:`MetaApiError`) if the plan was already executed —
+    re-approving is meaningless (the idempotency guard would refuse the re-execute regardless).
+
+    The signature is computed **after** the status flips, over the plan's now-approved items, so the
+    gate's recompute over the reloaded plan reproduces it byte-for-byte (:func:`canonical_approval_payload`).
+    """
+    now_fn = now_fn or (lambda: datetime.now(UTC))
+    path = find_proposal_path(plan_id, reports_root)
+    plan = load_proposal(plan_id, reports_root)
+    if (plan.get(EXECUTION_KEY) or {}).get("executed"):
+        raise MetaApiError(
+            f"proposal {plan_id!r} was already executed — refusing to (re-)approve it."
+        )
+    wanted = None if op_ids is None else {str(x) for x in op_ids}
+    approved_count = 0
+    for item in plan_items(plan):
+        item_id = str(item.get("op_id") or item.get("adset_id") or "")
+        if wanted is None or item_id in wanted:
+            item["status"] = control.APPROVED_STATUS
+            approved_count += 1
+    if approved_count == 0:
+        raise MetaApiError(
+            f"no items in proposal {plan_id!r} matched the approval selection (op_ids={op_ids!r}); "
+            "nothing approved."
+        )
+    approved_at = now_fn().replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    approval = {
+        "approved_at": approved_at,
+        "approved_count": approved_count,
+        "algorithm": APPROVAL_ALGORITHM,
+        "signature": compute_approval_signature(plan, approved_at, secret),
+    }
+    plan[APPROVAL_KEY] = approval
+    write_json(path, plan)
+    return approval

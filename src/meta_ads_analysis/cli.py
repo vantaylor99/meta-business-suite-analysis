@@ -1830,6 +1830,92 @@ def apply_ops_main() -> None:
             print(f"  {r.op_id}: {r.status} — {r.reason}")
 
 
+def approve_plan_main() -> None:
+    """Approve an MCP write proposal **out-of-band** — the anti-forgery step that stands between a
+    ``propose_*`` and the agent's ``execute_plan``.
+
+    An agent driving the MCP server can *propose* and *execute*, but it must not be able to *approve* its
+    own work. This CLI is run by a human, on the human's own terminal, and signs the approved content
+    with ``META_APPROVAL_SECRET`` — a secret the agent's MCP tool surface never holds. ``execute_plan``'s
+    :class:`~meta_ads_analysis.proposals.HmacApprovalGate` then verifies that signature; the agent can
+    freely edit the proposal JSON but cannot forge a matching signature. Set ``META_APPROVAL_SECRET`` in
+    **both** this shell and the MCP server's environment, and keep it out of the repo.
+
+    Local limitation (accepted for the single-operator playground): an actor that can read the server's
+    environment or secret file could still forge — the Azure/role-based ticket removes that by moving
+    approval state server-side behind Entra ID.
+    """
+    from .proposals import approval_secret_from_env, approve_proposal, load_proposal
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Approve an MCP write proposal out-of-band (HMAC-sign it so execute_plan will run it). Run "
+            "this yourself; the agent cannot. Requires META_APPROVAL_SECRET (same secret as the server)."
+        )
+    )
+    parser.add_argument("--plan-id", required=True, help="The plan_id a propose_* MCP tool returned.")
+    parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT), help="Reports root. Defaults to reports/.")
+    parser.add_argument("--account", help="Informational only (proposals are found by plan_id).")
+    parser.add_argument("--run-date", help="Informational only (proposals are found by plan_id).")
+    parser.add_argument(
+        "--op-id", action="append", dest="op_ids",
+        help="Approve only this op_id / adset_id (repeatable). Use with, or instead of, --all.",
+    )
+    parser.add_argument("--all", action="store_true", help="Approve every proposed item in the plan.")
+    parser.add_argument("--yes", action="store_true", help="Skip the interactive confirmation (for scripting).")
+    args = parser.parse_args()
+
+    secret = approval_secret_from_env()
+    if secret is None:
+        raise SystemExit(
+            "META_APPROVAL_SECRET is not set. Generate one with "
+            '`python -c "import secrets; print(secrets.token_hex(32))"` and set it in BOTH this shell and '
+            "the MCP server's environment before approving."
+        )
+    if not args.op_ids and not args.all:
+        raise SystemExit("Specify --all to approve every item, or one/more --op-id <id> to approve a subset.")
+
+    reports_root = Path(args.reports_root)
+    plan = load_proposal(args.plan_id, reports_root)  # raises a clear error if the id is unknown
+    if (plan.get("execution") or {}).get("executed"):
+        raise SystemExit(f"Proposal {args.plan_id} was already executed — refusing to (re-)approve it.")
+
+    # Show the human what they are approving (the same digest the agent relayed from propose_*).
+    from .mcp_server import _proposal_summary
+
+    summary = _proposal_summary(args.plan_id, plan)
+    op_ids = None if args.all else args.op_ids
+    selecting = {str(x) for x in op_ids} if op_ids else None
+    print(
+        f"Proposal {args.plan_id} [{summary['plan_type']} / {summary['intent']}] "
+        f"for account {summary['account_slug']}:"
+    )
+    to_approve = 0
+    for item in summary["ops"]:
+        item_id = str(item.get("op_id"))
+        approving = selecting is None or item_id in selecting
+        to_approve += 1 if approving else 0
+        mark = "  <- APPROVE" if approving else ""
+        print(
+            f"  [{item.get('status')}] {item.get('op')} {item.get('level') or ''} {item_id} "
+            f"(confidence={item.get('confidence_band')}, review={item.get('review_verdict')}){mark}"
+        )
+    if to_approve == 0:
+        raise SystemExit("No items matched the given --op-id selection; nothing to approve.")
+
+    # The interactive prompt is the human-confirmation channel the agent has no access to. --yes is for
+    # scripting; the security comes from the secret, not the prompt.
+    if not args.yes:
+        reply = input(f"Approve these {to_approve} item(s) and sign the plan? [y/N] ").strip().lower()
+        if reply not in ("y", "yes"):
+            print("Aborted; nothing approved.")
+            return
+
+    approval = approve_proposal(args.plan_id, secret=secret, op_ids=op_ids, reports_root=reports_root)
+    print(f"Approved and signed {args.plan_id} ({approval['approved_count']} item(s)) at {approval['approved_at']}.")
+    print(f'The agent may now run execute_plan(plan_id="{args.plan_id}").')
+
+
 def experiment_main() -> None:
     from datetime import date as _date
 

@@ -8938,7 +8938,10 @@ from meta_ads_analysis.reader_provider import reader_backend_from_env  # noqa: E
 
 
 def _clear_scaffold_env(monkeypatch) -> None:
-    for var in ("META_ACCESS_TOKEN", "META_API_VERSION", "META_READER_BACKEND"):
+    for var in (
+        "META_ACCESS_TOKEN", "META_API_VERSION", "META_READER_BACKEND",
+        "META_APPROVAL_SECRET", "META_APPROVAL_SECRET_FILE", "META_APPROVAL_TTL_SECONDS",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -8967,7 +8970,7 @@ def test_build_server_info_defaults_when_env_unset(monkeypatch) -> None:
     from meta_ads_analysis import __version__
     from meta_ads_analysis.config import DEFAULT_META_API_VERSION
 
-    _clear_scaffold_env(monkeypatch)
+    _clear_scaffold_env(monkeypatch)  # also clears any META_APPROVAL_SECRET, so approval_configured is False
     assert _mcp_server.build_server_info() == {
         "name": "meta-ads-mcp",
         "version": __version__,
@@ -8975,6 +8978,8 @@ def test_build_server_info_defaults_when_env_unset(monkeypatch) -> None:
         "read_backend": "direct",
         "live_calls_enabled": True,
         "write_tools_enabled": True,
+        "approval_required": True,
+        "approval_configured": False,
     }
 
 
@@ -10039,3 +10044,315 @@ def test_mcp_preview_plan_authoring_and_rotation_report_stored_intent(tmp_path):
 
     # NO write performed by either preview (create-only client too).
     assert client.creates == [] and client.updates == []
+
+
+# --- MCP local approval gate (HMAC-signed, out-of-band `approve_plan`) ------------------------
+# MOCKS ONLY: every test drives fake clients/readers; no live Meta call is ever made. The gate's
+# job is to make a human-produced approval something the *agent* structurally cannot forge.
+
+_APPROVAL_SECRET = b"test-secret-0123456789abcdef"  # >= proposals.MIN_APPROVAL_SECRET_LEN (16 bytes)
+
+
+def _ops_rename_plan(client, *, name="Renamed Set"):
+    """A one-op ops plan (rename ad set as1) — the simplest thing to approve/sign/execute."""
+    return _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="adset", id="as1", params={"name": name},
+        account_slug="demo", run_date="2026-07-01",
+    )
+
+
+def test_hmac_gate_accepts_signed_then_reloaded_plan(tmp_path):
+    # Round-trip parity (the correctness crux): approve_proposal signs the in-memory plan; the gate
+    # verifies the JSON-reloaded plan. Both canonicalize identically, so a genuine approval verifies.
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    approval = _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    assert approval["signature"] and approval["algorithm"] == "HMAC-SHA256" and approval["approved_count"] == 1
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)  # no raise == verified
+
+
+def test_approve_then_execute_end_to_end_ops(tmp_path):
+    # approve_proposal → execute_plan(HmacApprovalGate): validate-then-execute, audit written, verify.
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.HmacApprovalGate(_APPROVAL_SECRET),
+        reader=client, client=client, reports_root=tmp_path,
+    )
+    assert res["executed"] is True and res["ops"][0]["status"] == "executed"
+    assert res["audit_path"] and Path(res["audit_path"]).exists()
+
+
+def test_approve_then_execute_end_to_end_rotation(tmp_path):
+    # A non-ops family through the full loop: approve_proposal signs the rotation items (which live under
+    # "rotations", not "ops" — plan_items must route there) and execute runs them under the gate.
+    client = _AuthRotFakeClient()
+    plan = _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1",
+                                         offset=1, disable_advantage_audience=True)
+    pid = _proposals.save_proposal(plan, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.HmacApprovalGate(_APPROVAL_SECRET),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True
+    assert {o["adset_id"]: o["status"] for o in res["ops"]}["as1"] == "executed"
+
+
+def test_hmac_gate_rejects_agent_forged_approved_status(tmp_path):
+    # The incident this reopens: an agent hand-edits status:approved into the persisted plan but cannot
+    # sign it. No approval block → "no human approval"; execute raises and NOTHING is sent.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_approve_all(_ops_rename_plan(client)), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.execute_plan(
+            pid, approval_gate=_proposals.HmacApprovalGate(_APPROVAL_SECRET),
+            reader=client, client=client, reports_root=tmp_path,
+        )
+    assert "no human approval" in str(excinfo.value)
+    assert client.updates == []  # refused before any write / validate round-trip
+
+
+def test_hmac_gate_rejects_mutated_approved_op(tmp_path):
+    # Approve, then mutate the approved op's params on disk (a filesystem-write forgery): the recompute
+    # over the mutated approved set ≠ the stored signature. Because the FULL item dict is signed, this
+    # generalizes to any material field — including stripping confidence/evidence to dodge the grounding gate.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["ops"][0]["params"]["name"] = "Attacker Chosen Name"  # change AFTER signing
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+    assert "does not match" in str(excinfo.value)
+
+
+def test_hmac_gate_rejects_added_approved_op(tmp_path):
+    # Agent adds a brand-new approved op to a signed plan → recompute over the larger approved set ≠ stored.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["ops"].append(
+        {"op_id": "sneak", "op": "rename", "level": "ad", "id": "ad1", "params": {"name": "X"}, "status": "approved"}
+    )
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError):
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+
+
+def test_hmac_gate_rejects_cross_plan_signature_replay(tmp_path):
+    # Copying a valid approval block from plan A onto plan B is rejected: the signed payload carries the
+    # plan_id, so B's recompute (over B's id) ≠ A's signature.
+    import pytest
+    client = _control_fixture()
+    pid_a = _proposals.save_proposal(_ops_rename_plan(client, name="A"), account_slug="demo",
+                                     run_date="2026-07-01", reports_root=tmp_path)
+    pid_b = _proposals.save_proposal(_approve_all(_ops_rename_plan(client, name="B")), account_slug="demo",
+                                     run_date="2026-07-01", reports_root=tmp_path)
+    approval_a = _proposals.approve_proposal(pid_a, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path_b = _proposals.find_proposal_path(pid_b, tmp_path)
+    b = json.loads(path_b.read_text(encoding="utf-8"))
+    b["approval"] = approval_a  # graft A's signature onto B (B's ops already flipped approved)
+    path_b.write_text(json.dumps(b), encoding="utf-8")
+    reloaded_b = _proposals.load_proposal(pid_b, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid_b, reloaded_b)
+    assert "does not match" in str(excinfo.value)
+
+
+def test_hmac_gate_rejects_expired_approval_and_accepts_within_ttl(tmp_path):
+    # approved_at is inside the signed payload (cannot be forward-dated). With an injected clock: within
+    # the TTL passes; past it is rejected as expired.
+    import pytest
+    from datetime import UTC, datetime, timedelta
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    t0 = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path, now_fn=lambda: t0)
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    within = _proposals.HmacApprovalGate(_APPROVAL_SECRET, ttl_seconds=86400, now_fn=lambda: t0 + timedelta(hours=1))
+    within.assert_approved(pid, reloaded)  # no raise
+    expired = _proposals.HmacApprovalGate(_APPROVAL_SECRET, ttl_seconds=86400, now_fn=lambda: t0 + timedelta(hours=25))
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        expired.assert_approved(pid, reloaded)
+    assert "expired" in str(excinfo.value)
+
+
+def test_hmac_gate_empty_approved_set_with_leftover_signature_rejected(tmp_path):
+    # Sign a plan, then demote every op back to 'proposed' but leave the stale signature: recompute over
+    # the now-empty approved set ≠ stored. (The step-4 zero-approved refusal is a second layer behind this.)
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    for op in tampered["ops"]:
+        op["status"] = "proposed"  # un-approve but keep the signature
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError):
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+
+
+def test_approve_proposal_flips_only_selected_and_refuses_executed(tmp_path):
+    # op_ids selects a subset; only those flip to approved and the gate verifies. Re-approving an already
+    # -executed plan is refused (meaningless — the idempotency guard would refuse the re-execute anyway).
+    import pytest
+    two_op = {
+        "schema_version": 1, "plan_type": "ops", "intent": "rename", "account_slug": "demo",
+        "ad_account_id": "act_1", "run_date": "2026-07-01",
+        "guardrails": {"requires_explicit_approval": True, "requires_grounding": False},
+        "ops": [
+            {"op_id": "r1", "op": "rename", "level": "ad", "id": "ad1", "params": {"name": "A"}, "status": "proposed"},
+            {"op_id": "r2", "op": "rename", "level": "ad", "id": "ad2", "params": {"name": "B"}, "status": "proposed"},
+        ],
+    }
+    pid = _proposals.save_proposal(two_op, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    approval = _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, op_ids=["r1"], reports_root=tmp_path)
+    assert approval["approved_count"] == 1
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    by_id = {o["op_id"]: o for o in reloaded["ops"]}
+    assert by_id["r1"]["status"] == "approved" and by_id["r2"]["status"] == "proposed"
+    _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)  # verifies (only r1 approved)
+    _proposals._mark_executed(pid, tmp_path, audit_path=None)
+    with pytest.raises(MetaApiError) as excinfo:
+        _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, op_ids=["r1"], reports_root=tmp_path)
+    assert "already executed" in str(excinfo.value)
+
+
+def test_approval_secret_from_env_env_file_and_short(tmp_path, monkeypatch):
+    _clear_scaffold_env(monkeypatch)
+    assert _proposals.approval_secret_from_env() is None  # neither var set
+    monkeypatch.setenv("META_APPROVAL_SECRET", "a-sufficiently-long-secret-value")
+    assert _proposals.approval_secret_from_env() == b"a-sufficiently-long-secret-value"
+    # A too-short secret is a clear misconfig error, not a silent default.
+    monkeypatch.setenv("META_APPROVAL_SECRET", "short")
+    import pytest
+    with pytest.raises(ValueError) as excinfo:
+        _proposals.approval_secret_from_env()
+    assert "at least" in str(excinfo.value)
+    # File-based resolution strips a trailing newline.
+    monkeypatch.delenv("META_APPROVAL_SECRET", raising=False)
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("file-based-secret-0123456789\n", encoding="utf-8")
+    monkeypatch.setenv("META_APPROVAL_SECRET_FILE", str(secret_file))
+    assert _proposals.approval_secret_from_env() == b"file-based-secret-0123456789"
+
+
+def test_select_approval_gate_from_env_hmac_and_denied(monkeypatch):
+    _clear_scaffold_env(monkeypatch)
+    assert isinstance(_proposals.select_approval_gate_from_env(), _proposals.DeniedApprovalGate)
+    monkeypatch.setenv("META_APPROVAL_SECRET", "a-sufficiently-long-secret-value")
+    monkeypatch.setenv("META_APPROVAL_TTL_SECONDS", "0")  # empty/0 disables expiry
+    gate = _proposals.select_approval_gate_from_env()
+    assert isinstance(gate, _proposals.HmacApprovalGate) and gate._ttl_seconds is None
+
+
+def test_select_gate_denies_when_no_secret_but_reads_still_work(tmp_path, monkeypatch):
+    # Fail-closed: no secret → execute refused (ApprovalError naming META_APPROVAL_SECRET), nothing sent.
+    # Reads are never gated: a read tool from build_read_tools still returns live data.
+    import pytest
+    _clear_scaffold_env(monkeypatch)
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_approve_all(_ops_rename_plan(client)), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    gate = _proposals.select_approval_gate_from_env()  # DeniedApprovalGate (no secret)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+    assert "META_APPROVAL_SECRET" in str(excinfo.value)
+    assert client.updates == []
+    read_tools = _mcp_server.build_read_tools(DirectMetaReader(client))
+    assert read_tools["get_ad"]("ad1", fields=["id", "name"])["id"] == "ad1"
+
+
+def test_server_info_reports_approval_fields(monkeypatch):
+    _clear_scaffold_env(monkeypatch)
+    info = _mcp_server.build_server_info()
+    assert info["approval_required"] is True and info["approval_configured"] is False
+    monkeypatch.setenv("META_APPROVAL_SECRET", "a-sufficiently-long-secret-value")
+    assert _mcp_server.build_server_info()["approval_configured"] is True
+    # A misconfigured (too-short) secret degrades to False rather than raising (health probe, not ctor).
+    monkeypatch.setenv("META_APPROVAL_SECRET", "short")
+    assert _mcp_server.build_server_info()["approval_configured"] is False
+
+
+def test_build_server_wires_selected_approval_gate(monkeypatch):
+    # build_server selects the gate from the env: with a secret it's an HmacApprovalGate, and the write
+    # surface (incl. execute_plan) still registers. A fake FastMCP keeps this off the `server` extra.
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_ACCESS_TOKEN", "tok")
+    monkeypatch.setenv("META_APPROVAL_SECRET", "a-sufficiently-long-secret-value")
+    captured: dict = {}
+
+    class _SpyMcp:
+        def __init__(self, name, host, port):
+            pass
+
+        def tool(self):
+            def _d(fn):
+                return fn
+            return _d
+
+        def add_tool(self, func, name=None, description=None):
+            captured.setdefault("registered", []).append(name)
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", _SpyMcp)
+    real_build_write_tools = _mcp_server.build_write_tools
+
+    def _spy(reader, gate):
+        captured["gate"] = gate
+        return real_build_write_tools(reader, gate)
+
+    monkeypatch.setattr(_mcp_server, "build_write_tools", _spy)
+    monkeypatch.setattr(
+        _mcp_server.DirectMetaReader, "from_env",
+        classmethod(lambda cls, api_version=None: _mcp_server.DirectMetaReader(_control_fixture())),
+    )
+    _mcp_server.build_server("127.0.0.1", 8765)
+    assert isinstance(captured["gate"], _proposals.HmacApprovalGate)
+    assert "execute_plan" in captured["registered"]
+
+
+def test_approve_plan_cli_signs_and_gate_verifies(tmp_path, monkeypatch, capsys):
+    # The out-of-band CLI: approve → the persisted plan verifies under the gate keyed by the same secret.
+    from meta_ads_analysis.cli import approve_plan_main
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_APPROVAL_SECRET", "cli-test-secret-0123456789abc")
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    monkeypatch.setattr(sys, "argv", [
+        "approve_plan", "--plan-id", pid, "--reports-root", str(tmp_path), "--all", "--yes",
+    ])
+    approve_plan_main()
+    out = capsys.readouterr().out
+    assert pid in out and "execute_plan" in out
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    _proposals.HmacApprovalGate(b"cli-test-secret-0123456789abc").assert_approved(pid, reloaded)
+
+
+def test_approve_plan_cli_requires_secret(monkeypatch):
+    import pytest
+    from meta_ads_analysis.cli import approve_plan_main
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["approve_plan", "--plan-id", "x", "--all"])
+    with pytest.raises(SystemExit) as excinfo:
+        approve_plan_main()
+    assert "META_APPROVAL_SECRET" in str(excinfo.value)

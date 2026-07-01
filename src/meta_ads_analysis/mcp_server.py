@@ -108,7 +108,25 @@ def build_server_info() -> dict:
         # execute_plan — see build_write_tools). Every write is gated (propose → approve → validate →
         # execute → verify); execute refuses a plan with zero approved ops.
         "write_tools_enabled": True,
+        # Approval is always required to execute a write. ``approval_configured`` is a token-free health
+        # signal: True when an HMAC approval secret is set (HmacApprovalGate), False when it is absent or
+        # misconfigured (fail-closed DeniedApprovalGate — execute refuses, reads still work). Non-raising:
+        # a short/unreadable secret degrades to False here rather than breaking the health probe.
+        "approval_required": True,
+        "approval_configured": _approval_configured(),
     }
+
+
+def _approval_configured() -> bool:
+    """Whether an HMAC approval secret is resolvable (health signal for :func:`build_server_info`).
+
+    Non-raising: a misconfigured secret (too short / unreadable file) raises inside
+    :func:`proposals.approval_secret_from_env`, but ``server_info`` is a health probe, not a constructor,
+    so we report ``False`` rather than propagating the error."""
+    try:
+        return proposals.approval_secret_from_env() is not None
+    except ValueError:
+        return False
 
 
 def build_read_tools(reader: MetaReaderProvider) -> dict[str, Callable[..., Any]]:
@@ -672,10 +690,12 @@ def build_server(host: str, port: int):
             description=READ_TOOL_DESCRIPTIONS.get(name) or f"Meta read: {name}",
         )
 
-    # Guarded write surface. The default approval gate is a no-op relying on the apply invariant (only
-    # approved ops are sent); since no propose_* tool approves, a freshly-proposed plan has zero
-    # approved ops and execute_plan refuses. ticket 13 swaps in an un-forgeable gate behind this seam.
-    approval_gate = proposals.PlanStatusApprovalGate()
+    # Guarded write surface. The approval gate is selected from the environment: with META_APPROVAL_SECRET
+    # set it is an HmacApprovalGate (execute verifies an out-of-band, human-produced HMAC signature over
+    # the plan's approved content — a secret the agent's tool surface never holds); with no secret it is
+    # a fail-closed DeniedApprovalGate (execute refused with setup guidance; reads unaffected). The agent
+    # can freely edit the proposal JSON but cannot forge a signature. See proposals.select_approval_gate_from_env.
+    approval_gate = proposals.select_approval_gate_from_env()
     for name, func in build_write_tools(reader, approval_gate).items():
         mcp.add_tool(
             _wrap_tool_errors(func),
