@@ -1,5 +1,5 @@
 description: A simple, written walkthrough (plus any config needed) so I can start the MCP server on my own machine, connect Claude to it, and actually try reading data and running a safe propose-approve-execute cycle — all against mocks, no live account.
-prereq: mcp-read-tools, mcp-guarded-write-tools, mcp-local-approval-gate
+prereq: mcp-read-tools, mcp-guarded-write-tools, mcp-guarded-write-authoring-rotation, mcp-local-approval-gate
 files: docs/META_API_SETUP.md, docs/META_ACTION_WORKFLOW.md, README.md, .mcp.json
 difficulty: easy
 ----
