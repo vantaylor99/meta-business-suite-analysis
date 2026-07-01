@@ -8928,3 +8928,77 @@ def test_followups_mark_done_missing_ok_is_idempotent(tmp_path: Path) -> None:
                          missing_ok=True, root=root) is None
     with pytest.raises(FileNotFoundError):
         _fu.mark_done(account="acct", task_id=task_id, completed="2026-06-29", root=root)
+
+
+# --- Custom Meta MCP server scaffold (MOCKS ONLY: zero live Meta calls, no socket bound) ---
+
+from meta_ads_analysis import mcp_server as _mcp_server  # noqa: E402
+from meta_ads_analysis.meta_api import meta_api_version_from_env  # noqa: E402
+from meta_ads_analysis.reader_provider import reader_backend_from_env  # noqa: E402
+
+
+def _clear_scaffold_env(monkeypatch) -> None:
+    for var in ("META_ACCESS_TOKEN", "META_API_VERSION", "META_READER_BACKEND"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_meta_api_version_from_env_precedence(monkeypatch) -> None:
+    from meta_ads_analysis.config import DEFAULT_META_API_VERSION
+
+    monkeypatch.delenv("META_API_VERSION", raising=False)
+    assert meta_api_version_from_env() == DEFAULT_META_API_VERSION  # unset -> default
+    monkeypatch.setenv("META_API_VERSION", "v33.0")
+    assert meta_api_version_from_env() == "v33.0"  # env wins over default
+    assert meta_api_version_from_env("v44.0") == "v44.0"  # explicit arg wins over env
+
+
+def test_reader_backend_from_env_normalizes_and_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("META_READER_BACKEND", raising=False)
+    assert reader_backend_from_env() == "direct"  # unset -> direct
+    monkeypatch.setenv("META_READER_BACKEND", "  MCP ")
+    assert reader_backend_from_env() == "mcp"  # trimmed + lowercased
+    # Does NOT validate: an unknown value is reported verbatim-normalized, never raised.
+    monkeypatch.setenv("META_READER_BACKEND", "Bogus")
+    assert reader_backend_from_env() == "bogus"
+
+
+def test_build_server_info_defaults_when_env_unset(monkeypatch) -> None:
+    # Token-free health payload: works with NO META_ACCESS_TOKEN set and never raises.
+    from meta_ads_analysis import __version__
+    from meta_ads_analysis.config import DEFAULT_META_API_VERSION
+
+    _clear_scaffold_env(monkeypatch)
+    assert _mcp_server.build_server_info() == {
+        "name": "meta-ads-mcp",
+        "version": __version__,
+        "meta_api_version": DEFAULT_META_API_VERSION,
+        "read_backend": "direct",
+        "live_calls_enabled": False,
+    }
+
+
+def test_build_server_info_reflects_backend_and_version_overrides(monkeypatch) -> None:
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    monkeypatch.setenv("META_API_VERSION", "v99.0")
+    info = _mcp_server.build_server_info()
+    assert info["read_backend"] == "mcp"
+    assert info["meta_api_version"] == "v99.0"
+
+
+def test_build_server_info_live_calls_always_false(monkeypatch) -> None:
+    # MOCKS-ONLY guardrail made explicit: the scaffold makes ZERO live Meta calls.
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    monkeypatch.setenv("META_ACCESS_TOKEN", "should-not-matter")
+    assert _mcp_server.build_server_info()["live_calls_enabled"] is False
+
+
+def test_build_server_without_sdk_raises_actionable_systemexit(monkeypatch) -> None:
+    # SDK-missing path: mirror the requests-missing pattern — actionable SystemExit, not ImportError.
+    import pytest
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", None)
+    with pytest.raises(SystemExit) as excinfo:
+        _mcp_server.build_server("127.0.0.1", 8765)
+    assert ".[server]" in str(excinfo.value)

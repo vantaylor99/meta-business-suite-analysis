@@ -163,6 +163,42 @@ The MCP backend is consumed by the **agent runtime**, which injects the MCP tool
 CLI command with `META_READER_BACKEND=mcp` raises a clear error rather than silently degrading — keep
 CLI/sync runs on `direct`.
 
+### Our custom Meta MCP server (local, scaffold)
+
+Separate from the community `meta-ads-read` **read** candidate above, this repo also ships **our own**
+custom Meta MCP server — the long-term home for reads *and* guarded writes behind one connector. Today
+it is only a **scaffold**: it exposes a single `server_info` health tool and makes **zero live Meta
+calls** (it has no Meta read/write tools yet — those land in the `mcp-read-tools` /
+`mcp-guarded-write-tools` follow-on tickets). It runs as its own HTTP process, distinct from the parked
+community candidate.
+
+Install the server extra (kept optional so the CSV/analysis install stays lean) and launch it:
+
+```powershell
+pip install -e .[server]
+meta_mcp_server --host 127.0.0.1 --port 8765
+```
+
+Host/port precedence is **explicit flag > env var > local default**: `--host` / `--port` win, else
+`MCP_SERVER_HOST` / `MCP_SERVER_PORT`, else `127.0.0.1` / `8765`.
+
+```powershell
+$env:MCP_SERVER_HOST="127.0.0.1"
+$env:MCP_SERVER_PORT="8765"
+meta_mcp_server
+```
+
+An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
+`server_info`, which returns the server name/version, the configured Meta API version, the selected
+read backend, and `live_calls_enabled: false`. If the `server` extra is not installed, launching prints
+an actionable error (`pip install -e .[server]`) rather than a traceback.
+
+Its config lives in `.mcp.json` under `_candidateMcpServers` as the **`meta-suite`** entry — **parked
+and not launched** until the read/write tool tickets land (only `code-search` runs). Its tools carry
+the `mcp__meta-suite__*` prefix, deliberately distinct from the community server's `mcp__meta-ads__*`
+prefix (whose write tools are deny-listed in `.claude/settings.json`). Multi-user/hosted role headers
+are a later concern; local single-operator use needs no header.
+
 ### Official Meta hosted MCP server (OAuth) — drop-in, optional
 
 Meta also offers an **official hosted MCP server that authenticates with OAuth** (a remote/URL

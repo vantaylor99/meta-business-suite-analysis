@@ -255,6 +255,15 @@ Meta's **official hosted OAuth MCP server is a documented drop-in for later** �
 **no code change** (see `docs/META_API_SETUP.md`). It is **not wired or tested here**; only the seam is
 proven to support it.
 
+**Our own custom Meta MCP server (scaffold).** Separate from the community read candidate, this repo
+also ships the skeleton of *our own* Meta MCP server — the long-term single connector for reads +
+guarded writes. Today it is a **scaffold only**: console script `meta_mcp_server` (install the `server`
+extra), an HTTP process exposing just the `server_info` health tool, **mocks-only / zero live Meta
+calls**. Config is the parked `meta-suite` entry in `.mcp.json` (key distinct from the community
+`meta-ads` prefix so our sanctioned gated tools dodge that deny-list); it is **not launched** until the
+follow-on tickets add reads (`mcp-read-tools`) and guarded writes (`mcp-guarded-write-tools`). Setup and
+launch details are in `docs/META_API_SETUP.md`; the write catalog table below stays the source of truth.
+
 **Writes are deliberately not part of this seam.** `create_*` / `update_*` / `upload_*` always use the
 direct Graph client and stay behind the propose → approve → validate_only → execute gate, so the MCP
 read path is reads-only and the existing `ads_read` token is enough for it (writes still need
