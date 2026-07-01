@@ -9034,8 +9034,8 @@ def test_main_host_port_precedence_flag_over_env_over_default(monkeypatch) -> No
     # flag > MCP_SERVER_HOST/PORT env > default, verified without a socket bind.
     captured: dict = {}
 
-    def _fake_build_server(host, port):
-        captured["host"], captured["port"] = host, port
+    def _fake_build_server(host, port, *, mock=False):
+        captured["host"], captured["port"], captured["mock"] = host, port, mock
         return _FakeMcp()
 
     monkeypatch.setattr(_mcp_server, "build_server", _fake_build_server)
@@ -9043,6 +9043,7 @@ def test_main_host_port_precedence_flag_over_env_over_default(monkeypatch) -> No
     # default when nothing set
     monkeypatch.delenv("MCP_SERVER_HOST", raising=False)
     monkeypatch.delenv("MCP_SERVER_PORT", raising=False)
+    monkeypatch.delenv("META_MCP_MOCK", raising=False)
     monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
     _mcp_server.main()
     assert (captured["host"], captured["port"]) == (_mcp_server.DEFAULT_HOST, _mcp_server.DEFAULT_PORT)
@@ -9068,9 +9069,10 @@ def test_main_wraps_oserror_as_actionable_systemexit(monkeypatch) -> None:
         def run(self, transport: str) -> None:
             raise OSError("address already in use")
 
-    monkeypatch.setattr(_mcp_server, "build_server", lambda host, port: _RaisingMcp())
+    monkeypatch.setattr(_mcp_server, "build_server", lambda host, port, *, mock=False: _RaisingMcp())
     monkeypatch.delenv("MCP_SERVER_HOST", raising=False)
     monkeypatch.delenv("MCP_SERVER_PORT", raising=False)
+    monkeypatch.delenv("META_MCP_MOCK", raising=False)
     monkeypatch.setattr(sys, "argv", ["meta_mcp_server", "--host", "127.0.0.1", "--port", "8765"])
     with pytest.raises(SystemExit) as excinfo:
         _mcp_server.main()
@@ -10316,9 +10318,10 @@ def test_build_server_wires_selected_approval_gate(monkeypatch):
     monkeypatch.setattr(_mcp_server, "FastMCP", _SpyMcp)
     real_build_write_tools = _mcp_server.build_write_tools
 
-    def _spy(reader, gate):
+    def _spy(reader, gate, client=None):
         captured["gate"] = gate
-        return real_build_write_tools(reader, gate)
+        captured["client"] = client
+        return real_build_write_tools(reader, gate, client=client)
 
     monkeypatch.setattr(_mcp_server, "build_write_tools", _spy)
     monkeypatch.setattr(
@@ -10328,6 +10331,8 @@ def test_build_server_wires_selected_approval_gate(monkeypatch):
     _mcp_server.build_server("127.0.0.1", 8765)
     assert isinstance(captured["gate"], _proposals.HmacApprovalGate)
     assert "execute_plan" in captured["registered"]
+    # Live mode passes no explicit write client — execute_plan builds a real client_from_env() lazily.
+    assert captured["client"] is None
 
 
 def test_approve_plan_cli_signs_and_gate_verifies(tmp_path, monkeypatch, capsys):
@@ -10419,3 +10424,166 @@ def test_approve_plan_cli_interactive_confirm_and_abort(tmp_path, monkeypatch, c
     approve_plan_main()
     reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
     _proposals.HmacApprovalGate(b"cli-test-secret-0123456789abc").assert_approved(pid, reloaded)
+
+
+# --- Mock launch mode (--mock / META_MCP_MOCK): canned reads + no-op write client, zero live calls ---
+# MOCKS ONLY: every test here proves the mock rig itself; no live Meta call is ever made.
+
+
+def test_build_mock_reader_all_stubs_present() -> None:
+    # The mock reader must serve every read tool the scripted first session touches — i.e. every
+    # READ_TOOL_METHODS name — without raising FakeMetaReader's "not stubbed" NotImplementedError.
+    # Drives each read through the same build_read_tools seam the server exposes.
+    reader = _mcp_server.build_mock_reader()
+    tools = _mcp_server.build_read_tools(reader)
+    for name in _mcp_server.READ_TOOL_METHODS:
+        args, kwargs = _READER_CALL_SPECS[name]
+        tools[name](*args, **kwargs)  # must not raise NotImplementedError
+    # The account/campaign/adset/ad reads return the shared mock entities.
+    assert reader.get_account("act_mock001", fields=["name"])["id"] == _mcp_server.MOCK_ACCOUNT_ID
+    assert reader.get_ad("ad_mock001", fields=["id"]) == _mcp_server.MOCK_AD
+    assert reader.list_campaigns("act_mock001", fields=["id"]) == [_mcp_server.MOCK_CAMPAIGN]
+    # iter_paginated is seeded as a CALLABLE (FakeMetaReader invokes callable stubs with the path arg).
+    assert list(reader.iter_paginated("/act_mock001/ads", params={"limit": 1})) == [_mcp_server.MOCK_AD]
+
+
+def test_mock_write_client_update_returns_success_and_records() -> None:
+    # Each update_* returns {"success": True} for BOTH validate (True) and execute (False) passes and
+    # records (method, id, params, validate_only) — so neither pass looks like a failure to apply_ops_plan.
+    client = _mcp_server._MockWriteClient()
+    assert client.update_ad("ad_mock001", params={"status": "PAUSED"}, validate_only=True) == {"success": True}
+    assert client.update_adset("adset_mock001", params={"status": "PAUSED"}, validate_only=False) == {"success": True}
+    assert client.update_campaign("campaign_mock001", params={"name": "X"}) == {"success": True}
+    assert client.writes == [
+        ("update_ad", "ad_mock001", {"status": "PAUSED"}, True),
+        ("update_adset", "adset_mock001", {"status": "PAUSED"}, False),
+        ("update_campaign", "campaign_mock001", {"name": "X"}, False),
+    ]
+    # Read-backs return the shared mock entities so a post-execute verification read is consistent.
+    assert client.get_ad("ad_mock001", fields=["id"]) == _mcp_server.MOCK_AD
+    # Authoring creates never return an ACTIVE effective_status (PAUSED-by-default is never violated).
+    assert client.create_campaign()["effective_status"] == "PAUSED"
+
+
+def test_build_server_mock_skips_token_and_server_info_reports_no_secret(monkeypatch) -> None:
+    # build_server(mock=True) with NO META_ACCESS_TOKEN must not raise (the mock reader is token-free),
+    # and with no META_APPROVAL_SECRET, server_info reports approval_configured False (fail-closed gate).
+    # A fake FastMCP keeps this off the `server` extra and binds no socket.
+    _clear_scaffold_env(monkeypatch)
+
+    captured: dict = {}
+
+    class _SpyMcp:
+        def __init__(self, name, host, port):
+            pass
+
+        def tool(self):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+        def add_tool(self, func, name=None, description=None):
+            captured.setdefault("registered", []).append(name)
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", _SpyMcp)
+    real_build_read_tools = _mcp_server.build_read_tools
+
+    def _spy(reader):
+        captured["reader"] = reader
+        return real_build_read_tools(reader)
+
+    monkeypatch.setattr(_mcp_server, "build_read_tools", _spy)
+
+    _mcp_server.build_server("127.0.0.1", 8765, mock=True)  # must NOT raise — no token required
+    assert isinstance(captured["reader"], FakeMetaReader)
+    registered = set(captured["registered"])
+    assert set(_mcp_server.READ_TOOL_METHODS).issubset(registered)
+    assert {"execute_plan", "preview_plan", "propose_set_status"}.issubset(registered)
+    # No secret set -> the health probe reports the fail-closed posture (execute would be refused).
+    assert _mcp_server.build_server_info()["approval_configured"] is False
+
+
+def test_build_write_tools_threads_client_into_execute_plan(monkeypatch) -> None:
+    # build_write_tools' `client` is threaded into proposals.execute_plan (the only writer). Patch
+    # execute_plan to capture the kwargs and prove the mock client reaches it; and that omitting the
+    # client leaves it None (live mode -> execute_plan builds a real client_from_env() lazily).
+    captured: dict = {}
+
+    def _fake_execute_plan(plan_id, *, approval_gate, reader, client=None, **kw):
+        captured.update(plan_id=plan_id, approval_gate=approval_gate, reader=reader, client=client)
+        return {"executed": True, "plan_id": plan_id}
+
+    monkeypatch.setattr(_mcp_server.proposals, "execute_plan", _fake_execute_plan)
+    reader = _mcp_server.build_mock_reader()
+    gate = _proposals.PlanStatusApprovalGate()
+    mock_client = _mcp_server._MockWriteClient()
+
+    out = _mcp_server.build_write_tools(reader, gate, client=mock_client)["execute_plan"]("plan-xyz")
+    assert out == {"executed": True, "plan_id": "plan-xyz"}
+    assert captured["client"] is mock_client
+    assert captured["reader"] is reader and captured["approval_gate"] is gate
+
+    captured.clear()
+    _mcp_server.build_write_tools(reader, gate)["execute_plan"]("plan-abc")
+    assert captured["client"] is None  # no client passed -> None reaches execute_plan
+
+
+def test_mock_execute_records_writes_and_makes_no_live_call(tmp_path) -> None:
+    # Full guarded loop on the mock rig: propose set_status PAUSED on the sole ACTIVE ad -> companion
+    # ad-set pause appended -> approve -> execute via the mock write client. The client records both the
+    # validate pass and the execute pass; nothing contacts Meta; outcome verify re-reads the fake reader.
+    reader = _mcp_server.build_mock_reader()
+    plan = _control_mod.build_single_op_plan(
+        reader, "act_mock001", op="set_status", level="ad", id="ad_mock001",
+        params={"status": "PAUSED"}, account_slug="demo", run_date="2026-07-01",
+    )
+    plan = _control_mod.append_last_active_ad_pause(reader, plan)
+    targets = {(op["level"], op["id"]) for op in plan["ops"]}
+    assert ("ad", "ad_mock001") in targets and ("adset", "adset_mock001") in targets
+
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    mock_client = _mcp_server._MockWriteClient()
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=reader,
+        client=mock_client, reports_root=tmp_path,
+    )
+    assert res["executed"] is True
+    # Each approved op ran a validate pass (validate_only=True) THEN an execute pass (validate_only=False).
+    methods_modes = {(w[0], w[3]) for w in mock_client.writes}
+    assert {("update_ad", True), ("update_ad", False)}.issubset(methods_modes)
+    assert {("update_adset", True), ("update_adset", False)}.issubset(methods_modes)
+    # The pausing lesson: a verify_next_day_spend follow-up is emitted per executed pause.
+    followed = {(f["level"], f["id"]) for f in res["follow_ups"] if f["type"] == "verify_next_day_spend"}
+    assert ("ad", "ad_mock001") in followed and ("adset", "adset_mock001") in followed
+
+
+def test_main_mock_flag_and_env_propagate_to_build_server(monkeypatch) -> None:
+    # main() wires --mock (and META_MCP_MOCK=1) through to build_server(mock=...).
+    captured: dict = {}
+
+    def _fake_build_server(host, port, *, mock=False):
+        captured["mock"] = mock
+        return _FakeMcp()
+
+    monkeypatch.setattr(_mcp_server, "build_server", _fake_build_server)
+    monkeypatch.delenv("MCP_SERVER_HOST", raising=False)
+    monkeypatch.delenv("MCP_SERVER_PORT", raising=False)
+
+    # default: no flag, no env -> mock False
+    monkeypatch.delenv("META_MCP_MOCK", raising=False)
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
+    _mcp_server.main()
+    assert captured["mock"] is False
+
+    # --mock flag -> True
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server", "--mock"])
+    _mcp_server.main()
+    assert captured["mock"] is True
+
+    # META_MCP_MOCK=1 (no flag) -> True
+    monkeypatch.setenv("META_MCP_MOCK", "1")
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
+    _mcp_server.main()
+    assert captured["mock"] is True

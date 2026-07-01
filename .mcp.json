@@ -7,8 +7,13 @@
         "tess/scripts/mcp-search.mjs"
       ],
       "env": {}
+    },
+    "meta-suite": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
     }
   },
+  "_meta_suite_note": "'meta-suite' is OUR OWN custom Meta MCP server (distinct from the community 'meta-ads-read' read candidate under _candidateMcpServers). It is now PROMOTED into 'mcpServers' so Claude Code connects to it, but as an HTTP server it must be STARTED FIRST — Claude Code only connects, it does not launch the process. Start it in a separate terminal: `meta_mcp_server --mock` (mock mode — canned reads, a no-op write client, no META_ACCESS_TOKEN, zero live Meta calls) or `META_ACCESS_TOKEN=<token> meta_mcp_server` (live). Until it is running, this entry shows a connection error in Claude Code — that is expected. See docs/META_API_SETUP.md -> 'Run the Meta MCP server locally' for the step-by-step guide and scripted first session. It exposes the live Meta READ surface (13 read tools) AND the guarded WRITE surface (propose_* / preview_plan / execute_plan): every write routes through propose -> human approve -> validate -> execute -> verify (PAUSED-by-default, grounded, reviewed; see src/meta_ads_analysis/proposals.py and docs/META_ACTION_WORKFLOW.md); execute_plan is the only writer and refuses a plan with zero approved ops. Its tools carry the 'mcp__meta-suite__*' prefix -- deliberately distinct from the community 'mcp__meta-ads__*' prefix whose UNGATED write tools are deny-listed in .claude/settings.json -- so our sanctioned GATED write tools are never caught by that deny-list. The role/token header for multi-user/hosted use is a later concern (see backlog mcp-role-based-access-tiers); local single-operator use needs no header.",
   "_candidateMcpServers": {
     "_README": "DISABLED / UNVETTED. Entries here are NOT launched (only servers under 'mcpServers' are). 'meta-ads-read' is the community token-based Meta read server candidate. To enable: (1) vet the package + pin a known-good version, (2) confirm the token env-var name it expects, (3) move the 'meta-ads-read' object into 'mcpServers' above, then (4) set META_READER_BACKEND=mcp. It authenticates with the existing long-lived META_ACCESS_TOKEN (no OAuth). Reads only; writes always use the direct Graph client.",
     "_candidate": "meta-ads-mcp-server@1.5.1 (npm) — token-based, read-only tool set by default, no auto-pagination (provides meta_ads_fetch_pagination_url). UNVETTED: operator must review the package and pin before enabling.",
@@ -23,11 +28,6 @@
       "env": {
         "META_ADS_ACCESS_TOKEN": "${META_ACCESS_TOKEN}"
       }
-    },
-    "_meta_suite_note": "'meta-suite' is OUR OWN custom Meta MCP server (distinct from the community 'meta-ads-read' read candidate above). It now exposes the live Meta READ surface (13 read tools) AND the guarded WRITE surface (propose_* / preview_plan / execute_plan). Every write routes through propose -> human approve -> validate -> execute -> verify (PAUSED-by-default, grounded, reviewed; see src/meta_ads_analysis/proposals.py and docs/META_ACTION_WORKFLOW.md); execute_plan is the only writer and refuses a plan with zero approved ops. Launch it locally with `meta_mcp_server` after `pip install -e .[server]`; the client then connects at http://127.0.0.1:8765/mcp. Its tools carry the 'mcp__meta-suite__*' prefix — deliberately distinct from the community 'mcp__meta-ads__*' prefix whose UNGATED write tools are deny-listed in .claude/settings.json — so our sanctioned GATED write tools are never caught by that deny-list. The role/token header for multi-user/hosted use is a later concern (see backlog mcp-role-based-access-tiers); local single-operator use needs no header.",
-    "meta-suite": {
-      "type": "http",
-      "url": "http://127.0.0.1:8765/mcp"
     }
   }
 }

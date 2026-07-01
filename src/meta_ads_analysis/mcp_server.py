@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import functools
 import os
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -44,6 +45,7 @@ from .meta_api import MetaApiError, meta_api_version_from_env
 from .reader_provider import (
     READ_METHODS,
     DirectMetaReader,
+    FakeMetaReader,
     MetaReaderProvider,
     reader_backend_from_env,
 )
@@ -86,6 +88,116 @@ READ_TOOL_DESCRIPTIONS: dict[str, str] = {
     "list_pixels": "List the ad pixels configured on an ad account.",
     "list_custom_conversions": "List the custom conversions configured on an ad account.",
 }
+
+
+# --- Mock mode (`--mock` / META_MCP_MOCK=1) ---------------------------------
+#
+# A launch posture for trying the connect → read → propose → approve → execute loop with NO real
+# ``META_ACCESS_TOKEN`` and ZERO live Meta calls. ``build_mock_reader`` seeds a ``FakeMetaReader`` with
+# one fake account (``act_mock001``) so every read tool returns canned data, and ``_MockWriteClient``
+# records writes and returns success without contacting Meta — routed through the SAME guarded
+# propose → approve → validate → execute → verify pipeline as live mode (the gate is real; only the
+# reads/writes are faked). The scripted first session in docs/META_API_SETUP.md walks the deepest read
+# path: ``propose_set_status`` on ``ad_mock001`` (the only ACTIVE ad in ``adset_mock001``) drives
+# ``append_last_active_ad_pause`` → ``get_ad`` + ``iter_paginated``, then ``execute_plan`` writes via the
+# mock client and verifies via the fake reader. The three shared entity dicts keep reader + write-client
+# mock data in sync so the post-execute outcome read-back sees what the write "changed".
+MOCK_ACCOUNT_ID = "act_mock001"
+
+MOCK_CAMPAIGN: dict[str, Any] = {
+    "id": "campaign_mock001", "name": "Demo Campaign", "status": "ACTIVE",
+    "effective_status": "ACTIVE", "objective": "OUTCOME_TRAFFIC",
+}
+MOCK_ADSET: dict[str, Any] = {
+    "id": "adset_mock001", "name": "Demo Ad Set", "status": "ACTIVE", "effective_status": "ACTIVE",
+    "campaign_id": "campaign_mock001", "daily_budget": "10000", "targeting": {},
+}
+MOCK_AD: dict[str, Any] = {
+    "id": "ad_mock001", "name": "Demo Ad", "status": "ACTIVE", "effective_status": "ACTIVE",
+    "adset_id": "adset_mock001",
+}
+MOCK_ACCOUNT: dict[str, Any] = {
+    "id": MOCK_ACCOUNT_ID, "name": "Demo Account", "account_status": 1, "currency": "USD",
+}
+MOCK_INSIGHT: dict[str, Any] = {
+    "date_start": "2026-06-01", "date_stop": "2026-06-30", "spend": "100.00",
+    "impressions": "5000", "clicks": "200",
+}
+MOCK_DELIVERY_ESTIMATE: dict[str, Any] = {"estimate_dau": 10000, "estimate_mau": 50000}
+
+
+class _MockWriteClient:
+    """No-op write client for ``--mock`` mode: records calls, returns success, never contacts Meta.
+
+    Implements the write methods ``control._update_entity`` dispatches to (``update_ad`` / ``update_adset``
+    / ``update_campaign``) plus the authoring ``create_*`` methods, and the ``get_*`` reads a re-read would
+    use — all returning the same canned shapes as :func:`build_mock_reader` so a post-execute verification
+    read is consistent. The ``update_*`` methods return ``{"success": True}`` for BOTH the mandatory
+    ``validate_only=True`` pass and the real ``validate_only=False`` write, so neither pass looks like a
+    failure to :func:`meta_ads_analysis.control.apply_ops_plan`.
+    """
+
+    def __init__(self) -> None:
+        # (method, id, params, validate_only) for each recorded write — inspectable in tests / the REPL.
+        self.writes: list[tuple[str, str, dict[str, Any], bool]] = []
+
+    def update_ad(self, ad_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
+        self.writes.append(("update_ad", ad_id, params, validate_only))
+        return {"success": True}
+
+    def update_adset(self, adset_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
+        self.writes.append(("update_adset", adset_id, params, validate_only))
+        return {"success": True}
+
+    def update_campaign(self, campaign_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
+        self.writes.append(("update_campaign", campaign_id, params, validate_only))
+        return {"success": True}
+
+    # Read-backs (used only if a re-read reached the client instead of the explicit reader).
+    def get_ad(self, ad_id: str, *, fields: list[str]) -> dict[str, Any]:
+        return dict(MOCK_AD)
+
+    def get_adset(self, adset_id: str, *, fields: list[str]) -> dict[str, Any]:
+        return dict(MOCK_ADSET)
+
+    def get_campaign(self, campaign_id: str, *, fields: list[str]) -> dict[str, Any]:
+        return dict(MOCK_CAMPAIGN)
+
+    # Authoring creates (created entities are inspected for a non-ACTIVE effective_status post-execute).
+    def create_campaign(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"id": "campaign_mock_new", "effective_status": "PAUSED"}
+
+    def create_adset(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"id": "adset_mock_new", "effective_status": "PAUSED"}
+
+    def create_ad(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"id": "ad_mock_new", "effective_status": "PAUSED"}
+
+    def create_lookalike_audience(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"id": "audience_mock_new"}
+
+
+def build_mock_reader() -> FakeMetaReader:
+    """A :class:`FakeMetaReader` pre-seeded for ``act_mock001`` so every exposed read tool returns canned
+    data with no ``META_ACCESS_TOKEN`` and no live call. ``iter_paginated`` is seeded as a **callable**
+    because ``FakeMetaReader`` invokes callable stubs with the positional path arg; the rest are plain
+    values. Fresh ``dict(...)`` copies keep callers from mutating the shared module constants."""
+    return FakeMetaReader(
+        get_account=dict(MOCK_ACCOUNT),
+        list_campaigns=[dict(MOCK_CAMPAIGN)],
+        get_campaign=dict(MOCK_CAMPAIGN),
+        list_adsets=[dict(MOCK_ADSET)],
+        get_adset=dict(MOCK_ADSET),
+        fetch_ads=[dict(MOCK_AD)],
+        get_ad=dict(MOCK_AD),
+        iter_paginated=lambda path_or_url=None, params=None: [dict(MOCK_AD)],
+        fetch_insights=[dict(MOCK_INSIGHT)],
+        list_custom_audiences=[],
+        list_pixels=[],
+        list_custom_conversions=[],
+        search_targeting=[],
+        get_delivery_estimate=dict(MOCK_DELIVERY_ESTIMATE),
+    )
 
 
 def build_server_info() -> dict:
@@ -350,10 +462,15 @@ def _proposal_summary(plan_id: str, plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_write_tools(
-    reader: MetaReaderProvider, approval_gate: proposals.ApprovalGate
+    reader: MetaReaderProvider, approval_gate: proposals.ApprovalGate, client: Any | None = None
 ) -> dict[str, Callable[..., Any]]:
     """Return ``{tool_name: callable}`` for the full guarded write surface — control ops, authoring
     (create-only, PAUSED by default), and audience rotation / Advantage-Audience disable.
+
+    ``client`` is the explicit **write** client threaded into ``execute_plan``. In live mode it is
+    ``None`` and ``proposals.execute_plan`` builds a real ``client_from_env()`` lazily; in ``--mock``
+    mode a :class:`_MockWriteClient` is passed so the write pass records ops and returns success without
+    touching Meta (short-circuiting that ``client_from_env`` fallback — no change to ``proposals.py``).
 
     PURE: no FastMCP import, no socket — unit-testable with a ``FakeMetaReader``/fake gate. Each
     ``propose_*`` wraps an existing library builder (``control`` / ``authoring`` / ``rotation``) that
@@ -596,7 +713,9 @@ def build_write_tools(
         return proposals.preview_plan(plan_id, reader=reader)
 
     def execute_plan(plan_id: str) -> dict[str, Any]:
-        return proposals.execute_plan(plan_id, approval_gate=approval_gate, reader=reader)
+        return proposals.execute_plan(
+            plan_id, approval_gate=approval_gate, reader=reader, client=client
+        )
 
     tools: dict[str, Callable[..., Any]] = {
         "propose_set_status": propose_set_status,
@@ -645,18 +764,25 @@ def _wrap_tool_errors(func: Callable[..., Any]) -> Callable[..., Any]:
     return wrapped
 
 
-def build_server(host: str, port: int):
+def build_server(host: str, port: int, *, mock: bool = False):
     """Construct the FastMCP server exposing ``server_info`` plus the live Meta read tools.
 
     Raises an actionable ``SystemExit`` if the ``mcp`` SDK (the ``server`` extra) is not
     installed, rather than surfacing a bare ``ImportError``.
 
-    The reader is built **once** as a ``DirectMetaReader.from_env()`` and shared across all tool
-    calls. We deliberately do NOT call ``reader_from_env``: with ``META_READER_BACKEND=mcp`` that
-    would try to build an ``MCPMetaReader`` requiring an injected tool-executor — i.e. our server
-    would recursively try to be its own MCP client. Our server *is* the direct reader an ``mcp``
-    backend elsewhere points at; it must never recursively select an ``mcp`` backend. (``server_info``
-    still reports ``reader_backend_from_env()`` verbatim as a health string — independent of this.)
+    The reader is built **once** and shared across all tool calls. In **live** mode it is a
+    ``DirectMetaReader.from_env()``: we deliberately do NOT call ``reader_from_env`` — with
+    ``META_READER_BACKEND=mcp`` that would try to build an ``MCPMetaReader`` requiring an injected
+    tool-executor — i.e. our server would recursively try to be its own MCP client. Our server *is* the
+    direct reader an ``mcp`` backend elsewhere points at; it must never recursively select an ``mcp``
+    backend. (``server_info`` still reports ``reader_backend_from_env()`` verbatim as a health string —
+    independent of this.)
+
+    In **mock** mode (``mock=True``) no ``META_ACCESS_TOKEN`` is required and no live Meta call is made:
+    the reader is a token-free :func:`build_mock_reader` and the write client is a :class:`_MockWriteClient`
+    threaded into ``execute_plan``. The guarded pipeline (propose → approve → validate → execute → verify)
+    and the approval gate are unchanged and real — only the reads/writes are faked — so ``META_APPROVAL_SECRET``
+    is still required to execute a write (a missing secret leaves the fail-closed gate in place).
     """
     if FastMCP is None:
         raise SystemExit(
@@ -671,18 +797,29 @@ def build_server(host: str, port: int):
         live Meta calls are enabled."""
         return build_server_info()
 
-    # One shared direct reader (NOT reader_from_env — see docstring). Live reads flow through it.
-    # from_env() builds the client eagerly, so a missing META_ACCESS_TOKEN (or a missing `requests`)
-    # raises MetaApiError here at startup. Convert it to an actionable SystemExit — mirroring the
-    # SDK-missing branch above — so a mis-configured launch prints guidance instead of leaking a bare
-    # MetaApiError traceback out of main() (which only wraps OSError).
-    try:
-        reader = DirectMetaReader.from_env()
-    except MetaApiError as exc:
-        raise SystemExit(
-            f"Cannot start the Meta MCP server: {exc} "
-            "Set META_ACCESS_TOKEN (a token with the ads_read scope) before launching."
-        ) from exc
+    # One shared reader + optional explicit write client. In mock mode: a pre-seeded FakeMetaReader and a
+    # no-op _MockWriteClient (zero live calls, no token). In live mode: a DirectMetaReader.from_env() (NOT
+    # reader_from_env — see docstring) and client=None so execute_plan builds a real client_from_env()
+    # lazily. from_env() builds the client eagerly, so a missing META_ACCESS_TOKEN (or a missing `requests`)
+    # raises MetaApiError here at startup — converted to an actionable SystemExit (mirroring the SDK-missing
+    # branch) so a mis-configured launch prints guidance instead of leaking a bare traceback out of main().
+    write_client: Any | None
+    if mock:
+        reader: MetaReaderProvider = build_mock_reader()
+        write_client = _MockWriteClient()
+        print(
+            f"[mock mode] No live Meta calls will be made. Account: {MOCK_ACCOUNT_ID}",
+            file=sys.stderr,
+        )
+    else:
+        try:
+            reader = DirectMetaReader.from_env()
+        except MetaApiError as exc:
+            raise SystemExit(
+                f"Cannot start the Meta MCP server: {exc} "
+                "Set META_ACCESS_TOKEN (a token with the ads_read scope) before launching."
+            ) from exc
+        write_client = None
     for name, func in build_read_tools(reader).items():
         mcp.add_tool(
             _wrap_tool_errors(func),
@@ -696,7 +833,7 @@ def build_server(host: str, port: int):
     # a fail-closed DeniedApprovalGate (execute refused with setup guidance; reads unaffected). The agent
     # can freely edit the proposal JSON but cannot forge a signature. See proposals.select_approval_gate_from_env.
     approval_gate = proposals.select_approval_gate_from_env()
-    for name, func in build_write_tools(reader, approval_gate).items():
+    for name, func in build_write_tools(reader, approval_gate, client=write_client).items():
         mcp.add_tool(
             _wrap_tool_errors(func),
             name=name,
@@ -706,12 +843,24 @@ def build_server(host: str, port: int):
     return mcp
 
 
+def _env_flag(name: str) -> bool:
+    """True when env var ``name`` is set to a truthy value (``1``/``true``/``yes``/``on``, any case)."""
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the custom Meta MCP server (HTTP).")
     parser.add_argument("--host", default=os.environ.get("MCP_SERVER_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(os.environ.get("MCP_SERVER_PORT", DEFAULT_PORT)))
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        default=_env_flag("META_MCP_MOCK"),
+        help="Launch without a live token: canned reads + a no-op write client (zero live Meta calls). "
+        "Also enabled by META_MCP_MOCK=1. META_APPROVAL_SECRET is still required to execute a write.",
+    )
     args = parser.parse_args()
-    mcp = build_server(args.host, args.port)
+    mcp = build_server(args.host, args.port, mock=args.mock)
     try:
         mcp.run(transport="streamable-http")
     except OSError as exc:  # port in use / bad host bind

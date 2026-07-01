@@ -148,6 +148,9 @@ approve_plan --plan-id <plan_id> --all --yes    # skip the confirm prompt (scrip
 # The agent then calls execute_plan(plan_id) over MCP — HmacApprovalGate verifies your signature.
 ```
 
+See [META_API_SETUP.md → Run the Meta MCP server locally](META_API_SETUP.md#run-the-meta-mcp-server-locally)
+for the step-by-step local launch (mock mode by default), `.mcp.json` wiring, and a scripted first session.
+
 `server_info` exposes `approval_required: true` and `approval_configured` (a token-free health signal:
 whether a usable secret is set) so an operator can see at a glance whether the gate is armed.
 
