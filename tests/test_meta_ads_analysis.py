@@ -8974,6 +8974,7 @@ def test_build_server_info_defaults_when_env_unset(monkeypatch) -> None:
         "meta_api_version": DEFAULT_META_API_VERSION,
         "read_backend": "direct",
         "live_calls_enabled": True,
+        "write_tools_enabled": True,
     }
 
 
@@ -9286,7 +9287,11 @@ def test_build_server_uses_direct_reader_not_recursive_mcp_backend(monkeypatch) 
 
     _mcp_server.build_server("127.0.0.1", 8765)  # must not raise the reader_from_env RuntimeError
     assert isinstance(captured["reader"], DirectMetaReader)
-    assert set(captured["registered"]) == set(_mcp_server.READ_TOOL_METHODS)
+    registered = set(captured["registered"])
+    # All 13 reads register...
+    assert set(_mcp_server.READ_TOOL_METHODS).issubset(registered)
+    # ...alongside the guarded write surface (propose_* + preview_plan + execute_plan).
+    assert {"execute_plan", "preview_plan", "propose_set_status", "propose_set_daily_budget"}.issubset(registered)
     # server_info still reports the configured backend verbatim, decoupled from the reader used.
     assert _mcp_server.build_server_info()["read_backend"] == "mcp"
 
@@ -9343,8 +9348,14 @@ def test_read_tools_register_on_real_fastmcp_and_map_errors(monkeypatch) -> None
     mcp = _mcp_server.build_server("127.0.0.1", 8765)
     tool_manager = mcp._tool_manager
     names = {t.name for t in tool_manager.list_tools()}
-    # server_info plus all 13 reads registered; the escape hatch is not.
-    assert names == {"server_info", *_mcp_server.READ_TOOL_METHODS}
+    # server_info plus all 13 reads AND the guarded write surface registered; the escape hatch is not.
+    write_names = set(
+        _mcp_server.build_write_tools(
+            _mcp_server.DirectMetaReader(_MixedClient()), _mcp_server.proposals.PlanStatusApprovalGate()
+        )
+    )
+    assert names == {"server_info", *_mcp_server.READ_TOOL_METHODS, *write_names}
+    assert "execute_plan" in names and "propose_set_status" in names
     assert "iter_paginated" not in names
     # Schema derived from the wrapper's real signature (functools.wraps preserved it).
     assert set(tool_manager.get_tool("fetch_ads").parameters["properties"]) == {"ad_account_id", "fields"}
@@ -9381,3 +9392,319 @@ def test_build_server_missing_token_raises_actionable_systemexit(monkeypatch) ->
     with pytest.raises(SystemExit) as excinfo:
         _mcp_server.build_server("127.0.0.1", 8765)
     assert "META_ACCESS_TOKEN" in str(excinfo.value)
+
+
+# --- MCP guarded-write flow (proposals store + execute orchestration + server wiring) ----
+# MOCKS ONLY: every test here drives fake clients/readers; no live Meta call is ever made.
+
+import copy as _copy  # noqa: E402
+import inspect as _inspect  # noqa: E402
+
+from meta_ads_analysis import control as _control_mod  # noqa: E402
+from meta_ads_analysis import proposals as _proposals  # noqa: E402
+
+
+def _cbo_control_fixture():
+    """Campaign carries the daily budget; the ad set carries none (campaign-budget-optimization)."""
+    campaigns = [{"id": "c1", "name": "Camp", "status": "ACTIVE", "effective_status": "ACTIVE",
+                  "daily_budget": "50000", "lifetime_budget": None}]
+    adsets = [{"id": "as1", "name": "Set", "status": "ACTIVE", "effective_status": "ACTIVE",
+               "campaign_id": "c1", "daily_budget": None, "targeting": {}}]
+    ads = [{"id": "ad1", "name": "Ad", "status": "ACTIVE", "effective_status": "ACTIVE",
+            "adset_id": "as1", "issues_info": []}]
+    return _ControlFakeClient(campaigns, adsets, ads)
+
+
+def _approve_all(plan):
+    approved = _copy.deepcopy(plan)
+    for op in approved["ops"]:
+        op["status"] = "approved"
+    return approved
+
+
+def test_mcp_execute_refuses_freshly_proposed_plan_no_approval(tmp_path):
+    # THE core safety test: propose then execute with no human approval -> refused (0 approved ops).
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="ad", id="ad1", params={"name": "New Name"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    assert all(op["status"] != "approved" for op in plan["ops"])  # propose never approves
+    pid = _proposals.save_proposal(plan, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    assert res["refused"] is True and res["executed"] is False
+    assert "no approved ops" in res["reason"]
+    assert client.updates == []  # nothing was sent, not even a validate round-trip
+
+
+def test_mcp_execute_approved_validates_then_executes_with_audit_and_verify(tmp_path):
+    # An approved op (persisting a plan with status:approved simulates the eventual out-of-band stamp)
+    # -> validate pass THEN execute pass -> executed; audit artifact written; outcome read-back present.
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="adset", id="as1", params={"name": "Renamed Set"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    assert res["executed"] is True
+    # validate pass (validate_only=True) precedes the execute pass (validate_only=False) for the op.
+    modes = [u[3] for u in client.updates if u[0] == "adset" and u[1] == "as1"]
+    assert modes == [True, False]
+    # audit artifact written and includes the plan_id
+    assert res["audit_path"] and Path(res["audit_path"]).exists()
+    payload = json.loads(Path(res["audit_path"]).read_text(encoding="utf-8"))
+    assert payload["plan_id"] == pid and payload["executed"] is True
+    # outcome verification re-read is present per executed op
+    assert res["ops"][0]["status"] == "executed"
+    assert "effective_status" in res["ops"][0]["verify"]
+
+
+def test_mcp_execute_takes_only_plan_id_no_plan_body_param():
+    # Anti-forgery: execute_plan has NO plan-body parameter — it loads the persisted artifact by id, so
+    # a caller cannot inject a plan carrying forged status:approved ops.
+    params = _inspect.signature(_proposals.execute_plan).parameters
+    assert "plan_id" in params
+    assert "plan" not in params  # no body parameter at all
+    # the only positional param is the id (a str)
+    assert list(params)[0] == "plan_id"
+
+
+def test_mcp_execute_idempotency_refuses_second_run(tmp_path):
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="ad", id="ad1", params={"name": "X"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    gate = _proposals.PlanStatusApprovalGate()
+    first = _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+    assert first["executed"] is True
+    second = _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+    assert second["refused"] is True and second["executed"] is False
+    assert "already executed" in second["reason"]
+
+
+def test_mcp_cbo_budget_yields_campaign_op_and_refuses_adset_write_at_apply(tmp_path):
+    client = _cbo_control_fixture()
+    plan = _control_mod.build_budget_plan(
+        client, "act_1", new_daily_budget_cents=55000, adset_id="as1",
+        account_slug="demo", run_date="2026-07-01",
+    )
+    levels = [(op["level"], op.get("cbo_detected")) for op in plan["ops"]]
+    # A non-executable ad-set pointer (cbo_detected) PLUS an actionable campaign-level op.
+    assert ("adset", True) in levels
+    assert any(op["level"] == "campaign" for op in plan["ops"])
+
+    # Approving ONLY the ad-set pointer -> refused at the validate pass (it never writes the ad set).
+    pointer_only = _copy.deepcopy(plan)
+    for op in pointer_only["ops"]:
+        op["status"] = "approved" if op["level"] == "adset" else "proposed"
+    pid = _proposals.save_proposal(pointer_only, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    assert res["executed"] is False and res.get("validated") is False
+    assert any(o["status"] == "blocked" for o in res["ops"])
+    # No ad-set budget write ever reached the client.
+    assert not any(u[0] == "adset" for u in client.updates)
+
+    # And the apply-time CBO guard itself: an approved ad-set daily-budget op under CBO is blocked with
+    # a CBO reason by classify_adset_budget / _build_budget_request (grounding not required here so the
+    # block is unambiguously the CBO refusal, not the grounding gate).
+    cbo_write = {
+        "schema_version": 1, "plan_type": "ops", "intent": "set_budget", "ad_account_id": "act_1",
+        "guardrails": {"requires_explicit_approval": True, "requires_grounding": False},
+        "ops": [{"op_id": "b1", "op": "set_daily_budget", "level": "adset", "id": "as1",
+                 "params": {"daily_budget_cents": 55000}, "status": "approved"}],
+    }
+    results = _control_mod.apply_ops_plan(cbo_write, client, execute=True, reader=client)
+    assert results[0].status == "blocked" and "CBO" in (results[0].reason or "")
+
+
+def test_mcp_execute_partial_failure_reports_per_op_and_does_not_abort_others(tmp_path):
+    # validate passes for all; one op fails at the EXECUTE pass -> that op is 'failed', others 'executed'.
+    class _PartialFailClient(_ControlFakeClient):
+        def update_ad(self, node_id, *, params, validate_only=False):
+            if not validate_only and node_id == "ad2":
+                raise MetaApiError("transient graph error on ad2")
+            return super().update_ad(node_id, params=params, validate_only=validate_only)
+
+    base = _control_fixture()
+    client = _PartialFailClient(base._campaigns, base._adsets, base._ads)
+    plan = {
+        "schema_version": 1, "plan_type": "ops", "intent": "rename", "account_slug": "demo",
+        "ad_account_id": "act_1", "run_date": "2026-07-01",
+        "guardrails": {"requires_explicit_approval": True, "requires_grounding": False},
+        "ops": [
+            {"op_id": "r1", "op": "rename", "level": "ad", "id": "ad1", "params": {"name": "A"}, "status": "approved"},
+            {"op_id": "r2", "op": "rename", "level": "ad", "id": "ad2", "params": {"name": "B"}, "status": "approved"},
+        ],
+    }
+    pid = _proposals.save_proposal(plan, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    by_id = {o["op_id"]: o for o in res["ops"]}
+    assert by_id["r1"]["status"] == "executed"
+    assert by_id["r2"]["status"] == "failed"
+    assert "transient" in (by_id["r2"]["reason"] or "")
+
+
+def test_mcp_readonly_token_surfaces_clear_ads_management_error_at_validate(tmp_path):
+    # A read-only token fails the validate_only round-trip with a Meta permissions error; execute_plan
+    # maps it to the clear ads_management ToolError message (surfaced here as MetaApiError).
+    class _ScopeDeniedClient(_ControlFakeClient):
+        def update_ad(self, node_id, *, params, validate_only=False):
+            raise MetaApiError("(#200) Requires ads_management permission")
+
+    base = _control_fixture()
+    client = _ScopeDeniedClient(base._campaigns, base._adsets, base._ads)
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="ad", id="ad1", params={"name": "X"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    import pytest
+    with pytest.raises(MetaApiError) as excinfo:
+        _proposals.execute_plan(
+            pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+            reports_root=tmp_path,
+        )
+    assert "ads_management" in str(excinfo.value)
+
+
+def test_mcp_last_active_ad_pause_adds_companion_adset_op():
+    # Pausing ad1 (the sole ACTIVE ad in as1) proposes a companion PAUSE on the parent ad set as1.
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="set_status", level="ad", id="ad1", params={"status": "PAUSED"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    plan = _control_mod.append_last_active_ad_pause(client, plan)
+    companions = [op for op in plan["ops"] if op["level"] == "adset" and op["op"] == "set_status"]
+    assert len(companions) == 1
+    comp = companions[0]
+    assert comp["id"] == "as1" and comp["params"] == {"status": "PAUSED"} and comp["status"] == "proposed"
+    assert comp.get("companion_for_ad_id") == "ad1"
+
+
+def test_mcp_last_active_companion_not_added_when_other_active_ads_remain():
+    # An ad set with a second ACTIVE ad: pausing one leaves delivery running -> no companion.
+    campaigns = [{"id": "c1", "name": "C", "status": "ACTIVE", "effective_status": "ACTIVE"}]
+    adsets = [{"id": "as1", "name": "S", "status": "ACTIVE", "effective_status": "ACTIVE",
+               "campaign_id": "c1", "daily_budget": "10000", "targeting": {}}]
+    ads = [
+        {"id": "ad1", "name": "A1", "status": "ACTIVE", "effective_status": "ACTIVE", "adset_id": "as1", "issues_info": []},
+        {"id": "ad2", "name": "A2", "status": "ACTIVE", "effective_status": "ACTIVE", "adset_id": "as1", "issues_info": []},
+    ]
+    client = _ControlFakeClient(campaigns, adsets, ads)
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="set_status", level="ad", id="ad1", params={"status": "PAUSED"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    out = _control_mod.append_last_active_ad_pause(client, plan)
+    assert not any(op["level"] == "adset" for op in out["ops"])
+
+
+def test_mcp_pause_emits_verify_next_day_spend_followup(tmp_path):
+    # Carry the pausing lesson: an executed PAUSE emits a verify_next_day_spend follow-up marker.
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="set_status", level="ad", id="ad2", params={"status": "PAUSED"},
+        account_slug="demo", run_date="2026-07-01",
+    )  # ad2 is already PAUSED -> no companion; a direct single pause op
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    assert res["executed"] is True
+    markers = [f for f in res["follow_ups"] if f["type"] == "verify_next_day_spend"]
+    assert markers and markers[0]["id"] == "ad2" and markers[0]["level"] == "ad"
+
+
+def test_mcp_preview_plan_is_write_free_and_shows_approved_requests(tmp_path):
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="ad", id="ad1", params={"name": "Preview Me"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    prev = _proposals.preview_plan(pid, reader=client, reports_root=tmp_path)
+    assert prev["ops"][0]["would_send"] == {"name": "Preview Me"}
+    assert client.updates == []  # NO write performed by preview
+
+
+def test_mcp_load_proposal_missing_id_raises_clear_error(tmp_path):
+    import pytest
+    with pytest.raises(MetaApiError) as excinfo:
+        _proposals.load_proposal("does-not-exist", reports_root=tmp_path)
+    assert "No proposal found" in str(excinfo.value)
+
+
+def test_build_write_tools_exposes_full_gated_surface():
+    tools = _mcp_server.build_write_tools(FakeMetaReader(), _proposals.PlanStatusApprovalGate())
+    assert set(tools) == {
+        "propose_set_status", "propose_set_daily_budget", "propose_rename", "propose_set_creative",
+        "propose_set_creative_features", "propose_set_age_range", "propose_set_genders",
+        "propose_set_geo_locations", "propose_set_placements", "propose_enable_ads",
+        "propose_pause_ads", "preview_plan", "execute_plan",
+    }
+    # execute_plan is the ONLY tool whose name signals a write; propose_* are read-then-persist.
+    assert "execute_plan" in tools
+
+
+def test_build_write_tools_propose_never_emits_approved_op(monkeypatch):
+    # A propose_* tool persists a plan whose ops are all 'proposed' (or demoted) — NEVER 'approved'.
+    captured = {}
+
+    def _fake_save(plan, *, account_slug, run_date, reports_root=None):
+        captured["plan"] = plan
+        return "fake-plan-id"
+
+    monkeypatch.setattr(_proposals, "save_proposal", _fake_save)
+    reader = DirectMetaReader(_control_fixture())
+    tools = _mcp_server.build_write_tools(reader, _proposals.PlanStatusApprovalGate())
+    summary = tools["propose_set_status"](account="act_1", id="ad1", level="ad", status="PAUSED")
+    assert summary["plan_id"] == "fake-plan-id"
+    # ad1 is the sole active ad in as1 -> the companion ad-set pause rides along, still 'proposed'.
+    assert {op["level"] for op in captured["plan"]["ops"]} == {"ad", "adset"}
+    assert all(op["status"] != "approved" for op in captured["plan"]["ops"])
+    assert all(o["status"] != "approved" for o in summary["ops"])
+
+
+def test_build_write_tools_execute_and_preview_delegate_with_reader_and_gate(monkeypatch):
+    calls = {}
+
+    def _fake_execute(plan_id, *, approval_gate, reader, client=None, reports_root=None):
+        calls["execute"] = {"plan_id": plan_id, "gate": approval_gate, "reader": reader}
+        return {"executed": True, "plan_id": plan_id}
+
+    def _fake_preview(plan_id, *, reader, reports_root=None):
+        calls["preview"] = {"plan_id": plan_id, "reader": reader}
+        return {"plan_id": plan_id}
+
+    monkeypatch.setattr(_proposals, "execute_plan", _fake_execute)
+    monkeypatch.setattr(_proposals, "preview_plan", _fake_preview)
+    reader = FakeMetaReader()
+    gate = _proposals.PlanStatusApprovalGate()
+    tools = _mcp_server.build_write_tools(reader, gate)
+    assert tools["execute_plan"]("pid-1")["executed"] is True
+    assert calls["execute"] == {"plan_id": "pid-1", "gate": gate, "reader": reader}
+    tools["preview_plan"]("pid-2")
+    assert calls["preview"] == {"plan_id": "pid-2", "reader": reader}
+
+
+def test_mcp_scaffold_note_writes_stay_gated_no_upload_tool():
+    # Media uploads are intentionally NOT exposed over MCP (they create unreferenced, ungated assets).
+    tools = _mcp_server.build_write_tools(FakeMetaReader(), _proposals.PlanStatusApprovalGate())
+    assert not any("upload" in name for name in tools)

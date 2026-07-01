@@ -55,6 +55,64 @@ CLI proposes each)** is the single source of truth in
 [`../AGENTS.md`](../AGENTS.md) under **Hybrid Meta integration** — it is not duplicated here. The reader
 backend (direct vs MCP) and auth posture also live there and in [`META_API_SETUP.md`](META_API_SETUP.md).
 
+## MCP guarded-write path (`mcp__meta-suite__*`)
+
+The same guarded flow is now reachable over our **own** MCP server (`meta_mcp_server`, client key
+`meta-suite` in `.mcp.json`). This is the important distinction to internalize:
+
+- **`mcp__meta-ads__*`** is the *community* connector. Its write tools fire **immediately** against the
+  Graph API — no propose, no dry run, no confidence, no review. Those write tools are **deny-listed** in
+  `.claude/settings.json` and stay read-only. (This is the rule the Jun-2026 `$300/day IN_PROCESS`
+  incident is named for.)
+- **`mcp__meta-suite__*`** is *our* server. Its write tools are **gated by construction** — every one
+  routes through `propose → human approve → validate → execute → verify`, PAUSED-by-default, with the
+  same grounding + demote-only review as the CLI. They are deliberately **not** deny-listed, because the
+  guardrail is a capability boundary enforced *in the server* (see `src/meta_ads_analysis/proposals.py`),
+  not a prompt rule an agent can be talked out of. The monthly MCP-write auditor still flags any **new**
+  ungated write tool on *either* prefix.
+
+### The tool surface
+
+- **`propose_*`** — build a grounded, reviewed plan and persist it. Returns only a **`plan_id`
+  reference** plus a per-op summary (status / confidence band / review verdict / note) — never an
+  approvable plan body. Control-ops: `propose_set_status`, `propose_set_daily_budget`, `propose_rename`,
+  `propose_set_creative`, `propose_set_creative_features`, `propose_set_age_range`,
+  `propose_set_genders`, `propose_set_geo_locations`, `propose_set_placements`, plus the bulk
+  `propose_enable_ads` / `propose_pause_ads`. Each op comes back `proposed` (or demoted by review) —
+  **no propose tool ever emits an `approved` op.**
+- **`preview_plan(plan_id)`** — a local, **write-free** dry run: shows the request each *approved* op
+  would send. No Meta write (the reader may re-read live state to build a budget/targeting request).
+- **`execute_plan(plan_id)`** — the **only** tool that writes. It loads the plan **by id** (never a
+  body handed in by the agent — that is the anti-forgery seam), refuses if the plan was already executed
+  or has **zero approved ops**, runs a mandatory **`validate_only` pass first**, aborts on any validation
+  failure, then applies the approved ops, writes the audit artifact, and re-reads each entity to verify.
+
+### Approval seam (why a fresh proposal refuses)
+
+`execute_plan` consults an `ApprovalGate` before applying. The gate shipped today
+(`PlanStatusApprovalGate`) is a **no-op** that leans on the invariant that only `status == "approved"`
+ops are ever sent. Since **no MCP tool promotes an op to approved**, a freshly-proposed plan has zero
+approved ops → `execute_plan` returns `{refused: true, reason: "no approved ops — approval required"}`.
+That default is **forgeable** by an agent that can write the filesystem (it could hand-edit `status`);
+the `mcp-local-approval-gate` ticket replaces it, behind this same seam, with an un-forgeable source
+(out-of-band CLI stamp / confirmation token / HMAC over the plan).
+
+### Media uploads are NOT exposed (documented exception)
+
+`upload_video` / `upload_image` create inert, **unreferenced** assets and bypass the gate, so they are
+**not** MCP tools — the MCP write surface stays 100% gated. The operator uploads via the CLI
+(`upload_video` / `upload_image`), obtains asset ids, then the agent proposes
+`create_video_ad` / `create_ad` with those ids (authoring ticket).
+
+### PAUSED ≠ delivery stopped — verify next-day spend
+
+A `set_status → PAUSED` write *registering* is **necessary but not sufficient** proof delivery stopped:
+same-day spend can still post. `execute_plan` therefore emits a structured `verify_next_day_spend`
+follow-up marker for every executed pause, and re-reads each entity's `effective_status` as an outcome
+check. Relatedly, pausing an ad set's **last ACTIVE ad** leaves the ad set nominally live but delivering
+nothing — so `propose_set_status(status="PAUSED")` on such an ad also proposes a companion pause on the
+parent ad set (each op independently approvable). Enabling (ACTIVE) deliberately does **not** cascade.
+
 ## Commands
 
 Generate a plan:

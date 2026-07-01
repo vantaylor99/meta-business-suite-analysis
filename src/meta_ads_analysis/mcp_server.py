@@ -3,8 +3,14 @@
 This is our own Meta MCP server: a process that starts, reports health, and can be connected
 to from an MCP client over HTTP. Alongside the ``server_info`` health tool it exposes the live
 Meta **read** surface — one tool per :data:`READ_TOOL_METHODS` entry (13 reads), each bound to a
-shared :class:`~meta_ads_analysis.reader_provider.DirectMetaReader`. Guarded **write** tools land
-in the ``mcp-guarded-write-tools`` follow-on ticket; writes never travel through this server today.
+shared :class:`~meta_ads_analysis.reader_provider.DirectMetaReader` — plus the guarded **write**
+surface (``propose_* → preview_plan → execute_plan``). Every write travels through the same
+propose → human-approve → validate → execute → verify pipeline as the CLI: a ``propose_*`` tool
+grounds + reviews the op and persists a proposal, returning only a ``plan_id`` reference; ``execute_
+plan`` is the *only* tool that writes, and it refuses a plan with zero approved ops. The write
+lifecycle lives in :mod:`meta_ads_analysis.proposals` + the existing ``control`` builders; this
+module only wires callables. Our tools carry the ``mcp__meta-suite__*`` prefix (distinct from the
+deny-listed community ``mcp__meta-ads__*``) precisely because ours are gated.
 
 The module is a **thin entrypoint over the existing library**: it embeds no Meta/business
 logic and only imports and exposes package functions, so the CLI and the server stay two
@@ -31,7 +37,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only without the `se
     FastMCP = None
     ToolError = None
 
-from . import __version__
+from datetime import UTC, datetime
+
+from . import __version__, account_registry, control, proposals
 from .meta_api import MetaApiError, meta_api_version_from_env
 from .reader_provider import (
     READ_METHODS,
@@ -96,6 +104,10 @@ def build_server_info() -> dict:
         # Capability flag: this server now exposes live Meta **read** tools (see build_read_tools).
         # Independent of whether a token is present — build_server_info stays token-free.
         "live_calls_enabled": True,
+        # This server now also exposes the guarded **write** surface (propose_* / preview_plan /
+        # execute_plan — see build_write_tools). Every write is gated (propose → approve → validate →
+        # execute → verify); execute refuses a plan with zero approved ops.
+        "write_tools_enabled": True,
     }
 
 
@@ -199,19 +211,251 @@ def build_read_tools(reader: MetaReaderProvider) -> dict[str, Callable[..., Any]
     return tools
 
 
-def _wrap_tool_errors(func: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap a read-tool callable so a ``MetaApiError`` becomes a clean FastMCP ``ToolError``.
+# Short human descriptions for the guarded-write surface (surfaced to the MCP client / calling LLM).
+WRITE_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "propose_set_status": (
+        "Propose pausing (PAUSED) or enabling (ACTIVE) one ad / ad set / campaign. Grounded, reviewed, "
+        "and persisted as a proposal; pausing the last active ad in a set also proposes pausing the set."
+    ),
+    "propose_set_daily_budget": (
+        "Propose a daily-budget change for ONE ad set or campaign (exactly one). CBO is detected: an "
+        "ad set under campaign-budget-optimization yields a campaign-level op, not an ad-set write."
+    ),
+    "propose_rename": "Propose renaming one ad / ad set / campaign.",
+    "propose_set_creative": "Propose swapping an ad's creative to an existing creative id.",
+    "propose_set_creative_features": (
+        "Propose changing an ad's creative-enhancement enrollment (opt_in / opt_out feature lists)."
+    ),
+    "propose_set_age_range": "Propose an ad set's targeting age range (13 <= age_min <= age_max <= 65).",
+    "propose_set_genders": "Propose an ad set's gender targeting ([] = all; 1 = male, 2 = female).",
+    "propose_set_geo_locations": "Propose an ad set's geo-location targeting object.",
+    "propose_set_placements": "Propose an ad set's placements (automatic, or explicit publisher platforms).",
+    "propose_enable_ads": "Propose enabling currently-inactive ads (optionally filtered), each grounded on its own recent performance.",
+    "propose_pause_ads": "Propose pausing active ads by filter and/or a ROAS-below-threshold rule.",
+    "preview_plan": "Local, write-free dry run: show the request each APPROVED op in a proposal would send. No Meta write.",
+    "execute_plan": (
+        "Execute an approved proposal by plan_id — the ONLY tool that writes. Validates first, aborts on "
+        "any validation failure, then applies approved ops and verifies the outcome. Refuses if nothing "
+        "is approved or if the proposal was already executed."
+    ),
+}
 
-    A bad token, an insufficient scope, or a transient Graph failure surfaces to the MCP client as
-    a tool error (the server keeps serving) instead of an uncaught traceback. ``functools.wraps``
-    preserves ``func``'s signature so FastMCP still derives the correct JSON schema from it.
+
+def _resolve_account(account: str) -> tuple[str | None, str]:
+    """Resolve an ``account`` argument into ``(account_slug, ad_account_id)``.
+
+    Accepts a registry slug/name (grounding + policy use the slug) OR a raw ``act_<id>`` / numeric id
+    (slug ``None``). A value that is neither is a clear ``ValueError`` (mapped to a tool error), so a
+    typo never silently targets the wrong account.
+    """
+    text = str(account or "").strip()
+    try:
+        acct = account_registry.resolve_account(text, account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH)
+        return account_registry.slugify_name(text), acct.ad_account_id
+    except (FileNotFoundError, KeyError, ValueError):
+        pass
+    if text.startswith("act_") or text.isdigit():
+        return None, account_registry._normalize_ad_account_id(text)
+    raise ValueError(
+        f"Unknown account {account!r}: not a slug/name in config/meta_ads_accounts.json and not an "
+        "act_<id>. Pass a registry slug or an act_ id."
+    )
+
+
+def _proposal_summary(plan_id: str, plan: dict[str, Any]) -> dict[str, Any]:
+    """A review-ready digest the agent relays to a human: the ``plan_id`` reference + per-op status /
+    confidence band / review verdict / note. Deliberately NOT the approvable plan body — the agent
+    approves out-of-band and then calls ``execute_plan`` by id."""
+    ops: list[dict[str, Any]] = []
+    for op in plan.get("ops") or []:
+        if not isinstance(op, dict):
+            continue
+        conf = op.get("confidence") if isinstance(op.get("confidence"), dict) else {}
+        review = op.get("review") if isinstance(op.get("review"), dict) else {}
+        ops.append(
+            {
+                "op_id": op.get("op_id"),
+                "op": op.get("op"),
+                "level": op.get("level"),
+                "id": op.get("id"),
+                "status": op.get("status"),
+                "confidence_band": conf.get("band"),
+                "review_verdict": op.get("review_verdict") or review.get("verdict"),
+                "note": op.get("note"),
+            }
+        )
+    return {
+        "plan_id": plan_id,
+        "plan_type": plan.get("plan_type"),
+        "intent": plan.get("intent"),
+        "account_slug": plan.get("account_slug"),
+        "ops": ops,
+    }
+
+
+def build_write_tools(
+    reader: MetaReaderProvider, approval_gate: proposals.ApprovalGate
+) -> dict[str, Callable[..., Any]]:
+    """Return ``{tool_name: callable}`` for the guarded control-ops write surface.
+
+    PURE: no FastMCP import, no socket — unit-testable with a ``FakeMetaReader``/fake gate. Each
+    ``propose_*`` wraps an existing ``control`` builder (which attaches evidence + a computed
+    confidence band and runs the plan through ``review.review_ops_plan``), then persists the reviewed
+    plan via :mod:`meta_ads_analysis.proposals` and returns a review-ready **summary** (a ``plan_id``
+    reference + per-op digest) — never an approvable body. ``execute_plan`` is the only writer; it
+    loads by id and builds its own write client lazily (never the reader's hidden client).
+
+    Grounding note: the single-op ``set_status`` here abstains **structurally** (a direct operator
+    instruction on a named entity, no metric) — the safety-PAUSE treatment the gate allows. The
+    data-driven bulk paths ``propose_enable_ads`` / ``propose_pause_ads`` carry per-ad metric evidence
+    (so ``propose_enable_ads`` enforces the cold-ad boundary), which a single explicit status change
+    deliberately does not.
+    """
+
+    def _finalize(plan: dict[str, Any]) -> dict[str, Any]:
+        account_slug = plan.get("account_slug")
+        run_date = plan.get("run_date") or datetime.now(UTC).date().isoformat()
+        plan_id = proposals.save_proposal(plan, account_slug=account_slug, run_date=run_date)
+        return _proposal_summary(plan_id, plan)
+
+    def propose_set_status(
+        account: str, id: str, level: str, status: str, run_date: str | None = None
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = control.build_single_op_plan(
+            reader, ad_account_id, op="set_status", level=level, id=id,
+            params={"status": str(status).upper()}, account_slug=account_slug, run_date=run_date,
+        )
+        # Pausing the last ACTIVE ad in a set leaves it live-but-not-delivering; propose the set pause too.
+        if level == "ad" and str(status).upper() == "PAUSED":
+            plan = control.append_last_active_ad_pause(reader, plan)
+        return _finalize(plan)
+
+    def propose_set_daily_budget(
+        account: str,
+        daily_budget_cents: int,
+        adset_id: str | None = None,
+        campaign_id: str | None = None,
+        run_date: str | None = None,
+        max_increase_percent: float | None = None,
+        max_decrease_percent: float | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = control.build_budget_plan(
+            reader, ad_account_id, new_daily_budget_cents=int(daily_budget_cents),
+            adset_id=adset_id, campaign_id=campaign_id, account_slug=account_slug, run_date=run_date,
+            max_increase_percent=max_increase_percent, max_decrease_percent=max_decrease_percent,
+        )
+        return _finalize(plan)
+
+    def _single_op(account, *, op, level, id, params, run_date):
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = control.build_single_op_plan(
+            reader, ad_account_id, op=op, level=level, id=id, params=params,
+            account_slug=account_slug, run_date=run_date,
+        )
+        return _finalize(plan)
+
+    def propose_rename(account: str, id: str, level: str, name: str, run_date: str | None = None) -> dict[str, Any]:
+        return _single_op(account, op="rename", level=level, id=id, params={"name": name}, run_date=run_date)
+
+    def propose_set_creative(account: str, id: str, creative_id: str, run_date: str | None = None) -> dict[str, Any]:
+        return _single_op(account, op="set_creative", level="ad", id=id, params={"creative_id": creative_id}, run_date=run_date)
+
+    def propose_set_creative_features(
+        account: str, id: str, opt_in: list[str] | None = None, opt_out: list[str] | None = None,
+        run_date: str | None = None,
+    ) -> dict[str, Any]:
+        return _single_op(
+            account, op="set_creative_features", level="ad", id=id,
+            params={"opt_in": opt_in or [], "opt_out": opt_out or []}, run_date=run_date,
+        )
+
+    def propose_set_age_range(account: str, adset_id: str, age_min: int, age_max: int, run_date: str | None = None) -> dict[str, Any]:
+        return _single_op(account, op="set_age_range", level="adset", id=adset_id,
+                          params={"age_min": int(age_min), "age_max": int(age_max)}, run_date=run_date)
+
+    def propose_set_genders(account: str, adset_id: str, genders: list[int], run_date: str | None = None) -> dict[str, Any]:
+        return _single_op(account, op="set_genders", level="adset", id=adset_id,
+                          params={"genders": list(genders or [])}, run_date=run_date)
+
+    def propose_set_geo_locations(account: str, adset_id: str, geo_locations: dict[str, Any], run_date: str | None = None) -> dict[str, Any]:
+        return _single_op(account, op="set_geo_locations", level="adset", id=adset_id,
+                          params={"geo_locations": geo_locations}, run_date=run_date)
+
+    def propose_set_placements(
+        account: str, adset_id: str, automatic: bool = False,
+        publisher_platforms: list[str] | None = None, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"automatic": bool(automatic)}
+        if publisher_platforms is not None:
+            params["publisher_platforms"] = list(publisher_platforms)
+        return _single_op(account, op="set_placements", level="adset", id=adset_id, params=params, run_date=run_date)
+
+    def propose_enable_ads(
+        account: str, adset_ids: list[str] | None = None, name_contains: str | None = None,
+        date_from: str | None = None, date_to: str | None = None, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = control.build_enable_ads_plan(
+            reader, ad_account_id, account_slug=account_slug, adset_ids=adset_ids,
+            name_contains=name_contains, date_from=date_from, date_to=date_to, run_date=run_date,
+        )
+        return _finalize(plan)
+
+    def propose_pause_ads(
+        account: str, adset_ids: list[str] | None = None, name_contains: str | None = None,
+        roas_below: float | None = None, min_spend: float = 0.0,
+        date_from: str | None = None, date_to: str | None = None, run_date: str | None = None,
+    ) -> dict[str, Any]:
+        account_slug, ad_account_id = _resolve_account(account)
+        plan = control.build_pause_plan(
+            reader, ad_account_id, account_slug=account_slug, adset_ids=adset_ids,
+            name_contains=name_contains, roas_below=roas_below, min_spend=min_spend,
+            date_from=date_from, date_to=date_to, run_date=run_date,
+        )
+        return _finalize(plan)
+
+    def preview_plan(plan_id: str) -> dict[str, Any]:
+        return proposals.preview_plan(plan_id, reader=reader)
+
+    def execute_plan(plan_id: str) -> dict[str, Any]:
+        return proposals.execute_plan(plan_id, approval_gate=approval_gate, reader=reader)
+
+    tools: dict[str, Callable[..., Any]] = {
+        "propose_set_status": propose_set_status,
+        "propose_set_daily_budget": propose_set_daily_budget,
+        "propose_rename": propose_rename,
+        "propose_set_creative": propose_set_creative,
+        "propose_set_creative_features": propose_set_creative_features,
+        "propose_set_age_range": propose_set_age_range,
+        "propose_set_genders": propose_set_genders,
+        "propose_set_geo_locations": propose_set_geo_locations,
+        "propose_set_placements": propose_set_placements,
+        "propose_enable_ads": propose_enable_ads,
+        "propose_pause_ads": propose_pause_ads,
+        "preview_plan": preview_plan,
+        "execute_plan": execute_plan,
+    }
+    return tools
+
+
+def _wrap_tool_errors(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a tool callable so an operator-actionable error becomes a clean FastMCP ``ToolError``.
+
+    A bad token, an insufficient scope, or a transient Graph failure (``MetaApiError``), a malformed
+    op / guardrail violation (``ValueError`` from ``validate_op`` / ``build_budget_plan``), or an
+    approval-gate rejection (``ApprovalError``) all surface to the MCP client as a tool error — the
+    server keeps serving instead of leaking an uncaught traceback. ``functools.wraps`` preserves
+    ``func``'s signature so FastMCP still derives the correct JSON schema from it. (Read tools raise
+    only ``MetaApiError`` in practice, so widening the catch does not change their behavior.)
     """
 
     @functools.wraps(func)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         try:
             return func(*args, **kwargs)
-        except MetaApiError as exc:
+        except (MetaApiError, ValueError, proposals.ApprovalError) as exc:
             raise ToolError(str(exc)) from exc
 
     return wrapped
@@ -260,6 +504,17 @@ def build_server(host: str, port: int):
             _wrap_tool_errors(func),
             name=name,
             description=READ_TOOL_DESCRIPTIONS.get(name) or f"Meta read: {name}",
+        )
+
+    # Guarded write surface. The default approval gate is a no-op relying on the apply invariant (only
+    # approved ops are sent); since no propose_* tool approves, a freshly-proposed plan has zero
+    # approved ops and execute_plan refuses. ticket 13 swaps in an un-forgeable gate behind this seam.
+    approval_gate = proposals.PlanStatusApprovalGate()
+    for name, func in build_write_tools(reader, approval_gate).items():
+        mcp.add_tool(
+            _wrap_tool_errors(func),
+            name=name,
+            description=WRITE_TOOL_DESCRIPTIONS.get(name) or f"Meta guarded write: {name}",
         )
 
     return mcp
