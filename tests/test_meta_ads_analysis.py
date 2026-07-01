@@ -10008,3 +10008,34 @@ def test_mcp_no_approval_refusal_for_authoring_and_rotation(tmp_path):
         assert res["refused"] is True and res["executed"] is False
         assert "no approved ops" in res["reason"]
     assert client.creates == [] and client.updates == []  # nothing sent, not even a validate round-trip
+
+
+def test_mcp_preview_plan_authoring_and_rotation_report_stored_intent(tmp_path):
+    # preview_plan is write-free for the non-ops families too: an authoring item is not ops-shaped
+    # (control._build_request keys on op["op"], which it lacks) and a rotation item is keyed by adset_id,
+    # so preview must report the STORED intent (params / diff + new audiences) rather than re-deriving a
+    # Graph request — and it must never crash or write. This guards the documented non-ops preview path.
+    client = _AuthRotFakeClient()
+    # authoring: net-new campaign create — approved item reports its stored params (kind, no re-derive).
+    authoring_plan = _authoring.build_create_campaign_plan(
+        "act_1", name="C", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-01"
+    )
+    a_pid = _proposals.save_proposal(_approve_items(authoring_plan, drop_grounding=True),
+                                     account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    a_prev = _proposals.preview_plan(a_pid, reader=client, reports_root=tmp_path)
+    a_entry = a_prev["ops"][0]
+    assert a_entry["op"] == "create_campaign"  # normalized from the create kind
+    assert a_entry["would_send"]["params"]["objective"] == "OUTCOME_SALES"  # stored intent, not a re-derived request
+
+    # rotation: item is keyed by adset_id; would_send surfaces the diff + the new audience ids.
+    rotation_plan = _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo",
+                                                  ad_account_id="act_1", offset=1)
+    r_pid = _proposals.save_proposal(_approve_items(rotation_plan),
+                                     account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    r_prev = _proposals.preview_plan(r_pid, reader=client, reports_root=tmp_path)
+    r_entry = {e["op_id"]: e for e in r_prev["ops"]}["as1"]  # op_id falls back to adset_id
+    assert r_entry["would_send"]["new_included"] == ["B"]  # as1 rotates forward to as2's audience
+    assert "diff" in r_entry["would_send"]
+
+    # NO write performed by either preview (create-only client too).
+    assert client.creates == [] and client.updates == []
