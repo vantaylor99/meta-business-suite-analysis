@@ -692,7 +692,7 @@ def build_server(host: str, port: int):
 
     # Guarded write surface. The approval gate is selected from the environment: with META_APPROVAL_SECRET
     # set it is an HmacApprovalGate (execute verifies an out-of-band, human-produced HMAC signature over
-    # the plan's approved content — a secret the agent's tool surface never holds); with no secret it is
+    # the plan body — a secret the agent's tool surface never holds); with no secret it is
     # a fail-closed DeniedApprovalGate (execute refused with setup guidance; reads unaffected). The agent
     # can freely edit the proposal JSON but cannot forge a signature. See proposals.select_approval_gate_from_env.
     approval_gate = proposals.select_approval_gate_from_env()

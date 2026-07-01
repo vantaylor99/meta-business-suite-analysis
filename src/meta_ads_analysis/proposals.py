@@ -12,8 +12,9 @@ entrypoint so it is unit-testable with no ``mcp`` SDK and no live Meta call:
   :class:`HmacApprovalGate`: it verifies an HMAC-SHA256 signature over the plan's approved content,
   keyed by a secret (``META_APPROVAL_SECRET``) the agent's MCP tool surface never holds and produced
   out-of-band by the human-run ``approve_plan`` CLI (:func:`approve_proposal`). The agent may freely edit
-  the persisted proposal JSON, but any edit to the approved set changes the recompute and fails the
-  constant-time compare, and it cannot forge a matching signature without the secret. With **no** secret
+  the persisted proposal JSON, but any edit to the signed plan body (the approved ops **or** the
+  execution-affecting plan-level fields — ``guardrails``, ``ad_account_id``, …) changes the recompute and
+  fails the constant-time compare, and it cannot forge a matching signature without the secret. With **no** secret
   configured the seam fails **closed** via :class:`DeniedApprovalGate` (execute refused; reads
   unaffected) — the opposite of the old forgeable-open behavior. :class:`PlanStatusApprovalGate` stays as
   an explicit no-op used by the execute tests (which supply their own already-approved plans). Local
@@ -113,30 +114,37 @@ APPROVAL_ALGORITHM = "HMAC-SHA256"
 
 
 def canonical_approval_payload(plan: dict[str, Any], approved_at: str) -> str:
-    """Deterministic JSON over the plan's **approved** content — the single canonicalization used by
-    BOTH the signer (:func:`approve_proposal`) and the verifier (:class:`HmacApprovalGate`). If the two
-    sides canonicalized differently, every real approval would fail verification; keeping it in one
-    function is the parity contract (mirroring the repo's CBO / review re-derivation parity patterns).
+    """Deterministic JSON over the plan body — the single canonicalization used by BOTH the signer
+    (:func:`approve_proposal`) and the verifier (:class:`HmacApprovalGate`). If the two sides
+    canonicalized differently, every real approval would fail verification; keeping it in one function is
+    the parity contract (mirroring the repo's CBO / review re-derivation parity patterns).
 
     Round-trip-stable: signing the in-memory plan and verifying the JSON-reloaded plan produce
     byte-identical payloads (all values originate from JSON, so ``sort_keys`` + compact separators +
     ``ensure_ascii`` are enough — no ``default=`` coercion needed).
 
-    - Uses :func:`plan_items` (the plan-type-aware accessor), so it binds ops **and** rotation items — a
-      rotation plan's approved items live under ``"rotations"`` / ``"items"``, not ``"ops"``.
-    - Signs the **full approved item dicts**, so mutating any material field of an approved op (params,
-      target ``id``, ``level``) — or stripping its ``confidence``/``evidence`` to dodge the separate
-      write-grounding gate — changes the signature and is rejected.
-    - ``plan_id`` binds the signature to this specific plan (blocks copying an ``approval`` block from
-      plan A onto plan B — B's payload carries B's id, A's signature was over A's).
+    Signs the **entire plan body** minus the two self-referential blocks (:data:`APPROVAL_KEY` and
+    :data:`EXECUTION_KEY`), so the signature is not self-referential yet binds everything the appliers act
+    on:
+
+    - the approved item dicts (ops **and** rotation items — a rotation plan's items live under
+      ``"rotations"`` / ``"items"``, not ``"ops"``), so mutating any material field of an approved op, or
+      stripping its ``confidence``/``evidence``, changes the signature and is rejected;
+    - the **plan-level** execution-affecting fields — most importantly ``guardrails.requires_grounding``
+      (every applier reads it to decide whether the apply-time grounding gate runs) and ``ad_account_id``
+      (authoring POSTs creates to it). Signing only the approved items left these unprotected: an agent
+      with filesystem write could flip ``requires_grounding`` off, or redirect ``ad_account_id``, without
+      touching an approved item and the signature would still verify. Signing the whole body closes that
+      class of bypass and is strictly safer — nothing legitimately edits the plan between approval and
+      execute;
+    - ``plan_id`` (embedded by :func:`save_proposal`) binds the signature to this specific plan (blocks
+      copying an ``approval`` block from plan A onto plan B — B's payload carries B's id, A's over A's);
     - ``approved_at`` is inside the signed payload, so the agent cannot forward-date it to defeat the TTL.
     """
-    approved = [it for it in plan_items(plan) if it.get("status") == control.APPROVED_STATUS]
+    body = {k: v for k, v in plan.items() if k not in (APPROVAL_KEY, EXECUTION_KEY)}
     doc = {
-        "plan_id": plan.get("plan_id"),
-        "plan_type": plan.get("plan_type"),
         "approved_at": approved_at,
-        "approved_items": approved,
+        "plan": body,
     }
     return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -149,15 +157,17 @@ def compute_approval_signature(plan: dict[str, Any], approved_at: str, secret: b
 
 class HmacApprovalGate:
     """Un-forgeable local approval. Verifies ``plan['approval'].signature`` against a fresh recompute of
-    the HMAC over the plan's **current** approved items, keyed by a secret the agent never holds; the
-    compare is constant-time.
+    the HMAC over the plan's **current** body (minus the approval/execution blocks), keyed by a secret the
+    agent never holds; the compare is constant-time.
 
     Failure modes it closes:
 
     - a freshly-proposed plan (no ``approval`` block) → "no human approval" :class:`ApprovalError`;
-    - an agent that flips a status to ``approved`` but can't sign → recompute over the new approved set
+    - an agent that flips a status to ``approved`` but can't sign → recompute over the new body
       ≠ stored signature → mismatch;
     - a mutated / added / removed approved op, or a stripped ``confidence``/``evidence`` → mismatch;
+    - a flipped plan-level guardrail (e.g. ``guardrails.requires_grounding`` set ``false`` to disable the
+      apply-time grounding gate) or a redirected ``ad_account_id`` → mismatch;
     - a cross-plan replay (an ``approval`` block copied onto another plan) → ``plan_id`` differs → mismatch;
     - an approval older than the TTL → expired.
 
@@ -899,12 +909,13 @@ def approve_proposal(
 
     Loads the proposal by id, flips the selected items to ``approved`` (all proposed items when
     ``op_ids`` is ``None``; items match by ``op_id`` **or** ``adset_id`` so rotation items are
-    selectable), signs the approved content with ``secret``, writes ``plan['approval']``, persists, and
+    selectable), signs the plan body with ``secret``, writes ``plan['approval']``, persists, and
     returns the approval block. Refuses (:class:`MetaApiError`) if the plan was already executed —
     re-approving is meaningless (the idempotency guard would refuse the re-execute regardless).
 
-    The signature is computed **after** the status flips, over the plan's now-approved items, so the
-    gate's recompute over the reloaded plan reproduces it byte-for-byte (:func:`canonical_approval_payload`).
+    The signature is computed **after** the status flips, over the plan body (:func:`canonical_approval_payload`
+    excludes the not-yet-written ``approval`` block), so the gate's recompute over the reloaded plan
+    reproduces it byte-for-byte.
     """
     now_fn = now_fn or (lambda: datetime.now(UTC))
     path = find_proposal_path(plan_id, reports_root)

@@ -114,14 +114,16 @@ The same guarded flow is now reachable over our **own** MCP server (`meta_mcp_se
 (`proposals.select_approval_gate_from_env`) is the **local, single-operator** approval gate:
 
 - **`HmacApprovalGate`** (when `META_APPROVAL_SECRET` is set): approval is an **HMAC-SHA256 signature
-  over the plan's approved content**, keyed by a secret the agent's MCP tool surface never holds. It is
+  over the plan body**, keyed by a secret the agent's MCP tool surface never holds. It is
   produced **out-of-band** by the human-run `approve_plan` CLI and verified (constant-time) inside
-  `execute_plan`. The agent can freely edit the persisted proposal JSON — but any edit to the approved
-  set (adding/removing an approved op, changing a param/target/level, or stripping the
-  confidence/evidence the grounding gate needs) changes the recompute and is rejected, and the agent
-  cannot produce a matching signature without the secret. The signed payload binds the `plan_id` (blocks
-  copying an approval block from plan A onto plan B) and the `approved_at` timestamp (blocks
-  forward-dating to defeat the TTL). Approvals expire after `META_APPROVAL_TTL_SECONDS` (default 24 h;
+  `execute_plan`. The agent can freely edit the persisted proposal JSON — but any edit to the signed
+  body (adding/removing an approved op, changing a param/target/level, stripping the
+  confidence/evidence the grounding gate needs, **or flipping a plan-level guardrail such as
+  `guardrails.requires_grounding` off, or redirecting `ad_account_id`**) changes the recompute and is
+  rejected, and the agent cannot produce a matching signature without the secret. The signed payload
+  binds the `plan_id` (blocks copying an approval block from plan A onto plan B) and the `approved_at`
+  timestamp (blocks forward-dating to defeat the TTL); only the self-referential `approval` and
+  `execution` blocks are excluded. Approvals expire after `META_APPROVAL_TTL_SECONDS` (default 24 h;
   empty/`0` disables).
 - **`DeniedApprovalGate`** (when no secret is set): the seam **fails closed** — `execute_plan` refuses
   every write with setup guidance, while reads (never gated) keep working. This is the deliberate

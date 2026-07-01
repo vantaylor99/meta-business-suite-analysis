@@ -10356,3 +10356,66 @@ def test_approve_plan_cli_requires_secret(monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         approve_plan_main()
     assert "META_APPROVAL_SECRET" in str(excinfo.value)
+
+
+def test_hmac_gate_rejects_flipped_plan_level_guardrail(tmp_path):
+    # Regression (review of ticket 13): the signed body must cover plan-LEVEL execution-affecting fields,
+    # not just the approved items. An agent that flips guardrails.requires_grounding off would disable the
+    # apply-time grounding gate (every applier reads that flag) — an easier bypass than stripping an op's
+    # confidence/evidence. The signature now covers the whole plan body, so the flip is rejected.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    assert tampered["guardrails"]["requires_grounding"] is True  # what the human approved
+    tampered["guardrails"]["requires_grounding"] = False  # disable the grounding gate AFTER signing
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+    assert "does not match" in str(excinfo.value)
+
+
+def test_hmac_gate_rejects_redirected_ad_account_id(tmp_path):
+    # Regression (review of ticket 13): ad_account_id is plan-level (authoring POSTs creates to it) and is
+    # now inside the signed body, so redirecting an approved plan to a different account is rejected.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["ad_account_id"] = "act_999"  # redirect AFTER signing
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError):
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+
+
+def test_approve_plan_cli_interactive_confirm_and_abort(tmp_path, monkeypatch, capsys):
+    # The interactive input() branch (both CLI tests above use --yes). "n" aborts writing nothing;
+    # a second run answering "y" signs. The prompt is the human-confirmation channel the agent lacks.
+    import builtins
+    from meta_ads_analysis.cli import approve_plan_main
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_APPROVAL_SECRET", "cli-test-secret-0123456789abc")
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    monkeypatch.setattr(sys, "argv", ["approve_plan", "--plan-id", pid, "--reports-root", str(tmp_path), "--all"])
+
+    # Abort: nothing signed, no approval block written.
+    monkeypatch.setattr(builtins, "input", lambda *_a, **_k: "n")
+    approve_plan_main()
+    assert "Aborted" in capsys.readouterr().out
+    assert "approval" not in _proposals.load_proposal(pid, reports_root=tmp_path)
+
+    # Confirm: signs, and the persisted plan verifies under the gate.
+    monkeypatch.setattr(builtins, "input", lambda *_a, **_k: "y")
+    approve_plan_main()
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    _proposals.HmacApprovalGate(b"cli-test-secret-0123456789abc").assert_approved(pid, reloaded)
