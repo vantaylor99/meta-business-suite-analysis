@@ -1,5 +1,6 @@
 {
   "permissions": {
+    "_comment": "This deny-list bars UNGATED MCP writes — specifically the official community mcp__meta-ads__* connector, whose write tools fire immediately against the Graph API with NO propose/approve/validate gate and no dry run (the Jun-2026 $300/day IN_PROCESS incident). That connector stays read-only. Our OWN custom server's gated tools carry the mcp__meta-suite__* prefix and ARE sanctioned: they route through propose -> human approve -> validate -> execute -> verify (see src/meta_ads_analysis/proposals.py + docs/META_ACTION_WORKFLOW.md), so they are deliberately NOT deny-listed here. The monthly MCP-write auditor still flags any NEW ungated write tool on either prefix. (JSON has no comments; this _comment lives under permissions because the settings schema rejects unknown top-level keys.)",
     "deny": [
       "mcp__meta-ads__ads_create_*",
       "mcp__meta-ads__ads_update_*",

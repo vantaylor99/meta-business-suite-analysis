@@ -8928,3 +8928,1662 @@ def test_followups_mark_done_missing_ok_is_idempotent(tmp_path: Path) -> None:
                          missing_ok=True, root=root) is None
     with pytest.raises(FileNotFoundError):
         _fu.mark_done(account="acct", task_id=task_id, completed="2026-06-29", root=root)
+
+
+# --- Custom Meta MCP server scaffold (MOCKS ONLY: zero live Meta calls, no socket bound) ---
+
+from meta_ads_analysis import mcp_server as _mcp_server  # noqa: E402
+from meta_ads_analysis.meta_api import meta_api_version_from_env  # noqa: E402
+from meta_ads_analysis.reader_provider import reader_backend_from_env  # noqa: E402
+
+
+def _clear_scaffold_env(monkeypatch) -> None:
+    for var in (
+        "META_ACCESS_TOKEN", "META_API_VERSION", "META_READER_BACKEND",
+        "META_APPROVAL_SECRET", "META_APPROVAL_SECRET_FILE", "META_APPROVAL_TTL_SECONDS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_meta_api_version_from_env_precedence(monkeypatch) -> None:
+    from meta_ads_analysis.config import DEFAULT_META_API_VERSION
+
+    monkeypatch.delenv("META_API_VERSION", raising=False)
+    assert meta_api_version_from_env() == DEFAULT_META_API_VERSION  # unset -> default
+    monkeypatch.setenv("META_API_VERSION", "v33.0")
+    assert meta_api_version_from_env() == "v33.0"  # env wins over default
+    assert meta_api_version_from_env("v44.0") == "v44.0"  # explicit arg wins over env
+
+
+def test_reader_backend_from_env_normalizes_and_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("META_READER_BACKEND", raising=False)
+    assert reader_backend_from_env() == "direct"  # unset -> direct
+    monkeypatch.setenv("META_READER_BACKEND", "  MCP ")
+    assert reader_backend_from_env() == "mcp"  # trimmed + lowercased
+    # Does NOT validate: an unknown value is reported verbatim-normalized, never raised.
+    monkeypatch.setenv("META_READER_BACKEND", "Bogus")
+    assert reader_backend_from_env() == "bogus"
+
+
+def test_build_server_info_defaults_when_env_unset(monkeypatch) -> None:
+    # Token-free health payload: works with NO META_ACCESS_TOKEN set and never raises.
+    from meta_ads_analysis import __version__
+    from meta_ads_analysis.config import DEFAULT_META_API_VERSION
+
+    _clear_scaffold_env(monkeypatch)  # also clears any META_APPROVAL_SECRET, so approval_configured is False
+    assert _mcp_server.build_server_info() == {
+        "name": "meta-ads-mcp",
+        "version": __version__,
+        "meta_api_version": DEFAULT_META_API_VERSION,
+        "read_backend": "direct",
+        "live_calls_enabled": True,
+        "write_tools_enabled": True,
+        "approval_required": True,
+        "approval_configured": False,
+    }
+
+
+def test_build_server_info_reflects_backend_and_version_overrides(monkeypatch) -> None:
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    monkeypatch.setenv("META_API_VERSION", "v99.0")
+    info = _mcp_server.build_server_info()
+    assert info["read_backend"] == "mcp"
+    assert info["meta_api_version"] == "v99.0"
+
+
+def test_build_server_info_live_calls_enabled_true(monkeypatch) -> None:
+    # Capability flag flipped now that the server exposes live Meta read tools. It reports the
+    # capability regardless of env — build_server_info stays token-free, so the token value here
+    # must not matter (and no live call is ever made just to answer the health probe).
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    monkeypatch.setenv("META_ACCESS_TOKEN", "should-not-matter")
+    assert _mcp_server.build_server_info()["live_calls_enabled"] is True
+
+
+def test_build_server_without_sdk_raises_actionable_systemexit(monkeypatch) -> None:
+    # SDK-missing path: mirror the requests-missing pattern — actionable SystemExit, not ImportError.
+    import pytest
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", None)
+    with pytest.raises(SystemExit) as excinfo:
+        _mcp_server.build_server("127.0.0.1", 8765)
+    assert ".[server]" in str(excinfo.value)
+
+
+def test_build_server_info_does_not_raise_on_unknown_backend(monkeypatch) -> None:
+    # End-to-end health-probe path (not just the helper): a bogus backend is reported
+    # verbatim-normalized and NEVER raises — server_info is a probe, not a constructor.
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_READER_BACKEND", "garbage")
+    assert _mcp_server.build_server_info()["read_backend"] == "garbage"
+
+
+class _FakeMcp:
+    """Records the run() call without binding a socket."""
+
+    def __init__(self) -> None:
+        self.ran_with = None
+
+    def run(self, transport: str) -> None:
+        self.ran_with = transport
+
+
+def test_main_host_port_precedence_flag_over_env_over_default(monkeypatch) -> None:
+    # flag > MCP_SERVER_HOST/PORT env > default, verified without a socket bind.
+    captured: dict = {}
+
+    def _fake_build_server(host, port, *, mock=False):
+        captured["host"], captured["port"], captured["mock"] = host, port, mock
+        return _FakeMcp()
+
+    monkeypatch.setattr(_mcp_server, "build_server", _fake_build_server)
+
+    # default when nothing set
+    monkeypatch.delenv("MCP_SERVER_HOST", raising=False)
+    monkeypatch.delenv("MCP_SERVER_PORT", raising=False)
+    monkeypatch.delenv("META_MCP_MOCK", raising=False)
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
+    _mcp_server.main()
+    assert (captured["host"], captured["port"]) == (_mcp_server.DEFAULT_HOST, _mcp_server.DEFAULT_PORT)
+
+    # env overrides default
+    monkeypatch.setenv("MCP_SERVER_HOST", "0.0.0.0")
+    monkeypatch.setenv("MCP_SERVER_PORT", "9001")
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
+    _mcp_server.main()
+    assert (captured["host"], captured["port"]) == ("0.0.0.0", 9001)
+
+    # flag overrides env
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server", "--host", "10.0.0.5", "--port", "7000"])
+    _mcp_server.main()
+    assert (captured["host"], captured["port"]) == ("10.0.0.5", 7000)
+
+
+def test_main_wraps_oserror_as_actionable_systemexit(monkeypatch) -> None:
+    # Port-in-use / bad-bind path: OSError from run() becomes an actionable SystemExit.
+    import pytest
+
+    class _RaisingMcp:
+        def run(self, transport: str) -> None:
+            raise OSError("address already in use")
+
+    monkeypatch.setattr(_mcp_server, "build_server", lambda host, port, *, mock=False: _RaisingMcp())
+    monkeypatch.delenv("MCP_SERVER_HOST", raising=False)
+    monkeypatch.delenv("MCP_SERVER_PORT", raising=False)
+    monkeypatch.delenv("META_MCP_MOCK", raising=False)
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server", "--host", "127.0.0.1", "--port", "8765"])
+    with pytest.raises(SystemExit) as excinfo:
+        _mcp_server.main()
+    assert "127.0.0.1:8765" in str(excinfo.value)
+
+
+# --- Meta MCP server read tools (MOCKS ONLY: no live Meta call anywhere; no socket bound) ---
+#
+# All read-tool *logic* is exercised through the pure build_read_tools(reader) seam with a
+# FakeMetaReader / a canned-client DirectMetaReader. The FastMCP glue (real mcp.add_tool
+# registration + real MetaApiError->ToolError mapping) runs only when the `server` extra is
+# installed; the one test that touches it is guarded with pytest.importorskip so it skips in an
+# env without `mcp` (see the "known gap" note in the review handoff).
+
+
+class _CannedClient:
+    """Client stand-in whose every method returns a per-name canned value.
+
+    MOCKS ONLY: wrapped by DirectMetaReader to prove the read tools pass results through 1:1
+    without ever touching the network.
+    """
+
+    def __init__(self, canned: dict) -> None:
+        self._canned = canned
+
+    def __getattr__(self, name):
+        def _method(*args, **kwargs):
+            return self._canned[name]
+
+        return _method
+
+
+def test_every_read_tool_round_trips_to_direct_reader_shape() -> None:
+    # Distinct canned value per read so a wrapper that delegates to the wrong reader method fails.
+    canned = {
+        "fetch_insights": [{"spend": "1.00"}],
+        "fetch_ads": [{"id": "ad1"}],
+        "list_campaigns": [{"id": "c1"}],
+        "get_campaign": {"id": "c1", "name": "C1"},
+        "list_adsets": [{"id": "as1"}],
+        "get_adset": {"id": "as1", "name": "AS1"},
+        "get_ad": {"id": "ad1", "name": "AD1"},
+        "list_custom_audiences": [{"id": "aud1"}],
+        "get_account": {"name": "Acme", "currency": "USD"},
+        "get_delivery_estimate": {"estimate_dau": 1000},
+        "search_targeting": [{"id": "int1", "name": "Jewelry"}],
+        "list_pixels": [{"id": "px1"}],
+        "list_custom_conversions": [{"id": "cc1"}],
+    }
+    direct = DirectMetaReader(_CannedClient(canned))
+    tools = _mcp_server.build_read_tools(direct)
+    # Iterating READ_TOOL_METHODS makes a newly added read that is not wired fail here (parallel
+    # to test_reader_call_specs_cover_every_read_method).
+    assert set(tools) == set(_mcp_server.READ_TOOL_METHODS)
+    for name in _mcp_server.READ_TOOL_METHODS:
+        args, kwargs = _READER_CALL_SPECS[name]
+        via_tool = tools[name](*args, **kwargs)
+        via_reader = getattr(direct, name)(*args, **kwargs)
+        assert via_tool == via_reader == canned[name], f"{name} tool did not match the direct reader"
+
+
+def test_iter_paginated_not_exposed_and_server_tool_map_is_identity() -> None:
+    tools = _mcp_server.build_read_tools(FakeMetaReader())
+    # The raw pagination escape hatch has no natural tool shape and is not exposed.
+    assert "iter_paginated" not in tools
+    assert "iter_paginated" not in _mcp_server.SERVER_TOOL_MAP
+    # READ_TOOL_METHODS is exactly the read surface minus that escape hatch.
+    assert set(_mcp_server.READ_TOOL_METHODS) == set(READ_METHODS) - {"iter_paginated"}
+    assert set(tools) == set(_mcp_server.READ_TOOL_METHODS)
+    # SERVER_TOOL_MAP covers every read tool and is an identity map (tool name == reader method).
+    assert set(_mcp_server.SERVER_TOOL_MAP) == set(_mcp_server.READ_TOOL_METHODS)
+    assert all(name == tool for name, tool in _mcp_server.SERVER_TOOL_MAP.items())
+
+
+def test_superset_reads_present_beyond_community_candidate() -> None:
+    # The five reads DEFAULT_MCP_TOOL_MAP marks None (the parked candidate could not serve) are
+    # the deliberate delta our own server adds — assert them explicitly.
+    tools = _mcp_server.build_read_tools(FakeMetaReader())
+    superset = {
+        "list_custom_audiences",
+        "get_delivery_estimate",
+        "search_targeting",
+        "list_pixels",
+        "list_custom_conversions",
+    }
+    assert superset <= set(tools)
+
+
+def test_read_tool_empty_result_is_not_an_error() -> None:
+    # An empty page comes back as [] (not an error) and is distinguishable from a raised error.
+    reader = FakeMetaReader(fetch_ads=[])
+    tools = _mcp_server.build_read_tools(reader)
+    assert tools["fetch_ads"]("act_1", fields=["id"]) == []
+
+
+def test_read_tool_propagates_meta_api_error_from_reader() -> None:
+    # Insufficient token scope surfaces cleanly: the pure wrapper propagates MetaApiError unchanged
+    # (the MetaApiError->ToolError mapping is the FastMCP layer's job, tested separately).
+    import pytest
+
+    def _denied(ad_account_id, *, fields):
+        raise MetaApiError("(#200) The user does not have permission (requires ads_management)")
+
+    reader = FakeMetaReader(list_pixels=_denied)
+    tools = _mcp_server.build_read_tools(reader)
+    with pytest.raises(MetaApiError) as excinfo:
+        tools["list_pixels"]("act_1", fields=["id"])
+    assert "ads_management" in str(excinfo.value)
+
+
+def test_read_tools_drain_multiple_pages_without_truncation() -> None:
+    # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
+    # returns every page's items in order (reuses the session-mock pattern from
+    # test_meta_api_client_paginates).
+    def _three_page_session():
+        p1, p2, p3 = Mock(), Mock(), Mock()
+        p1.status_code = p2.status_code = p3.status_code = 200
+        p1.json.return_value = {"data": [{"id": "1"}], "paging": {"next": "https://example.com/page-2"}}
+        p2.json.return_value = {"data": [{"id": "2"}], "paging": {"next": "https://example.com/page-3"}}
+        p3.json.return_value = {"data": [{"id": "3"}], "paging": {}}
+        session = Mock()
+        session.get.side_effect = [p1, p2, p3]
+        return session
+
+    # fetch_ads (account-scoped list read)
+    ads_session = _three_page_session()
+    ads_tools = _mcp_server.build_read_tools(DirectMetaReader(MetaMarketingApiClient("token", session=ads_session)))
+    assert ads_tools["fetch_ads"]("act_123", fields=["id"]) == [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+    assert ads_session.get.call_count == 3
+
+    # list_adsets (a second list read, to prove pagination isn't fetch_ads-specific)
+    adsets_session = _three_page_session()
+    adsets_tools = _mcp_server.build_read_tools(DirectMetaReader(MetaMarketingApiClient("token", session=adsets_session)))
+    assert adsets_tools["list_adsets"]("act_123", fields=["id"]) == [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+    assert adsets_session.get.call_count == 3
+
+
+def test_search_targeting_tool_signature_is_account_independent() -> None:
+    # search_targeting(query, search_type, limit) — no ad_account_id, list result.
+    reader = FakeMetaReader(
+        search_targeting=lambda *, query, search_type, limit: [
+            {"query": query, "type": search_type, "limit": limit}
+        ]
+    )
+    tools = _mcp_server.build_read_tools(reader)
+    assert tools["search_targeting"]("jewelry", "adinterest", 5) == [
+        {"query": "jewelry", "type": "adinterest", "limit": 5}
+    ]
+    # Defaults apply when only the query is supplied.
+    assert tools["search_targeting"]("running") == [
+        {"query": "running", "type": "adinterest", "limit": 25}
+    ]
+
+
+def test_get_delivery_estimate_tool_signature_returns_node() -> None:
+    # get_delivery_estimate(adset_id, fields) — node/dict result, adset-scoped (not account-scoped).
+    reader = FakeMetaReader(
+        get_delivery_estimate=lambda adset_id, *, fields: {"adset": adset_id, "fields": fields}
+    )
+    tools = _mcp_server.build_read_tools(reader)
+    assert tools["get_delivery_estimate"]("as1", ["estimate_dau"]) == {
+        "adset": "as1",
+        "fields": ["estimate_dau"],
+    }
+
+
+def test_no_write_tool_reachable_from_build_read_tools() -> None:
+    # Read-only-by-construction seam: no wrapper name looks like a write...
+    tools = _mcp_server.build_read_tools(FakeMetaReader())
+    for name in tools:
+        assert not name.startswith(("create_", "update_", "upload_")), f"{name} looks like a write"
+    # ...and the reader interface itself defines no write methods.
+    for write in (
+        "create_campaign",
+        "create_adset",
+        "create_ad",
+        "update_campaign",
+        "update_ad",
+        "update_adset",
+        "upload_video",
+        "upload_image",
+    ):
+        assert not hasattr(MetaReaderProvider, write)
+
+
+def test_build_server_uses_direct_reader_not_recursive_mcp_backend(monkeypatch) -> None:
+    # With META_READER_BACKEND=mcp, build_server must STILL build a DirectMetaReader (not recurse
+    # into an MCPMetaReader that needs a tool-executor) and must not raise reader_from_env's
+    # "no tool-executor" RuntimeError. A fake FastMCP keeps this portable (no live socket, no
+    # dependency on the `server` extra) and a spy on build_read_tools captures the reader built.
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_READER_BACKEND", "mcp")
+    monkeypatch.setenv("META_ACCESS_TOKEN", "tok")  # DirectMetaReader.from_env needs a token
+
+    captured: dict = {}
+
+    class _SpyMcp:
+        def __init__(self, name, host, port):
+            captured["init"] = (name, host, port)
+
+        def tool(self):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+        def add_tool(self, func, name=None, description=None):
+            captured.setdefault("registered", []).append(name)
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", _SpyMcp)
+
+    real_build_read_tools = _mcp_server.build_read_tools
+
+    def _spy(reader):
+        captured["reader"] = reader
+        return real_build_read_tools(reader)
+
+    monkeypatch.setattr(_mcp_server, "build_read_tools", _spy)
+
+    _mcp_server.build_server("127.0.0.1", 8765)  # must not raise the reader_from_env RuntimeError
+    assert isinstance(captured["reader"], DirectMetaReader)
+    registered = set(captured["registered"])
+    # All 13 reads register...
+    assert set(_mcp_server.READ_TOOL_METHODS).issubset(registered)
+    # ...alongside the guarded write surface (propose_* + preview_plan + execute_plan).
+    assert {"execute_plan", "preview_plan", "propose_set_status", "propose_set_daily_budget"}.issubset(registered)
+    # server_info still reports the configured backend verbatim, decoupled from the reader used.
+    assert _mcp_server.build_server_info()["read_backend"] == "mcp"
+
+
+def test_wrap_tool_errors_maps_meta_api_error_to_tool_error(monkeypatch) -> None:
+    # The FastMCP glue converts a MetaApiError into a clean ToolError so the server keeps serving.
+    # Exercised with a fake ToolError so it runs even without the `server` extra installed.
+    import pytest
+
+    class _FakeToolError(Exception):
+        pass
+
+    monkeypatch.setattr(_mcp_server, "ToolError", _FakeToolError)
+
+    def _scope_denied(ad_account_id, fields):
+        raise MetaApiError("(#200) Requires ads_management permission")
+
+    wrapped = _mcp_server._wrap_tool_errors(_scope_denied)
+    with pytest.raises(_FakeToolError) as excinfo:
+        wrapped("act_1", fields=["id"])
+    assert "ads_management" in str(excinfo.value)
+
+    # Non-error path returns the reader's result straight through (no wrapping, no mutation).
+    passthrough = _mcp_server._wrap_tool_errors(lambda ad_account_id, fields: [{"id": ad_account_id}])
+    assert passthrough("act_9", fields=["id"]) == [{"id": "act_9"}]
+
+
+def test_read_tools_register_on_real_fastmcp_and_map_errors(monkeypatch) -> None:
+    # Integration coverage of the FastMCP glue (real mcp.add_tool + real ToolError). Skips where
+    # the `server` extra is absent (e.g. CI without mcp). Pokes FastMCP internals deliberately —
+    # there is no sync public tool-enumeration API. Still MOCKS ONLY: the reader is a canned
+    # DirectMetaReader, so no live Meta call is made.
+    import pytest
+
+    pytest.importorskip("mcp")
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    _clear_scaffold_env(monkeypatch)
+
+    class _MixedClient:
+        # MOCKS ONLY: one method returns data, one raises a scope error; nothing hits the network.
+        def fetch_ads(self, ad_account_id, *, fields):
+            return [{"id": "ad1"}]
+
+        def get_account(self, ad_account_id, *, fields):
+            raise MetaApiError("(#190) Invalid OAuth access token")
+
+    monkeypatch.setattr(
+        _mcp_server.DirectMetaReader,
+        "from_env",
+        classmethod(lambda cls, api_version=None: _mcp_server.DirectMetaReader(_MixedClient())),
+    )
+
+    mcp = _mcp_server.build_server("127.0.0.1", 8765)
+    tool_manager = mcp._tool_manager
+    names = {t.name for t in tool_manager.list_tools()}
+    # server_info plus all 13 reads AND the guarded write surface registered; the escape hatch is not.
+    write_names = set(
+        _mcp_server.build_write_tools(
+            _mcp_server.DirectMetaReader(_MixedClient()), _mcp_server.proposals.PlanStatusApprovalGate()
+        )
+    )
+    assert names == {"server_info", *_mcp_server.READ_TOOL_METHODS, *write_names}
+    assert "execute_plan" in names and "propose_set_status" in names
+    assert "iter_paginated" not in names
+    # Schema derived from the wrapper's real signature (functools.wraps preserved it).
+    assert set(tool_manager.get_tool("fetch_ads").parameters["properties"]) == {"ad_account_id", "fields"}
+    # Happy path returns the reader's data through the registered (wrapped) callable.
+    assert tool_manager.get_tool("fetch_ads").fn("act_1", fields=["id"]) == [{"id": "ad1"}]
+    # MetaApiError -> ToolError conversion on the real registered tool.
+    with pytest.raises(ToolError):
+        tool_manager.get_tool("get_account").fn("act_1", fields=["name"])
+
+
+def test_build_server_missing_token_raises_actionable_systemexit(monkeypatch) -> None:
+    # build_server constructs DirectMetaReader.from_env() eagerly, so a missing META_ACCESS_TOKEN
+    # must surface as an actionable SystemExit (guidance to set the token), NOT a bare MetaApiError
+    # traceback leaking out of main() (which wraps only OSError). A fake FastMCP keeps this test off
+    # the `server` extra and binds no socket.
+    import pytest
+
+    _clear_scaffold_env(monkeypatch)  # clears META_ACCESS_TOKEN (among others)
+
+    class _FakeMcp:
+        def __init__(self, name, host, port):
+            pass
+
+        def tool(self):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+        def add_tool(self, func, name=None, description=None):  # pragma: no cover - never reached
+            raise AssertionError("add_tool must not run when the token is missing")
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", _FakeMcp)
+    with pytest.raises(SystemExit) as excinfo:
+        _mcp_server.build_server("127.0.0.1", 8765)
+    assert "META_ACCESS_TOKEN" in str(excinfo.value)
+
+
+# --- MCP guarded-write flow (proposals store + execute orchestration + server wiring) ----
+# MOCKS ONLY: every test here drives fake clients/readers; no live Meta call is ever made.
+
+import copy as _copy  # noqa: E402
+import inspect as _inspect  # noqa: E402
+
+from meta_ads_analysis import control as _control_mod  # noqa: E402
+from meta_ads_analysis import proposals as _proposals  # noqa: E402
+
+
+def _cbo_control_fixture():
+    """Campaign carries the daily budget; the ad set carries none (campaign-budget-optimization)."""
+    campaigns = [{"id": "c1", "name": "Camp", "status": "ACTIVE", "effective_status": "ACTIVE",
+                  "daily_budget": "50000", "lifetime_budget": None}]
+    adsets = [{"id": "as1", "name": "Set", "status": "ACTIVE", "effective_status": "ACTIVE",
+               "campaign_id": "c1", "daily_budget": None, "targeting": {}}]
+    ads = [{"id": "ad1", "name": "Ad", "status": "ACTIVE", "effective_status": "ACTIVE",
+            "adset_id": "as1", "issues_info": []}]
+    return _ControlFakeClient(campaigns, adsets, ads)
+
+
+def _approve_all(plan):
+    approved = _copy.deepcopy(plan)
+    for op in approved["ops"]:
+        op["status"] = "approved"
+    return approved
+
+
+def test_mcp_execute_refuses_freshly_proposed_plan_no_approval(tmp_path):
+    # THE core safety test: propose then execute with no human approval -> refused (0 approved ops).
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="ad", id="ad1", params={"name": "New Name"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    assert all(op["status"] != "approved" for op in plan["ops"])  # propose never approves
+    pid = _proposals.save_proposal(plan, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    assert res["refused"] is True and res["executed"] is False
+    assert "no approved ops" in res["reason"]
+    assert client.updates == []  # nothing was sent, not even a validate round-trip
+
+
+def test_mcp_execute_approved_validates_then_executes_with_audit_and_verify(tmp_path):
+    # An approved op (persisting a plan with status:approved simulates the eventual out-of-band stamp)
+    # -> validate pass THEN execute pass -> executed; audit artifact written; outcome read-back present.
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="adset", id="as1", params={"name": "Renamed Set"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    assert res["executed"] is True
+    # validate pass (validate_only=True) precedes the execute pass (validate_only=False) for the op.
+    modes = [u[3] for u in client.updates if u[0] == "adset" and u[1] == "as1"]
+    assert modes == [True, False]
+    # audit artifact written and includes the plan_id
+    assert res["audit_path"] and Path(res["audit_path"]).exists()
+    payload = json.loads(Path(res["audit_path"]).read_text(encoding="utf-8"))
+    assert payload["plan_id"] == pid and payload["executed"] is True
+    # outcome verification re-read is present per executed op
+    assert res["ops"][0]["status"] == "executed"
+    assert "effective_status" in res["ops"][0]["verify"]
+
+
+def test_mcp_execute_takes_only_plan_id_no_plan_body_param():
+    # Anti-forgery: execute_plan has NO plan-body parameter — it loads the persisted artifact by id, so
+    # a caller cannot inject a plan carrying forged status:approved ops.
+    params = _inspect.signature(_proposals.execute_plan).parameters
+    assert "plan_id" in params
+    assert "plan" not in params  # no body parameter at all
+    # the only positional param is the id (a str)
+    assert list(params)[0] == "plan_id"
+
+
+def test_mcp_execute_idempotency_refuses_second_run(tmp_path):
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="ad", id="ad1", params={"name": "X"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    gate = _proposals.PlanStatusApprovalGate()
+    first = _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+    assert first["executed"] is True
+    second = _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+    assert second["refused"] is True and second["executed"] is False
+    assert "already executed" in second["reason"]
+
+
+def test_mcp_cbo_budget_yields_campaign_op_and_refuses_adset_write_at_apply(tmp_path):
+    client = _cbo_control_fixture()
+    plan = _control_mod.build_budget_plan(
+        client, "act_1", new_daily_budget_cents=55000, adset_id="as1",
+        account_slug="demo", run_date="2026-07-01",
+    )
+    levels = [(op["level"], op.get("cbo_detected")) for op in plan["ops"]]
+    # A non-executable ad-set pointer (cbo_detected) PLUS an actionable campaign-level op.
+    assert ("adset", True) in levels
+    assert any(op["level"] == "campaign" for op in plan["ops"])
+
+    # Approving ONLY the ad-set pointer -> refused at the validate pass (it never writes the ad set).
+    pointer_only = _copy.deepcopy(plan)
+    for op in pointer_only["ops"]:
+        op["status"] = "approved" if op["level"] == "adset" else "proposed"
+    pid = _proposals.save_proposal(pointer_only, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    assert res["executed"] is False and res.get("validated") is False
+    assert any(o["status"] == "blocked" for o in res["ops"])
+    # No ad-set budget write ever reached the client.
+    assert not any(u[0] == "adset" for u in client.updates)
+
+    # And the apply-time CBO guard itself: an approved ad-set daily-budget op under CBO is blocked with
+    # a CBO reason by classify_adset_budget / _build_budget_request (grounding not required here so the
+    # block is unambiguously the CBO refusal, not the grounding gate).
+    cbo_write = {
+        "schema_version": 1, "plan_type": "ops", "intent": "set_budget", "ad_account_id": "act_1",
+        "guardrails": {"requires_explicit_approval": True, "requires_grounding": False},
+        "ops": [{"op_id": "b1", "op": "set_daily_budget", "level": "adset", "id": "as1",
+                 "params": {"daily_budget_cents": 55000}, "status": "approved"}],
+    }
+    results = _control_mod.apply_ops_plan(cbo_write, client, execute=True, reader=client)
+    assert results[0].status == "blocked" and "CBO" in (results[0].reason or "")
+
+
+def test_mcp_execute_partial_failure_reports_per_op_and_does_not_abort_others(tmp_path):
+    # validate passes for all; one op fails at the EXECUTE pass -> that op is 'failed', others 'executed'.
+    class _PartialFailClient(_ControlFakeClient):
+        def update_ad(self, node_id, *, params, validate_only=False):
+            if not validate_only and node_id == "ad2":
+                raise MetaApiError("transient graph error on ad2")
+            return super().update_ad(node_id, params=params, validate_only=validate_only)
+
+    base = _control_fixture()
+    client = _PartialFailClient(base._campaigns, base._adsets, base._ads)
+    plan = {
+        "schema_version": 1, "plan_type": "ops", "intent": "rename", "account_slug": "demo",
+        "ad_account_id": "act_1", "run_date": "2026-07-01",
+        "guardrails": {"requires_explicit_approval": True, "requires_grounding": False},
+        "ops": [
+            {"op_id": "r1", "op": "rename", "level": "ad", "id": "ad1", "params": {"name": "A"}, "status": "approved"},
+            {"op_id": "r2", "op": "rename", "level": "ad", "id": "ad2", "params": {"name": "B"}, "status": "approved"},
+        ],
+    }
+    pid = _proposals.save_proposal(plan, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    by_id = {o["op_id"]: o for o in res["ops"]}
+    assert by_id["r1"]["status"] == "executed"
+    assert by_id["r2"]["status"] == "failed"
+    assert "transient" in (by_id["r2"]["reason"] or "")
+
+
+def test_mcp_readonly_token_surfaces_clear_ads_management_error_at_validate(tmp_path):
+    # A read-only token fails the validate_only round-trip with a Meta permissions error; execute_plan
+    # maps it to the clear ads_management ToolError message (surfaced here as MetaApiError).
+    class _ScopeDeniedClient(_ControlFakeClient):
+        def update_ad(self, node_id, *, params, validate_only=False):
+            raise MetaApiError("(#200) Requires ads_management permission")
+
+    base = _control_fixture()
+    client = _ScopeDeniedClient(base._campaigns, base._adsets, base._ads)
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="ad", id="ad1", params={"name": "X"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    import pytest
+    with pytest.raises(MetaApiError) as excinfo:
+        _proposals.execute_plan(
+            pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+            reports_root=tmp_path,
+        )
+    assert "ads_management" in str(excinfo.value)
+
+
+def test_mcp_last_active_ad_pause_adds_companion_adset_op():
+    # Pausing ad1 (the sole ACTIVE ad in as1) proposes a companion PAUSE on the parent ad set as1.
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="set_status", level="ad", id="ad1", params={"status": "PAUSED"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    plan = _control_mod.append_last_active_ad_pause(client, plan)
+    companions = [op for op in plan["ops"] if op["level"] == "adset" and op["op"] == "set_status"]
+    assert len(companions) == 1
+    comp = companions[0]
+    assert comp["id"] == "as1" and comp["params"] == {"status": "PAUSED"} and comp["status"] == "proposed"
+    assert comp.get("companion_for_ad_id") == "ad1"
+
+
+def test_mcp_last_active_companion_not_added_when_other_active_ads_remain():
+    # An ad set with a second ACTIVE ad: pausing one leaves delivery running -> no companion.
+    campaigns = [{"id": "c1", "name": "C", "status": "ACTIVE", "effective_status": "ACTIVE"}]
+    adsets = [{"id": "as1", "name": "S", "status": "ACTIVE", "effective_status": "ACTIVE",
+               "campaign_id": "c1", "daily_budget": "10000", "targeting": {}}]
+    ads = [
+        {"id": "ad1", "name": "A1", "status": "ACTIVE", "effective_status": "ACTIVE", "adset_id": "as1", "issues_info": []},
+        {"id": "ad2", "name": "A2", "status": "ACTIVE", "effective_status": "ACTIVE", "adset_id": "as1", "issues_info": []},
+    ]
+    client = _ControlFakeClient(campaigns, adsets, ads)
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="set_status", level="ad", id="ad1", params={"status": "PAUSED"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    out = _control_mod.append_last_active_ad_pause(client, plan)
+    assert not any(op["level"] == "adset" for op in out["ops"])
+
+
+def test_mcp_pause_emits_verify_next_day_spend_followup(tmp_path):
+    # Carry the pausing lesson: an executed PAUSE emits a verify_next_day_spend follow-up marker.
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="set_status", level="ad", id="ad2", params={"status": "PAUSED"},
+        account_slug="demo", run_date="2026-07-01",
+    )  # ad2 is already PAUSED -> no companion; a direct single pause op
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=client, client=client,
+        reports_root=tmp_path,
+    )
+    assert res["executed"] is True
+    markers = [f for f in res["follow_ups"] if f["type"] == "verify_next_day_spend"]
+    assert markers and markers[0]["id"] == "ad2" and markers[0]["level"] == "ad"
+
+
+def test_mcp_preview_plan_is_write_free_and_shows_approved_requests(tmp_path):
+    client = _control_fixture()
+    plan = _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="ad", id="ad1", params={"name": "Preview Me"},
+        account_slug="demo", run_date="2026-07-01",
+    )
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    prev = _proposals.preview_plan(pid, reader=client, reports_root=tmp_path)
+    assert prev["ops"][0]["would_send"] == {"name": "Preview Me"}
+    assert client.updates == []  # NO write performed by preview
+
+
+def test_mcp_load_proposal_missing_id_raises_clear_error(tmp_path):
+    import pytest
+    with pytest.raises(MetaApiError) as excinfo:
+        _proposals.load_proposal("does-not-exist", reports_root=tmp_path)
+    assert "No proposal found" in str(excinfo.value)
+
+
+def test_build_write_tools_exposes_full_gated_surface():
+    tools = _mcp_server.build_write_tools(FakeMetaReader(), _proposals.PlanStatusApprovalGate())
+    assert set(tools) == {
+        # control ops
+        "propose_set_status", "propose_set_daily_budget", "propose_rename", "propose_set_creative",
+        "propose_set_creative_features", "propose_set_age_range", "propose_set_genders",
+        "propose_set_geo_locations", "propose_set_placements", "propose_enable_ads",
+        "propose_pause_ads",
+        # authoring (create-only, PAUSED by default)
+        "propose_create_campaign", "propose_create_adset", "propose_create_ad",
+        "propose_create_video_ad", "propose_duplicate_ad", "propose_lookalike",
+        # rotation family
+        "propose_audience_rotation", "propose_advantage_disable",
+        # shared
+        "preview_plan", "execute_plan",
+    }
+    # execute_plan is the ONLY tool whose name signals a write; propose_* are read-then-persist.
+    assert "execute_plan" in tools
+    # Every write tool carries a human description (surfaced to the MCP client / calling LLM).
+    assert all(name in _mcp_server.WRITE_TOOL_DESCRIPTIONS for name in tools)
+    # No upload/create-audience raw-media tool leaked onto the surface (uploads stay CLI-only).
+    assert not any("upload" in name for name in tools)
+
+
+def test_build_write_tools_propose_never_emits_approved_op(monkeypatch):
+    # A propose_* tool persists a plan whose ops are all 'proposed' (or demoted) — NEVER 'approved'.
+    captured = {}
+
+    def _fake_save(plan, *, account_slug, run_date, reports_root=None):
+        captured["plan"] = plan
+        return "fake-plan-id"
+
+    monkeypatch.setattr(_proposals, "save_proposal", _fake_save)
+    reader = DirectMetaReader(_control_fixture())
+    tools = _mcp_server.build_write_tools(reader, _proposals.PlanStatusApprovalGate())
+    summary = tools["propose_set_status"](account="act_1", id="ad1", level="ad", status="PAUSED")
+    assert summary["plan_id"] == "fake-plan-id"
+    # ad1 is the sole active ad in as1 -> the companion ad-set pause rides along, still 'proposed'.
+    assert {op["level"] for op in captured["plan"]["ops"]} == {"ad", "adset"}
+    assert all(op["status"] != "approved" for op in captured["plan"]["ops"])
+    assert all(o["status"] != "approved" for o in summary["ops"])
+
+
+def test_build_write_tools_execute_and_preview_delegate_with_reader_and_gate(monkeypatch):
+    calls = {}
+
+    def _fake_execute(plan_id, *, approval_gate, reader, client=None, reports_root=None):
+        calls["execute"] = {"plan_id": plan_id, "gate": approval_gate, "reader": reader}
+        return {"executed": True, "plan_id": plan_id}
+
+    def _fake_preview(plan_id, *, reader, reports_root=None):
+        calls["preview"] = {"plan_id": plan_id, "reader": reader}
+        return {"plan_id": plan_id}
+
+    monkeypatch.setattr(_proposals, "execute_plan", _fake_execute)
+    monkeypatch.setattr(_proposals, "preview_plan", _fake_preview)
+    reader = FakeMetaReader()
+    gate = _proposals.PlanStatusApprovalGate()
+    tools = _mcp_server.build_write_tools(reader, gate)
+    assert tools["execute_plan"]("pid-1")["executed"] is True
+    assert calls["execute"] == {"plan_id": "pid-1", "gate": gate, "reader": reader}
+    tools["preview_plan"]("pid-2")
+    assert calls["preview"] == {"plan_id": "pid-2", "reader": reader}
+
+
+def test_mcp_scaffold_note_writes_stay_gated_no_upload_tool():
+    # Media uploads are intentionally NOT exposed over MCP (they create unreferenced, ungated assets).
+    tools = _mcp_server.build_write_tools(FakeMetaReader(), _proposals.PlanStatusApprovalGate())
+    assert not any("upload" in name for name in tools)
+
+
+# --- MCP guarded-write: authoring (create, PAUSED-by-default) + audience rotation ------------
+# MOCKS ONLY: every test here drives a fake client/reader; no live Meta call is ever made.
+
+from meta_ads_analysis import authoring as _authoring  # noqa: E402
+from meta_ads_analysis import rotation as _rotation  # noqa: E402
+
+
+def _authrot_adsets():
+    """Two ACTIVE ad sets in a target-one/exclude-the-other partition; as1 has Advantage Audience on."""
+    return [
+        {"id": "as1", "name": "Set 1", "status": "ACTIVE", "effective_status": "ACTIVE", "campaign_id": "c1",
+         "targeting": {"custom_audiences": [{"id": "A", "name": "aud-A"}],
+                       "excluded_custom_audiences": [{"id": "B", "name": "aud-B"}],
+                       "targeting_automation": {"advantage_audience": 1}}},
+        {"id": "as2", "name": "Set 2", "status": "ACTIVE", "effective_status": "ACTIVE", "campaign_id": "c1",
+         "targeting": {"custom_audiences": [{"id": "B", "name": "aud-B"}],
+                       "excluded_custom_audiences": [{"id": "A", "name": "aud-A"}]}},
+    ]
+
+
+class _AuthRotFakeClient:
+    """Combined fake for the MCP authoring + rotation flow: it creates entities, reads back the created
+    ids (so the outcome-verify PAUSED read-back has something to read), lists/reads ad sets, and applies
+    ad-set updates. MOCKS ONLY — no method touches the network."""
+
+    def __init__(self, *, source_ad=None, ad_insights=None, adsets=None, created_ad_effective="PAUSED"):
+        self.creates: list = []
+        self.updates: list = []
+        self._ad_insights = ad_insights or []
+        self._source_ad = source_ad or {"id": "src", "name": "Winner", "creative": {"id": "cr_src"}}
+        self._adsets = adsets if adsets is not None else _authrot_adsets()
+        # Created entities become readable at their new id; a create is forced PAUSED, so the read-back
+        # reports PAUSED (the `created_ad_effective` knob lets a test simulate an unexpected ACTIVE).
+        self._by_id = {
+            "new_camp": {"id": "new_camp", "status": "PAUSED", "effective_status": "PAUSED"},
+            "new_adset": {"id": "new_adset", "status": "PAUSED", "effective_status": "PAUSED"},
+            "new_ad": {"id": "new_ad", "status": created_ad_effective, "effective_status": created_ad_effective},
+            "new_lal": {"id": "new_lal"},  # an audience has no status/effective_status
+        }
+        for a in self._adsets:
+            self._by_id[a["id"]] = a
+
+    # reads
+    def get_ad(self, node_id, *, fields):
+        return self._source_ad if node_id == self._source_ad["id"] else self._by_id[node_id]
+
+    def get_adset(self, node_id, *, fields):
+        return self._by_id[node_id]
+
+    def get_campaign(self, node_id, *, fields):
+        return self._by_id[node_id]
+
+    def list_adsets(self, ad_account_id, *, fields, effective_status=None):
+        return self._adsets
+
+    def fetch_insights(self, ad_account_id, *, fields, date_from, date_to, level, time_increment=1, breakdowns=None):
+        return self._ad_insights if level == "ad" else []
+
+    def iter_paginated(self, path, *, params=None):
+        return []
+
+    # creates (create-only authoring surface)
+    def create_campaign(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("campaign", params, validate_only))
+        return {"id": "new_camp"}
+
+    def create_adset(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("adset", params, validate_only))
+        return {"id": "new_adset"}
+
+    def create_ad(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("ad", params, validate_only))
+        return {"id": "new_ad"}
+
+    def create_custom_audience(self, ad_account_id, *, params, validate_only=False):
+        self.creates.append(("audience", params, validate_only))
+        return {"id": "new_lal"}
+
+    # writes (rotation / advantage disable)
+    def update_adset(self, node_id, *, params, validate_only=False):
+        self.updates.append((node_id, params, validate_only))
+        return {"id": node_id, "success": True}
+
+
+def _approve_items(plan, *, drop_grounding=False):
+    """Approve every reviewable item under the plan-type's key (ops / rotations / items). ``drop_grounding``
+    simulates the conscious operator override that lets an approved net-new (abstaining) create execute."""
+    p = _copy.deepcopy(plan)
+    for it in _proposals.plan_items(p):
+        it["status"] = "approved"
+    if drop_grounding and isinstance(p.get("guardrails"), dict):
+        p["guardrails"]["requires_grounding"] = False
+    return p
+
+
+def test_mcp_authoring_create_executes_paused_and_verifies(tmp_path):
+    # create campaign / ad set / ad ⇒ approved (with the conscious override, since net-new abstains) ⇒
+    # validate-then-execute ⇒ created, forced PAUSED, and the outcome read-back confirms PAUSED.
+    client = _AuthRotFakeClient()
+    gate = _proposals.PlanStatusApprovalGate()
+    builders = [
+        ("campaign", _authoring.build_create_campaign_plan("act_1", name="C", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-01")),
+        ("adset", _authoring.build_create_adset_plan("act_1", name="S", campaign_id="c1", account_slug=None, run_date="2026-07-01")),
+        ("ad", _authoring.build_create_ad_plan("act_1", name="A", adset_id="as1", creative_id="cr1", account_slug=None, run_date="2026-07-01")),
+    ]
+    for _label, plan in builders:
+        assert plan["plan_type"] == "authoring"
+        assert plan["ops"][0]["confidence"]["band"] == "abstain"  # net-new cites a zero sample
+        pid = _proposals.save_proposal(_approve_items(plan, drop_grounding=True),
+                                       account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+        res = _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+        assert res["executed"] is True
+        op = res["ops"][0]
+        assert op["status"] == "created" and op["created_id"] in ("new_camp", "new_adset", "new_ad")
+        # outcome read-back confirms the created entity came back PAUSED (never ACTIVE)
+        assert op["verify"]["effective_status"] == "PAUSED" and "red_flag" not in op["verify"]
+    # every create the client received (validate pass + execute pass) was forced PAUSED
+    assert all(params.get("status") == "PAUSED" for _kind, params, _vo in client.creates)
+    # a validate pass (validate_only=True) preceded each execute pass (validate_only=False)
+    assert any(vo for *_r, vo in client.creates) and any(not vo for *_r, vo in client.creates)
+
+
+def test_mcp_authoring_created_active_is_red_flagged(tmp_path):
+    # Defense-in-depth: if a created ad somehow comes back ACTIVE, the outcome verify surfaces a red flag
+    # and a `created_active` follow-up (authoring forces PAUSED, so ACTIVE means it may be spending).
+    client = _AuthRotFakeClient(created_ad_effective="ACTIVE")
+    plan = _authoring.build_create_ad_plan("act_1", name="A", adset_id="as1", creative_id="cr1", account_slug=None, run_date="2026-07-01")
+    pid = _proposals.save_proposal(_approve_items(plan, drop_grounding=True),
+                                   account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert "red_flag" in res["ops"][0]["verify"]
+    assert any(f["type"] == "created_active" for f in res["follow_ups"])
+
+
+def test_mcp_authoring_lookalike_executes_without_paused_assertion(tmp_path):
+    # A lookalike is a structural abstain (seed size/quality is not a ROAS/conversions metric) → the gate
+    # ALLOWS it even under requires_grounding, and an audience is inert: no status, so no PAUSED read-back.
+    client = _AuthRotFakeClient()
+    plan = _authoring.build_lookalike_plan("act_1", name="LAL", origin_audience_id="seed1", country="US",
+                                           ratio=0.05, account_slug=None, run_date="2026-07-01")
+    assert plan["ops"][0]["confidence"]["band"] == "abstain"
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    op = res["ops"][0]
+    assert res["executed"] is True and op["status"] == "created" and op["created_id"] == "new_lal"
+    assert "verify" not in op  # inert audience: nothing to read back, no PAUSED to assert
+    # the create request is a LOOKALIKE audience (no forced status — audiences have none)
+    _kind, params, _vo = client.creates[-1]
+    assert params["subtype"] == "LOOKALIKE" and "status" not in params
+
+
+def test_mcp_authoring_duplicate_ad_recreates_source_creative_paused(tmp_path):
+    # A duplicate grounds on the SOURCE ad's own strong metric (executable), copies the source creative
+    # id into the target ad set, and is forced PAUSED.
+    ad_insights = [{"ad_id": "src", "ad_name": "Winner", "spend": "2400", "impressions": "100000",
+                    "actions": [{"action_type": "purchase", "value": "120"}],
+                    "action_values": [{"action_type": "purchase", "value": "9600"}],
+                    "purchase_roas": [{"value": "4.0"}]}]
+    client = _AuthRotFakeClient(source_ad={"id": "src", "name": "Winner", "creative": {"id": "cr_src"}},
+                                ad_insights=ad_insights)
+    plan = _authoring.build_duplicate_ad_plan(client, "act_1", source_ad_id="src", target_adset_id="as2",
+                                              account_slug=None, date_from="2026-06-01", date_to="2026-06-30",
+                                              run_date="2026-07-01")
+    assert plan["ops"][0]["confidence"]["band"] != "abstain"  # proven winner → real band, not blocked
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True and res["ops"][0]["status"] == "created"
+    # execute-pass create copies the source creative id into the target ad set, forced PAUSED
+    ad_create = [(p, vo) for kind, p, vo in client.creates if kind == "ad" and not vo][0][0]
+    assert ad_create["adset_id"] == "as2"
+    assert ad_create["creative"] == {"creative_id": "cr_src"}
+    assert ad_create["status"] == "PAUSED"
+
+
+def test_mcp_rotation_validates_then_executes(tmp_path):
+    # An approved rotation runs a validate pass then an execute pass; the ad-set targeting write lands and
+    # the outcome read-back confirms it registered. metrics_by_id=None ⇒ structural abstain ⇒ gate-allowed.
+    client = _AuthRotFakeClient()
+    plan = _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1",
+                                         offset=1, disable_advantage_audience=True)
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True
+    # validate pass (validate_only=True) preceded the execute pass (validate_only=False) for as1
+    modes = [vo for aid, _params, vo in client.updates if aid == "as1"]
+    assert modes[:2] == [True, False]
+    # results keyed by adset_id and carry an outcome-verify read-back
+    by_adset = {o["adset_id"]: o for o in res["ops"]}
+    assert by_adset["as1"]["status"] == "executed" and "verify" in by_adset["as1"]
+
+
+def test_mcp_advantage_disable_writes_only_off_and_cannot_invert(tmp_path):
+    # advantage_disable turns Advantage Audience OFF in place: it writes advantage_audience=0 and
+    # preserves the included/excluded audiences verbatim. The direction can NEVER invert to ON.
+    client = _AuthRotFakeClient()
+    plan = _rotation.build_advantage_disable_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1")
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True
+    statuses = {o["adset_id"]: o["status"] for o in res["ops"]}
+    assert statuses["as1"] == "executed"    # as1 had it enabled
+    assert statuses["as2"] == "skipped"     # as2 already off — nothing to write
+    # the as1 execute write set advantage_audience=0 and preserved the audiences verbatim
+    write = [(p, vo) for aid, p, vo in client.updates if aid == "as1" and not vo][0][0]
+    t = write["targeting"]
+    assert t["targeting_automation"]["advantage_audience"] == 0
+    assert [r["id"] for r in t["custom_audiences"]] == ["A"]
+    assert [r["id"] for r in t["excluded_custom_audiences"]] == ["B"]
+    # compute_new_targeting only ever writes 0 for the automation flag — there is no path that sets 1.
+    off = _rotation.compute_new_targeting({"targeting_automation": {"advantage_audience": 1}},
+                                          new_included_ids=["A"], new_excluded_ids=["B"],
+                                          disable_advantage_audience=True)
+    assert off["targeting_automation"]["advantage_audience"] == 0
+
+
+def test_mcp_dispatch_plan_type_matches_applier_and_items_key():
+    # The #1 rotation failure mode: a plan whose plan_type doesn't match its applier / items key reviews
+    # and applies NOTHING. Assert each builder stamps a plan_type that is wired in BOTH maps and that its
+    # items live under the mapped key (non-empty), so no family routes to a silent no-op.
+    plans = [
+        _authoring.build_create_campaign_plan("act_1", name="C", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-01"),
+        _authoring.build_lookalike_plan("act_1", name="L", origin_audience_id="s1", country="US", ratio=0.05, account_slug=None, run_date="2026-07-01"),
+        _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1", offset=1),
+        _rotation.build_advantage_disable_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1"),
+    ]
+    for plan in plans:
+        pt = plan["plan_type"]
+        assert pt in _proposals.PLAN_APPLIERS, f"{pt} has no applier — execute would raise"
+        assert pt in _proposals.PLAN_ITEMS_KEY, f"{pt} has no items key — approval/serialize would miss it"
+        assert _proposals.plan_items(plan), f"{pt} items not found under its mapped key"
+
+
+def test_mcp_dispatch_reader_kwarg_split_no_typeerror():
+    # The reader-kwarg split: authoring apply must NOT receive `reader` (it has no such param); rotation
+    # apply MUST. Both applier wrappers accept the uniform reader= kwarg without a TypeError.
+    client = _AuthRotFakeClient()
+    authoring_plan = {"plan_type": "authoring", "ad_account_id": "act_1",
+                      "guardrails": {"requires_grounding": False},
+                      "ops": [{"op_id": "c", "kind": "create_campaign",
+                               "params": {"name": "C", "objective": "OUTCOME_SALES"}, "status": "approved"}]}
+    rotation_plan = _approve_items(
+        _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1", offset=1)
+    )
+    # authoring applier: reader kwarg is accepted-and-dropped (no TypeError), create executes.
+    a = _proposals.PLAN_APPLIERS["authoring"](authoring_plan, client, execute=True, validate_only=False, reader=client)
+    assert a[0].status == "created"
+    # rotation applier: reader kwarg is used for the live-drift re-read (no TypeError), write executes.
+    r = _proposals.PLAN_APPLIERS["audience_rotation"](rotation_plan, client, execute=True, validate_only=False, reader=client)
+    assert any(res.status == "executed" for res in r)
+
+
+def test_mcp_create_video_ad_missing_video_id_blocks_at_execute(tmp_path):
+    # A create_video_ad missing its (uploaded) video_id fails validate_authoring_op — surfaced as a clear
+    # per-op block at the execute validate pass (no write performed), never a silent create.
+    client = _AuthRotFakeClient()
+    plan = _authoring.build_video_ad_plan("act_1", name="V", adset_id="as1", video_id="", page_id="p1",
+                                          link="https://x/y", message="hi", account_slug=None, run_date="2026-07-01")
+    pid = _proposals.save_proposal(_approve_items(plan, drop_grounding=True),
+                                   account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is False and res["validated"] is False
+    assert "video_id" in (res["ops"][0]["reason"] or "")
+    assert client.creates == []  # nothing was created
+
+
+def test_mcp_no_approval_refusal_for_authoring_and_rotation(tmp_path):
+    # THE core safety refusal, for a fresh authoring plan AND a fresh rotation plan (whose approvable
+    # items live under "rotations", not "ops" — plan_items must route there or this would crash/mis-count).
+    client = _AuthRotFakeClient()
+    gate = _proposals.PlanStatusApprovalGate()
+    for plan in (
+        _authoring.build_create_campaign_plan("act_1", name="C", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-01"),
+        _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1", offset=1),
+    ):
+        assert all(it["status"] != "approved" for it in _proposals.plan_items(plan))  # propose never approves
+        pid = _proposals.save_proposal(plan, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+        res = _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+        assert res["refused"] is True and res["executed"] is False
+        assert "no approved ops" in res["reason"]
+    assert client.creates == [] and client.updates == []  # nothing sent, not even a validate round-trip
+
+
+def test_mcp_preview_plan_authoring_and_rotation_report_stored_intent(tmp_path):
+    # preview_plan is write-free for the non-ops families too: an authoring item is not ops-shaped
+    # (control._build_request keys on op["op"], which it lacks) and a rotation item is keyed by adset_id,
+    # so preview must report the STORED intent (params / diff + new audiences) rather than re-deriving a
+    # Graph request — and it must never crash or write. This guards the documented non-ops preview path.
+    client = _AuthRotFakeClient()
+    # authoring: net-new campaign create — approved item reports its stored params (kind, no re-derive).
+    authoring_plan = _authoring.build_create_campaign_plan(
+        "act_1", name="C", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-01"
+    )
+    a_pid = _proposals.save_proposal(_approve_items(authoring_plan, drop_grounding=True),
+                                     account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    a_prev = _proposals.preview_plan(a_pid, reader=client, reports_root=tmp_path)
+    a_entry = a_prev["ops"][0]
+    assert a_entry["op"] == "create_campaign"  # normalized from the create kind
+    assert a_entry["would_send"]["params"]["objective"] == "OUTCOME_SALES"  # stored intent, not a re-derived request
+
+    # rotation: item is keyed by adset_id; would_send surfaces the diff + the new audience ids.
+    rotation_plan = _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo",
+                                                  ad_account_id="act_1", offset=1)
+    r_pid = _proposals.save_proposal(_approve_items(rotation_plan),
+                                     account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    r_prev = _proposals.preview_plan(r_pid, reader=client, reports_root=tmp_path)
+    r_entry = {e["op_id"]: e for e in r_prev["ops"]}["as1"]  # op_id falls back to adset_id
+    assert r_entry["would_send"]["new_included"] == ["B"]  # as1 rotates forward to as2's audience
+    assert "diff" in r_entry["would_send"]
+
+    # NO write performed by either preview (create-only client too).
+    assert client.creates == [] and client.updates == []
+
+
+# --- MCP local approval gate (HMAC-signed, out-of-band `approve_plan`) ------------------------
+# MOCKS ONLY: every test drives fake clients/readers; no live Meta call is ever made. The gate's
+# job is to make a human-produced approval something the *agent* structurally cannot forge.
+
+_APPROVAL_SECRET = b"test-secret-0123456789abcdef"  # >= proposals.MIN_APPROVAL_SECRET_LEN (16 bytes)
+
+
+def _ops_rename_plan(client, *, name="Renamed Set"):
+    """A one-op ops plan (rename ad set as1) — the simplest thing to approve/sign/execute."""
+    return _control_mod.build_single_op_plan(
+        client, "act_1", op="rename", level="adset", id="as1", params={"name": name},
+        account_slug="demo", run_date="2026-07-01",
+    )
+
+
+def test_hmac_gate_accepts_signed_then_reloaded_plan(tmp_path):
+    # Round-trip parity (the correctness crux): approve_proposal signs the in-memory plan; the gate
+    # verifies the JSON-reloaded plan. Both canonicalize identically, so a genuine approval verifies.
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    approval = _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    assert approval["signature"] and approval["algorithm"] == "HMAC-SHA256" and approval["approved_count"] == 1
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)  # no raise == verified
+
+
+def test_approve_then_execute_end_to_end_ops(tmp_path):
+    # approve_proposal → execute_plan(HmacApprovalGate): validate-then-execute, audit written, verify.
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.HmacApprovalGate(_APPROVAL_SECRET),
+        reader=client, client=client, reports_root=tmp_path,
+    )
+    assert res["executed"] is True and res["ops"][0]["status"] == "executed"
+    assert res["audit_path"] and Path(res["audit_path"]).exists()
+
+
+def test_approve_then_execute_end_to_end_rotation(tmp_path):
+    # A non-ops family through the full loop: approve_proposal signs the rotation items (which live under
+    # "rotations", not "ops" — plan_items must route there) and execute runs them under the gate.
+    client = _AuthRotFakeClient()
+    plan = _rotation.build_rotation_plan(_authrot_adsets(), account_slug="demo", ad_account_id="act_1",
+                                         offset=1, disable_advantage_audience=True)
+    pid = _proposals.save_proposal(plan, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.HmacApprovalGate(_APPROVAL_SECRET),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True
+    assert {o["adset_id"]: o["status"] for o in res["ops"]}["as1"] == "executed"
+
+
+def test_hmac_gate_rejects_agent_forged_approved_status(tmp_path):
+    # The incident this reopens: an agent hand-edits status:approved into the persisted plan but cannot
+    # sign it. No approval block → "no human approval"; execute raises and NOTHING is sent.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_approve_all(_ops_rename_plan(client)), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.execute_plan(
+            pid, approval_gate=_proposals.HmacApprovalGate(_APPROVAL_SECRET),
+            reader=client, client=client, reports_root=tmp_path,
+        )
+    assert "no human approval" in str(excinfo.value)
+    assert client.updates == []  # refused before any write / validate round-trip
+
+
+def test_hmac_gate_rejects_mutated_approved_op(tmp_path):
+    # Approve, then mutate the approved op's params on disk (a filesystem-write forgery): the recompute
+    # over the mutated approved set ≠ the stored signature. Because the FULL item dict is signed, this
+    # generalizes to any material field — including stripping confidence/evidence to dodge the grounding gate.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["ops"][0]["params"]["name"] = "Attacker Chosen Name"  # change AFTER signing
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+    assert "does not match" in str(excinfo.value)
+
+
+def test_hmac_gate_rejects_added_approved_op(tmp_path):
+    # Agent adds a brand-new approved op to a signed plan → recompute over the larger approved set ≠ stored.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["ops"].append(
+        {"op_id": "sneak", "op": "rename", "level": "ad", "id": "ad1", "params": {"name": "X"}, "status": "approved"}
+    )
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError):
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+
+
+def test_hmac_gate_rejects_cross_plan_signature_replay(tmp_path):
+    # Copying a valid approval block from plan A onto plan B is rejected: the signed payload carries the
+    # plan_id, so B's recompute (over B's id) ≠ A's signature.
+    import pytest
+    client = _control_fixture()
+    pid_a = _proposals.save_proposal(_ops_rename_plan(client, name="A"), account_slug="demo",
+                                     run_date="2026-07-01", reports_root=tmp_path)
+    pid_b = _proposals.save_proposal(_approve_all(_ops_rename_plan(client, name="B")), account_slug="demo",
+                                     run_date="2026-07-01", reports_root=tmp_path)
+    approval_a = _proposals.approve_proposal(pid_a, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path_b = _proposals.find_proposal_path(pid_b, tmp_path)
+    b = json.loads(path_b.read_text(encoding="utf-8"))
+    b["approval"] = approval_a  # graft A's signature onto B (B's ops already flipped approved)
+    path_b.write_text(json.dumps(b), encoding="utf-8")
+    reloaded_b = _proposals.load_proposal(pid_b, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid_b, reloaded_b)
+    assert "does not match" in str(excinfo.value)
+
+
+def test_hmac_gate_rejects_expired_approval_and_accepts_within_ttl(tmp_path):
+    # approved_at is inside the signed payload (cannot be forward-dated). With an injected clock: within
+    # the TTL passes; past it is rejected as expired.
+    import pytest
+    from datetime import UTC, datetime, timedelta
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    t0 = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path, now_fn=lambda: t0)
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    within = _proposals.HmacApprovalGate(_APPROVAL_SECRET, ttl_seconds=86400, now_fn=lambda: t0 + timedelta(hours=1))
+    within.assert_approved(pid, reloaded)  # no raise
+    expired = _proposals.HmacApprovalGate(_APPROVAL_SECRET, ttl_seconds=86400, now_fn=lambda: t0 + timedelta(hours=25))
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        expired.assert_approved(pid, reloaded)
+    assert "expired" in str(excinfo.value)
+
+
+def test_hmac_gate_empty_approved_set_with_leftover_signature_rejected(tmp_path):
+    # Sign a plan, then demote every op back to 'proposed' but leave the stale signature: recompute over
+    # the now-empty approved set ≠ stored. (The step-4 zero-approved refusal is a second layer behind this.)
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    for op in tampered["ops"]:
+        op["status"] = "proposed"  # un-approve but keep the signature
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError):
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+
+
+def test_approve_proposal_flips_only_selected_and_refuses_executed(tmp_path):
+    # op_ids selects a subset; only those flip to approved and the gate verifies. Re-approving an already
+    # -executed plan is refused (meaningless — the idempotency guard would refuse the re-execute anyway).
+    import pytest
+    two_op = {
+        "schema_version": 1, "plan_type": "ops", "intent": "rename", "account_slug": "demo",
+        "ad_account_id": "act_1", "run_date": "2026-07-01",
+        "guardrails": {"requires_explicit_approval": True, "requires_grounding": False},
+        "ops": [
+            {"op_id": "r1", "op": "rename", "level": "ad", "id": "ad1", "params": {"name": "A"}, "status": "proposed"},
+            {"op_id": "r2", "op": "rename", "level": "ad", "id": "ad2", "params": {"name": "B"}, "status": "proposed"},
+        ],
+    }
+    pid = _proposals.save_proposal(two_op, account_slug="demo", run_date="2026-07-01", reports_root=tmp_path)
+    approval = _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, op_ids=["r1"], reports_root=tmp_path)
+    assert approval["approved_count"] == 1
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    by_id = {o["op_id"]: o for o in reloaded["ops"]}
+    assert by_id["r1"]["status"] == "approved" and by_id["r2"]["status"] == "proposed"
+    _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)  # verifies (only r1 approved)
+    _proposals._mark_executed(pid, tmp_path, audit_path=None)
+    with pytest.raises(MetaApiError) as excinfo:
+        _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, op_ids=["r1"], reports_root=tmp_path)
+    assert "already executed" in str(excinfo.value)
+
+
+def test_approval_secret_from_env_env_file_and_short(tmp_path, monkeypatch):
+    _clear_scaffold_env(monkeypatch)
+    assert _proposals.approval_secret_from_env() is None  # neither var set
+    monkeypatch.setenv("META_APPROVAL_SECRET", "a-sufficiently-long-secret-value")
+    assert _proposals.approval_secret_from_env() == b"a-sufficiently-long-secret-value"
+    # A too-short secret is a clear misconfig error, not a silent default.
+    monkeypatch.setenv("META_APPROVAL_SECRET", "short")
+    import pytest
+    with pytest.raises(ValueError) as excinfo:
+        _proposals.approval_secret_from_env()
+    assert "at least" in str(excinfo.value)
+    # File-based resolution strips a trailing newline.
+    monkeypatch.delenv("META_APPROVAL_SECRET", raising=False)
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("file-based-secret-0123456789\n", encoding="utf-8")
+    monkeypatch.setenv("META_APPROVAL_SECRET_FILE", str(secret_file))
+    assert _proposals.approval_secret_from_env() == b"file-based-secret-0123456789"
+
+
+def test_select_approval_gate_from_env_hmac_and_denied(monkeypatch):
+    _clear_scaffold_env(monkeypatch)
+    assert isinstance(_proposals.select_approval_gate_from_env(), _proposals.DeniedApprovalGate)
+    monkeypatch.setenv("META_APPROVAL_SECRET", "a-sufficiently-long-secret-value")
+    monkeypatch.setenv("META_APPROVAL_TTL_SECONDS", "0")  # empty/0 disables expiry
+    gate = _proposals.select_approval_gate_from_env()
+    assert isinstance(gate, _proposals.HmacApprovalGate) and gate._ttl_seconds is None
+
+
+def test_select_gate_denies_when_no_secret_but_reads_still_work(tmp_path, monkeypatch):
+    # Fail-closed: no secret → execute refused (ApprovalError naming META_APPROVAL_SECRET), nothing sent.
+    # Reads are never gated: a read tool from build_read_tools still returns live data.
+    import pytest
+    _clear_scaffold_env(monkeypatch)
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_approve_all(_ops_rename_plan(client)), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    gate = _proposals.select_approval_gate_from_env()  # DeniedApprovalGate (no secret)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.execute_plan(pid, approval_gate=gate, reader=client, client=client, reports_root=tmp_path)
+    assert "META_APPROVAL_SECRET" in str(excinfo.value)
+    assert client.updates == []
+    read_tools = _mcp_server.build_read_tools(DirectMetaReader(client))
+    assert read_tools["get_ad"]("ad1", fields=["id", "name"])["id"] == "ad1"
+
+
+def test_server_info_reports_approval_fields(monkeypatch):
+    _clear_scaffold_env(monkeypatch)
+    info = _mcp_server.build_server_info()
+    assert info["approval_required"] is True and info["approval_configured"] is False
+    monkeypatch.setenv("META_APPROVAL_SECRET", "a-sufficiently-long-secret-value")
+    assert _mcp_server.build_server_info()["approval_configured"] is True
+    # A misconfigured (too-short) secret degrades to False rather than raising (health probe, not ctor).
+    monkeypatch.setenv("META_APPROVAL_SECRET", "short")
+    assert _mcp_server.build_server_info()["approval_configured"] is False
+
+
+def test_build_server_wires_selected_approval_gate(monkeypatch):
+    # build_server selects the gate from the env: with a secret it's an HmacApprovalGate, and the write
+    # surface (incl. execute_plan) still registers. A fake FastMCP keeps this off the `server` extra.
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_ACCESS_TOKEN", "tok")
+    monkeypatch.setenv("META_APPROVAL_SECRET", "a-sufficiently-long-secret-value")
+    captured: dict = {}
+
+    class _SpyMcp:
+        def __init__(self, name, host, port):
+            pass
+
+        def tool(self):
+            def _d(fn):
+                return fn
+            return _d
+
+        def add_tool(self, func, name=None, description=None):
+            captured.setdefault("registered", []).append(name)
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", _SpyMcp)
+    real_build_write_tools = _mcp_server.build_write_tools
+
+    def _spy(reader, gate, client=None):
+        captured["gate"] = gate
+        captured["client"] = client
+        return real_build_write_tools(reader, gate, client=client)
+
+    monkeypatch.setattr(_mcp_server, "build_write_tools", _spy)
+    monkeypatch.setattr(
+        _mcp_server.DirectMetaReader, "from_env",
+        classmethod(lambda cls, api_version=None: _mcp_server.DirectMetaReader(_control_fixture())),
+    )
+    _mcp_server.build_server("127.0.0.1", 8765)
+    assert isinstance(captured["gate"], _proposals.HmacApprovalGate)
+    assert "execute_plan" in captured["registered"]
+    # Live mode passes no explicit write client — execute_plan builds a real client_from_env() lazily.
+    assert captured["client"] is None
+
+
+def test_approve_plan_cli_signs_and_gate_verifies(tmp_path, monkeypatch, capsys):
+    # The out-of-band CLI: approve → the persisted plan verifies under the gate keyed by the same secret.
+    from meta_ads_analysis.cli import approve_plan_main
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_APPROVAL_SECRET", "cli-test-secret-0123456789abc")
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    monkeypatch.setattr(sys, "argv", [
+        "approve_plan", "--plan-id", pid, "--reports-root", str(tmp_path), "--all", "--yes",
+    ])
+    approve_plan_main()
+    out = capsys.readouterr().out
+    assert pid in out and "execute_plan" in out
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    _proposals.HmacApprovalGate(b"cli-test-secret-0123456789abc").assert_approved(pid, reloaded)
+
+
+def test_approve_plan_cli_requires_secret(monkeypatch):
+    import pytest
+    from meta_ads_analysis.cli import approve_plan_main
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["approve_plan", "--plan-id", "x", "--all"])
+    with pytest.raises(SystemExit) as excinfo:
+        approve_plan_main()
+    assert "META_APPROVAL_SECRET" in str(excinfo.value)
+
+
+def test_hmac_gate_rejects_flipped_plan_level_guardrail(tmp_path):
+    # Regression (review of ticket 13): the signed body must cover plan-LEVEL execution-affecting fields,
+    # not just the approved items. An agent that flips guardrails.requires_grounding off would disable the
+    # apply-time grounding gate (every applier reads that flag) — an easier bypass than stripping an op's
+    # confidence/evidence. The signature now covers the whole plan body, so the flip is rejected.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    assert tampered["guardrails"]["requires_grounding"] is True  # what the human approved
+    tampered["guardrails"]["requires_grounding"] = False  # disable the grounding gate AFTER signing
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError) as excinfo:
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+    assert "does not match" in str(excinfo.value)
+
+
+def test_hmac_gate_rejects_redirected_ad_account_id(tmp_path):
+    # Regression (review of ticket 13): ad_account_id is plan-level (authoring POSTs creates to it) and is
+    # now inside the signed body, so redirecting an approved plan to a different account is rejected.
+    import pytest
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    _proposals.approve_proposal(pid, secret=_APPROVAL_SECRET, reports_root=tmp_path)
+    path = _proposals.find_proposal_path(pid, tmp_path)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["ad_account_id"] = "act_999"  # redirect AFTER signing
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    with pytest.raises(_proposals.ApprovalError):
+        _proposals.HmacApprovalGate(_APPROVAL_SECRET).assert_approved(pid, reloaded)
+
+
+def test_approve_plan_cli_interactive_confirm_and_abort(tmp_path, monkeypatch, capsys):
+    # The interactive input() branch (both CLI tests above use --yes). "n" aborts writing nothing;
+    # a second run answering "y" signs. The prompt is the human-confirmation channel the agent lacks.
+    import builtins
+    from meta_ads_analysis.cli import approve_plan_main
+    _clear_scaffold_env(monkeypatch)
+    monkeypatch.setenv("META_APPROVAL_SECRET", "cli-test-secret-0123456789abc")
+    client = _control_fixture()
+    pid = _proposals.save_proposal(_ops_rename_plan(client), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    monkeypatch.setattr(sys, "argv", ["approve_plan", "--plan-id", pid, "--reports-root", str(tmp_path), "--all"])
+
+    # Abort: nothing signed, no approval block written.
+    monkeypatch.setattr(builtins, "input", lambda *_a, **_k: "n")
+    approve_plan_main()
+    assert "Aborted" in capsys.readouterr().out
+    assert "approval" not in _proposals.load_proposal(pid, reports_root=tmp_path)
+
+    # Confirm: signs, and the persisted plan verifies under the gate.
+    monkeypatch.setattr(builtins, "input", lambda *_a, **_k: "y")
+    approve_plan_main()
+    reloaded = _proposals.load_proposal(pid, reports_root=tmp_path)
+    _proposals.HmacApprovalGate(b"cli-test-secret-0123456789abc").assert_approved(pid, reloaded)
+
+
+# --- Mock launch mode (--mock / META_MCP_MOCK): canned reads + no-op write client, zero live calls ---
+# MOCKS ONLY: every test here proves the mock rig itself; no live Meta call is ever made.
+
+
+def test_build_mock_reader_all_stubs_present() -> None:
+    # The mock reader must serve every read tool the scripted first session touches — i.e. every
+    # READ_TOOL_METHODS name — without raising FakeMetaReader's "not stubbed" NotImplementedError.
+    # Drives each read through the same build_read_tools seam the server exposes.
+    reader = _mcp_server.build_mock_reader()
+    tools = _mcp_server.build_read_tools(reader)
+    for name in _mcp_server.READ_TOOL_METHODS:
+        args, kwargs = _READER_CALL_SPECS[name]
+        tools[name](*args, **kwargs)  # must not raise NotImplementedError
+    # The account/campaign/adset/ad reads return the shared mock entities.
+    assert reader.get_account("act_mock001", fields=["name"])["id"] == _mcp_server.MOCK_ACCOUNT_ID
+    assert reader.get_ad("ad_mock001", fields=["id"]) == _mcp_server.MOCK_AD
+    assert reader.list_campaigns("act_mock001", fields=["id"]) == [_mcp_server.MOCK_CAMPAIGN]
+    # iter_paginated is seeded as a CALLABLE (FakeMetaReader invokes callable stubs with the path arg).
+    assert list(reader.iter_paginated("/act_mock001/ads", params={"limit": 1})) == [_mcp_server.MOCK_AD]
+
+
+def test_mock_write_client_update_returns_success_and_records() -> None:
+    # Each update_* returns {"success": True} for BOTH validate (True) and execute (False) passes and
+    # records (method, id, params, validate_only) — so neither pass looks like a failure to apply_ops_plan.
+    client = _mcp_server._MockWriteClient()
+    assert client.update_ad("ad_mock001", params={"status": "PAUSED"}, validate_only=True) == {"success": True}
+    assert client.update_adset("adset_mock001", params={"status": "PAUSED"}, validate_only=False) == {"success": True}
+    assert client.update_campaign("campaign_mock001", params={"name": "X"}) == {"success": True}
+    assert client.writes == [
+        ("update_ad", "ad_mock001", {"status": "PAUSED"}, True),
+        ("update_adset", "adset_mock001", {"status": "PAUSED"}, False),
+        ("update_campaign", "campaign_mock001", {"name": "X"}, False),
+    ]
+    # Read-backs return the shared mock entities so a post-execute verification read is consistent.
+    assert client.get_ad("ad_mock001", fields=["id"]) == _mcp_server.MOCK_AD
+    # Authoring creates never return an ACTIVE effective_status (PAUSED-by-default is never violated).
+    assert client.create_campaign()["effective_status"] == "PAUSED"
+
+
+def test_build_server_mock_skips_token_and_server_info_reports_no_secret(monkeypatch) -> None:
+    # build_server(mock=True) with NO META_ACCESS_TOKEN must not raise (the mock reader is token-free),
+    # and with no META_APPROVAL_SECRET, server_info reports approval_configured False (fail-closed gate).
+    # A fake FastMCP keeps this off the `server` extra and binds no socket.
+    _clear_scaffold_env(monkeypatch)
+
+    captured: dict = {}
+
+    class _SpyMcp:
+        def __init__(self, name, host, port):
+            pass
+
+        def tool(self):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+        def add_tool(self, func, name=None, description=None):
+            captured.setdefault("registered", []).append(name)
+
+    monkeypatch.setattr(_mcp_server, "FastMCP", _SpyMcp)
+    real_build_read_tools = _mcp_server.build_read_tools
+
+    def _spy(reader):
+        captured["reader"] = reader
+        return real_build_read_tools(reader)
+
+    monkeypatch.setattr(_mcp_server, "build_read_tools", _spy)
+
+    _mcp_server.build_server("127.0.0.1", 8765, mock=True)  # must NOT raise — no token required
+    assert isinstance(captured["reader"], FakeMetaReader)
+    registered = set(captured["registered"])
+    assert set(_mcp_server.READ_TOOL_METHODS).issubset(registered)
+    assert {"execute_plan", "preview_plan", "propose_set_status"}.issubset(registered)
+    # No secret set -> the health probe reports the fail-closed posture (execute would be refused).
+    assert _mcp_server.build_server_info()["approval_configured"] is False
+
+
+def test_build_write_tools_threads_client_into_execute_plan(monkeypatch) -> None:
+    # build_write_tools' `client` is threaded into proposals.execute_plan (the only writer). Patch
+    # execute_plan to capture the kwargs and prove the mock client reaches it; and that omitting the
+    # client leaves it None (live mode -> execute_plan builds a real client_from_env() lazily).
+    captured: dict = {}
+
+    def _fake_execute_plan(plan_id, *, approval_gate, reader, client=None, **kw):
+        captured.update(plan_id=plan_id, approval_gate=approval_gate, reader=reader, client=client)
+        return {"executed": True, "plan_id": plan_id}
+
+    monkeypatch.setattr(_mcp_server.proposals, "execute_plan", _fake_execute_plan)
+    reader = _mcp_server.build_mock_reader()
+    gate = _proposals.PlanStatusApprovalGate()
+    mock_client = _mcp_server._MockWriteClient()
+
+    out = _mcp_server.build_write_tools(reader, gate, client=mock_client)["execute_plan"]("plan-xyz")
+    assert out == {"executed": True, "plan_id": "plan-xyz"}
+    assert captured["client"] is mock_client
+    assert captured["reader"] is reader and captured["approval_gate"] is gate
+
+    captured.clear()
+    _mcp_server.build_write_tools(reader, gate)["execute_plan"]("plan-abc")
+    assert captured["client"] is None  # no client passed -> None reaches execute_plan
+
+
+def test_mock_execute_records_writes_and_makes_no_live_call(tmp_path) -> None:
+    # Full guarded loop on the mock rig: propose set_status PAUSED on the sole ACTIVE ad -> companion
+    # ad-set pause appended -> approve -> execute via the mock write client. The client records both the
+    # validate pass and the execute pass; nothing contacts Meta; outcome verify re-reads the fake reader.
+    reader = _mcp_server.build_mock_reader()
+    plan = _control_mod.build_single_op_plan(
+        reader, "act_mock001", op="set_status", level="ad", id="ad_mock001",
+        params={"status": "PAUSED"}, account_slug="demo", run_date="2026-07-01",
+    )
+    plan = _control_mod.append_last_active_ad_pause(reader, plan)
+    targets = {(op["level"], op["id"]) for op in plan["ops"]}
+    assert ("ad", "ad_mock001") in targets and ("adset", "adset_mock001") in targets
+
+    pid = _proposals.save_proposal(_approve_all(plan), account_slug="demo",
+                                   run_date="2026-07-01", reports_root=tmp_path)
+    mock_client = _mcp_server._MockWriteClient()
+    res = _proposals.execute_plan(
+        pid, approval_gate=_proposals.PlanStatusApprovalGate(), reader=reader,
+        client=mock_client, reports_root=tmp_path,
+    )
+    assert res["executed"] is True
+    # Each approved op ran a validate pass (validate_only=True) THEN an execute pass (validate_only=False).
+    methods_modes = {(w[0], w[3]) for w in mock_client.writes}
+    assert {("update_ad", True), ("update_ad", False)}.issubset(methods_modes)
+    assert {("update_adset", True), ("update_adset", False)}.issubset(methods_modes)
+    # The pausing lesson: a verify_next_day_spend follow-up is emitted per executed pause.
+    followed = {(f["level"], f["id"]) for f in res["follow_ups"] if f["type"] == "verify_next_day_spend"}
+    assert ("ad", "ad_mock001") in followed and ("adset", "adset_mock001") in followed
+
+
+def test_main_mock_flag_and_env_propagate_to_build_server(monkeypatch) -> None:
+    # main() wires --mock (and META_MCP_MOCK=1) through to build_server(mock=...).
+    captured: dict = {}
+
+    def _fake_build_server(host, port, *, mock=False):
+        captured["mock"] = mock
+        return _FakeMcp()
+
+    monkeypatch.setattr(_mcp_server, "build_server", _fake_build_server)
+    monkeypatch.delenv("MCP_SERVER_HOST", raising=False)
+    monkeypatch.delenv("MCP_SERVER_PORT", raising=False)
+
+    # default: no flag, no env -> mock False
+    monkeypatch.delenv("META_MCP_MOCK", raising=False)
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
+    _mcp_server.main()
+    assert captured["mock"] is False
+
+    # --mock flag -> True
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server", "--mock"])
+    _mcp_server.main()
+    assert captured["mock"] is True
+
+    # META_MCP_MOCK=1 (no flag) -> True
+    monkeypatch.setenv("META_MCP_MOCK", "1")
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
+    _mcp_server.main()
+    assert captured["mock"] is True

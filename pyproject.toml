@@ -21,6 +21,10 @@ dev = [
 media = [
   "faster-whisper>=1.0",
 ]
+# Custom Meta MCP server (our own, HTTP). Kept optional so the CSV/analysis install stays lean.
+server = [
+  "mcp>=1.9,<2",
+]
 
 [project.scripts]
 ingest_meta_exports = "meta_ads_analysis.cli:ingest_meta_exports_main"
@@ -52,6 +56,7 @@ propose_enable_ads = "meta_ads_analysis.cli:propose_enable_ads_main"
 propose_pause_ads = "meta_ads_analysis.cli:propose_pause_ads_main"
 propose_budget = "meta_ads_analysis.cli:propose_budget_main"
 apply_ops = "meta_ads_analysis.cli:apply_ops_main"
+approve_plan = "meta_ads_analysis.cli:approve_plan_main"
 propose_duplicate_ad = "meta_ads_analysis.cli:propose_duplicate_ad_main"
 propose_lookalike = "meta_ads_analysis.cli:propose_lookalike_main"
 apply_authoring = "meta_ads_analysis.cli:apply_authoring_main"
@@ -60,6 +65,7 @@ upload_video = "meta_ads_analysis.cli:upload_video_main"
 propose_video_ad = "meta_ads_analysis.cli:propose_video_ad_main"
 propose_creative_features = "meta_ads_analysis.cli:propose_creative_features_main"
 operator_brief = "meta_ads_analysis.cli:operator_brief_main"
+meta_mcp_server = "meta_ads_analysis.mcp_server:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

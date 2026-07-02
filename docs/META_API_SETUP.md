@@ -163,6 +163,58 @@ The MCP backend is consumed by the **agent runtime**, which injects the MCP tool
 CLI command with `META_READER_BACKEND=mcp` raises a clear error rather than silently degrading — keep
 CLI/sync runs on `direct`.
 
+### Our custom Meta MCP server (local)
+
+Separate from the community `meta-ads-read` **read** candidate above, this repo also ships **our own**
+custom Meta MCP server — the long-term home for reads *and* guarded writes behind one connector. It now
+exposes the full live Meta **read** surface: the `server_info` health tool plus one tool per read (13
+tools — `fetch_insights`, `fetch_ads`, `list_campaigns`, `get_account`, `search_targeting`,
+`list_pixels`, … — a superset of what the parked community candidate could serve). Each read tool is a
+1:1 wrapper over the direct reader; a bad token or insufficient scope comes back as a clean tool error,
+not a crash. It **also now exposes the guarded write surface**: `propose_*` (grounded, reviewed,
+persisted as a proposal returning only a `plan_id`), `preview_plan` (write-free dry run), and
+`execute_plan` (the only writer — validate-then-execute, refuses a plan with zero approved ops).
+Every write routes through the same propose → human-approve → validate → execute → verify gate as the
+CLI; the guardrail is enforced *in the server*, not by prompt. It runs as its own HTTP process, distinct
+from the parked community candidate. (Writes still need an `ads_management`-scoped token; the read-only
+`ads_read` token fails the mandatory `validate_only` pass with a clear scope error.)
+
+Install the server extra (kept optional so the CSV/analysis install stays lean) and launch it. A valid
+`META_ACCESS_TOKEN` (with the `ads_read` scope) must be set — the server builds its reader at startup
+and exits with an actionable message if the token is missing:
+
+```powershell
+pip install -e .[server]
+$env:META_ACCESS_TOKEN="<your token>"
+meta_mcp_server --host 127.0.0.1 --port 8765
+```
+
+Host/port precedence is **explicit flag > env var > local default**: `--host` / `--port` win, else
+`MCP_SERVER_HOST` / `MCP_SERVER_PORT`, else `127.0.0.1` / `8765`.
+
+```powershell
+$env:MCP_SERVER_HOST="127.0.0.1"
+$env:MCP_SERVER_PORT="8765"
+meta_mcp_server
+```
+
+An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
+`server_info` (server name/version, configured Meta API version, selected read backend,
+`live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
+plus any of the 13 read tools and the guarded write tools (`propose_*` / `preview_plan` /
+`execute_plan`). If the `server` extra is not installed, launching prints an actionable error
+(`pip install -e .[server]`) rather than a traceback.
+
+Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
+Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the
+process first** (`meta_mcp_server --mock` for mock mode, or with a real `META_ACCESS_TOKEN` for live), so
+the entry shows a connection error until it is running. See
+[**Run the Meta MCP server locally**](#run-the-meta-mcp-server-locally) below for the step-by-step launch,
+`.mcp.json` wiring, and a scripted first session. Its tools carry
+the `mcp__meta-suite__*` prefix, deliberately distinct from the community server's `mcp__meta-ads__*`
+prefix (whose write tools are deny-listed in `.claude/settings.json`). Multi-user/hosted role headers
+are a later concern; local single-operator use needs no header.
+
 ### Official Meta hosted MCP server (OAuth) — drop-in, optional
 
 Meta also offers an **official hosted MCP server that authenticates with OAuth** (a remote/URL
@@ -184,6 +236,132 @@ OAuth server satisfy the same `MetaReaderProvider` seam, swapping is config-only
 tested here** — only the seam is proven to support it. The single-operator-now vs multi-user/OAuth-later
 auth posture is documented in [`../AGENTS.md`](../AGENTS.md) under **Hybrid Meta integration → Auth
 posture**.
+
+## Run the Meta MCP server locally
+
+This is the copy-paste path for trying our own custom server (the `meta-suite` connector) end-to-end:
+**connect → read → propose → approve → execute**. It defaults to **mock mode** — no real Meta account,
+no `META_ACCESS_TOKEN`, and zero live Meta calls — so you can exercise the whole guarded loop safely.
+Going live is an explicit opt-in at the end.
+
+Mock mode fakes only the reads and the write itself: it seeds one fake account (`act_mock001`) whose
+reads return canned data, and routes `execute_plan` through a no-op write client that records the op and
+returns success. **The guardrail pipeline is real and unchanged** — propose → human-approve → validate →
+execute → verify, PAUSED-by-default, grounded, reviewed. In particular you still need an HMAC approval
+secret to execute a write; without one the fail-closed gate refuses every write (reads still work).
+
+### 1. Install the server extra
+
+```powershell
+pip install -e .[server]
+```
+
+### 2. Generate an HMAC approval secret (one-time)
+
+Approval is an out-of-band HMAC signature (see [META_ACTION_WORKFLOW.md → Approval seam](META_ACTION_WORKFLOW.md#approval-seam--the-human-signs-the-agent-cannot)).
+Generate a secret once and keep it **out of the repo**:
+
+```powershell
+python -c "import secrets; print(secrets.token_hex(32))"
+# -> copy the output; you will use it as META_APPROVAL_SECRET in BOTH shells below
+```
+
+### 3. Launch in mock mode (no real token, no live calls)
+
+```powershell
+$env:META_APPROVAL_SECRET="<hex from step 2>"
+meta_mcp_server --mock
+# Server starts at http://127.0.0.1:8765/mcp
+# [mock mode] No live Meta calls will be made. Account: act_mock001
+```
+
+`--mock` is also enabled by `META_MCP_MOCK=1`. Host/port precedence is unchanged (`--host`/`--port` >
+`MCP_SERVER_HOST`/`MCP_SERVER_PORT` > `127.0.0.1`/`8765`). Leave this terminal running.
+
+### 4. Connect Claude Code
+
+The `meta-suite` entry is already in `.mcp.json` under `mcpServers`, so no edit is needed — Claude Code
+connects to the running process at `http://127.0.0.1:8765/mcp`. Confirm the connection with `/mcp`, or by
+asking Claude to call `server_info`. (Because it is an HTTP server, the entry shows a **connection error**
+whenever the process in step 3 is not running — that is expected, not a misconfiguration.)
+
+### 5. Scripted first session
+
+Run these tool calls in order. The `→` lines show representative output.
+
+```text
+# Step 1 — health check
+server_info()
+# → {"name":"meta-ads-mcp","live_calls_enabled":true,"write_tools_enabled":true,
+#    "approval_required":true,"approval_configured":true, ...}
+#   (live_calls_enabled is a capability flag — it stays true in mock mode; approval_configured is
+#    true only because you set META_APPROVAL_SECRET in step 3.)
+
+# Step 2 — a read tool
+list_campaigns(ad_account_id="act_mock001", fields=["id","name","status"])
+# → [{"id":"campaign_mock001","name":"Demo Campaign","status":"ACTIVE", ...}]
+
+# Step 3 — propose a write (returns a plan_id reference + a per-op summary, never an approvable body)
+propose_set_status(account="act_mock001", id="ad_mock001", level="ad", status="PAUSED")
+# → {"plan_id":"<uuid>","plan_type":"ops","ops":[
+#      {"op":"set_status","id":"ad_mock001","status":"proposed", ...},
+#      {"op":"set_status","id":"adset_mock001","status":"proposed", ...}]}
+#   Note the SECOND op: ad_mock001 is the only ACTIVE ad in adset_mock001, so a companion ad-set pause
+#   is appended (pausing the last live ad leaves the set live-but-not-delivering). Each op is
+#   independently approvable.
+
+# Step 4 — approve, OUT OF BAND, in a SEPARATE shell (this is the human's step, not a tool call)
+#   Give the second shell the SAME secret, then sign the plan:
+$env:META_APPROVAL_SECRET="<same hex from step 2>"
+approve_plan --plan-id <uuid from step 3> --all
+# → Approved 2 ops. Signature written to the proposal.
+
+# Step 5 — preview: a local, write-free dry run of what execute would send (no Meta call)
+preview_plan(plan_id="<uuid from step 3>")
+# → shows would_send (the exact PATCH request) for each APPROVED op.
+#   preview only renders the request for ops that are already approved — run it AFTER step 4, not before
+#   (before approval it reports "not approved — would be skipped").
+
+# Step 6 — execute (the ONLY tool that writes; validate pass first, then apply, then verify)
+execute_plan(plan_id="<uuid from step 3>")
+# → {"executed":true,"plan_id":"<uuid>","ops":[...],"follow_ups":[...]}
+#   In mock mode the no-op write client recorded the writes and outcome verification re-read the fake
+#   reader — no Meta call was made. A verify_next_day_spend follow-up is emitted for the pause.
+```
+
+### 6. Troubleshooting
+
+- **"Connection refused" / server not found:** make sure `meta_mcp_server --mock` (step 3) is running in
+  a terminal *before* you connect or call a tool.
+- **`execute_plan` refused with an approval message:** you did not set `META_APPROVAL_SECRET` before
+  launching (step 3), or you approved with a different secret than the server holds. `server_info` shows
+  `approval_configured: false` when no usable secret is set.
+- **Wrong port:** the URL in `.mcp.json` is `http://127.0.0.1:8765/mcp`; if you launched with a different
+  `--port` / `MCP_SERVER_PORT`, they must match.
+
+### 7. Go live (opt-in)
+
+Only after the mock loop above behaves as expected:
+
+- **Use a sandbox / test ad account for the first live run** — Meta's Ads Sandbox, or a low-budget real
+  account you fully control. Drop `--mock` and set a real token:
+  ```powershell
+  $env:META_APPROVAL_SECRET="<hex>"
+  $env:META_ACCESS_TOKEN="<token>"
+  meta_mcp_server
+  ```
+- **`ads_read` is enough to read and to *validate*.** With a read-only token, reads work and
+  `execute_plan` fails its mandatory `validate_only` pass with a clear `ads_management` scope error —
+  **zero spend risk**. To actually execute a write, the token also needs `ads_management`.
+- **Verify next-day spend = $0** after the first pause (a `PAUSED` write *registering* is necessary but
+  not sufficient proof delivery stopped — same-day spend can still post; `execute_plan` emits a
+  `verify_next_day_spend` follow-up for exactly this). This is the repo's build-safety rule.
+
+### 8. Single-operator note
+
+This is a **single-operator, local** setup. Multi-user auth, roles, and server-side (Azure-hosted)
+approval state are a separate backlog item (`mcp-role-based-access-tiers`) that drops in behind the same
+`ApprovalGate` seam. Do not treat this local rig as the production shape.
 
 ## Notes
 

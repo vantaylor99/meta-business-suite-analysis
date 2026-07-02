@@ -533,6 +533,7 @@ def write_rotation_results(
         "schema_version": 1,
         "plan_type": "audience_rotation",
         "account_slug": plan.get("account_slug"),
+        "plan_id": plan.get("plan_id"),  # present when the plan came from the proposal store (proposals.py)
         "executed": execute,
         "generated_at": _now_iso(),
         "results": [
@@ -732,6 +733,7 @@ def write_advantage_disable_results(
         "schema_version": 1,
         "plan_type": "advantage_disable",
         "account_slug": plan.get("account_slug"),
+        "plan_id": plan.get("plan_id"),  # present when the plan came from the proposal store (proposals.py)
         "executed": execute,
         "generated_at": _now_iso(),
         "results": [

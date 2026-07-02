@@ -55,6 +55,128 @@ CLI proposes each)** is the single source of truth in
 [`../AGENTS.md`](../AGENTS.md) under **Hybrid Meta integration** — it is not duplicated here. The reader
 backend (direct vs MCP) and auth posture also live there and in [`META_API_SETUP.md`](META_API_SETUP.md).
 
+## MCP guarded-write path (`mcp__meta-suite__*`)
+
+The same guarded flow is now reachable over our **own** MCP server (`meta_mcp_server`, client key
+`meta-suite` in `.mcp.json`). This is the important distinction to internalize:
+
+- **`mcp__meta-ads__*`** is the *community* connector. Its write tools fire **immediately** against the
+  Graph API — no propose, no dry run, no confidence, no review. Those write tools are **deny-listed** in
+  `.claude/settings.json` and stay read-only. (This is the rule the Jun-2026 `$300/day IN_PROCESS`
+  incident is named for.)
+- **`mcp__meta-suite__*`** is *our* server. Its write tools are **gated by construction** — every one
+  routes through `propose → human approve → validate → execute → verify`, PAUSED-by-default, with the
+  same grounding + demote-only review as the CLI. They are deliberately **not** deny-listed, because the
+  guardrail is a capability boundary enforced *in the server* (see `src/meta_ads_analysis/proposals.py`),
+  not a prompt rule an agent can be talked out of. The monthly MCP-write auditor still flags any **new**
+  ungated write tool on *either* prefix.
+
+### The tool surface
+
+- **`propose_*`** — build a grounded, reviewed plan and persist it. Returns only a **`plan_id`
+  reference** plus a per-item summary (status / confidence band / review verdict / note) — never an
+  approvable plan body. Each item comes back `proposed` (or demoted by review) — **no propose tool ever
+  emits an `approved` item.** The propose surface spans all four write families, and every one routes
+  through the same `execute_plan` gate:
+  - **Control-ops** (`plan_type: ops`): `propose_set_status`, `propose_set_daily_budget`,
+    `propose_rename`, `propose_set_creative`, `propose_set_creative_features`, `propose_set_age_range`,
+    `propose_set_genders`, `propose_set_geo_locations`, `propose_set_placements`, plus the bulk
+    `propose_enable_ads` / `propose_pause_ads`.
+  - **Authoring** (`plan_type: authoring`, create-only, **every created spending entity forced PAUSED**):
+    `propose_create_campaign`, `propose_create_adset`, `propose_create_ad`, `propose_create_video_ad`,
+    `propose_duplicate_ad`, `propose_lookalike`. A **net-new** create (campaign / ad set / ad / video ad)
+    cites a zero sample → `abstain`, so an approved net-new create is **blocked at apply** until a
+    conscious operator override — creating PAUSED is fine, auto-executing a create on no evidence is not.
+    `propose_duplicate_ad` instead grounds on the **source ad's** own metric (a proven winner is
+    executable). `propose_lookalike` is a **structural abstain** — an audience is inert (no status, never
+    PAUSED, never spends), so the gate allows it. **No delete / archive.**
+  - **Rotation** (`plan_type: audience_rotation` / `advantage_disable`, reversible): `propose_audience_
+    rotation` reads the account's ACTIVE ad sets, rotates each ad set's included custom audience forward
+    by `offset`, and recomputes exclusions (grounded on each ad set's fatigue signal at the correlational
+    tier); `propose_advantage_disable` turns Advantage Audience **off** on each ad set that has it
+    enabled, preserving audiences verbatim (only ever off, never on — a structural abstain the gate
+    allows). Bulk ad-set rename is intentionally **not** an MCP tool — the ops `rename` already covers it.
+  - **Outcome verification is family-aware.** After execute, `execute_plan` re-reads each touched
+    entity: an ops `set_status→PAUSED` emits a `verify_next_day_spend` follow-up; an **authoring** create
+    is read back to confirm its `effective_status` is not ACTIVE (a created-ACTIVE entity is a red flag,
+    since authoring forces PAUSED); a **rotation** write is read back to confirm the new audiences (and,
+    for a disable, `advantage_audience=off`) registered.
+- **`preview_plan(plan_id)`** — a local, **write-free** dry run: shows the request each *approved* op
+  would send. No Meta write (the reader may re-read live state to build a budget/targeting request).
+- **`execute_plan(plan_id)`** — the **only** tool that writes. It loads the plan **by id** (never a
+  body handed in by the agent — that is the anti-forgery seam), refuses if the plan was already executed
+  or has **zero approved ops**, runs a mandatory **`validate_only` pass first**, aborts on any validation
+  failure, then applies the approved ops, writes the audit artifact, and re-reads each entity to verify.
+
+### Approval seam — the human signs, the agent cannot
+
+`execute_plan` consults an `ApprovalGate` before applying. The gate the running server wires
+(`proposals.select_approval_gate_from_env`) is the **local, single-operator** approval gate:
+
+- **`HmacApprovalGate`** (when `META_APPROVAL_SECRET` is set): approval is an **HMAC-SHA256 signature
+  over the plan body**, keyed by a secret the agent's MCP tool surface never holds. It is
+  produced **out-of-band** by the human-run `approve_plan` CLI and verified (constant-time) inside
+  `execute_plan`. The agent can freely edit the persisted proposal JSON — but any edit to the signed
+  body (adding/removing an approved op, changing a param/target/level, stripping the
+  confidence/evidence the grounding gate needs, **or flipping a plan-level guardrail such as
+  `guardrails.requires_grounding` off, or redirecting `ad_account_id`**) changes the recompute and is
+  rejected, and the agent cannot produce a matching signature without the secret. The signed payload
+  binds the `plan_id` (blocks copying an approval block from plan A onto plan B) and the `approved_at`
+  timestamp (blocks forward-dating to defeat the TTL); only the self-referential `approval` and
+  `execution` blocks are excluded. Approvals expire after `META_APPROVAL_TTL_SECONDS` (default 24 h;
+  empty/`0` disables).
+- **`DeniedApprovalGate`** (when no secret is set): the seam **fails closed** — `execute_plan` refuses
+  every write with setup guidance, while reads (never gated) keep working. This is the deliberate
+  opposite of the old forgeable-open default.
+
+Since **no `propose_*` tool ever emits an `approved` item**, a freshly-proposed plan also has zero
+approved ops — so even before the gate runs, `execute_plan` would refuse. The gate is what makes a
+*hand-edited* `status: approved` unforgeable.
+
+**The local loop is: propose (agent) → review + `approve_plan` (you) → `execute_plan` (agent).**
+
+```powershell
+# One-time: generate a secret and set it in BOTH the server shell and your approve shell.
+python -c "import secrets; print(secrets.token_hex(32))"   # -> META_APPROVAL_SECRET
+# (export META_APPROVAL_SECRET=<hex>   — or point META_APPROVAL_SECRET_FILE at a file holding it.)
+# Keep it OUT of the repo. It must never be returned by a tool or written into a proposal/audit.
+
+# Agent proposes over MCP; it hands you a plan_id. You review and approve out-of-band:
+approve_plan --plan-id <plan_id> --all          # or one/more --op-id <id> to approve a subset
+approve_plan --plan-id <plan_id> --all --yes    # skip the confirm prompt (scripting); security is the secret
+
+# The agent then calls execute_plan(plan_id) over MCP — HmacApprovalGate verifies your signature.
+```
+
+See [META_API_SETUP.md → Run the Meta MCP server locally](META_API_SETUP.md#run-the-meta-mcp-server-locally)
+for the step-by-step local launch (mock mode by default), `.mcp.json` wiring, and a scripted first session.
+
+`server_info` exposes `approval_required: true` and `approval_configured` (a token-free health signal:
+whether a usable secret is set) so an operator can see at a glance whether the gate is armed.
+
+**Residual local limitation (accepted tradeoff, not a bug).** On a single-user machine an actor that can
+read the MCP server process's environment or the secret file could forge a signature. That is exactly
+what the multi-user, role-based ticket (`mcp-role-based-access-tiers`, Entra ID + server-side approval
+state in Azure) removes — and it drops in behind this **same** `ApprovalGate` seam, without rewriting
+`execute_plan`.
+
+### Media uploads are NOT exposed (documented exception)
+
+`upload_video` / `upload_image` create inert, **unreferenced** assets and bypass the gate, so they are
+**not** MCP tools — the MCP write surface stays 100% gated. The operator uploads via the CLI
+(`upload_video` / `upload_image`), obtains asset ids, then the agent proposes
+`propose_create_video_ad` / `propose_create_ad` with those already-uploaded asset ids (the `video_id` /
+`creative_id` argument). The authoring propose tools accept an id; they never upload.
+
+### PAUSED ≠ delivery stopped — verify next-day spend
+
+A `set_status → PAUSED` write *registering* is **necessary but not sufficient** proof delivery stopped:
+same-day spend can still post. `execute_plan` therefore emits a structured `verify_next_day_spend`
+follow-up marker for every executed pause, and re-reads each entity's `effective_status` as an outcome
+check. Relatedly, pausing an ad set's **last ACTIVE ad** leaves the ad set nominally live but delivering
+nothing — so `propose_set_status(status="PAUSED")` on such an ad also proposes a companion pause on the
+parent ad set (each op independently approvable). Enabling (ACTIVE) deliberately does **not** cascade.
+
 ## Commands
 
 Generate a plan:

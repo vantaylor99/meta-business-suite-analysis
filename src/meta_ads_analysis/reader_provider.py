@@ -588,6 +588,18 @@ def as_reader(reader_or_client: Any) -> MetaReaderProvider | None:
 READER_BACKEND_ENV = "META_READER_BACKEND"
 
 
+def reader_backend_from_env() -> str:
+    """Return the configured read backend string, normalized (lowercased, trimmed).
+
+    Token-free and construction-free: reads only ``META_READER_BACKEND`` (default ``"direct"``)
+    and returns the raw normalized value **without validating it**. This is the single source of
+    the backend-name normalization rule; :func:`reader_from_env` calls it and is the only place
+    that validates/raises on an unknown backend. A health probe (the MCP ``server_info`` tool)
+    reports this string verbatim, so it must not raise on an unrecognized value.
+    """
+    return (os.environ.get(READER_BACKEND_ENV) or "direct").strip().lower()
+
+
 def reader_from_env(
     api_version: str | None = None,
     *,
@@ -603,7 +615,7 @@ def reader_from_env(
     executor **raises** rather than silently degrading. Reads-only either way — writes always use
     the direct client.
     """
-    backend = (os.environ.get(READER_BACKEND_ENV) or "direct").strip().lower()
+    backend = reader_backend_from_env()
     if backend in ("", "direct"):
         return DirectMetaReader.from_env(api_version)
     if backend == "mcp":
