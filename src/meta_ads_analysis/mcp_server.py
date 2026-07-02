@@ -126,42 +126,76 @@ MOCK_INSIGHT: dict[str, Any] = {
 MOCK_DELIVERY_ESTIMATE: dict[str, Any] = {"estimate_dau": 10000, "estimate_mau": 50000}
 
 
+def _fresh_mock_entities() -> dict[str, dict[str, Any]]:
+    """Fresh, MUTABLE demo entities keyed by id, shared between the mock reader and the mock write
+    client so a write is visible to the post-write verify read — mirroring how a live account behaves
+    (the point of the verify step). Fresh ``dict(...)`` copies per call keep the module constants pristine."""
+    return {
+        MOCK_CAMPAIGN["id"]: dict(MOCK_CAMPAIGN),
+        MOCK_ADSET["id"]: dict(MOCK_ADSET),
+        MOCK_AD["id"]: dict(MOCK_AD),
+    }
+
+
 class _MockWriteClient:
-    """No-op write client for ``--mock`` mode: records calls, returns success, never contacts Meta.
+    """Write client for ``--mock`` mode: records calls and mutates the SHARED entity store so a
+    post-write verify read reflects the change (as a live account would), and never contacts Meta.
 
     Implements the write methods ``control._update_entity`` dispatches to (``update_ad`` / ``update_adset``
     / ``update_campaign``) plus the authoring ``create_*`` methods, and the ``get_*`` reads a re-read would
-    use — all returning the same canned shapes as :func:`build_mock_reader` so a post-execute verification
-    read is consistent. The ``update_*`` methods return ``{"success": True}`` for BOTH the mandatory
-    ``validate_only=True`` pass and the real ``validate_only=False`` write, so neither pass looks like a
-    failure to :func:`meta_ads_analysis.control.apply_ops_plan`.
+    use. The ``update_*`` methods return ``{"success": True}`` for BOTH the mandatory ``validate_only=True``
+    pass and the real ``validate_only=False`` write, so neither pass looks like a failure to
+    :func:`meta_ads_analysis.control.apply_ops_plan`; only the real (non-validate) write mutates state, so
+    the validate pass stays side-effect-free.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, entities: dict[str, dict[str, Any]] | None = None) -> None:
+        # Share this dict with the mock reader (pass the same one to build_mock_reader) so a write shows
+        # up on the verify read. Defaults to a private store when constructed standalone.
+        self._entities = entities if entities is not None else _fresh_mock_entities()
         # (method, id, params, validate_only) for each recorded write — inspectable in tests / the REPL.
         self.writes: list[tuple[str, str, dict[str, Any], bool]] = []
 
+    def _apply(self, entity_id: str, params: dict[str, Any], validate_only: bool) -> None:
+        # Only the REAL write mutates shared state; the validate_only pass is deliberately side-effect-free.
+        if validate_only:
+            return
+        entity = self._entities.get(entity_id)
+        if entity is None:
+            return
+        if "status" in params:
+            # Reflect the toggle on both status and effective_status so a verify read shows it.
+            entity["status"] = params["status"]
+            entity["effective_status"] = params["status"]
+        for field in ("daily_budget", "name"):
+            if field in params:
+                entity[field] = params[field]
+
     def update_ad(self, ad_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
         self.writes.append(("update_ad", ad_id, params, validate_only))
+        self._apply(ad_id, params, validate_only)
         return {"success": True}
 
     def update_adset(self, adset_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
         self.writes.append(("update_adset", adset_id, params, validate_only))
+        self._apply(adset_id, params, validate_only)
         return {"success": True}
 
     def update_campaign(self, campaign_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
         self.writes.append(("update_campaign", campaign_id, params, validate_only))
+        self._apply(campaign_id, params, validate_only)
         return {"success": True}
 
-    # Read-backs (used only if a re-read reached the client instead of the explicit reader).
+    # Read-backs (used only if a re-read reached the client instead of the explicit reader). Read from the
+    # shared store so they agree with the reader after a write.
     def get_ad(self, ad_id: str, *, fields: list[str]) -> dict[str, Any]:
-        return dict(MOCK_AD)
+        return dict(self._entities.get(ad_id, MOCK_AD))
 
     def get_adset(self, adset_id: str, *, fields: list[str]) -> dict[str, Any]:
-        return dict(MOCK_ADSET)
+        return dict(self._entities.get(adset_id, MOCK_ADSET))
 
     def get_campaign(self, campaign_id: str, *, fields: list[str]) -> dict[str, Any]:
-        return dict(MOCK_CAMPAIGN)
+        return dict(self._entities.get(campaign_id, MOCK_CAMPAIGN))
 
     # Authoring creates (created entities are inspected for a non-ACTIVE effective_status post-execute).
     def create_campaign(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -177,20 +211,27 @@ class _MockWriteClient:
         return {"id": "audience_mock_new"}
 
 
-def build_mock_reader() -> FakeMetaReader:
+def build_mock_reader(entities: dict[str, dict[str, Any]] | None = None) -> FakeMetaReader:
     """A :class:`FakeMetaReader` pre-seeded for ``act_mock001`` so every exposed read tool returns canned
-    data with no ``META_ACCESS_TOKEN`` and no live call. ``iter_paginated`` is seeded as a **callable**
-    because ``FakeMetaReader`` invokes callable stubs with the positional path arg; the rest are plain
-    values. Fresh ``dict(...)`` copies keep callers from mutating the shared module constants."""
+    data with no ``META_ACCESS_TOKEN`` and no live call.
+
+    Entity reads (``get_ad`` / ``get_adset`` / ``get_campaign`` and their list/fetch variants) are seeded
+    as **callables over a shared, mutable entity store**, so that after a mock write flips an entity's
+    status the post-write verify read reflects it — the same store the paired :class:`_MockWriteClient`
+    mutates. Pass the same ``entities`` dict to both. Each read returns a fresh ``dict(...)`` copy so a
+    caller can't mutate the store by accident. ``iter_paginated`` stays a callable because
+    ``FakeMetaReader`` invokes callable stubs with the call args."""
+    ents = entities if entities is not None else _fresh_mock_entities()
+    ad, adset, campaign = ents[MOCK_AD["id"]], ents[MOCK_ADSET["id"]], ents[MOCK_CAMPAIGN["id"]]
     return FakeMetaReader(
         get_account=dict(MOCK_ACCOUNT),
-        list_campaigns=[dict(MOCK_CAMPAIGN)],
-        get_campaign=dict(MOCK_CAMPAIGN),
-        list_adsets=[dict(MOCK_ADSET)],
-        get_adset=dict(MOCK_ADSET),
-        fetch_ads=[dict(MOCK_AD)],
-        get_ad=dict(MOCK_AD),
-        iter_paginated=lambda path_or_url=None, params=None: [dict(MOCK_AD)],
+        list_campaigns=lambda *a, **k: [dict(campaign)],
+        get_campaign=lambda campaign_id, *, fields: dict(ents.get(campaign_id, campaign)),
+        list_adsets=lambda *a, **k: [dict(adset)],
+        get_adset=lambda adset_id, *, fields: dict(ents.get(adset_id, adset)),
+        fetch_ads=lambda *a, **k: [dict(ad)],
+        get_ad=lambda ad_id, *, fields: dict(ents.get(ad_id, ad)),
+        iter_paginated=lambda path_or_url=None, params=None: [dict(ad)],
         fetch_insights=[dict(MOCK_INSIGHT)],
         list_custom_audiences=[],
         list_pixels=[],
@@ -805,8 +846,10 @@ def build_server(host: str, port: int, *, mock: bool = False):
     # branch) so a mis-configured launch prints guidance instead of leaking a bare traceback out of main().
     write_client: Any | None
     if mock:
-        reader: MetaReaderProvider = build_mock_reader()
-        write_client = _MockWriteClient()
+        # One shared entity store so a mock write is visible to the verify read (mirrors live behavior).
+        mock_entities = _fresh_mock_entities()
+        reader: MetaReaderProvider = build_mock_reader(mock_entities)
+        write_client = _MockWriteClient(mock_entities)
         print(
             f"[mock mode] No live Meta calls will be made. Account: {MOCK_ACCOUNT_ID}",
             file=sys.stderr,
@@ -849,7 +892,9 @@ def _env_flag(name: str) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the custom Meta MCP server (HTTP).")
+    parser = argparse.ArgumentParser(
+        description="Run the custom Meta MCP server (HTTP by default, or --stdio for a local Claude Desktop server)."
+    )
     parser.add_argument("--host", default=os.environ.get("MCP_SERVER_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(os.environ.get("MCP_SERVER_PORT", DEFAULT_PORT)))
     parser.add_argument(
@@ -859,8 +904,19 @@ def main() -> None:
         help="Launch without a live token: canned reads + a no-op write client (zero live Meta calls). "
         "Also enabled by META_MCP_MOCK=1. META_APPROVAL_SECRET is still required to execute a write.",
     )
+    parser.add_argument(
+        "--stdio",
+        action="store_true",
+        default=_env_flag("MCP_STDIO"),
+        help="Run over the stdio transport for a LOCAL Claude Desktop MCP server (Settings -> Developer "
+        "-> Edit Config) instead of HTTP; --host/--port are ignored. Also enabled by MCP_STDIO=1.",
+    )
     args = parser.parse_args()
     mcp = build_server(args.host, args.port, mock=args.mock)
+    if args.stdio:
+        # stdio speaks the MCP protocol over stdin/stdout — no socket bind, so no host/port and no OSError.
+        mcp.run(transport="stdio")
+        return
     try:
         mcp.run(transport="streamable-http")
     except OSError as exc:  # port in use / bad host bind

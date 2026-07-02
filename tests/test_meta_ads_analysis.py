@@ -9079,6 +9079,43 @@ def test_main_wraps_oserror_as_actionable_systemexit(monkeypatch) -> None:
     assert "127.0.0.1:8765" in str(excinfo.value)
 
 
+def test_main_stdio_runs_over_stdio_transport(monkeypatch) -> None:
+    # --stdio selects the stdio transport (local Claude Desktop) and skips the HTTP OSError-wrapping path.
+    ran: dict = {}
+
+    class _M:
+        def run(self, transport: str) -> None:
+            ran["transport"] = transport
+
+    monkeypatch.setattr(_mcp_server, "build_server", lambda host, port, *, mock=False: _M())
+    monkeypatch.delenv("MCP_STDIO", raising=False)
+    monkeypatch.delenv("META_MCP_MOCK", raising=False)
+    monkeypatch.setattr(sys, "argv", ["meta_mcp_server", "--stdio"])
+    _mcp_server.main()
+    assert ran["transport"] == "stdio"
+
+
+def test_mock_write_flips_shared_entity_state_for_verify_read() -> None:
+    # The mock reader and mock write client share one entity store, so a REAL write is visible to the
+    # post-write verify read (mirrors live behavior); the validate_only pass stays side-effect-free.
+    entities = _mcp_server._fresh_mock_entities()
+    reader = _mcp_server.build_mock_reader(entities)
+    client = _mcp_server._MockWriteClient(entities)
+
+    # validate pass must NOT mutate.
+    client.update_ad("ad_mock001", params={"status": "PAUSED"}, validate_only=True)
+    assert reader.get_ad("ad_mock001", fields=["status"])["status"] == "ACTIVE"
+
+    # real write flips both status and effective_status, visible to the verify read.
+    client.update_ad("ad_mock001", params={"status": "PAUSED"}, validate_only=False)
+    ad = reader.get_ad("ad_mock001", fields=["status", "effective_status"])
+    assert ad["status"] == "PAUSED" and ad["effective_status"] == "PAUSED"
+
+    # companion ad-set pause is likewise visible.
+    client.update_adset("adset_mock001", params={"status": "PAUSED"}, validate_only=False)
+    assert reader.get_adset("adset_mock001", fields=["status"])["status"] == "PAUSED"
+
+
 # --- Meta MCP server read tools (MOCKS ONLY: no live Meta call anywhere; no socket bound) ---
 #
 # All read-tool *logic* is exercised through the pure build_read_tools(reader) seam with a
