@@ -285,6 +285,39 @@ connects to the running process at `http://127.0.0.1:8765/mcp`. Confirm the conn
 asking Claude to call `server_info`. (Because it is an HTTP server, the entry shows a **connection error**
 whenever the process in step 3 is not running — that is expected, not a misconfiguration.)
 
+### 4b. Connect Claude Desktop instead (local stdio server)
+
+On **Claude Desktop** — especially a **managed/corporate workspace where custom connectors are disabled
+by org policy** — connect a *local* server over **stdio** rather than the HTTP URL. Claude Desktop launches
+the process on demand from your machine: no port, no tunnel, no connector UI, and it is governed by the
+local Developer config rather than the org connector policy. Use the `--stdio` flag.
+
+1. Open **Settings → Developer → Edit Config** and add, at the **top level** of the JSON (a sibling of any
+   existing keys — do not nest it inside another object):
+
+   ```json
+   {
+     "mcpServers": {
+       "meta-ads-mock": {
+         "command": "/abs/path/to/.venv/bin/meta_mcp_server",
+         "args": ["--stdio", "--mock"],
+         "env": { "META_APPROVAL_SECRET": "<hex from step 2>" }
+       }
+     }
+   }
+   ```
+
+   The `env` block passes the approval secret to the launched process (Claude Desktop does not read your
+   shell env). Use the **same** secret when you `approve_plan` in the scripted session below. `--stdio` is
+   also enabled by `MCP_STDIO=1`; `--host`/`--port` are ignored on this transport.
+
+2. Fully **quit and reopen** Claude Desktop. The server appears under **Settings → Developer → Local MCP
+   servers** with a `running` badge, and its tools are available in chat. Everything else — the guarded
+   loop, out-of-band `approve_plan`, mock safety — is identical to the HTTP path; only the transport differs.
+
+   Going live over stdio is the same opt-in as §7: drop `--mock` from `args` and add
+   `"META_ACCESS_TOKEN": "<token>"` to the `env` block.
+
 ### 5. Scripted first session
 
 Run these tool calls in order. The `→` lines show representative output.
