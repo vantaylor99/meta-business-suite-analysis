@@ -1600,6 +1600,174 @@ def build_budget_plan(
     return review.review_ops_plan(plan)
 
 
+# --- Single-op builder: rename / creative / targeting (no dedicated builder) -
+
+
+def build_single_op_plan(
+    reader: MetaReaderProvider | MetaMarketingApiClient,
+    ad_account_id: str,
+    *,
+    op: str,
+    level: str,
+    id: str,
+    params: dict[str, Any],
+    account_slug: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    run_date: str | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a one-op grounded ops plan for the direction / no-metric ops that have no dedicated
+    builder: ``rename`` / ``set_creative`` / ``set_creative_features`` and the four ``TARGETING_OPS``.
+
+    ``build_enable_ads_plan`` / ``build_pause_plan`` / ``build_budget_plan`` cover status + budget with
+    their own metric-grounded evidence. The ops handled here carry no performance metric (renaming an
+    entity, swapping a creative id, tightening targeting), so the op abstains **structurally** — an
+    honest "no sample" abstain that the apply-time grounding gate ALLOWS (the same treatment as a safety
+    PAUSE), never a fabricated ``low``/``medium`` band. The op is validated by :func:`validate_op` (the
+    single source of the op guardrails — unsupported ops, wrong levels, blocked Meta-AI/Advantage+
+    params), grounded via :func:`write_grounding.attach_op_grounding`, and the whole plan is run through
+    :func:`review.review_ops_plan` before return, so the op comes back ``proposed`` (or demoted), never
+    pre-approved. Read-only: it may resolve the grounding window but issues no write.
+    """
+    reader = as_reader(reader)
+    policy = policy if policy is not None else resolve_action_policy(account_slug)
+    date_from, date_to, recency_days, run_date_iso = _resolve_grounding_window(date_from, date_to, run_date)
+    op_dict: dict[str, Any] = {
+        "op_id": f"{op}_{level}_{id}",
+        "op": op,
+        "level": level,
+        "id": id,
+        "params": dict(params or {}),
+        "status": PROPOSED_STATUS,
+        "note": f"proposed {op} on {level} {id}",
+    }
+    # Fail fast on a malformed op / a blocked AI param BEFORE grounding + review (mirror the builder's
+    # ValueError so a bad tool call surfaces a clear error rather than a half-built plan).
+    validate_op(op_dict)
+    # Structural (no-metric) grounding: evidence=None -> abstain with NO sample cited -> the apply-time
+    # gate ALLOWS it (structural abstain, exactly like a safety PAUSE). A pure ``rename`` is exempt from
+    # the gate entirely (cosmetic — see GROUNDING_REQUIRED_OPS).
+    attach_op_grounding(
+        op_dict,
+        evidence=None,
+        tier=EvidenceTier.direct_observation,
+        spend_floor=MIN_WASTE_SPEND,
+        conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=recency_days,
+    )
+    plan = {
+        "schema_version": 1,
+        "plan_type": "ops",
+        "intent": op,
+        "account_slug": account_slug,
+        "ad_account_id": ad_account_id,
+        "generated_at": _now_iso(),
+        "run_date": run_date_iso,
+        "account_action_policy": policy,
+        "selection": {"date_from": date_from, "date_to": date_to},
+        "approval_instructions": (
+            "Review the op. To apply it, set its status to 'approved'. Only approved ops are sent to "
+            "Meta, and only via execute (after a mandatory validate-only pass)."
+        ),
+        "guardrails": {
+            "requires_explicit_approval": True,
+            "requires_grounding": True,
+        },
+        "ops": [op_dict],
+    }
+    return review.review_ops_plan(plan)
+
+
+def append_last_active_ad_pause(
+    reader: MetaReaderProvider | MetaMarketingApiClient,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """If a ``set_status``→PAUSED op in ``plan`` targets the LAST ACTIVE ad in its ad set, append a
+    companion ``set_status``→PAUSED op for the parent **ad set** (each op independently approvable) and
+    re-review the plan. Returns a NEW reviewed plan; the input plan is returned unchanged when no pause
+    op is the last active ad in its set.
+
+    Carries the pausing lesson forward: pausing an ad set's only remaining live ad leaves the ad set
+    nominally "active" but delivering nothing — so we surface the ad-set pause as its own approvable op.
+    Enabling (ACTIVE) deliberately does NOT cascade — only pausing. Idempotent: skips an ad set that
+    already carries a pause op in this plan. Read-only (reads the ad + the account's ads via ``reader``).
+    """
+    reader = as_reader(reader)
+    ad_account_id = str(plan.get("ad_account_id") or "")
+    ops = list(plan.get("ops") or [])
+    # Ad-set ids that already carry a pause op here (avoid a duplicate / conflicting companion).
+    paused_adset_ids = {
+        str(o.get("id"))
+        for o in ops
+        if isinstance(o, dict)
+        and o.get("op") == "set_status"
+        and o.get("level") == "adset"
+        and str((o.get("params") or {}).get("status") or "").upper() == "PAUSED"
+    }
+    all_ads: list[dict[str, Any]] | None = None
+    companions: list[dict[str, Any]] = []
+    for op in ops:
+        if not isinstance(op, dict) or op.get("op") != "set_status" or op.get("level") != "ad":
+            continue
+        if str((op.get("params") or {}).get("status") or "").upper() != "PAUSED":
+            continue
+        ad_id = str(op.get("id") or "")
+        if not ad_id:
+            continue
+        ad = _get_entity(reader, "ad", ad_id, ["id", "adset_id", "effective_status"])
+        # Only cascade when the ad being paused is itself currently delivering; pausing an already-off
+        # ad changes no delivery, so no companion is warranted.
+        if ad.get("effective_status") != "ACTIVE":
+            continue
+        adset_id = _optional_str(ad.get("adset_id"))
+        if not adset_id or adset_id in paused_adset_ids:
+            continue
+        if all_ads is None:
+            all_ads = list(
+                reader.iter_paginated(
+                    f"/{ad_account_id}/ads", params={"fields": ",".join(AD_FIELDS), "limit": 200}
+                )
+            )
+        active_siblings = [
+            a
+            for a in all_ads
+            if str(a.get("adset_id")) == adset_id
+            and a.get("effective_status") == "ACTIVE"
+            and str(a.get("id")) != ad_id
+        ]
+        if active_siblings:
+            continue  # not the last active ad — pausing it leaves the ad set delivering
+        companion = {
+            "op_id": f"pause_adset_{adset_id}",
+            "op": "set_status",
+            "level": "adset",
+            "id": adset_id,
+            "params": {"status": "PAUSED"},
+            "status": PROPOSED_STATUS,
+            "note": (
+                f"companion pause: ad {ad_id} is the LAST ACTIVE ad in ad set {adset_id}; pausing it "
+                "alone leaves the ad set live but delivering nothing. Approve to pause the ad set too."
+            ),
+            "companion_for_ad_id": ad_id,
+        }
+        attach_op_grounding(
+            companion,
+            evidence=None,
+            tier=EvidenceTier.direct_observation,
+            spend_floor=MIN_WASTE_SPEND,
+            conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+            recency_days=None,
+        )
+        companions.append(companion)
+        paused_adset_ids.add(adset_id)
+    if not companions:
+        return plan
+    new_plan = dict(plan)
+    new_plan["ops"] = ops + companions
+    return review.review_ops_plan(new_plan)
+
+
 # --- Paths / writers --------------------------------------------------------
 
 
@@ -1645,6 +1813,7 @@ def write_ops_results(*, plan: dict[str, Any], results: list[OpResult], output_p
         "plan_type": "ops",
         "intent": plan.get("intent"),
         "account_slug": plan.get("account_slug"),
+        "plan_id": plan.get("plan_id"),  # present when the plan came from the proposal store (proposals.py)
         "executed": execute,
         "generated_at": _now_iso(),
         "results": [

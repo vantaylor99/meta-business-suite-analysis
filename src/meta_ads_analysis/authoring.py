@@ -416,6 +416,128 @@ def _attach_lookalike_grounding(
 # --- Convenience builders ---------------------------------------------------
 
 
+def _build_netnew_create_plan(
+    ad_account_id: str,
+    *,
+    kind: str,
+    params: dict[str, Any],
+    op_id: str,
+    note: str,
+    entity_level: str,
+    account_slug: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    run_date: str | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Shared net-new create builder (campaign / ad set / ad with an existing creative).
+
+    Validates the op with :func:`validate_authoring_op` (required-param enforcement lives there — this
+    reuses it rather than duplicating the checks), grounds it on a **zero** sample via
+    :func:`_attach_netnew_grounding` (net-new → ``abstain``: the create is forced PAUSED regardless, and
+    an *approved* create is blocked at apply until a conscious operator override — the cold-create
+    boundary), then wraps + reviews the plan. No live read is needed: a net-new create has no prior
+    entity to measure."""
+    validate_authoring_op({"kind": kind, "params": params})
+    op = {
+        "op_id": op_id,
+        "kind": kind,
+        "params": dict(params),
+        "status": PROPOSED_STATUS,
+        "note": note,
+    }
+    policy = policy if policy is not None else resolve_action_policy(account_slug)
+    goal = policy.get("primary_goal")
+    date_from, date_to, recency_days, run_date_iso = _resolve_grounding_window(date_from, date_to, run_date)
+    _attach_netnew_grounding(
+        op, entity_level=entity_level, goal=goal, account_slug=account_slug,
+        date_from=date_from, date_to=date_to, recency_days=recency_days,
+    )
+    return _wrap_plan([op], ad_account_id, account_slug, intent=kind, run_date=run_date_iso, policy=policy)
+
+
+def build_create_campaign_plan(
+    ad_account_id: str,
+    *,
+    name: str,
+    objective: str,
+    special_ad_categories: list[str] | None = None,
+    params: dict[str, Any] | None = None,
+    account_slug: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    run_date: str | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Plan to create a campaign (net-new → grounded on a zero sample → ``abstain``; forced PAUSED).
+
+    ``params`` carries any extra campaign fields (``buying_type``, ``bid_strategy``, …); ``name`` and
+    ``objective`` are required (enforced by :func:`validate_authoring_op`). ``special_ad_categories``
+    defaults to ``[]`` in :func:`_build_create` if omitted."""
+    body: dict[str, Any] = dict(params or {})
+    body["name"] = name
+    body["objective"] = objective
+    if special_ad_categories is not None:
+        body["special_ad_categories"] = special_ad_categories
+    return _build_netnew_create_plan(
+        ad_account_id, kind="create_campaign", params=body, entity_level="campaign",
+        op_id=f"create_campaign_{name}", note=f"create campaign '{name}' ({objective}); created PAUSED",
+        account_slug=account_slug, date_from=date_from, date_to=date_to, run_date=run_date, policy=policy,
+    )
+
+
+def build_create_adset_plan(
+    ad_account_id: str,
+    *,
+    name: str,
+    campaign_id: str,
+    params: dict[str, Any] | None = None,
+    account_slug: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    run_date: str | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Plan to create an ad set under a campaign (net-new → ``abstain``; forced PAUSED).
+
+    ``params`` carries the rest of the ad set body (``optimization_goal``, ``billing_event``,
+    ``targeting``, ``daily_budget``, ``promoted_object``, …); ``name`` and ``campaign_id`` are required
+    (enforced by :func:`validate_authoring_op`)."""
+    body: dict[str, Any] = dict(params or {})
+    body["name"] = name
+    body["campaign_id"] = campaign_id
+    return _build_netnew_create_plan(
+        ad_account_id, kind="create_adset", params=body, entity_level="adset",
+        op_id=f"create_adset_{name}_in_{campaign_id}",
+        note=f"create ad set '{name}' under campaign {campaign_id}; created PAUSED",
+        account_slug=account_slug, date_from=date_from, date_to=date_to, run_date=run_date, policy=policy,
+    )
+
+
+def build_create_ad_plan(
+    ad_account_id: str,
+    *,
+    name: str,
+    adset_id: str,
+    creative_id: str,
+    account_slug: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    run_date: str | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Plan to create an ad in an ad set from an **existing** creative id (net-new → ``abstain``; forced
+    PAUSED). To recreate a *proven* ad's creative instead — grounded on that source ad's own metric —
+    use :func:`build_duplicate_ad_plan`."""
+    body = {"name": name, "adset_id": adset_id, "creative": {"creative_id": creative_id}}
+    return _build_netnew_create_plan(
+        ad_account_id, kind="create_ad", params=body, entity_level="ad",
+        op_id=f"create_ad_{name}_in_{adset_id}",
+        note=f"create ad '{name}' in ad set {adset_id} (creative {creative_id}); created PAUSED",
+        account_slug=account_slug, date_from=date_from, date_to=date_to, run_date=run_date, policy=policy,
+    )
+
+
 def build_duplicate_ad_plan(
     reader: MetaReaderProvider | MetaMarketingApiClient,
     ad_account_id: str,
@@ -640,6 +762,7 @@ def write_authoring_results(*, plan: dict[str, Any], results: list[AuthoringResu
         "plan_type": "authoring",
         "intent": plan.get("intent"),
         "account_slug": plan.get("account_slug"),
+        "plan_id": plan.get("plan_id"),  # present when the plan came from the proposal store (proposals.py)
         "executed": execute,
         "generated_at": _now_iso(),
         "results": [

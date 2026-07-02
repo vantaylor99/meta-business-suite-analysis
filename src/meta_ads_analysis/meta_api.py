@@ -32,10 +32,21 @@ class MetaApiError(RuntimeError):
     """Raised when the Meta API returns an operator-actionable error."""
 
 
+def meta_api_version_from_env(api_version: str | None = None) -> str:
+    """Resolve the effective Meta API version: explicit arg > ``META_API_VERSION`` > default.
+
+    Token-free: unlike :func:`client_from_env` this constructs nothing and never touches
+    ``META_ACCESS_TOKEN``, so a health probe (the MCP ``server_info`` tool) can report the
+    configured version with no credentials present. This is the single source of the
+    version-resolution rule; ``client_from_env`` calls it.
+    """
+    return api_version or os.environ.get("META_API_VERSION") or DEFAULT_META_API_VERSION
+
+
 def client_from_env(api_version: str | None = None) -> "MetaMarketingApiClient":
     """Build a client from META_ACCESS_TOKEN / META_API_VERSION environment variables."""
     access_token = os.environ.get("META_ACCESS_TOKEN", "").strip()
-    effective_version = api_version or os.environ.get("META_API_VERSION") or DEFAULT_META_API_VERSION
+    effective_version = meta_api_version_from_env(api_version)
     return MetaMarketingApiClient(access_token=access_token, api_version=effective_version)
 
 
