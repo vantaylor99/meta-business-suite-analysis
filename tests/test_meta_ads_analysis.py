@@ -4095,12 +4095,39 @@ def test_targeting_ops_validation() -> None:
         {"op_id": "x", "op": "set_geo_locations", "level": "adset", "id": "as1", "params": {"geo_locations": {}}},
         {"op_id": "x", "op": "set_placements", "level": "adset", "id": "as1", "params": {}},
         {"op_id": "x", "op": "set_age_range", "level": "campaign", "id": "c1", "params": {"age_min": 18, "age_max": 65}},
+        {"op_id": "x", "op": "set_custom_audiences", "level": "adset", "id": "as1", "params": {"custom_audiences": []}},
+        {"op_id": "x", "op": "set_custom_audiences", "level": "adset", "id": "as1", "params": {"custom_audiences": ["A"], "excluded_custom_audiences": "B"}},
+        {"op_id": "x", "op": "set_custom_audiences", "level": "campaign", "id": "c1", "params": {"custom_audiences": ["A"]}},
     ]:
         try:
             _validate_op(bad)
             raise AssertionError(f"expected ValueError for {bad}")
         except ValueError:
             pass
+    # valid set_custom_audiences passes validation
+    _validate_op({"op_id": "x", "op": "set_custom_audiences", "level": "adset", "id": "as1", "params": {"custom_audiences": ["A", "B"]}})
+
+
+def test_apply_set_custom_audiences_swaps_included_preserves_rest() -> None:
+    # Ad set targets [old-lal] + excludes [X], with Advantage+ off and a geo/age set.
+    adsets = [_adset("as1", "Engaged", ["seed", "old-lal"], ["X"])]
+    plan = {
+        "guardrails": {"requires_grounding": False},
+        "ops": [
+            {"op_id": "swap", "op": "set_custom_audiences", "level": "adset", "id": "as1",
+             "params": {"custom_audiences": ["seed", "new-lal"]}, "status": "approved"},
+        ],
+    }
+    client = _FakeClient(adsets)
+    results = apply_ops_plan(plan, client, execute=True)
+    assert {r.status for r in results} == {"executed"}
+    sent = client.updates[0][1]["targeting"]
+    # included audiences swapped wholesale (id-only form); broken lookalike gone, seed kept
+    assert sent["custom_audiences"] == [{"id": "seed"}, {"id": "new-lal"}]
+    # everything else preserved by the read-modify-write
+    assert sent["excluded_custom_audiences"] == [{"id": "X", "name": "aud-X"}]
+    assert sent["geo_locations"] == {"countries": ["US"]}
+    assert sent["age_min"] == 25
 
 
 def test_apply_targeting_ops_read_modify_write_preserves_other_fields() -> None:

@@ -2,6 +2,39 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-07-02 (root-cause + action) — broken lookalikes found; rebuilt Engaged's 5% US LAL and swapped it in; shipped `set_custom_audiences` op
+
+**This reframes the whole post-Jun-22 "tank." It was never one thing — it's three layers, and the ad-specific one is a real, fixable bug.**
+
+Investigation (operator Van pushed: "these are the lowest numbers in account history, we're missing something"):
+- **Funnel localizes it to demand, not delivery/checkout.** Shopify-pixel on-site funnel pre (Jun 15–22) vs post (Jun 24–Jul 1): PageView −42%, ViewContent −41%, AddToCart −53%, Purchase −47% — the *whole* funnel scaled down proportionally and **conversion rates held** (PageView→Purchase 1.38%→1.26%; Cart→Purchase 31%→35%). So checkout/site is fine; total site traffic fell ~42%.
+- **Father's Day was Jun 21.** The "cliff" (Jun 23) is two days after it. Our "healthy baseline" (30d ending Jun 22, 3.6 ROAS) was the spring-gifting + Father's-Day peak; Jun 23+ is the post-holiday trough. A gift store shows exactly this. The Jun-22-changes timing was **confounded** with the seasonal cliff — we'd been over-attributing the drop to our edits. (Confirm via Shopify YoY late-June 2025; our Meta data only goes back to Nov 2025.)
+- **Meta attribution loss on top.** Pixel is healthy (real-time, Purchase EMQ 8.7, all 18 ad sets correctly on the Shopify pixel `2263151130774482`, PURCHASE/VALUE). But `fbc` (click-ID) coverage is only ~46%, and Meta-attributed purchases fell ~70% while Van confirms real Shopify orders fell less (~the pixel's ~40%). So Meta *understates* ad-driven revenue — steering by ROAS alone is unsafe right now.
+- **THE ad-specific bug — broken lookalikes.** All three active ad sets' lookalikes never built: size **1,000–1,000**, `lookalike_spec.country = None`, all three identical across different ratios/seeds (Meta's floor for an audience that never populated). A real 5% US LAL ≈ ~11M. So "seed + 5% lookalike" was really **tiny seed + a placeholder.** This is very likely why turning **Advantage+ Audience OFF on Jun 22 hurt**: with AA ON, Meta expanded broadly and the broken LAL didn't matter; with AA OFF we locked delivery to audiences that effectively don't exist at scale.
+
+**Account change executed (repo CLI guarded flow, NOT the MCP):**
+- **Rebuilt Engaged's lookalike:** created `Lookalike (5%) US - engaged-audience [rebuilt 2026-07-02]`
+  (`120247434998550733`, origin = engaged seed `120242999702630733`, ratio 0.05, **country US**) via
+  `propose-lookalike` → `apply-authoring`. It populated to **~10.6–12.5M** (vs the broken one's 1,000).
+  (Meta's `validate_only` persists audience creates, so the follow-up `--execute` returned a #2654
+  "duplicate" — harmless; the audience already existed. Lesson: for `create_lookalike`, validate-only
+  IS the create.)
+- **Swapped Engaged (`120241592681330733`) onto it:** `set_custom_audiences` op, custom_audiences =
+  [seed `120242999702630733`, new LAL `120247434998550733`]. Verified by independent re-read: broken
+  LAL (`120245881024420733`) gone, seed kept, **advantage_audience still 0** (Van wants AA off to keep
+  audiences A/B-testable), placements (Feed+Reels+Stories) / age / gender / exclusions all preserved.
+  Ad set went `IN_PROCESS` (targeting edit re-enters learning) — expect a soft day or two.
+- **Tooling shipped:** added a first-class **`set_custom_audiences` guarded op** (control.py:
+  `TARGETING_OPS` + `OP_LEVELS` + `_validate_op` + `_apply_targeting_change`; auto-covered by
+  `GROUNDING_REQUIRED_OPS`; +2 tests, 457 pass). Closes the gap that previously forced a raw
+  `update_adset` write — which the auto-mode classifier correctly **blocked** per the MCP-read/CLI-write
+  rule. Van asked to loosen the rule; declined (the only loosening broad enough would re-open the
+  unguarded-write hole that caused the Jun-28 Influencer stuck-write). Did it through the op instead.
+
+**NOT done yet:** High Value (`120245033400010733`, 1%) and Low Value (`120245880988810733`, 1%)
+lookalikes are broken the same way — rebuild + swap them next (Low Value's campaign is paused, so no
+rush). High Value is the clean AA-off control while Engaged's rebuilt-audience fix is read.
+
 ## 2026-07-01 (action) — bleed-control: paused May Lower Spend, halved 100K budget ($280→$140)
 
 **Operator (Van) directed a "massive budget cut" — account had bled sub-1.0 ROAS for 9 straight days
