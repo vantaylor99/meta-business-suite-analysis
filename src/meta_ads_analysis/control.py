@@ -42,7 +42,7 @@ APPROVED_STATUS = "approved"
 PROPOSED_STATUS = "proposed"
 EXECUTED_STATUS = "executed"
 
-TARGETING_OPS = {"set_age_range", "set_genders", "set_geo_locations", "set_placements"}
+TARGETING_OPS = {"set_age_range", "set_genders", "set_geo_locations", "set_placements", "set_custom_audiences"}
 SUPPORTED_OPS = {"set_status", "set_daily_budget", "rename", "set_creative", "set_creative_features"} | TARGETING_OPS
 OP_LEVELS = {
     "set_status": {"ad", "adset", "campaign"},
@@ -54,6 +54,7 @@ OP_LEVELS = {
     "set_genders": {"adset"},
     "set_geo_locations": {"adset"},
     "set_placements": {"adset"},
+    "set_custom_audiences": {"adset"},
 }
 
 # Account default for creative enhancements (data + research, 2026-06-24): additive/visual ON,
@@ -257,6 +258,13 @@ def validate_op(op: dict[str, Any]) -> None:
     elif op_type == "set_placements":
         if not params.get("automatic") and not (isinstance(params.get("publisher_platforms"), list) and params["publisher_platforms"]):
             raise ValueError("set_placements requires params.automatic=true or a non-empty publisher_platforms list.")
+    elif op_type == "set_custom_audiences":
+        cas = params.get("custom_audiences")
+        if not isinstance(cas, list) or not cas or not all(str(a).strip() for a in cas):
+            raise ValueError("set_custom_audiences requires a non-empty params.custom_audiences list of audience ids.")
+        excl = params.get("excluded_custom_audiences")
+        if excl is not None and not isinstance(excl, list):
+            raise ValueError("set_custom_audiences params.excluded_custom_audiences must be a list of audience ids when provided.")
 
 
 def _get_entity(reader: MetaReaderProvider, level: str, node_id: str, fields: list[str]) -> dict[str, Any]:
@@ -303,6 +311,16 @@ def _apply_targeting_change(op_type: str, params: dict[str, Any], targeting: Any
             for k in ("facebook_positions", "instagram_positions", "device_platforms"):
                 if params.get(k) is not None:
                     t[k] = params[k]
+    elif op_type == "set_custom_audiences":
+        # Replace the ad set's INCLUDED custom audiences wholesale (id-only form Meta accepts).
+        # Every other targeting dimension — placements, age/gender, geo, targeting_automation
+        # (Advantage+ state), and existing exclusions — is preserved by the deepcopy above.
+        # Exclusions are only touched when explicitly supplied, so a pure include-swap leaves them intact.
+        t["custom_audiences"] = [{"id": str(a)} for a in (params.get("custom_audiences") or [])]
+        if params.get("excluded_custom_audiences") is not None:
+            t["excluded_custom_audiences"] = [
+                {"id": str(a)} for a in params["excluded_custom_audiences"]
+            ]
     return t
 
 
