@@ -64,10 +64,12 @@ person or over a screen share, instead of handing it off.
 5. Fully quit and reopen Claude Desktop after adding that config. Their account's read/write tools
    appear in chat.
 6. Day to day: ask Cowork to read/analyze freely. For a write, Cowork will produce a `plan_id` —
-   double-click **`local/Approve.command`**, paste that id in when it asks, then go back to
-   Cowork/Desktop and ask it to execute. This is the same propose → approve → validate → execute →
-   verify loop the operator uses locally; only the approver's identity (and that it's a double-click
-   instead of a typed command) differs.
+   double-click **`local/Approve.app`**. A normal macOS popup appears (no terminal window) asking
+   for the plan_id — paste it in and click **Approve**, then go back to Cowork/Desktop and ask it
+   to execute. This is the same propose → approve → validate → execute → verify loop the operator
+   uses locally; only the approver's identity differs.
+   - If `local/Approve.app` doesn't work (some managed/corporate Macs restrict AppleScript running
+     shell commands), use `local/Approve.command` instead — same idea, opens a terminal window.
 
 ## Rotating or revoking access
 

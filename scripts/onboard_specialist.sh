@@ -109,17 +109,15 @@ exec "$REPO_ROOT/.venv/bin/approve_plan" "\$@"
 EOF
 chmod 700 "$APPROVE_PATH"
 
-# Double-clickable equivalent — prompts for the plan id instead of taking it as an argument, so
-# no terminal typing of a full command line is needed day-to-day, only answering one question.
+# Terminal-based double-clickable fallback — prompts for the plan id, no full command to type.
+# Kept in case the native app below (Approve.app) hits a corporate Mac restriction.
 APPROVE_COMMAND_PATH="$LOCAL_DIR/Approve.command"
 cat > "$APPROVE_COMMAND_PATH" <<EOF
 #!/usr/bin/env bash
 # Double-click this to approve a write plan. Cowork will show you a "plan_id" before this is
 # needed — have that ready to paste in.
-cd "\$(dirname "\${BASH_SOURCE[0]}")"
 read -r -p "Paste the plan_id Cowork showed you: " PLAN_ID
-export META_APPROVAL_SECRET="\$(cat "$SECRET_PATH")"
-if "$REPO_ROOT/.venv/bin/approve_plan" --plan-id "\$PLAN_ID" --all; then
+if "$APPROVE_PATH" --plan-id "\$PLAN_ID" --all; then
   echo
   echo "Approved. Go back to Cowork/Desktop and ask it to execute the plan."
 else
@@ -130,6 +128,39 @@ echo
 read -r -p "Press Enter to close this window..."
 EOF
 chmod 700 "$APPROVE_COMMAND_PATH"
+
+# Native macOS app (no terminal at all) — a real popup dialog asking for the plan id, then a
+# native alert with the result. This is the recommended day-to-day approval method; the .command
+# above is the fallback if a managed/corporate Mac blocks AppleScript's "do shell script".
+APPROVE_APP_PATH="$LOCAL_DIR/Approve.app"
+if command -v osacompile >/dev/null 2>&1; then
+  APPLESCRIPT_SRC="$LOCAL_DIR/.approve_dialog_src.applescript"
+  cat > "$APPLESCRIPT_SRC" <<APPLESCRIPT_EOF
+try
+	set planID to text returned of (display dialog "Paste the plan_id Cowork showed you:" default answer "" with title "Approve Meta Ads Write" buttons {"Cancel", "Approve"} default button "Approve")
+on error number -128
+	return
+end try
+
+set approveScript to "$APPROVE_PATH"
+
+try
+	set cmd to (quoted form of approveScript) & " --plan-id " & (quoted form of planID) & " --all 2>&1"
+	set shellResult to do shell script cmd
+	display alert "Approved" message "Go back to Cowork/Desktop and ask it to execute the plan." & return & return & shellResult
+on error errMsg
+	display alert "Something went wrong" message errMsg as critical
+end try
+APPLESCRIPT_EOF
+  rm -rf "$APPROVE_APP_PATH"
+  osacompile -o "$APPROVE_APP_PATH" "$APPLESCRIPT_SRC"
+  rm -f "$APPLESCRIPT_SRC"
+else
+  APPROVE_APP_PATH=""
+  echo
+  echo "Note: 'osacompile' wasn't found, so the native Approve.app popup couldn't be built. Use"
+  echo "$APPROVE_COMMAND_PATH instead (double-click, same idea, just a terminal window)."
+fi
 
 # --- 6. Claude Desktop config snippet ---------------------------------------
 echo
@@ -156,8 +187,15 @@ echo
 echo "3. Fully quit and reopen Claude Desktop. Your account's read/write tools appear in chat."
 echo
 echo "4. To approve a write Cowork proposes: double-click"
-echo "     $APPROVE_COMMAND_PATH"
-echo "   and paste in the plan_id Cowork shows you when it asks."
+if [ -n "$APPROVE_APP_PATH" ]; then
+  echo "     $APPROVE_APP_PATH"
+  echo "   A popup asks for the plan_id Cowork shows you — paste it in and click Approve."
+  echo "   (If that app doesn't work — some managed/corporate Macs restrict AppleScript — use"
+  echo "   $APPROVE_COMMAND_PATH instead, same idea via a terminal window.)"
+else
+  echo "     $APPROVE_COMMAND_PATH"
+  echo "   and paste in the plan_id Cowork shows you when it asks."
+fi
 echo "   (Terminal command equivalent, if you prefer: $APPROVE_PATH --plan-id <id> --all)"
 echo
 echo "See docs/SPECIALIST_ONBOARDING.md if anything above doesn't match what you see."
