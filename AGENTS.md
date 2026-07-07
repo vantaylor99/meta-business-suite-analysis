@@ -1,5 +1,13 @@
 # Meta Ads Analysis Agent Guide
 
+> **Is this machine even set up yet?** If `.env`, `config/meta_ads_accounts.json`, or
+> `local/approval_secret` don't exist (or you're not sure), don't try to analyze an account or
+> follow the rest of this file yet — the human you're talking to is very likely someone being
+> onboarded onto this system for the first time, not an operator who's already running it. Go
+> read [`docs/SPECIALIST_ONBOARDING.md`](docs/SPECIALIST_ONBOARDING.md) — it has a section
+> specifically for you (the AI) on how to walk a non-technical person through setup safely from
+> inside a sandbox. Come back to this file once setup is confirmed done.
+
 > **Start here:** before analyzing data or taking any account action, read
 > [`knowledge/README.md`](knowledge/README.md) and the relevant
 > `knowledge/accounts/<account>/` files. That is the project's durable memory — account
