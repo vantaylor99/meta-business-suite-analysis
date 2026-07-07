@@ -24,9 +24,13 @@ already scoped as backlog work.
 1. **Repo access.** This repo is private. Add the specialist as a GitHub collaborator (or hand
    them a copy some other way) — a deliberate, visible action you take yourself; nothing here
    automates it.
-2. **A scoped Meta access token.** Get (or generate, via Meta Business Manager) an
-   `ads_management`-scoped token that only has access to the *one* ad account this specialist
-   runs. Hand it over through a secure channel — never plaintext chat, email, or a ticket.
+2. **A scoped Meta access token.** Get an `ads_management`-scoped token that only has access to
+   the *one* ad account this specialist runs — see
+   [META_API_SETUP.md → Getting an access token](META_API_SETUP.md#getting-an-access-token) for
+   the actual steps (use the System User path, not a personal Graph API Explorer token, for
+   anyone other than yourself). Hand it over through a secure channel — never plaintext chat,
+   email, or a ticket; a password-manager share link works and doesn't require them to have an
+   account with that service.
 3. **That one account's config block.** From your own (gitignored, local-only)
    `config/meta_ads_accounts.json`, copy out **just that one account's `{...}` object** — not your
    whole file — into a standalone JSON file. That's what `scripts/onboard_specialist.sh` expects

@@ -17,6 +17,56 @@ python -m meta_ads_analysis sync-api --account pollen_sense --run-date 2026-04-2
     guarded-write catalog is in [`../AGENTS.md`](../AGENTS.md) under **Hybrid Meta integration**.
 - Real ad account IDs in `config/meta_ads_accounts.json`
 
+## Getting an access token
+
+There are two ways to get a token. For anyone other than yourself running this long-term (a
+specialist, a second machine), use the **System User** path — it doesn't expire on a schedule and
+isn't tied to a personal Facebook login that can log out or lose access.
+
+### Recommended: a Business Manager System User token (for a specialist / long-term use)
+
+1. Go to [Meta Business Settings](https://business.facebook.com/settings) for the Business Manager
+   that owns the ad account(s) in question.
+2. **Users → System Users → Add.** Name it for what it's for (e.g. `seattle-mission-mcp-server`),
+   role can be **Employee** (not Admin — don't over-grant).
+3. On that System User, click **Add Assets** and assign **only the specific ad account(s)** it
+   needs (e.g. just Seattle Mission), with **Manage campaigns** permission (this is what maps to
+   the `ads_management` scope). This is how you scope a token to exactly one account — the token
+   itself has no account restriction, the System User's asset assignment does.
+4. Click **Generate New Token** on that System User. Select the app (or create a minimal one under
+   **Accounts → Apps** first if none exists yet — it just needs to exist, no App Review required
+   for this token to work for assets the System User already has explicit access to). Check
+   **`ads_management`** (covers `ads_read` too) in the permission list.
+5. Copy the token immediately — Meta shows it once. System User tokens don't expire on the usual
+   60-day user-token schedule (they're revoked by deleting the System User, deleting the token, or
+   removing its asset assignment).
+
+### Quicker but shorter-lived: Graph API Explorer (fine for your own ad-hoc testing)
+
+1. [Graph API Explorer](https://developers.facebook.com/tools/explorer/) → select your app → select
+   your user → check `ads_management`/`ads_read` → **Generate Access Token**.
+2. This is a **short-lived** (~1 hour) user token by default. Exchange it for a 60-day long-lived
+   token via the `/oauth/access_token?grant_type=fb_exchange_token...` endpoint (see
+   [Meta's long-lived token docs](https://developers.facebook.com/docs/facebook-login/guides/access-tokens/get-long-lived)) if you need it to last.
+3. This token rides on *your* personal Facebook login and ad-account permissions — don't hand this
+   kind of token to someone else; generate them a System User token instead.
+
+### Handing a token to someone else securely
+
+Whatever the token, send it through something that doesn't leave it sitting in plaintext (chat,
+email, a ticket) — a password manager's one-time share link (e.g. 1Password's or Bitwarden's
+"share via link" — these produce a URL the recipient opens in a browser and do **not** require
+them to have an account with that service) works well and matches what
+[SPECIALIST_ONBOARDING.md](SPECIALIST_ONBOARDING.md) assumes.
+
+### Sanity-check a token before handing it off
+
+```bash
+curl -s "https://graph.facebook.com/v21.0/me/adaccounts?access_token=<token>"
+```
+Should list the ad account(s) it has access to. An empty list or an error means the asset
+assignment (System User path) or the permission grant (Explorer path) didn't take.
+
 ## Configuration
 
 Update:
