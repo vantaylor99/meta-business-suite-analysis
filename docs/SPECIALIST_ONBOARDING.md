@@ -8,6 +8,40 @@ This is a manual, single-specialist process. It is *not* the production shape �
 [Where this goes next](#where-this-goes-next) for the role-based, multi-specialist version that's
 already scoped as backlog work.
 
+## Note for the AI walking someone through this (read this first if that's you)
+
+If a human just cloned this repo and opened it in Cowork asking for help getting set up, you are
+almost certainly running in a **sandbox that mirrors this project folder, not their real Mac** —
+confirmed by direct testing 2026-07-07: a prior session found the sandbox reported a "broken venv"
+that was actually fine on the real machine (just a different Python install), and confirmed
+directly that it couldn't reach `127.0.0.1` on the real machine or edit Desktop's config file.
+That changes how you should operate here:
+
+- **You cannot run the real MCP server, and you cannot see or edit Claude Desktop's own app
+  config** (`claude_desktop_config.json`) — both live outside anything mounted into your sandbox.
+  For every step that needs to happen on their actual machine, tell them exactly what to
+  click/type in a real Terminal or in Claude Desktop's own Settings, then **stop and wait for them
+  to confirm what happened** before continuing. Don't assume a step succeeded just because you
+  told them to do it.
+- **Never ask them to paste a real secret (their Meta access token, their approval secret) into
+  this chat.** If a value needs to move from a file into Desktop's config, tell them to copy it to
+  their clipboard themselves and paste it directly where it's needed — e.g. on macOS:
+  `cat local/approval_secret | pbcopy`. You should never see the raw value.
+- **Before reporting something as broken, consider whether it's a sandbox-vs-real-machine
+  mismatch instead of a real bug** — e.g. a venv pointing at a Python version your sandbox doesn't
+  have installed is expected and does not mean it's broken on their actual Mac. If you're not
+  sure, say so plainly and suggest they confirm by running the same check in their own real
+  Terminal, rather than reporting your sandbox's result as fact.
+- **Go one step at a time.** This audience is explicitly not made up of programmers and can get
+  confused or overwhelmed easily (this is a hard requirement from the project's own backlog notes,
+  not a suggestion) — confirm each step is actually done before describing the next one. Don't
+  paste this whole document at them at once.
+- **Verify what you can, honestly flag what you can't.** You can check file state in the mounted
+  folder (does `.venv/` exist? does `config/meta_ads_accounts.json` have exactly one account? does
+  `local/approval_secret` exist?) — use that instead of just taking their word for it. But you
+  genuinely cannot verify whether Desktop's config saved correctly or whether the server actually
+  started on their machine — say so, and ask them to tell you what they see instead of guessing.
+
 ## What this is not
 
 - **Not** multi-user auth. There is one Meta token and one approval secret *per machine*, not per
@@ -47,6 +81,14 @@ person or over a screen share, instead of handing it off.
    their Desktop) — they'll need its path in step 2 below. Send it the same secure way as the token.
 
 ## What the specialist does, on their own machine
+
+**Optional but recommended: open Cowork alongside these steps for live help.** After cloning,
+open the project folder in Claude Cowork and say something like *"I just cloned this repo and
+need to get set up — can you walk me through it?"* Cowork should read this file's "Note for the
+AI" section above on its own (via `AGENTS.md`'s pointer to it) and guide you step by step,
+checking its own limits honestly rather than guessing. It cannot do the double-click/Terminal
+steps below for you — those still have to happen on your actual Mac — but it can explain what
+you're seeing, confirm things look right after each step, and help if something goes wrong.
 
 1. Double-click **`scripts/Setup Meta Ads Account.command`** in Finder. (First time only, macOS
    may say it's from an unidentified developer — right-click it → **Open** → confirm once; that
