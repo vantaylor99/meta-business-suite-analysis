@@ -86,7 +86,11 @@ person or over a screen share, instead of handing it off.
 3. **That one account's config block.** From your own (gitignored, local-only)
    `config/meta_ads_accounts.json`, copy out **just that one account's `{...}` object** — not your
    whole file — into a standalone JSON file, and save/send it somewhere they can find it (e.g. on
-   their Desktop) — they'll need its path in step 2 below. Send it the same secure way as the token.
+   their Desktop) — they'll need its path in step 2 below. This is lower-stakes than the token — it's
+   business config (account ID, targets, guardrail numbers), not a credential; nothing in it grants
+   access on its own without a real token to go with it. A direct message on an internal tool (e.g.
+   Teams, to the specialist specifically, not a group channel) is a reasonable way to send it — it
+   doesn't need the same password-manager-link treatment as the token.
 
 ## What the specialist does, on their own machine
 
