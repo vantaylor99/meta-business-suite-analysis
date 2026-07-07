@@ -12,6 +12,7 @@ import json
 import os
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 try:
@@ -43,9 +44,33 @@ def meta_api_version_from_env(api_version: str | None = None) -> str:
     return api_version or os.environ.get("META_API_VERSION") or DEFAULT_META_API_VERSION
 
 
+ACCESS_TOKEN_ENV = "META_ACCESS_TOKEN"
+ACCESS_TOKEN_FILE_ENV = "META_ACCESS_TOKEN_FILE"
+
+
+def access_token_from_env() -> str:
+    """Resolve the Meta access token: :data:`ACCESS_TOKEN_ENV` first, else the file at
+    :data:`ACCESS_TOKEN_FILE_ENV` (trailing newline stripped). Empty string if neither is set —
+    mirrors :func:`proposals.approval_secret_from_env`'s env-then-file precedence, so a launcher
+    (e.g. a Claude Desktop MCP config) can point at a token file instead of embedding the raw
+    token inline, without a real Meta call to test it against.
+    """
+    raw = os.environ.get(ACCESS_TOKEN_ENV, "").strip()
+    if raw:
+        return raw
+    file_path = os.environ.get(ACCESS_TOKEN_FILE_ENV, "").strip()
+    if file_path:
+        try:
+            return Path(file_path).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise MetaApiError(f"{ACCESS_TOKEN_FILE_ENV}={file_path!r} could not be read: {exc}") from exc
+    return ""
+
+
 def client_from_env(api_version: str | None = None) -> "MetaMarketingApiClient":
-    """Build a client from META_ACCESS_TOKEN / META_API_VERSION environment variables."""
-    access_token = os.environ.get("META_ACCESS_TOKEN", "").strip()
+    """Build a client from META_ACCESS_TOKEN (or META_ACCESS_TOKEN_FILE) / META_API_VERSION
+    environment variables."""
+    access_token = access_token_from_env()
     effective_version = meta_api_version_from_env(api_version)
     return MetaMarketingApiClient(access_token=access_token, api_version=effective_version)
 

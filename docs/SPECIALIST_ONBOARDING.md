@@ -24,9 +24,13 @@ That changes how you should operate here:
   to confirm what happened** before continuing. Don't assume a step succeeded just because you
   told them to do it.
 - **Never ask them to paste a real secret (their Meta access token, their approval secret) into
-  this chat.** If a value needs to move from a file into Desktop's config, tell them to copy it to
-  their clipboard themselves and paste it directly where it's needed — e.g. on macOS:
-  `cat local/approval_secret | pbcopy`. You should never see the raw value.
+  this chat.** The setup script's printed Claude Desktop config block already avoids this by
+  design — it references `local/approval_secret` and `local/access_token` by *file path*
+  (`META_APPROVAL_SECRET_FILE` / `META_ACCESS_TOKEN_FILE`), never by value, so that block itself is
+  safe for them to paste back to you if something looks wrong. If you ever do need a raw value
+  moved somewhere (unusual — check whether a file-path reference would work instead first), tell
+  them to copy it to their clipboard themselves and paste it directly where it's needed — e.g. on
+  macOS: `cat local/approval_secret | pbcopy`. You should never see the raw value.
 - **Before reporting something as broken, consider whether it's a sandbox-vs-real-machine
   mismatch instead of a real bug** — e.g. a venv pointing at a Python version your sandbox doesn't
   have installed is expected and does not mean it's broken on their actual Mac. If you're not
@@ -119,7 +123,12 @@ you're seeing, confirm things look right after each step, and help if something 
    Enter.
 5. It prints a block to paste into Claude Desktop's config, and a reminder to test in mock mode
    first. Follow along in the same window; it tells you exactly what to do next, including the
-   **Settings → Developer → Edit Config** step in Claude Desktop.
+   **Settings → Developer → Edit Config** step in Claude Desktop. That block points at
+   `local/approval_secret` and `local/access_token` by *path* (`META_APPROVAL_SECRET_FILE` /
+   `META_ACCESS_TOKEN_FILE`) rather than containing either value directly — the server reads those
+   files itself at startup. That's deliberate: it means the block itself has nothing secret in it,
+   so if something looks wrong and you want to show it to Cowork for help, that's fine to paste —
+   just never paste what's *inside* those two files anywhere.
 6. Fully quit and reopen Claude Desktop after adding that config. Their account's read/write tools
    appear in chat.
 7. Day to day: ask Cowork to read/analyze freely. For a write, Cowork will produce a `plan_id` —
