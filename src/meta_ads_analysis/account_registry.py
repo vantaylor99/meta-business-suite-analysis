@@ -30,8 +30,12 @@ class MetaAdsAccount:
 
 
 def load_account_registry(
-    config_path: Path = DEFAULT_ACCOUNTS_CONFIG_PATH,
+    config_path: Path | None = None,
 ) -> dict[str, MetaAdsAccount]:
+    # Resolved fresh on every call (not bound as a default-argument value) so a test's
+    # monkeypatch of DEFAULT_ACCOUNTS_CONFIG_PATH takes effect even for callers that omit
+    # config_path — a bound default would capture the module's original value at import time.
+    config_path = config_path or DEFAULT_ACCOUNTS_CONFIG_PATH
     if not config_path.exists():
         raise FileNotFoundError(
             f"Meta account registry not found: {config_path}. Expected config/meta_ads_accounts.json"
@@ -104,13 +108,14 @@ def load_account_registry(
 
 def resolve_account(
     account_slug: str,
-    config_path: Path = DEFAULT_ACCOUNTS_CONFIG_PATH,
+    config_path: Path | None = None,
 ) -> MetaAdsAccount:
     normalized_slug = slugify_name(account_slug)
     accounts = load_account_registry(config_path)
     if normalized_slug not in accounts:
+        resolved_path = config_path or DEFAULT_ACCOUNTS_CONFIG_PATH
         raise KeyError(
-            f"Account '{normalized_slug}' was not found in {config_path}. "
+            f"Account '{normalized_slug}' was not found in {resolved_path}. "
             "Add it to config/meta_ads_accounts.json first."
         )
     return accounts[normalized_slug]

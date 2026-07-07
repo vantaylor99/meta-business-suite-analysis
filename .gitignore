@@ -17,3 +17,14 @@ data/normalized/*
 
 reports/*
 !reports/.gitkeep
+
+# Real account config — contains live ad account IDs, domains, budget policy.
+# Copy config/meta_ads_accounts.example.json to config/meta_ads_accounts.json and fill in
+# your own account details locally; never commit the real file.
+config/meta_ads_accounts.json
+
+# Divine Designs — real client business data (revenue/ROAS, real domain, creative assets).
+# Was committed historically; untracked 2026-07-07. Stays on disk, just not in git going forward.
+knowledge/accounts/divine_designs/
+followups/divine_designs/
+data/video_intake/divine_designs/

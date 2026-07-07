@@ -3,7 +3,10 @@
 When you add an account that's never been used in this repo, the goal is to capture **what
 "good" and "bad" mean for this specific account** so the analysis, the operator brief, and the
 guarded write tools all judge it correctly. Every account is one entry in
-[`config/meta_ads_accounts.json`](../config/meta_ads_accounts.json).
+`config/meta_ads_accounts.json` — **gitignored on purpose** (it holds real ad account IDs,
+domains, and business-specific notes). On a fresh clone, copy
+[`config/meta_ads_accounts.example.json`](../config/meta_ads_accounts.example.json) to
+`config/meta_ads_accounts.json` and fill in your own accounts; never commit the real file.
 
 Different accounts have different goals — a store optimizes for **ROAS**, a lead-gen account for
 **cost per lead (CPR)**, an app for **cost per install/subscription**. The fields below let one

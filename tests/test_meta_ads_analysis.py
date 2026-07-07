@@ -643,15 +643,19 @@ def test_account_registry_max_budget_decrease_percent_defaults_absent(tmp_path: 
     assert accounts["test_account"].max_budget_decrease_percent is None
 
 
-def test_account_registry_existing_config_loads() -> None:
-    from meta_ads_analysis.config import DEFAULT_ACCOUNTS_CONFIG_PATH
+def test_account_registry_example_config_loads() -> None:
+    # The real config/meta_ads_accounts.json is gitignored (holds live ad account IDs, domains,
+    # and business-specific notes) — this exercises the tracked example template instead, which
+    # is what actually exists on a fresh clone.
+    from meta_ads_analysis.config import PROJECT_ROOT
 
-    accounts = load_account_registry(DEFAULT_ACCOUNTS_CONFIG_PATH)
+    example_path = PROJECT_ROOT / "config" / "meta_ads_accounts.example.json"
+    accounts = load_account_registry(example_path)
 
-    assert "pollen_sense" in accounts
-    assert "divine_designs" in accounts
-    assert accounts["pollen_sense"].max_budget_decrease_percent is None
-    assert accounts["divine_designs"].max_budget_decrease_percent is None
+    assert "example_subscription_app" in accounts
+    assert "example_ecommerce_store" in accounts
+    assert accounts["example_subscription_app"].max_budget_decrease_percent is None
+    assert accounts["example_ecommerce_store"].max_budget_decrease_percent is None
 
 
 def test_default_date_window_uses_trailing_30_days() -> None:
@@ -6912,11 +6916,14 @@ def test_real_learnings_md_lints_with_zero_errors() -> None:
     assert all(e.rot in {"fast", "evergreen"} and e.verified for e in entries)
 
 
-def test_real_profile_baseline_header_is_present_and_fresh() -> None:
-    from meta_ads_analysis.config import PROJECT_ROOT
-
-    text = (PROJECT_ROOT / "knowledge" / "accounts" / "divine_designs" / "profile.md").read_text(
-        encoding="utf-8"
+def test_profile_baseline_header_is_present_and_fresh() -> None:
+    # Account knowledge folders (knowledge/accounts/<slug>/) are gitignored — they hold real
+    # business data and aren't guaranteed to exist on a fresh clone — so this mirrors the real
+    # divine_designs profile.md's baseline-header shape as an inline fixture instead of reading it.
+    text = (
+        "## Performance baseline — 30 days ending 2026-06-22\n\n"
+        "**Rot:** fast · **Verified:** 2026-06-22\n"
+        "- Spend $18,478 → purchase value $44,865 → blended ROAS 2.43 (target 3.0).\n"
     )
     # Fresh relative to the baseline date → no warning; far in the future → ⏳ re-verify warning.
     assert lint_profile_baseline(text, today=date(2026, 6, 25)) == []
@@ -7338,6 +7345,13 @@ def _run_audit_cli(tmp_path, monkeypatch, text, rows, *, apply: bool, as_of="202
     from meta_ads_analysis import cli
     import meta_ads_analysis.meta_api as meta_api
 
+    # config/meta_ads_accounts.json is gitignored (real business data) — isolate from it with a
+    # tmp registry carrying the same divine_designs policy fields the real one has, matching what
+    # this test previously relied on implicitly.
+    _use_account_policy(
+        tmp_path, monkeypatch, "divine_designs",
+        {"primary_goal": "roas", "target_roas": 3.0, "pause_roas_floor": 1.8, "scale_roas_floor": 3.0},
+    )
     learnings = tmp_path / "learnings.md"
     learnings.write_text(text, encoding="utf-8")
     monkeypatch.setattr(cli, "resolve_ad_account_id", lambda slug: "act_test")

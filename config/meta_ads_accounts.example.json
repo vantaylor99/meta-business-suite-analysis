@@ -1,0 +1,89 @@
+{
+  "accounts": [
+    {
+      "account_slug": "example_subscription_app",
+      "account_name": "Example Subscription App",
+      "ad_account_id": "REPLACE_WITH_REAL_AD_ACCOUNT_ID",
+      "measurement_focus": {
+        "primary_metric": "results",
+        "primary_result_action_type": "app_custom_event.fb_mobile_subscribe",
+        "primary_result_label": "In-app subscriptions",
+        "secondary_metric": "app_installs",
+        "secondary_metric_label": "App installs",
+        "roas_role": "supporting_only_until_subscription_value_is_stable",
+        "analysis_notes": "Optimize for recorded in-app subscriptions first. Use app installs as the secondary fallback when subscription volume is sparse or revenue reporting is still stabilizing."
+      },
+      "action_policy": {
+        "primary_goal": "maximize_in_app_subscriptions",
+        "primary_metric": "results",
+        "primary_result_label": "In-app subscriptions",
+        "primary_result_cost_cap": null,
+        "secondary_metric": "app_installs",
+        "secondary_cost_per_app_install_target": 3.0,
+        "pause_if_no_primary_and_secondary_cost_above": 3.0,
+        "scale_if_primary_results_at_least": 1,
+        "max_budget_increase_percent": 20,
+        "disable_meta_ai_features": true,
+        "operator_brief_todo": true
+      },
+      "notes": "Copy this file to config/meta_ads_accounts.json and replace every placeholder with your real account details. Never commit the real file — it's gitignored on purpose."
+    },
+    {
+      "account_slug": "example_ecommerce_store",
+      "account_name": "Example Ecommerce Store",
+      "ad_account_id": "REPLACE_WITH_REAL_AD_ACCOUNT_ID",
+      "default_destination_url": "https://www.example.com",
+      "measurement_focus": {
+        "primary_metric": "results",
+        "primary_result_action_type": "purchase",
+        "primary_result_label": "Website purchases",
+        "secondary_metric": "outbound_clicks",
+        "secondary_metric_label": "Outbound clicks",
+        "roas_role": "supporting_metric_when_purchase_value_is_trustworthy",
+        "analysis_notes": "Optimize for purchases first. Use outbound clicks as a diagnostic secondary signal for under-attributed creatives, not as a replacement for purchase efficiency."
+      },
+      "action_policy": {
+        "primary_goal": "roas",
+        "primary_metric": "blended_roas",
+        "target_roas": 3.0,
+        "pause_roas_floor": 1.8,
+        "scale_roas_floor": 3.0,
+        "evaluation_grace_days": 3,
+        "min_spend_before_pause": 100.0,
+        "max_budget_increase_percent": 20,
+        "disable_meta_ai_features": true,
+        "operator_brief_todo": true,
+        "guardrail_notes": "CUTOFF = 1.8 ROAS: if an ad has been running more than a couple of days (past evaluation_grace_days) and shows no other positive signals (improving trajectory, strong hook rate, etc.), pause it when blended ROAS is at or below 1.8. DO NOT apply the cutoff to a brand-new ad in its first 1-2 days, or to any ad right after a BIG change (creative/audience/budget) — give it up to evaluation_grace_days to stabilize. NEVER pause on the cutoff if the ad has barely spent (< min_spend_before_pause): that is insufficient data, so keep it running rather than calling it a loser."
+      },
+      "notes": "Replace with the real Meta ad account ID before using sync-api."
+    },
+    {
+      "account_slug": "example_lead_gen",
+      "account_name": "Example Lead Gen Account",
+      "ad_account_id": "REPLACE_WITH_REAL_AD_ACCOUNT_ID",
+      "measurement_focus": {
+        "primary_metric": "results",
+        "primary_result_action_type": "leadgen_grouped",
+        "primary_result_label": "Leads (form)",
+        "secondary_metric": null,
+        "secondary_metric_label": null,
+        "roas_role": "not_applicable",
+        "analysis_notes": "Lead generation via Meta Instant Forms (objective OUTCOME_LEADS). Success = form leads; efficiency = cost per lead (CPR). This account does NOT sell products — do not apply purchases, purchase value, or ROAS to it. VERIFY primary_result_action_type on first sync-api run (instant-form lead action type may resolve as 'leadgen_grouped' or 'onsite_conversion.lead_grouped'); if Results come back blank, let the sync infer or adjust here."
+      },
+      "action_policy": {
+        "primary_goal": "minimize_cost_per_lead",
+        "primary_metric": "cost_per_result",
+        "primary_result_label": "Leads (form)",
+        "target_cost_per_result": 10.0,
+        "pause_cost_per_result_above": 40.0,
+        "evaluation_grace_days": 3,
+        "min_spend_before_pause": 100.0,
+        "max_budget_increase_percent": 20,
+        "disable_meta_ai_features": true,
+        "operator_brief_todo": true,
+        "guardrail_notes": "GOAL = $10 per lead (target_cost_per_result). CUTOFF = $40 per lead (pause_cost_per_result_above): if an ad has run more than a couple of days (past evaluation_grace_days) with no other positive signals, pause it when cost-per-lead is at or above $40. DO NOT apply the cutoff in a new ad's first 1-2 days, or right after a BIG change — give it up to evaluation_grace_days. NEVER pause on the cutoff if the ad has barely spent (< min_spend_before_pause): insufficient data, keep running. ROAS/purchase metrics do not apply to this account."
+      },
+      "notes": "Replace with the real Meta ad account ID before using sync-api."
+    }
+  ]
+}
