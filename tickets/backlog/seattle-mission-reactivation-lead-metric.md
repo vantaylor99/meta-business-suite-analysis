@@ -33,3 +33,14 @@ $40). The config note already anticipated the cause: the instant-form lead actio
 - Historical: ~$98k spent / 12,600+ form leads across 2024–2025 at ~$25–30 cost-per-lead.
 - Surfaced by the 2026-06-29 daily-overview check (read-only MCP pull), which caught both the stale
   config note and the missing lead metric.
+
+**Update 2026-07-07:** the config-note portion of this ticket is done — `notes` now says ACTIVE
+with current spend context (van, interactive session, not this pipeline). The `results`/cost-per-lead
+"Not available" bug from `ads_get_ad_entities` **is still open** and is the remaining scope here:
+requesting `lead` as an explicit field works and returns real counts (verified 2026-07-07: e.g. 12
+leads on 7/1, 12 on 7/4), but `results`/`cost_per_result` still come back "Not available" — so
+whatever produces the goal-aware grade (`primary_result_action_type` resolution) still needs the
+fix described above. New account context now lives in `knowledge/accounts/seattle_mission/`
+(profile.md, decision-log.md) — read those first, they cover current status and the recent
+cost-per-lead improvement (attributed to an audience-size expansion by account manager Hunter
+Johanson around 7/1).
