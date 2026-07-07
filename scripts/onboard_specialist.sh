@@ -109,6 +109,28 @@ exec "$REPO_ROOT/.venv/bin/approve_plan" "\$@"
 EOF
 chmod 700 "$APPROVE_PATH"
 
+# Double-clickable equivalent — prompts for the plan id instead of taking it as an argument, so
+# no terminal typing of a full command line is needed day-to-day, only answering one question.
+APPROVE_COMMAND_PATH="$LOCAL_DIR/Approve.command"
+cat > "$APPROVE_COMMAND_PATH" <<EOF
+#!/usr/bin/env bash
+# Double-click this to approve a write plan. Cowork will show you a "plan_id" before this is
+# needed — have that ready to paste in.
+cd "\$(dirname "\${BASH_SOURCE[0]}")"
+read -r -p "Paste the plan_id Cowork showed you: " PLAN_ID
+export META_APPROVAL_SECRET="\$(cat "$SECRET_PATH")"
+if "$REPO_ROOT/.venv/bin/approve_plan" --plan-id "\$PLAN_ID" --all; then
+  echo
+  echo "Approved. Go back to Cowork/Desktop and ask it to execute the plan."
+else
+  echo
+  echo "Something went wrong — check the plan_id was pasted correctly and try again."
+fi
+echo
+read -r -p "Press Enter to close this window..."
+EOF
+chmod 700 "$APPROVE_COMMAND_PATH"
+
 # --- 6. Claude Desktop config snippet ---------------------------------------
 echo
 echo "== Done with local setup. Next steps =="
@@ -133,7 +155,9 @@ EOF
 echo
 echo "3. Fully quit and reopen Claude Desktop. Your account's read/write tools appear in chat."
 echo
-echo "4. To approve a write Cowork proposes, run (in a terminal):"
-echo "     $APPROVE_PATH --plan-id <the id Cowork shows you> --all"
+echo "4. To approve a write Cowork proposes: double-click"
+echo "     $APPROVE_COMMAND_PATH"
+echo "   and paste in the plan_id Cowork shows you when it asks."
+echo "   (Terminal command equivalent, if you prefer: $APPROVE_PATH --plan-id <id> --all)"
 echo
 echo "See docs/SPECIALIST_ONBOARDING.md if anything above doesn't match what you see."
