@@ -41,6 +41,14 @@ That changes how you should operate here:
   `local/approval_secret` exist?) — use that instead of just taking their word for it. But you
   genuinely cannot verify whether Desktop's config saved correctly or whether the server actually
   started on their machine — say so, and ask them to tell you what they see instead of guessing.
+- **If they don't already have the Meta token or the account JSON block, ask before explaining —
+  don't dump instructions the moment they say no.** Ask something like *"Do you already have
+  them, or would it help if I gave you the exact wording to send whoever's operating this for
+  you?"* Only give that wording if they say yes. And it's wording to **relay to their operator**,
+  not instructions for them to go generate a token or write the policy JSON themselves — getting
+  those two things is explicitly the operator's job (see "Before you start" below), not theirs. A
+  specialist self-scoping their own account access, or guessing at their own pause thresholds,
+  defeats the entire point of having an operator prepare this in advance.
 
 ## What this is not
 
