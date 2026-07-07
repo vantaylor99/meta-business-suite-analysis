@@ -8976,13 +8976,13 @@ def test_followups_mark_done_missing_ok_is_idempotent(tmp_path: Path) -> None:
 # --- Custom Meta MCP server scaffold (MOCKS ONLY: zero live Meta calls, no socket bound) ---
 
 from meta_ads_analysis import mcp_server as _mcp_server  # noqa: E402
-from meta_ads_analysis.meta_api import meta_api_version_from_env  # noqa: E402
+from meta_ads_analysis.meta_api import access_token_from_env, meta_api_version_from_env  # noqa: E402
 from meta_ads_analysis.reader_provider import reader_backend_from_env  # noqa: E402
 
 
 def _clear_scaffold_env(monkeypatch) -> None:
     for var in (
-        "META_ACCESS_TOKEN", "META_API_VERSION", "META_READER_BACKEND",
+        "META_ACCESS_TOKEN", "META_ACCESS_TOKEN_FILE", "META_API_VERSION", "META_READER_BACKEND",
         "META_APPROVAL_SECRET", "META_APPROVAL_SECRET_FILE", "META_APPROVAL_TTL_SECONDS",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -8996,6 +8996,26 @@ def test_meta_api_version_from_env_precedence(monkeypatch) -> None:
     monkeypatch.setenv("META_API_VERSION", "v33.0")
     assert meta_api_version_from_env() == "v33.0"  # env wins over default
     assert meta_api_version_from_env("v44.0") == "v44.0"  # explicit arg wins over env
+
+
+def test_access_token_from_env_env_then_file(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    _clear_scaffold_env(monkeypatch)
+    assert access_token_from_env() == ""  # neither var set
+    monkeypatch.setenv("META_ACCESS_TOKEN", "inline-token")
+    assert access_token_from_env() == "inline-token"
+    # File-based resolution only kicks in when the inline var is unset, and strips whitespace.
+    token_file = tmp_path / "token.txt"
+    token_file.write_text("file-token\n", encoding="utf-8")
+    monkeypatch.setenv("META_ACCESS_TOKEN_FILE", str(token_file))
+    assert access_token_from_env() == "inline-token"  # inline still wins
+    monkeypatch.delenv("META_ACCESS_TOKEN", raising=False)
+    assert access_token_from_env() == "file-token"
+    # A missing file is a clear, actionable error, not a silent empty token.
+    monkeypatch.setenv("META_ACCESS_TOKEN_FILE", str(tmp_path / "missing.txt"))
+    with pytest.raises(MetaApiError, match="META_ACCESS_TOKEN_FILE"):
+        access_token_from_env()
 
 
 def test_reader_backend_from_env_normalizes_and_defaults(monkeypatch) -> None:

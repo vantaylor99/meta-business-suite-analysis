@@ -92,13 +92,13 @@ else
   "$REPO_ROOT/.venv/bin/python" -c "import secrets; print(secrets.token_hex(32))" > "$SECRET_PATH"
   chmod 600 "$SECRET_PATH"
 fi
-SECRET_VALUE="$(cat "$SECRET_PATH")"
 
 # --- 4. Meta access token ----------------------------------------------------
 ENV_PATH="$REPO_ROOT/.env"
 if [ -f "$ENV_PATH" ] && grep -q "^META_ACCESS_TOKEN=" "$ENV_PATH" 2>/dev/null; then
   echo
   echo ".env already has META_ACCESS_TOKEN — leaving it as-is."
+  META_TOKEN="$(grep "^META_ACCESS_TOKEN=" "$ENV_PATH" | tail -1 | cut -d= -f2-)"
 else
   echo
   read -r -s -p "Paste the Meta access token your operator gave you (input hidden): " META_TOKEN
@@ -106,6 +106,15 @@ else
   printf 'META_ACCESS_TOKEN=%s\n' "$META_TOKEN" >> "$ENV_PATH"
   chmod 600 "$ENV_PATH"
   echo "Wrote META_ACCESS_TOKEN to $ENV_PATH"
+fi
+# Also drop a bare-value copy under local/ — this is what Claude Desktop's config points at
+# (via META_ACCESS_TOKEN_FILE) instead of ever embedding the raw token inline.
+TOKEN_FILE_PATH="$LOCAL_DIR/access_token"
+if [ -f "$TOKEN_FILE_PATH" ]; then
+  echo "$TOKEN_FILE_PATH already exists — reusing it."
+else
+  printf '%s' "$META_TOKEN" > "$TOKEN_FILE_PATH"
+  chmod 600 "$TOKEN_FILE_PATH"
 fi
 
 # --- 5. Your own approve.sh (self-approve your own proposed writes) --------
@@ -178,8 +187,9 @@ echo
 echo "== Done with local setup. Next steps =="
 echo
 echo "1. Test in mock mode first (no live Meta calls, safe to explore):"
-echo "     META_APPROVAL_SECRET=\"$SECRET_VALUE\" \"$REPO_ROOT/.venv/bin/meta_mcp_server\" --stdio --mock"
-echo "   (Ctrl-C to stop once you've confirmed it starts.)"
+echo "     META_APPROVAL_SECRET_FILE=\"$SECRET_PATH\" \"$REPO_ROOT/.venv/bin/meta_mcp_server\" --stdio --mock"
+echo "   (Ctrl-C to stop once you've confirmed it starts. Notice this command has no secret in it —"
+echo "   just a path to local/approval_secret; the server reads the file itself at startup.)"
 echo
 echo "2. Open Claude Desktop -> Settings -> Developer -> Edit Config, and add this entry inside"
 echo "   the top-level \"mcpServers\" object (create that object if it doesn't exist):"
@@ -189,11 +199,16 @@ cat <<EOF
       "command": "$REPO_ROOT/.venv/bin/meta_mcp_server",
       "args": ["--stdio"],
       "env": {
-        "META_APPROVAL_SECRET": "$SECRET_VALUE",
-        "META_ACCESS_TOKEN": "<use the token you already put in .env — copy it here too>"
+        "META_APPROVAL_SECRET_FILE": "$SECRET_PATH",
+        "META_ACCESS_TOKEN_FILE": "$TOKEN_FILE_PATH"
       }
     }
 EOF
+echo
+echo "   This block has NO secrets in it — only paths to local/approval_secret and"
+echo "   local/access_token, which the server reads itself when it starts. That means this exact"
+echo "   block is safe to paste into a chat (e.g. asking Cowork for help if something looks wrong)."
+echo "   The two files it points to ARE sensitive, though — never paste what's INSIDE them anywhere."
 echo
 echo "3. Fully quit and reopen Claude Desktop. Your account's read/write tools appear in chat."
 echo
