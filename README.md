@@ -55,6 +55,8 @@ The end-to-end workflow + diagram is in
 [docs/META_ACTION_WORKFLOW.md](docs/META_ACTION_WORKFLOW.md), and MCP/token setup is in
 [docs/META_API_SETUP.md](docs/META_API_SETUP.md). For the local server run guide (mock mode + scripted
 first session) see [docs/META_API_SETUP.md → Run the Meta MCP server locally](docs/META_API_SETUP.md#run-the-meta-mcp-server-locally).
+To hand this off to someone else's machine (Cowork-only, scoped to one account), see
+[docs/SPECIALIST_ONBOARDING.md](docs/SPECIALIST_ONBOARDING.md).
 
 ## API Sync
 

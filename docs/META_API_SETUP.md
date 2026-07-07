@@ -426,6 +426,10 @@ This is a **single-operator, local** setup. Multi-user auth, roles, and server-s
 approval state are a separate backlog item (`mcp-role-based-access-tiers`) that drops in behind the same
 `ApprovalGate` seam. Do not treat this local rig as the production shape.
 
+To hand a *second* person their own machine (Cowork-only, scoped to one account) ahead of that
+real multi-user work landing, see [SPECIALIST_ONBOARDING.md](SPECIALIST_ONBOARDING.md) and
+`scripts/onboard_specialist.sh`.
+
 ## Notes
 
 - Reads now flow through a swappable provider seam (`MetaReaderProvider` in `reader_provider.py`) so an MCP read backend can supply reads without touching call sites; writes stay on the direct Graph API client. See **Read backend: direct vs MCP** above; the read model, auth posture, and full guarded-write catalog are in [`../AGENTS.md`](../AGENTS.md) under **Hybrid Meta integration**.

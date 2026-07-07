@@ -28,3 +28,8 @@ config/meta_ads_accounts.json
 knowledge/accounts/divine_designs/
 followups/divine_designs/
 data/video_intake/divine_designs/
+
+# Per-machine artifacts from scripts/onboard_specialist.sh — approval secret, approve.sh wrapper.
+# Never shared, never committed; every machine (yours or a specialist's) generates its own.
+local/*
+!local/.gitkeep
