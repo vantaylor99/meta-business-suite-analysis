@@ -25,6 +25,15 @@ approved create is *sent*. Two shapes of justification:
   cold-ad enable). A lookalike is the exception — its basis is the seed audience's size/quality, not a
   ROAS/conversions metric, so it cites NO sample (a structural abstain that the gate allows); creating
   an audience is inert (no status, no spend; lookalike is NOT in ``PAUSED_KINDS``).
+- **net-new create declared as an experiment variant** — pass ``experiment_control_id`` /
+  ``experiment_control_level`` / ``experiment_hypothesis`` to ground the create on a declared CONTROL
+  entity's own real recent performance instead of a fabricated zero. This is not a bypass: the control's
+  real sample still has to clear the significance floor (a control with no delivery of its own cites a
+  zero sample and abstains exactly like an unqualified net-new create — borrowing evidence from an
+  equally-unproven control isn't a loophole), and the tier is ``model_inference`` (never
+  ``direct_observation``), so even a strong control sample caps the band at Low — real evidence,
+  deliberately modest confidence, since the new entity itself is still unobserved. The hypothesis is
+  required and recorded in the evidence so the plan is self-explaining.
 """
 
 from __future__ import annotations
@@ -377,6 +386,65 @@ def _attach_duplicate_grounding(
     )
 
 
+def _attach_experiment_grounding(
+    op: dict[str, Any],
+    reader: MetaReaderProvider,
+    ad_account_id: str,
+    *,
+    control_entity_id: str,
+    control_level: str,
+    hypothesis: str,
+    goal: str | None,
+    account_slug: str | None,
+    date_from: str,
+    date_to: str,
+    recency_days: int | None,
+) -> None:
+    """Ground a net-new create declared as an experiment VARIANT on its declared CONTROL entity's own
+    real recent performance (read-only via the reader) — an honest analogical basis for a brand-new
+    entity that has no history of its own.
+
+    Tier is ``model_inference``, never ``direct_observation``: the new entity itself is unobserved, so
+    even a strong control sample caps at ``Band.low`` (see ``confidence._TIER_CEILING``) — real evidence,
+    deliberately modest confidence, not an overclaim. A control with no delivery of its own cites a zero
+    sample and abstains, same as an unqualified net-new create (:func:`_attach_netnew_grounding`) —
+    borrowing evidence from an equally-unproven control isn't a loophole. ``hypothesis`` is passed as
+    ``causal_text`` (an accidentally causal rationale downgrades grounding, same guard as everywhere
+    else) and folded into ``metric_display`` so the plan is self-explaining without a separate field."""
+    rows = fetch_entity_metrics(reader, ad_account_id, level=control_level, date_from=date_from, date_to=date_to)
+    row = next((m for m in rows if str(m.get("id")) == str(control_entity_id)), None)
+    metric_name, metric_value, metric_display = _status_metric(row, goal)
+    window = f"{date_from}..{date_to}"
+    regen = build_regenerating_query(account_slug, control_level, date_from, date_to)
+    display = (
+        f"{metric_display} — cited from control {control_level} {control_entity_id} "
+        f"for experiment hypothesis: {hypothesis}"
+    )
+    if row is None:
+        evidence = Evidence(
+            metric_name=metric_name, metric_value=None, metric_display=display, window=window,
+            sample_conversions=0.0, sample_spend=0.0, entity_level=control_level,
+            entity_id=_optional_str(control_entity_id), entity_name=None, regenerating_query=regen,
+        )
+    else:
+        evidence = Evidence(
+            metric_name=metric_name, metric_value=metric_value, metric_display=display, window=window,
+            sample_conversions=_status_sample_conversions(row, goal),
+            sample_spend=_num(row.get("spend")) or 0.0, entity_level=control_level,
+            entity_id=_optional_str(control_entity_id), entity_name=row.get("name"),
+            regenerating_query=regen,
+        )
+    attach_op_grounding(
+        op,
+        evidence=evidence,
+        tier=EvidenceTier.model_inference,
+        spend_floor=CREATE_SPEND_FLOOR,
+        conversions_floor=CONFIDENCE_CONVERSIONS_FLOOR,
+        recency_days=recency_days,
+        causal_text=hypothesis,
+    )
+
+
 def _attach_lookalike_grounding(
     op: dict[str, Any],
     *,
@@ -429,15 +497,25 @@ def _build_netnew_create_plan(
     date_to: str | None = None,
     run_date: str | None = None,
     policy: dict[str, Any] | None = None,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
+    experiment_control_id: str | None = None,
+    experiment_control_level: str | None = None,
+    experiment_hypothesis: str | None = None,
 ) -> dict[str, Any]:
     """Shared net-new create builder (campaign / ad set / ad with an existing creative).
 
     Validates the op with :func:`validate_authoring_op` (required-param enforcement lives there — this
-    reuses it rather than duplicating the checks), grounds it on a **zero** sample via
-    :func:`_attach_netnew_grounding` (net-new → ``abstain``: the create is forced PAUSED regardless, and
-    an *approved* create is blocked at apply until a conscious operator override — the cold-create
-    boundary), then wraps + reviews the plan. No live read is needed: a net-new create has no prior
-    entity to measure."""
+    reuses it rather than duplicating the checks), then grounds it one of two ways:
+
+    - Default: a **zero** sample via :func:`_attach_netnew_grounding` (net-new → ``abstain``: the create
+      is forced PAUSED regardless, and an *approved* create is blocked at apply until a conscious
+      operator override — the cold-create boundary). No live read is needed here.
+    - When ``experiment_control_id`` is given: the declared control entity's own real recent
+      performance via :func:`_attach_experiment_grounding` (requires ``reader`` and
+      ``experiment_control_level``/``experiment_hypothesis`` too — enforced here, not left to the
+      grounding helper, so a missing param fails loudly at propose time).
+
+    Either way the plan is then wrapped + reviewed."""
     validate_authoring_op({"kind": kind, "params": params})
     op = {
         "op_id": op_id,
@@ -449,10 +527,23 @@ def _build_netnew_create_plan(
     policy = policy if policy is not None else resolve_action_policy(account_slug)
     goal = policy.get("primary_goal")
     date_from, date_to, recency_days, run_date_iso = _resolve_grounding_window(date_from, date_to, run_date)
-    _attach_netnew_grounding(
-        op, entity_level=entity_level, goal=goal, account_slug=account_slug,
-        date_from=date_from, date_to=date_to, recency_days=recency_days,
-    )
+    if experiment_control_id is not None:
+        if not experiment_control_level:
+            raise ValueError("experiment_control_level is required when experiment_control_id is given.")
+        if not experiment_hypothesis:
+            raise ValueError("experiment_hypothesis is required when experiment_control_id is given.")
+        if reader is None:
+            raise ValueError("reader is required to ground an experiment-cited create.")
+        _attach_experiment_grounding(
+            op, reader, ad_account_id, control_entity_id=experiment_control_id,
+            control_level=experiment_control_level, hypothesis=experiment_hypothesis, goal=goal,
+            account_slug=account_slug, date_from=date_from, date_to=date_to, recency_days=recency_days,
+        )
+    else:
+        _attach_netnew_grounding(
+            op, entity_level=entity_level, goal=goal, account_slug=account_slug,
+            date_from=date_from, date_to=date_to, recency_days=recency_days,
+        )
     return _wrap_plan([op], ad_account_id, account_slug, intent=kind, run_date=run_date_iso, policy=policy)
 
 
@@ -468,8 +559,14 @@ def build_create_campaign_plan(
     date_to: str | None = None,
     run_date: str | None = None,
     policy: dict[str, Any] | None = None,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
+    experiment_control_id: str | None = None,
+    experiment_control_level: str | None = None,
+    experiment_hypothesis: str | None = None,
 ) -> dict[str, Any]:
-    """Plan to create a campaign (net-new → grounded on a zero sample → ``abstain``; forced PAUSED).
+    """Plan to create a campaign (net-new → grounded on a zero sample → ``abstain``; forced PAUSED,
+    unless ``experiment_control_id`` declares this as an experiment variant — see
+    :func:`_build_netnew_create_plan`).
 
     ``params`` carries any extra campaign fields (``buying_type``, ``bid_strategy``, …); ``name`` and
     ``objective`` are required (enforced by :func:`validate_authoring_op`). ``special_ad_categories``
@@ -483,6 +580,8 @@ def build_create_campaign_plan(
         ad_account_id, kind="create_campaign", params=body, entity_level="campaign",
         op_id=f"create_campaign_{name}", note=f"create campaign '{name}' ({objective}); created PAUSED",
         account_slug=account_slug, date_from=date_from, date_to=date_to, run_date=run_date, policy=policy,
+        reader=reader, experiment_control_id=experiment_control_id,
+        experiment_control_level=experiment_control_level, experiment_hypothesis=experiment_hypothesis,
     )
 
 
@@ -497,8 +596,14 @@ def build_create_adset_plan(
     date_to: str | None = None,
     run_date: str | None = None,
     policy: dict[str, Any] | None = None,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
+    experiment_control_id: str | None = None,
+    experiment_control_level: str | None = None,
+    experiment_hypothesis: str | None = None,
 ) -> dict[str, Any]:
-    """Plan to create an ad set under a campaign (net-new → ``abstain``; forced PAUSED).
+    """Plan to create an ad set under a campaign (net-new → ``abstain``; forced PAUSED, unless
+    ``experiment_control_id`` declares this as an experiment variant — see
+    :func:`_build_netnew_create_plan`).
 
     ``params`` carries the rest of the ad set body (``optimization_goal``, ``billing_event``,
     ``targeting``, ``daily_budget``, ``promoted_object``, …); ``name`` and ``campaign_id`` are required
@@ -511,6 +616,8 @@ def build_create_adset_plan(
         op_id=f"create_adset_{name}_in_{campaign_id}",
         note=f"create ad set '{name}' under campaign {campaign_id}; created PAUSED",
         account_slug=account_slug, date_from=date_from, date_to=date_to, run_date=run_date, policy=policy,
+        reader=reader, experiment_control_id=experiment_control_id,
+        experiment_control_level=experiment_control_level, experiment_hypothesis=experiment_hypothesis,
     )
 
 
@@ -525,16 +632,23 @@ def build_create_ad_plan(
     date_to: str | None = None,
     run_date: str | None = None,
     policy: dict[str, Any] | None = None,
+    reader: MetaReaderProvider | MetaMarketingApiClient | None = None,
+    experiment_control_id: str | None = None,
+    experiment_control_level: str | None = None,
+    experiment_hypothesis: str | None = None,
 ) -> dict[str, Any]:
     """Plan to create an ad in an ad set from an **existing** creative id (net-new → ``abstain``; forced
-    PAUSED). To recreate a *proven* ad's creative instead — grounded on that source ad's own metric —
-    use :func:`build_duplicate_ad_plan`."""
+    PAUSED, unless ``experiment_control_id`` declares this as an experiment variant — see
+    :func:`_build_netnew_create_plan`). To recreate a *proven* ad's creative instead — grounded on that
+    source ad's own metric — use :func:`build_duplicate_ad_plan`."""
     body = {"name": name, "adset_id": adset_id, "creative": {"creative_id": creative_id}}
     return _build_netnew_create_plan(
         ad_account_id, kind="create_ad", params=body, entity_level="ad",
         op_id=f"create_ad_{name}_in_{adset_id}",
         note=f"create ad '{name}' in ad set {adset_id} (creative {creative_id}); created PAUSED",
         account_slug=account_slug, date_from=date_from, date_to=date_to, run_date=run_date, policy=policy,
+        reader=reader, experiment_control_id=experiment_control_id,
+        experiment_control_level=experiment_control_level, experiment_hypothesis=experiment_hypothesis,
     )
 
 

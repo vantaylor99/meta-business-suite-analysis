@@ -44,6 +44,7 @@ READ_METHODS: tuple[str, ...] = (
     "search_targeting",
     "list_pixels",
     "list_custom_conversions",
+    "get_activity_log",
     "iter_paginated",
 )
 
@@ -110,6 +111,17 @@ class MetaReaderProvider(ABC):
 
     @abstractmethod
     def list_custom_conversions(self, ad_account_id: str, *, fields: list[str]) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    def get_activity_log(
+        self,
+        ad_account_id: str,
+        *,
+        fields: list[str],
+        since: str | None = None,
+        until: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]: ...
 
     @abstractmethod
     def iter_paginated(
@@ -198,6 +210,19 @@ class DirectMetaReader(MetaReaderProvider):
 
     def list_custom_conversions(self, ad_account_id: str, *, fields: list[str]) -> list[dict[str, Any]]:
         return self._client.list_custom_conversions(ad_account_id, fields=fields)
+
+    def get_activity_log(
+        self,
+        ad_account_id: str,
+        *,
+        fields: list[str],
+        since: str | None = None,
+        until: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._client.get_activity_log(
+            ad_account_id, fields=fields, since=since, until=until, category=category
+        )
 
     def iter_paginated(
         self, path_or_url: str, *, params: dict[str, Any] | None = None
@@ -307,6 +332,19 @@ class FakeMetaReader(MetaReaderProvider):
     def list_custom_conversions(self, ad_account_id: str, *, fields: list[str]) -> list[dict[str, Any]]:
         return self._result("list_custom_conversions", ad_account_id, fields=fields)
 
+    def get_activity_log(
+        self,
+        ad_account_id: str,
+        *,
+        fields: list[str],
+        since: str | None = None,
+        until: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._result(
+            "get_activity_log", ad_account_id, fields=fields, since=since, until=until, category=category
+        )
+
     def iter_paginated(
         self, path_or_url: str, *, params: dict[str, Any] | None = None
     ) -> Iterator[dict[str, Any]]:
@@ -342,6 +380,7 @@ DEFAULT_MCP_TOOL_MAP: dict[str, str | None] = {
     "search_targeting": None,
     "list_pixels": None,
     "list_custom_conversions": None,
+    "get_activity_log": None,
     # Raw Graph-path escape hatch: no MCP tool equivalent (see iter_paginated below).
     "iter_paginated": None,
 }
@@ -555,6 +594,24 @@ class MCPMetaReader(MetaReaderProvider):
         return self._call_list(
             "list_custom_conversions", {"act_id": ad_account_id, "fields": self._join_fields(fields)}
         )
+
+    def get_activity_log(
+        self,
+        ad_account_id: str,
+        *,
+        fields: list[str],
+        since: str | None = None,
+        until: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        arguments: dict[str, Any] = {"act_id": ad_account_id, "fields": self._join_fields(fields)}
+        if since:
+            arguments["since"] = since
+        if until:
+            arguments["until"] = until
+        if category:
+            arguments["category"] = category
+        return self._call_list("get_activity_log", arguments)
 
     def iter_paginated(
         self, path_or_url: str, *, params: dict[str, Any] | None = None

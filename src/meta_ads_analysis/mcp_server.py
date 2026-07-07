@@ -2,7 +2,7 @@
 
 This is our own Meta MCP server: a process that starts, reports health, and can be connected
 to from an MCP client over HTTP. Alongside the ``server_info`` health tool it exposes the live
-Meta **read** surface — one tool per :data:`READ_TOOL_METHODS` entry (13 reads), each bound to a
+Meta **read** surface — one tool per :data:`READ_TOOL_METHODS` entry (14 reads), each bound to a
 shared :class:`~meta_ads_analysis.reader_provider.DirectMetaReader` — plus the guarded **write**
 surface (``propose_* → preview_plan → execute_plan``). Every write travels through the same
 propose → human-approve → validate → execute → verify pipeline as the CLI: a ``propose_*`` tool
@@ -62,7 +62,7 @@ READ_TOOL_METHODS: tuple[str, ...] = tuple(m for m in READ_METHODS if m != "iter
 # reader-method -> MCP tool name. Identity, because each tool is named **exactly** for its reader
 # method (see the plan's decision 1: natural, self-describing names, not the community package's
 # dialect). Shipped as a module constant so a future consumer wiring an ``MCPMetaReader`` at our
-# server has the full name map for all 13 reads in one import.
+# server has the full name map for all 14 reads in one import.
 SERVER_TOOL_MAP: dict[str, str] = {m: m for m in READ_TOOL_METHODS}
 
 # Short human descriptions surfaced to the MCP client (and the calling LLM) per tool.
@@ -87,6 +87,11 @@ READ_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "list_pixels": "List the ad pixels configured on an ad account.",
     "list_custom_conversions": "List the custom conversions configured on an ad account.",
+    "get_activity_log": (
+        "Fetch the ad account's activity log (status/budget/targeting/creative change history) — the "
+        "same data source Ads Manager's campaign-history page reads from. Optional since/until "
+        "(YYYY-MM-DD or Unix timestamp) and category filter."
+    ),
 }
 
 
@@ -238,6 +243,7 @@ def build_mock_reader(entities: dict[str, dict[str, Any]] | None = None) -> Fake
         list_custom_conversions=[],
         search_targeting=[],
         get_delivery_estimate=dict(MOCK_DELIVERY_ESTIMATE),
+        get_activity_log=[],
     )
 
 
@@ -358,6 +364,17 @@ def build_read_tools(reader: MetaReaderProvider) -> dict[str, Callable[..., Any]
     def list_custom_conversions(ad_account_id: str, fields: list[str]) -> list[dict[str, Any]]:
         return reader.list_custom_conversions(ad_account_id, fields=fields)
 
+    def get_activity_log(
+        ad_account_id: str,
+        fields: list[str],
+        since: str | None = None,
+        until: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return reader.get_activity_log(
+            ad_account_id, fields=fields, since=since, until=until, category=category
+        )
+
     tools: dict[str, Callable[..., Any]] = {
         "fetch_insights": fetch_insights,
         "fetch_ads": fetch_ads,
@@ -372,6 +389,7 @@ def build_read_tools(reader: MetaReaderProvider) -> dict[str, Callable[..., Any]
         "search_targeting": search_targeting,
         "list_pixels": list_pixels,
         "list_custom_conversions": list_custom_conversions,
+        "get_activity_log": get_activity_log,
     }
     # Guard against a read added to READ_TOOL_METHODS but not wired here (or vice versa). The
     # parity test asserts the same, but failing loudly at construction beats a silently-missing tool.
@@ -406,11 +424,16 @@ WRITE_TOOL_DESCRIPTIONS: dict[str, str] = {
     # Authoring (create-only; every created spending entity is forced PAUSED).
     "propose_create_campaign": (
         "Propose creating a campaign (name + objective; created PAUSED). Net-new → no performance "
-        "evidence → abstains, so an approved create is blocked at apply until a conscious override."
+        "evidence → abstains, so an approved create is blocked at apply until a conscious override. To "
+        "ground it instead, pass experiment_control_id/level/hypothesis to cite a declared control "
+        "entity's own real recent performance (tier model_inference, capped at Low) — an honest basis "
+        "for a deliberate experiment variant, not a bypass: an unproven control still abstains too."
     ),
     "propose_create_adset": (
         "Propose creating an ad set under a campaign (created PAUSED). Pass the rest of the ad set body "
-        "(optimization_goal, billing_event, targeting, daily_budget, …) in params. Net-new → abstains."
+        "(optimization_goal, billing_event, targeting, daily_budget, …) in params. Net-new → abstains "
+        "unless experiment_control_id/level/hypothesis cite a declared control entity's own real recent "
+        "performance (tier model_inference, capped at Low) as the grounding for a deliberate test."
     ),
     "propose_create_ad": (
         "Propose creating an ad in an ad set from an existing creative id (created PAUSED). To recreate "
@@ -645,23 +668,33 @@ def build_write_tools(
     def propose_create_campaign(
         account: str, name: str, objective: str, special_ad_categories: list[str] | None = None,
         params: dict[str, Any] | None = None, run_date: str | None = None,
+        experiment_control_id: str | None = None, experiment_control_level: str | None = None,
+        experiment_hypothesis: str | None = None,
     ) -> dict[str, Any]:
         account_slug, ad_account_id = _resolve_account(account)
         plan = authoring.build_create_campaign_plan(
             ad_account_id, name=name, objective=objective,
             special_ad_categories=special_ad_categories, params=params,
-            account_slug=account_slug, run_date=run_date,
+            account_slug=account_slug, run_date=run_date, reader=reader,
+            experiment_control_id=experiment_control_id,
+            experiment_control_level=experiment_control_level,
+            experiment_hypothesis=experiment_hypothesis,
         )
         return _finalize(plan)
 
     def propose_create_adset(
         account: str, name: str, campaign_id: str,
         params: dict[str, Any] | None = None, run_date: str | None = None,
+        experiment_control_id: str | None = None, experiment_control_level: str | None = None,
+        experiment_hypothesis: str | None = None,
     ) -> dict[str, Any]:
         account_slug, ad_account_id = _resolve_account(account)
         plan = authoring.build_create_adset_plan(
             ad_account_id, name=name, campaign_id=campaign_id, params=params,
-            account_slug=account_slug, run_date=run_date,
+            account_slug=account_slug, run_date=run_date, reader=reader,
+            experiment_control_id=experiment_control_id,
+            experiment_control_level=experiment_control_level,
+            experiment_hypothesis=experiment_hypothesis,
         )
         return _finalize(plan)
 

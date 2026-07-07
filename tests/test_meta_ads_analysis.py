@@ -7455,6 +7455,7 @@ _READER_CALL_SPECS = {
     "search_targeting": ((), {"query": "jewelry"}),
     "list_pixels": (("act_1",), {"fields": ["id"]}),
     "list_custom_conversions": (("act_1",), {"fields": ["id"]}),
+    "get_activity_log": (("act_1",), {"fields": ["event_type"]}),
     "iter_paginated": (("/act_1/ads",), {"params": {"limit": 1}}),
 }
 
@@ -7805,6 +7806,7 @@ def test_mcp_reader_unsupported_reads_raise_naming_the_method() -> None:
         "list_pixels": lambda: reader.list_pixels("act_1", fields=["id"]),
         "list_custom_conversions": lambda: reader.list_custom_conversions("act_1", fields=["id"]),
         "list_custom_audiences": lambda: reader.list_custom_audiences("act_1", fields=["id"]),
+        "get_activity_log": lambda: reader.get_activity_log("act_1", fields=["event_type"]),
         "iter_paginated": lambda: reader.iter_paginated("/act_1/ads"),
     }
     for name, call in cases.items():
@@ -9185,6 +9187,7 @@ def test_every_read_tool_round_trips_to_direct_reader_shape() -> None:
         "search_targeting": [{"id": "int1", "name": "Jewelry"}],
         "list_pixels": [{"id": "px1"}],
         "list_custom_conversions": [{"id": "cc1"}],
+        "get_activity_log": [{"event_type": "update_ad_set_run_status"}],
     }
     direct = DirectMetaReader(_CannedClient(canned))
     tools = _mcp_server.build_read_tools(direct)
@@ -9212,7 +9215,7 @@ def test_iter_paginated_not_exposed_and_server_tool_map_is_identity() -> None:
 
 
 def test_superset_reads_present_beyond_community_candidate() -> None:
-    # The five reads DEFAULT_MCP_TOOL_MAP marks None (the parked candidate could not serve) are
+    # The six reads DEFAULT_MCP_TOOL_MAP marks None (the parked candidate could not serve) are
     # the deliberate delta our own server adds — assert them explicitly.
     tools = _mcp_server.build_read_tools(FakeMetaReader())
     superset = {
@@ -9221,6 +9224,7 @@ def test_superset_reads_present_beyond_community_candidate() -> None:
         "search_targeting",
         "list_pixels",
         "list_custom_conversions",
+        "get_activity_log",
     }
     assert superset <= set(tools)
 
@@ -9359,7 +9363,7 @@ def test_build_server_uses_direct_reader_not_recursive_mcp_backend(monkeypatch) 
     _mcp_server.build_server("127.0.0.1", 8765)  # must not raise the reader_from_env RuntimeError
     assert isinstance(captured["reader"], DirectMetaReader)
     registered = set(captured["registered"])
-    # All 13 reads register...
+    # All 14 reads register...
     assert set(_mcp_server.READ_TOOL_METHODS).issubset(registered)
     # ...alongside the guarded write surface (propose_* + preview_plan + execute_plan).
     assert {"execute_plan", "preview_plan", "propose_set_status", "propose_set_daily_budget"}.issubset(registered)
@@ -9419,7 +9423,7 @@ def test_read_tools_register_on_real_fastmcp_and_map_errors(monkeypatch) -> None
     mcp = _mcp_server.build_server("127.0.0.1", 8765)
     tool_manager = mcp._tool_manager
     names = {t.name for t in tool_manager.list_tools()}
-    # server_info plus all 13 reads AND the guarded write surface registered; the escape hatch is not.
+    # server_info plus all 14 reads AND the guarded write surface registered; the escape hatch is not.
     write_names = set(
         _mcp_server.build_write_tools(
             _mcp_server.DirectMetaReader(_MixedClient()), _mcp_server.proposals.PlanStatusApprovalGate()
@@ -9913,6 +9917,124 @@ def test_mcp_authoring_create_executes_paused_and_verifies(tmp_path):
     assert all(params.get("status") == "PAUSED" for _kind, params, _vo in client.creates)
     # a validate pass (validate_only=True) preceded each execute pass (validate_only=False)
     assert any(vo for *_r, vo in client.creates) and any(not vo for *_r, vo in client.creates)
+
+
+def test_build_create_campaign_plan_experiment_grounds_on_control_and_executes(tmp_path):
+    # A net-new campaign declared as an experiment VARIANT cites its declared CONTROL's own real
+    # recent performance instead of a fabricated zero. Even a strong control sample (150 purchases,
+    # well over 4x the significance floor) caps at Band.low — model_inference's ceiling — never
+    # medium/high, since the NEW campaign itself is still unobserved. Because the band isn't
+    # `abstain`, this clears the apply-time gate WITHOUT the conscious-override flag the plain
+    # net-new path needs.
+    reader = FakeMetaReader(
+        fetch_insights=lambda *a, **k: [
+            {"campaign_id": "control1", "campaign_name": "july the 4th", "spend": "3000",
+             "action_values": [{"action_type": "purchase", "value": "9000"}],
+             "actions": [{"action_type": "purchase", "value": "150"}]}
+        ],
+    )
+    plan = _authoring.build_create_campaign_plan(
+        "act_1", name="4th of July (AA Off Test)", objective="OUTCOME_SALES", account_slug=None,
+        run_date="2026-07-06", reader=reader, experiment_control_id="control1",
+        experiment_control_level="campaign",
+        experiment_hypothesis="Same targeting as the control, Advantage+ Audience off, to isolate AA's effect.",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["entity_id"] == "control1"  # cites the CONTROL, not the (nonexistent) new entity
+    assert op["evidence"]["sample_conversions"] == 150.0
+    assert "hypothesis" in op["evidence"]["metric_display"]
+    assert op["confidence"]["band"] == "low"  # capped by the model_inference ceiling, not abstain
+    assert op["review"]["verdict"] == "stands"
+
+    client = _AuthRotFakeClient()
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-06",
+                                   reports_root=tmp_path)  # no drop_grounding override needed
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True
+    assert res["ops"][0]["status"] == "created"
+    assert client.creates[0][1]["status"] == "PAUSED"  # still forced PAUSED regardless of the band
+
+
+def test_build_create_campaign_plan_experiment_control_undelivered_abstains(tmp_path):
+    # Borrowing evidence from an equally-unproven control isn't a loophole: a control with no
+    # delivery in the window cites a ZERO sample → abstain, same as an unqualified net-new create,
+    # and the apply-time gate blocks it without the conscious override.
+    reader = FakeMetaReader(fetch_insights=lambda *a, **k: [])  # no row for the control
+    plan = _authoring.build_create_campaign_plan(
+        "act_1", name="Variant", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-06",
+        reader=reader, experiment_control_id="control1", experiment_control_level="campaign",
+        experiment_hypothesis="Testing AA off vs on.",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["entity_id"] == "control1"  # still names the (undelivered) control
+    assert op["evidence"]["sample_conversions"] == 0.0
+    assert op["confidence"]["band"] == "abstain"
+    assert op["review"]["verdict"] == "insufficient"
+
+    client = _AuthRotFakeClient()
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-06",
+                                   reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is False
+    assert res["ops"][0]["status"] == "blocked"
+    assert client.creates == []
+
+
+def test_build_create_campaign_plan_experiment_requires_hypothesis_and_level_and_reader():
+    # Fail loudly at propose time, not silently at apply time: a citation without a stated reason (or
+    # a level, or a reader to actually look it up) isn't grounding.
+    def _expect_value_error(*, match: str, **kwargs):
+        try:
+            _authoring.build_create_campaign_plan(
+                "act_1", name="V", objective="OUTCOME_SALES", account_slug=None, run_date="2026-07-06",
+                **kwargs,
+            )
+            raise AssertionError(f"expected ValueError containing {match!r}")
+        except ValueError as exc:
+            assert match in str(exc)
+
+    _expect_value_error(
+        match="experiment_hypothesis",
+        reader=FakeMetaReader(), experiment_control_id="control1", experiment_control_level="campaign",
+    )
+    _expect_value_error(
+        match="experiment_control_level",
+        reader=FakeMetaReader(), experiment_control_id="control1", experiment_hypothesis="why",
+    )
+    _expect_value_error(
+        match="reader is required",
+        experiment_control_id="control1", experiment_control_level="campaign", experiment_hypothesis="why",
+    )
+
+
+def test_build_create_adset_plan_experiment_grounds_on_control_and_executes(tmp_path):
+    # Parity guard: build_create_adset_plan gets the same experiment-citation treatment as
+    # build_create_campaign_plan, since both route through the shared _build_netnew_create_plan.
+    reader = FakeMetaReader(
+        fetch_insights=lambda *a, **k: [
+            {"adset_id": "control_as1", "adset_name": "4th of July", "spend": "2000",
+             "action_values": [{"action_type": "purchase", "value": "6000"}],
+             "actions": [{"action_type": "purchase", "value": "60"}]}
+        ],
+    )
+    plan = _authoring.build_create_adset_plan(
+        "act_1", name="4th of July", campaign_id="new_camp", account_slug=None, run_date="2026-07-06",
+        reader=reader, experiment_control_id="control_as1", experiment_control_level="adset",
+        experiment_hypothesis="Same targeting/creative as the control ad set, Advantage+ Audience off.",
+    )
+    op = plan["ops"][0]
+    assert op["evidence"]["entity_id"] == "control_as1"
+    assert op["confidence"]["band"] == "low"  # real data, capped by the model_inference ceiling
+
+    client = _AuthRotFakeClient()
+    pid = _proposals.save_proposal(_approve_items(plan), account_slug="demo", run_date="2026-07-06",
+                                   reports_root=tmp_path)
+    res = _proposals.execute_plan(pid, approval_gate=_proposals.PlanStatusApprovalGate(),
+                                  reader=client, client=client, reports_root=tmp_path)
+    assert res["executed"] is True
+    assert res["ops"][0]["status"] == "created"
 
 
 def test_mcp_authoring_created_active_is_red_flagged(tmp_path):
