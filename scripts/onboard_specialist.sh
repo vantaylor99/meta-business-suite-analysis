@@ -68,6 +68,17 @@ with open(dest_path, "w", encoding="utf-8") as f:
     f.write("\n")
 print(f"Wrote scoped registry ({account.get('account_slug')!r}) -> {dest_path}")
 PYEOF
+  # The handoff file itself carries the same real account data now duplicated into
+  # config/meta_ads_accounts.json — if it's sitting inside this repo checkout, leaving it there
+  # un-gitignored is exactly how real account data has leaked into git before (see
+  # mcp-azure-knowledge-store's 2026-07-07 incident note). Move it under local/ (already
+  # gitignored) rather than relying on someone remembering to clean it up.
+  case "$(cd "$(dirname "$ACCOUNT_JSON_PATH")" && pwd)/$(basename "$ACCOUNT_JSON_PATH")" in
+    "$REPO_ROOT"/*)
+      mv "$ACCOUNT_JSON_PATH" "$LOCAL_DIR/"
+      echo "Moved $ACCOUNT_JSON_PATH -> $LOCAL_DIR/$(basename "$ACCOUNT_JSON_PATH") (it was inside this repo checkout; local/ is gitignored, the repo root is not)"
+      ;;
+  esac
 fi
 
 # --- 3. Approval secret (this specialist's own — never Van's) --------------
