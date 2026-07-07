@@ -57,9 +57,9 @@ That changes how you should operate here:
   write" — same trust model as the operator's own local setup, just a second, independent
   instance of it.
 - **Not** a way to give someone access to *your* accounts. This process scopes their machine's
-  `config/meta_ads_accounts.json` to a single account on purpose (see step 2 below) — it is the
-  concrete floor implied by the earlier decision that a specialist's machine should only reach
-  the one account they run.
+  `config/meta_ads_accounts.json` to a single account on purpose (see step 3 under "Before you
+  start" below) — it is the concrete floor implied by the earlier decision that a specialist's
+  machine should only reach the one account they run.
 
 ## If the specialist has no terminal/CLI comfort at all
 
@@ -86,11 +86,12 @@ person or over a screen share, instead of handing it off.
 3. **That one account's config block.** From your own (gitignored, local-only)
    `config/meta_ads_accounts.json`, copy out **just that one account's `{...}` object** — not your
    whole file — into a standalone JSON file, and save/send it somewhere they can find it (e.g. on
-   their Desktop) — they'll need its path in step 2 below. This is lower-stakes than the token — it's
-   business config (account ID, targets, guardrail numbers), not a credential; nothing in it grants
-   access on its own without a real token to go with it. A direct message on an internal tool (e.g.
-   Teams, to the specialist specifically, not a group channel) is a reasonable way to send it — it
-   doesn't need the same password-manager-link treatment as the token.
+   their Desktop) — they'll need its path in step 3 of "What the specialist does" below. This is
+   lower-stakes than the token — it's business config (account ID, targets, guardrail numbers), not
+   a credential; nothing in it grants access on its own without a real token to go with it. A
+   direct message on an internal tool (e.g. Teams, to the specialist specifically, not a group
+   channel) is a reasonable way to send it — it doesn't need the same password-manager-link
+   treatment as the token.
 
 ## What the specialist does, on their own machine
 
@@ -102,22 +103,26 @@ checking its own limits honestly rather than guessing. It cannot do the double-c
 steps below for you — those still have to happen on your actual Mac — but it can explain what
 you're seeing, confirm things look right after each step, and help if something goes wrong.
 
-1. Double-click **`scripts/Setup Meta Ads Account.command`** in Finder. (First time only, macOS
-   may say it's from an unidentified developer — right-click it → **Open** → confirm once; that
-   shouldn't come up for a file that arrived via `git clone` rather than a browser download, but
-   macOS is occasionally inconsistent about it.) A Terminal window opens and walks through the
-   rest — nothing here needs typing a command, only answering what it asks.
-2. When it asks for the path to the single-account JSON file (step 3 above): rather than typing
-   the path, **drag that file from Finder into the Terminal window** — it fills in the full path
-   automatically — then press Enter.
-3. When it asks for the Meta access token: paste it in (the window hides what's typed) and press
+1. Get to the project folder in Finder, then go into its `scripts` folder. The easiest way there:
+   in the Cowork sidebar, click the small **folder icon** next to the project name (top right of
+   the project panel) — it opens the project's actual folder directly in Finder, no manual
+   navigating needed.
+2. Double-click **`scripts/Setup Meta Ads Account.command`**. (First time only, macOS may say it's
+   from an unidentified developer — right-click it → **Open** → confirm once; that shouldn't come
+   up for a file that arrived via `git clone` rather than a browser download, but macOS is
+   occasionally inconsistent about it.) A Terminal window opens and walks through the rest —
+   nothing here needs typing a command, only answering what it asks.
+3. When it asks for the path to the single-account JSON file (step 3 under "Before you start"
+   above): rather than typing the path, **drag that file from Finder into the Terminal window** —
+   it fills in the full path automatically — then press Enter.
+4. When it asks for the Meta access token: paste it in (the window hides what's typed) and press
    Enter.
-4. It prints a block to paste into Claude Desktop's config, and a reminder to test in mock mode
+5. It prints a block to paste into Claude Desktop's config, and a reminder to test in mock mode
    first. Follow along in the same window; it tells you exactly what to do next, including the
    **Settings → Developer → Edit Config** step in Claude Desktop.
-5. Fully quit and reopen Claude Desktop after adding that config. Their account's read/write tools
+6. Fully quit and reopen Claude Desktop after adding that config. Their account's read/write tools
    appear in chat.
-6. Day to day: ask Cowork to read/analyze freely. For a write, Cowork will produce a `plan_id` —
+7. Day to day: ask Cowork to read/analyze freely. For a write, Cowork will produce a `plan_id` —
    double-click **`local/Approve.app`**. A normal macOS popup appears (no terminal window) asking
    for the plan_id — paste it in and click **Approve**, then go back to Cowork/Desktop and ask it
    to execute. This is the same propose → approve → validate → execute → verify loop the operator
