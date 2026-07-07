@@ -152,8 +152,9 @@ This is deliberate: nothing in the build runs the community server.
 - **Covered reads (mapped to MCP tools):** `fetch_insights`, `fetch_ads`, `list_campaigns`,
   `get_campaign`, `list_adsets`, `get_adset`, `get_ad`, `get_account`.
 - **NOT covered (fall back to `direct` for these):** `list_custom_audiences`,
-  `get_delivery_estimate`, `search_targeting`, `list_pixels`, `list_custom_conversions`, and the raw
-  `iter_paginated` escape hatch. Each raises a clear `NotImplementedError` naming the read.
+  `get_delivery_estimate`, `search_targeting`, `list_pixels`, `list_custom_conversions`,
+  `get_activity_log`, and the raw `iter_paginated` escape hatch. Each raises a clear
+  `NotImplementedError` naming the read.
 - **Pagination:** the candidate does not auto-paginate; `MCPMetaReader` follows `paging.next` via the
   server's `meta_ads_fetch_pagination_url` tool and **refuses to silently truncate** (it raises if a
   page is dropped and no pagination tool is configured).
@@ -167,9 +168,10 @@ CLI/sync runs on `direct`.
 
 Separate from the community `meta-ads-read` **read** candidate above, this repo also ships **our own**
 custom Meta MCP server — the long-term home for reads *and* guarded writes behind one connector. It now
-exposes the full live Meta **read** surface: the `server_info` health tool plus one tool per read (13
+exposes the full live Meta **read** surface: the `server_info` health tool plus one tool per read (14
 tools — `fetch_insights`, `fetch_ads`, `list_campaigns`, `get_account`, `search_targeting`,
-`list_pixels`, … — a superset of what the parked community candidate could serve). Each read tool is a
+`list_pixels`, `get_activity_log`, … — a superset of what the parked community candidate could serve).
+Each read tool is a
 1:1 wrapper over the direct reader; a bad token or insufficient scope comes back as a clean tool error,
 not a crash. It **also now exposes the guarded write surface**: `propose_*` (grounded, reviewed,
 persisted as a proposal returning only a `plan_id`), `preview_plan` (write-free dry run), and
@@ -201,7 +203,7 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 13 read tools and the guarded write tools (`propose_*` / `preview_plan` /
+plus any of the 14 read tools and the guarded write tools (`propose_*` / `preview_plan` /
 `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
 
@@ -318,6 +320,22 @@ local Developer config rather than the org connector policy. Use the `--stdio` f
    Going live over stdio is the same opt-in as §7: drop `--mock` from `args` and add
    `"META_ACCESS_TOKEN": "<token>"` to the `env` block.
 
+**Alternative: a wrapper-launcher pattern (what this account actually runs).** Instead of putting
+`META_APPROVAL_SECRET`/`META_ACCESS_TOKEN` inline in the Desktop config's `env` block, `mcpServers` can
+point `command`/`args` at a small Python launcher script (e.g. `~/.mcp-cowork-test/stdio_server_live.py`)
+that loads the secret itself — typically from a local file like `~/.mcp-cowork-test/secret` — and sets
+`os.environ["META_APPROVAL_SECRET"]` before building the server. **If you inspect the Desktop config and
+don't see `META_APPROVAL_SECRET` in an `env` block, this is why — it's not missing, it's just loaded
+inside the launcher instead.** Check the launcher script (`cat` the path in `command`/`args`) to find
+where it reads the secret from before assuming you need to generate a new one.
+
+When this pattern is used, there is usually a matching `approve.sh` next to the launcher (e.g.
+`~/.mcp-cowork-test/approve.sh`) that loads that same secret and calls `approve_plan` for you — use it
+instead of manually exporting `META_APPROVAL_SECRET` and calling `approve_plan` yourself:
+```bash
+~/.mcp-cowork-test/approve.sh --plan-id <uuid from step 3> --all
+```
+
 ### 5. Scripted first session
 
 Run these tool calls in order. The `→` lines show representative output.
@@ -344,7 +362,11 @@ propose_set_status(account="act_mock001", id="ad_mock001", level="ad", status="P
 #   independently approvable.
 
 # Step 4 — approve, OUT OF BAND, in a SEPARATE shell (this is the human's step, not a tool call)
-#   Give the second shell the SAME secret, then sign the plan:
+#   Give the second shell the SAME secret, then sign the plan. `approve_plan` is a console script
+#   installed into THIS project's venv, not your system PATH — use the venv path or activate it first,
+#   e.g. `.venv/bin/approve_plan` (macOS/Linux) or activate then plain `approve_plan`. If a wrapper
+#   launcher + `approve.sh` is in play (see §4b), use that instead — it already has the secret loaded:
+#   `~/.mcp-cowork-test/approve.sh --plan-id <uuid from step 3> --all`
 $env:META_APPROVAL_SECRET="<same hex from step 2>"
 approve_plan --plan-id <uuid from step 3> --all
 # → Approved 2 ops. Signature written to the proposal.
@@ -371,6 +393,14 @@ execute_plan(plan_id="<uuid from step 3>")
   `approval_configured: false` when no usable secret is set.
 - **Wrong port:** the URL in `.mcp.json` is `http://127.0.0.1:8765/mcp`; if you launched with a different
   `--port` / `MCP_SERVER_PORT`, they must match.
+- **`zsh: command not found: approve_plan` (or `python`):** these are console scripts inside this
+  project's `.venv`, not on your system `PATH`. Use `.venv/bin/approve_plan` (from the repo root) or
+  activate the venv first (`source .venv/bin/activate`).
+- **Can't find `META_APPROVAL_SECRET` in the Claude Desktop config:** if `mcpServers` points at a
+  wrapper launcher script instead of `meta_mcp_server` directly (see §4b), the secret is loaded inside
+  that script (often from a local file), not from an inline `env` block. Read the launcher script to find
+  where it loads the secret from, and use the matching `approve.sh` helper if one exists next to it —
+  don't generate a fresh secret, since it won't match what the running server already holds.
 
 ### 7. Go live (opt-in)
 

@@ -161,6 +161,28 @@ class MetaMarketingApiClient:
         params = {"fields": ",".join(fields), "limit": 100}
         return list(self.iter_paginated(f"/{ad_account_id}/customconversions", params=params))
 
+    def get_activity_log(
+        self,
+        ad_account_id: str,
+        *,
+        fields: list[str],
+        since: str | None = None,
+        until: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Ad account activity log (status/budget/targeting/creative change history) — the same
+        data source Ads Manager's campaign-history page reads from. ``since``/``until`` accept any
+        format the Graph API's ``activities`` edge parses (e.g. ``YYYY-MM-DD`` or a Unix timestamp);
+        ``category`` filters to one event category (e.g. ``budget``, ``status``, ``targeting``)."""
+        params: dict[str, Any] = {"fields": ",".join(fields), "limit": 200}
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+        if category:
+            params["category"] = category
+        return list(self.iter_paginated(f"/{ad_account_id}/activities", params=params))
+
     def create_campaign(self, ad_account_id: str, *, params: dict[str, Any], validate_only: bool = False) -> dict[str, Any]:
         """Create a campaign (requires ``ads_management``)."""
         return self._post_json(

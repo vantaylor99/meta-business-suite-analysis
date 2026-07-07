@@ -2,6 +2,14 @@
 
 Append-only, dated. Newest first. Record every change to the live account + the reason + result.
 
+## 2026-07-03/04 (out-of-band account changes) — Van launched `july the 4th` directly in Ads Manager; a second operator paused `100K` to fund it
+
+**Both changes were made directly in the Meta Ads Manager UI, not through the repo's guarded CLI flow — so neither shows up in the tooling's own audit trail. Logging here after the fact from `fetch_insights`/`get_adset` reads so we don't lose the thread.**
+
+- **`july the 4th`** (campaign `120247467198830733`, ad set `120247467198840733`) — built and launched by **Van**, 2026-07-03. Reason: the repo doesn't yet have a solid flow for getting new video/image creative uploaded through the guarded ops, so Van uploaded the holiday creative and set targeting directly in-platform rather than wait on tooling. Structurally different from the core three ad sets: **Advantage+ Audience ON**, no custom audience/lookalike (just "Engaged Shoppers" behavior + "Religious studies" flex-spec, narrowed to core LDS-market cities), `OFFSITE_CONVERSIONS` optimization instead of `VALUE`. One ad (`New Sales Ad`) ran a **25% sitewide discount** offer; two others (`blue and green 4th of july`, `easter ad/ 4th of July`) use `{{product.name}}` templated/catalog creative. Performance during the holiday window was very strong (7–9x ROAS on the themed ads 7/3–7/4), but that's confounded by AA-on + the discount offer + catalog creative + July 4th seasonality all landing at once — see 2026-07-06 read below. On 7/5 swapped in evergreen "-Copy" duplicates of the proven winners as the holiday creative wound down; settled to ~2.7–2.9 ROAS.
+- **`100K` paused** (campaign `120241587361240733`, containing Engaged Audience + High Value Customers) — paused by **a second operator on the account (not Van, not through this tooling)** on 2026-07-03/04, specifically to free up budget for `july the 4th`. Effect: Engaged's rebuilt-lookalike fix (below, applied 7/2) only got **one partial day** of clean post-fix delivery (7/3, $37 spend, 2.62 ROAS) before spend went to $0 — not the full week the 2026-07-07 settle-read follow-up assumed. Also affects the "roll the lookalike fix to High Value/Low Value" call, which was waiting on that read.
+- **Why this matters going forward:** more than one person can change this account outside the guarded flow, and those changes don't get logged automatically. Any time spend/status looks off vs. what we last set, check Ads Manager activity/who's who before assuming it's a tooling bug or a delivery issue.
+
 ## 2026-07-02 (root-cause + action) — broken lookalikes found; rebuilt Engaged's 5% US LAL and swapped it in; shipped `set_custom_audiences` op
 
 **This reframes the whole post-Jun-22 "tank." It was never one thing — it's three layers, and the ad-specific one is a real, fixable bug.**
