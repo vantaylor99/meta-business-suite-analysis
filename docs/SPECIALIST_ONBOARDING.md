@@ -36,6 +36,21 @@ That changes how you should operate here:
   have installed is expected and does not mean it's broken on their actual Mac. If you're not
   sure, say so plainly and suggest they confirm by running the same check in their own real
   Terminal, rather than reporting your sandbox's result as fact.
+- **Ignore `.mcp.json` when checking whether the specialist's MCP connection is working — it is
+  not the thing you're looking for.** That file configures a *different, unrelated* setup: the
+  operator's own personal use of **Claude Code (the CLI)**, which connects over **HTTP** to a
+  manually-started, long-running `meta_mcp_server` process. It has nothing to do with the
+  specialist's actual connection, which is a **stdio** entry (named `meta-suite-<their folder
+  name>`) inside **Claude Desktop's own app config** — a file that lives outside this repo
+  entirely and that you cannot see (see the first bullet above). Confirmed 2026-07-08: a prior
+  session read `.mcp.json`, concluded the "meta-suite" server needed to be started manually via
+  `meta_mcp_server --mock`/`meta_mcp_server`, and gave that as troubleshooting advice — it was
+  checking the wrong file and the advice didn't apply. If a specialist asks you to check whether
+  their custom Meta tools are connected: look at whether any tool names starting with
+  `mcp__meta-suite-` (or similar) are actually available to you right now — that's the only
+  reliable signal you have. If they're not, the fix is almost always "did you add the printed
+  block to Claude Desktop's config and fully quit/reopen it?", never anything about `.mcp.json` or
+  starting an HTTP server by hand.
 - **Go one step at a time.** This audience is explicitly not made up of programmers and can get
   confused or overwhelmed easily (this is a hard requirement from the project's own backlog notes,
   not a suggestion) — confirm each step is actually done before describing the next one. Don't
