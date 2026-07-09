@@ -67,6 +67,10 @@ curl -s "https://graph.facebook.com/v21.0/me/adaccounts?access_token=<token>"
 Should list the ad account(s) it has access to. An empty list or an error means the asset
 assignment (System User path) or the permission grant (Explorer path) didn't take.
 
+The MCP server exposes this same check as the **`list_ad_accounts`** tool (it takes no `account`
+argument), so once the server is running you can discover every reachable account from inside
+Cowork — with a human-readable status for each — instead of hand-running this curl.
+
 ## Configuration
 
 Update:
@@ -253,8 +257,9 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools and the guarded write tools (`propose_*` / `preview_plan` /
-`execute_plan`). If the `server` extra is not installed, launching prints an actionable error
+plus any of the 14 read tools, the two discovery tools (`list_ad_accounts` and
+`cross_account_spend_summary` — neither takes an `account` argument), and the
+guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude

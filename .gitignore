@@ -29,6 +29,10 @@ knowledge/accounts/divine_designs/
 followups/divine_designs/
 data/video_intake/divine_designs/
 
+# Seattle Mission — real client account knowledge (run out-of-band by the operator).
+# Same treatment as divine_designs: stays on disk, never committed.
+knowledge/accounts/seattle_mission/
+
 # Per-machine artifacts from scripts/onboard_specialist.sh — approval secret, approve.sh wrapper.
 # Never shared, never committed; every machine (yours or a specialist's) generates its own.
 local/*
