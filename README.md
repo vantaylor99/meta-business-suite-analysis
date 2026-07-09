@@ -41,7 +41,10 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
 - **Reads reach every account the token sees.** They are intentionally not registry-gated — config
   is only needed for writes. The `list_ad_accounts` discovery tool (no `account` argument) lists every
   ad account the access token can reach, with a human-readable status for each, so you can find
-  accounts before any are added to the config file.
+  accounts before any are added to the config file. The `cross_account_spend_summary` tool builds on it:
+  a one-call cross-account spend view for a date range that subtotals **per currency** (never summing
+  across different currencies, so there is no misleading grand total) and reports any account it could
+  not read instead of failing the whole call.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

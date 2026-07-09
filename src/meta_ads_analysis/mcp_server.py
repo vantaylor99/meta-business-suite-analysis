@@ -422,12 +422,17 @@ def build_read_tools(reader: MetaReaderProvider) -> dict[str, Callable[..., Any]
 # Discovery tools are the reads that take NO ``account`` argument and add a light normalization on
 # top of the reader row (a human-readable status label) — they do not fit the 1:1 ``build_read_tools``
 # seam, so they live in ``build_discovery_tools``. Reads reach every account the token sees (no
-# registry gate). The follow-up ticket adds ``cross_account_spend_summary`` here.
+# registry gate). ``cross_account_spend_summary`` fans out over these accounts and subtotals by currency.
 DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
     "list_ad_accounts": (
         "List every ad account this access token can reach (no account argument needed). "
         "Returns account id, name, currency, and a human-readable status for each — use it to "
         "discover accounts before any are added to the config file."
+    ),
+    "cross_account_spend_summary": (
+        "Summarize spend/performance across every ad account this token can reach (or an explicit "
+        "list of account ids) for a date range. Groups totals by currency and never sums across "
+        "different currencies; reports any accounts that could not be read."
     ),
 }
 
@@ -447,7 +452,17 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
     def list_ad_accounts(fields: list[str] | None = None) -> list[dict[str, Any]]:
         return account_discovery.list_ad_accounts(reader, fields=fields)
 
-    return {"list_ad_accounts": list_ad_accounts}
+    def cross_account_spend_summary(
+        date_from: str, date_to: str, account_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        return account_discovery.cross_account_spend_summary(
+            reader, date_from=date_from, date_to=date_to, account_ids=account_ids
+        )
+
+    return {
+        "list_ad_accounts": list_ad_accounts,
+        "cross_account_spend_summary": cross_account_spend_summary,
+    }
 
 
 # Short human descriptions for the guarded-write surface (surfaced to the MCP client / calling LLM).

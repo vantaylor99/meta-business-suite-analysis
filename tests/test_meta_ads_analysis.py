@@ -9411,6 +9411,252 @@ def test_discovery_tool_mock_smoke_returns_single_seeded_account() -> None:
     assert rows[0]["account_status_label"] == "ACTIVE"
 
 
+# --- Cross-account spend summary: fan out reads, subtotal per currency, NEVER across currencies ---
+# MOCKS ONLY: every test seeds a FakeMetaReader; no live Meta call is ever made.
+
+
+def _summary_accounts() -> list[dict[str, object]]:
+    # 2 USD + 1 EUR reachable accounts (as /me/adaccounts rows: id=act_<n>, account_id=<n>).
+    return [
+        {"id": "act_1", "account_id": "1", "name": "USD One", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "USD Two", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "EUR One", "account_status": 1, "currency": "EUR"},
+    ]
+
+
+_SUMMARY_INSIGHTS: dict[str, list[dict[str, str]]] = {
+    "act_1": [{"spend": "100.50", "impressions": "1000", "clicks": "40"}],
+    "act_2": [{"spend": "50.25", "impressions": "500", "clicks": "20"}],
+    "act_3": [{"spend": "12.00", "impressions": "300", "clicks": "10"}],
+}
+
+
+def _summary_reader(**overrides: object) -> FakeMetaReader:
+    accounts = _summary_accounts()
+
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [dict(r) for r in _SUMMARY_INSIGHTS[ad_account_id]]
+
+    stubs: dict[str, object] = {
+        "list_ad_accounts": lambda *, fields: [dict(a) for a in accounts],
+        "fetch_insights": _fetch_insights,
+    }
+    stubs.update(overrides)
+    return FakeMetaReader(**stubs)
+
+
+def test_cross_account_summary_subtotals_per_currency_no_grand_total() -> None:
+    reader = _summary_reader()
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    # Exactly the two currencies present — never merged into one bucket.
+    assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
+    usd = summary["totals_by_currency"]["USD"]
+    eur = summary["totals_by_currency"]["EUR"]
+    # USD subtotal == sum of the two USD accounts (spend parsed to float, counts to int).
+    assert usd["spend"] == 150.75
+    assert usd["impressions"] == 1500 and usd["clicks"] == 60
+    assert usd["account_count"] == 2
+    assert eur == {"spend": 12.0, "impressions": 300, "clicks": 10, "account_count": 1}
+    # No grand total anywhere — totals_by_currency is the ONLY aggregate.
+    assert "total_spend" not in summary and "total" not in summary and "totals" not in summary
+    assert summary["reachable_count"] == summary["account_count"] == 3
+    assert summary["errors"] == []
+    # Rows carry normalized metadata (currency + human status label).
+    labels = {r["ad_account_id"]: r["account_status_label"] for r in summary["accounts"]}
+    assert labels == {"act_1": "ACTIVE", "act_2": "ACTIVE", "act_3": "ACTIVE"}
+    # fetch_insights was called account-level, aggregated over the whole window.
+    insight_calls = [c for c in reader.calls if c[0] == "fetch_insights"]
+    assert insight_calls and all(
+        c[2]["level"] == "account" and c[2]["time_increment"] == "all_days" for c in insight_calls
+    )
+
+
+def test_cross_account_summary_parses_numeric_string_spend_as_float() -> None:
+    # A naive sum of Meta's string spends would concatenate ("100.50"+"50.25"); we parse first.
+    reader = _summary_reader()
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    usd_spend = summary["totals_by_currency"]["USD"]["spend"]
+    assert usd_spend == 150.75
+    assert isinstance(usd_spend, float)
+    # Per-row spends are parsed numbers, not the raw strings.
+    per_row = {r["ad_account_id"]: r["spend"] for r in summary["accounts"] if r["currency"] == "USD"}
+    assert per_row == {"act_1": 100.5, "act_2": 50.25}
+
+
+def test_cross_account_summary_partial_failure_is_recorded_not_fatal() -> None:
+    accounts = _summary_accounts()
+
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        if ad_account_id == "act_2":
+            raise MetaApiError("(#200) no permission for act_2")
+        return [dict(r) for r in _SUMMARY_INSIGHTS[ad_account_id]]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch_insights,
+    )
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    # The failing account is recorded with its id + message and excluded from accounts.
+    assert summary["errors"] == [{"ad_account_id": "act_2", "error": "(#200) no permission for act_2"}]
+    assert "act_2" not in {r["ad_account_id"] for r in summary["accounts"]}
+    # Other accounts' subtotals are unaffected: only act_1 remains in USD, EUR intact.
+    assert summary["totals_by_currency"]["USD"] == {
+        "spend": 100.5, "impressions": 1000, "clicks": 40, "account_count": 1
+    }
+    assert summary["totals_by_currency"]["EUR"]["account_count"] == 1
+    # account_count is the fan-out size (3); reachable is discovery size (3).
+    assert summary["account_count"] == 3 and summary["reachable_count"] == 3
+
+
+def test_cross_account_summary_explicit_ids_use_get_account_and_skip_discovery() -> None:
+    accounts_by_id = {
+        "act_1": {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        "act_9": {"id": "act_9", "account_id": "9", "name": "B", "account_status": 2, "currency": "EUR"},
+    }
+    insights = {
+        "act_1": [{"spend": "10.00", "impressions": "100", "clicks": "5"}],
+        "act_9": [{"spend": "20.00", "impressions": "200", "clicks": "8"}],
+    }
+
+    def _get_account(ad_account_id, *, fields):
+        return dict(accounts_by_id[ad_account_id])
+
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [dict(r) for r in insights[ad_account_id]]
+
+    # list_ad_accounts intentionally NOT stubbed — if the explicit path touched it, FakeMetaReader
+    # would raise NotImplementedError.
+    reader = FakeMetaReader(get_account=_get_account, fetch_insights=_fetch_insights)
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=["1", "act_9"]
+    )
+    # Fan-out targets exactly the given ids; a bare numeric id is normalized to act_ form.
+    assert summary["reachable_count"] == summary["account_count"] == 2
+    assert {r["ad_account_id"] for r in summary["accounts"]} == {"act_1", "act_9"}
+    # Discovery was never consulted; get_account was called per id.
+    assert not any(c[0] == "list_ad_accounts" for c in reader.calls)
+    get_calls = [c for c in reader.calls if c[0] == "get_account"]
+    assert {c[1][0] for c in get_calls} == {"act_1", "act_9"}
+    # Per-currency subtotals still separate; status label from get_account metadata propagates.
+    assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
+    labels = {r["ad_account_id"]: r["account_status_label"] for r in summary["accounts"]}
+    assert labels == {"act_1": "ACTIVE", "act_9": "DISABLED"}
+
+
+def test_cross_account_summary_explicit_id_unreadable_is_partial_failure() -> None:
+    # An explicit id the token cannot read fails its get_account -> same per-account error path.
+    def _get_account(ad_account_id, *, fields):
+        raise MetaApiError("(#100) cannot read act_404")
+
+    reader = FakeMetaReader(get_account=_get_account, fetch_insights=lambda *a, **k: [])
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=["404"]
+    )
+    assert summary["accounts"] == []
+    assert summary["errors"] == [{"ad_account_id": "act_404", "error": "(#100) cannot read act_404"}]
+    # Explicit ids: no discovery, so no note even though accounts is empty.
+    assert "note" not in summary
+
+
+def test_cross_account_summary_empty_reach_returns_note() -> None:
+    reader = FakeMetaReader(list_ad_accounts=[])
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    assert summary["accounts"] == []
+    assert summary["totals_by_currency"] == {}
+    assert summary["errors"] == []
+    assert summary["note"] == "no accounts reachable"
+    assert summary["reachable_count"] == 0 and summary["account_count"] == 0
+
+
+def test_cross_account_summary_discovery_failure_propagates() -> None:
+    # A discovery-level MetaApiError (bad token / no scope) is a whole-call failure, not a per-account
+    # one — it propagates for the FastMCP layer to map to a ToolError.
+    import pytest
+
+    def _denied(*, fields):
+        raise MetaApiError("(#190) Invalid OAuth access token")
+
+    reader = FakeMetaReader(list_ad_accounts=_denied)
+    with pytest.raises(MetaApiError) as excinfo:
+        _account_discovery.cross_account_spend_summary(
+            reader, date_from="2026-06-01", date_to="2026-06-30"
+        )
+    assert "Invalid OAuth" in str(excinfo.value)
+
+
+def test_cross_account_summary_missing_currency_groups_under_unknown() -> None:
+    # An account with no currency lands in an "UNKNOWN" bucket rather than being dropped or merged.
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1}]  # no currency
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=lambda *a, **k: [{"spend": "5.00"}],  # only spend; no impressions/clicks
+    )
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    assert set(summary["totals_by_currency"]) == {"UNKNOWN"}
+    assert summary["accounts"][0]["currency"] == "UNKNOWN"
+    # Per-row reflects what Meta returned: spend present, impressions/clicks omitted...
+    assert summary["accounts"][0]["spend"] == 5.0
+    assert "impressions" not in summary["accounts"][0]
+    # ...but the subtotal is still complete (a missing metric counts as 0).
+    assert summary["totals_by_currency"]["UNKNOWN"] == {
+        "spend": 5.0, "impressions": 0, "clicks": 0, "account_count": 1
+    }
+
+
+def test_cross_account_summary_no_delivery_counts_as_zero_not_error() -> None:
+    # Zero insight rows (no delivery in range) -> metrics 0, still an account row, NOT an error.
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=lambda *a, **k: [],
+    )
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    assert summary["errors"] == []
+    assert len(summary["accounts"]) == 1
+    assert summary["totals_by_currency"]["USD"] == {
+        "spend": 0, "impressions": 0, "clicks": 0, "account_count": 1
+    }
+    # No insight row -> per-row carries no metric keys.
+    assert "spend" not in summary["accounts"][0]
+
+
+def test_cross_account_summary_mock_smoke_single_usd_account() -> None:
+    # --mock: one seeded USD account -> one row + a one-key totals_by_currency, zero live calls.
+    reader = _mcp_server.build_mock_reader()
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    assert len(summary["accounts"]) == 1
+    assert list(summary["totals_by_currency"]) == ["USD"]
+    assert summary["totals_by_currency"]["USD"]["account_count"] == 1
+    assert summary["accounts"][0]["currency"] == "USD"
+    assert summary["errors"] == []
+    # Discovery path uses list_ad_accounts metadata, never get_account.
+    assert not any(c[0] == "get_account" for c in reader.calls)
+
+
+def test_build_discovery_tools_exposes_cross_account_summary() -> None:
+    reader = _summary_reader()
+    discovery = _mcp_server.build_discovery_tools(reader)
+    # Both discovery tools are exposed.
+    assert set(discovery) == {"list_ad_accounts", "cross_account_spend_summary"}
+    summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
+    assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
+    assert "cross_account_spend_summary" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from
@@ -9593,6 +9839,7 @@ def test_read_tools_register_on_real_fastmcp_and_map_errors(monkeypatch) -> None
     assert names == {"server_info", *_mcp_server.READ_TOOL_METHODS, *discovery_names, *write_names}
     assert "execute_plan" in names and "propose_set_status" in names
     assert "list_ad_accounts" in names  # discovery tool registered
+    assert "cross_account_spend_summary" in names  # cross-account aggregate discovery tool registered
     assert "iter_paginated" not in names
     # Schema derived from the wrapper's real signature (functools.wraps preserved it).
     assert set(tool_manager.get_tool("fetch_ads").parameters["properties"]) == {"ad_account_id", "fields"}
