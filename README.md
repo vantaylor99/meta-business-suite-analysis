@@ -38,6 +38,10 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   A community token-based MCP server is wired as a **disabled, unvetted placeholder** in `.mcp.json`,
   and Meta's official OAuth server is a **config-only drop-in for later** (no code change). Writes
   always use the direct Graph client.
+- **Reads reach every account the token sees.** They are intentionally not registry-gated — config
+  is only needed for writes. The `list_ad_accounts` discovery tool (no `account` argument) lists every
+  ad account the access token can reach, with a human-readable status for each, so you can find
+  accounts before any are added to the config file.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

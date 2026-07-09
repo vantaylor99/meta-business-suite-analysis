@@ -186,6 +186,11 @@ class MetaMarketingApiClient:
         params = {"fields": ",".join(fields), "limit": 100}
         return list(self.iter_paginated(f"/{ad_account_id}/customconversions", params=params))
 
+    def list_ad_accounts(self, *, fields: list[str]) -> list[dict[str, Any]]:
+        """List every ad account the token can reach, via the /me/adaccounts edge."""
+        params = {"fields": ",".join(fields), "limit": 200}
+        return list(self.iter_paginated("/me/adaccounts", params=params))
+
     def get_activity_log(
         self,
         ad_account_id: str,

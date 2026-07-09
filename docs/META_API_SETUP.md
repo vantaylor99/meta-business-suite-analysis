@@ -67,6 +67,10 @@ curl -s "https://graph.facebook.com/v21.0/me/adaccounts?access_token=<token>"
 Should list the ad account(s) it has access to. An empty list or an error means the asset
 assignment (System User path) or the permission grant (Explorer path) didn't take.
 
+The MCP server exposes this same check as the **`list_ad_accounts`** tool (it takes no `account`
+argument), so once the server is running you can discover every reachable account from inside
+Cowork — with a human-readable status for each — instead of hand-running this curl.
+
 ## Configuration
 
 Update:

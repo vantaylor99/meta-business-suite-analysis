@@ -45,6 +45,7 @@ READ_METHODS: tuple[str, ...] = (
     "list_pixels",
     "list_custom_conversions",
     "get_activity_log",
+    "list_ad_accounts",
     "iter_paginated",
 )
 
@@ -122,6 +123,9 @@ class MetaReaderProvider(ABC):
         until: str | None = None,
         category: str | None = None,
     ) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    def list_ad_accounts(self, *, fields: list[str]) -> list[dict[str, Any]]: ...
 
     @abstractmethod
     def iter_paginated(
@@ -223,6 +227,9 @@ class DirectMetaReader(MetaReaderProvider):
         return self._client.get_activity_log(
             ad_account_id, fields=fields, since=since, until=until, category=category
         )
+
+    def list_ad_accounts(self, *, fields: list[str]) -> list[dict[str, Any]]:
+        return self._client.list_ad_accounts(fields=fields)
 
     def iter_paginated(
         self, path_or_url: str, *, params: dict[str, Any] | None = None
@@ -345,6 +352,9 @@ class FakeMetaReader(MetaReaderProvider):
             "get_activity_log", ad_account_id, fields=fields, since=since, until=until, category=category
         )
 
+    def list_ad_accounts(self, *, fields: list[str]) -> list[dict[str, Any]]:
+        return self._result("list_ad_accounts", fields=fields)
+
     def iter_paginated(
         self, path_or_url: str, *, params: dict[str, Any] | None = None
     ) -> Iterator[dict[str, Any]]:
@@ -381,6 +391,8 @@ DEFAULT_MCP_TOOL_MAP: dict[str, str | None] = {
     "list_pixels": None,
     "list_custom_conversions": None,
     "get_activity_log": None,
+    # Cross-account discovery read (/me/adaccounts): no community MCP tool equivalent -> direct.
+    "list_ad_accounts": None,
     # Raw Graph-path escape hatch: no MCP tool equivalent (see iter_paginated below).
     "iter_paginated": None,
 }
@@ -612,6 +624,11 @@ class MCPMetaReader(MetaReaderProvider):
         if category:
             arguments["category"] = category
         return self._call_list("get_activity_log", arguments)
+
+    def list_ad_accounts(self, *, fields: list[str]) -> list[dict[str, Any]]:
+        # None-mapped in DEFAULT_MCP_TOOL_MAP (no community tool) -> _tool_for raises
+        # NotImplementedError naming the read; the discovery tool falls back to `direct`.
+        return self._call_list("list_ad_accounts", {"fields": self._join_fields(fields)})
 
     def iter_paginated(
         self, path_or_url: str, *, params: dict[str, Any] | None = None

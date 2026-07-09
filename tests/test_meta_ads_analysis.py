@@ -687,6 +687,27 @@ def test_meta_api_client_paginates() -> None:
     assert session.get.call_count == 2
 
 
+def test_meta_api_client_list_ad_accounts_hits_me_adaccounts_edge() -> None:
+    # list_ad_accounts targets the token-scoped /me/adaccounts edge (no account arg), joins the
+    # fields list to a comma string, and drains pagination like every other list read.
+    page = Mock()
+    page.status_code = 200
+    page.json.return_value = {
+        "data": [{"account_id": "111", "name": "A"}, {"account_id": "222", "name": "B"}],
+        "paging": {},
+    }
+    session = Mock()
+    session.get.return_value = page
+
+    client = MetaMarketingApiClient("token", session=session)
+    rows = client.list_ad_accounts(fields=["account_id", "name"])
+
+    assert rows == [{"account_id": "111", "name": "A"}, {"account_id": "222", "name": "B"}]
+    url, kwargs = session.get.call_args
+    assert url[0].endswith("/me/adaccounts")
+    assert kwargs["params"]["fields"] == "account_id,name"
+
+
 def test_meta_api_client_raises_operator_friendly_error() -> None:
     response = Mock()
     response.status_code = 400
@@ -7470,6 +7491,7 @@ _READER_CALL_SPECS = {
     "list_pixels": (("act_1",), {"fields": ["id"]}),
     "list_custom_conversions": (("act_1",), {"fields": ["id"]}),
     "get_activity_log": (("act_1",), {"fields": ["event_type"]}),
+    "list_ad_accounts": ((), {"fields": ["account_id", "name"]}),
     "iter_paginated": (("/act_1/ads",), {"params": {"limit": 1}}),
 }
 
@@ -7821,6 +7843,7 @@ def test_mcp_reader_unsupported_reads_raise_naming_the_method() -> None:
         "list_custom_conversions": lambda: reader.list_custom_conversions("act_1", fields=["id"]),
         "list_custom_audiences": lambda: reader.list_custom_audiences("act_1", fields=["id"]),
         "get_activity_log": lambda: reader.get_activity_log("act_1", fields=["event_type"]),
+        "list_ad_accounts": lambda: reader.list_ad_accounts(fields=["account_id"]),
         "iter_paginated": lambda: reader.iter_paginated("/act_1/ads"),
     }
     for name, call in cases.items():
@@ -8975,6 +8998,7 @@ def test_followups_mark_done_missing_ok_is_idempotent(tmp_path: Path) -> None:
 
 # --- Custom Meta MCP server scaffold (MOCKS ONLY: zero live Meta calls, no socket bound) ---
 
+from meta_ads_analysis import account_discovery as _account_discovery  # noqa: E402
 from meta_ads_analysis import mcp_server as _mcp_server  # noqa: E402
 from meta_ads_analysis.meta_api import access_token_from_env, meta_api_version_from_env  # noqa: E402
 from meta_ads_analysis.reader_provider import reader_backend_from_env  # noqa: E402
@@ -9240,8 +9264,12 @@ def test_iter_paginated_not_exposed_and_server_tool_map_is_identity() -> None:
     # The raw pagination escape hatch has no natural tool shape and is not exposed.
     assert "iter_paginated" not in tools
     assert "iter_paginated" not in _mcp_server.SERVER_TOOL_MAP
-    # READ_TOOL_METHODS is exactly the read surface minus that escape hatch.
-    assert set(_mcp_server.READ_TOOL_METHODS) == set(READ_METHODS) - {"iter_paginated"}
+    # list_ad_accounts is a discovery tool (no account arg + label normalization), not a 1:1 read
+    # tool — so it is excluded from build_read_tools / SERVER_TOOL_MAP too.
+    assert "list_ad_accounts" not in tools
+    assert "list_ad_accounts" not in _mcp_server.SERVER_TOOL_MAP
+    # READ_TOOL_METHODS is exactly the read surface minus the escape hatch and the discovery read.
+    assert set(_mcp_server.READ_TOOL_METHODS) == set(READ_METHODS) - {"iter_paginated", "list_ad_accounts"}
     assert set(tools) == set(_mcp_server.READ_TOOL_METHODS)
     # SERVER_TOOL_MAP covers every read tool and is an identity map (tool name == reader method).
     assert set(_mcp_server.SERVER_TOOL_MAP) == set(_mcp_server.READ_TOOL_METHODS)
@@ -9283,6 +9311,104 @@ def test_read_tool_propagates_meta_api_error_from_reader() -> None:
     with pytest.raises(MetaApiError) as excinfo:
         tools["list_pixels"]("act_1", fields=["id"])
     assert "ads_management" in str(excinfo.value)
+
+
+# --- Ad-account discovery (list_ad_accounts): normalizes /me/adaccounts rows, no registry gate ---
+# MOCKS ONLY: every test seeds a FakeMetaReader; no live Meta call is ever made.
+
+
+def test_account_status_label_maps_codes_and_defaults_unknown() -> None:
+    # A representative mapped code, plus every unmapped/None/garbage input -> "UNKNOWN" (never raises).
+    assert _account_discovery.account_status_label(1) == "ACTIVE"
+    assert _account_discovery.account_status_label(101) == "CLOSED"
+    assert _account_discovery.account_status_label(999) == "UNKNOWN"
+    assert _account_discovery.account_status_label(None) == "UNKNOWN"
+    assert _account_discovery.account_status_label("nonsense") == "UNKNOWN"
+
+
+def test_normalize_ad_account_adds_label_preserving_raw_code() -> None:
+    row = {"account_id": "111", "name": "Acme", "account_status": 2, "currency": "USD"}
+    out = _account_discovery.normalize_ad_account(row)
+    # Label added alongside the raw code (which is preserved verbatim, never replaced).
+    assert out["account_status_label"] == "DISABLED"
+    assert out["account_status"] == 2
+    assert out["account_id"] == "111" and out["name"] == "Acme"
+    # Shallow copy: the source row is not mutated.
+    assert "account_status_label" not in row
+
+
+def test_normalize_ad_account_tolerates_missing_status_field() -> None:
+    # Meta omits empty fields; normalization must not index a missing key.
+    out = _account_discovery.normalize_ad_account({"account_id": "222"})
+    assert out["account_status_label"] == "UNKNOWN"
+    assert "account_status" not in out  # not fabricated
+
+
+def test_list_ad_accounts_returns_normalized_rows_for_mixed_statuses() -> None:
+    reader = FakeMetaReader(
+        list_ad_accounts=[
+            {"account_id": "1", "name": "Active Co", "account_status": 1},
+            {"account_id": "2", "name": "Closed Co", "account_status": 101},
+            {"account_id": "3", "name": "Weird Co", "account_status": 555},
+        ]
+    )
+    rows = _account_discovery.list_ad_accounts(reader)
+    assert [r["account_status_label"] for r in rows] == ["ACTIVE", "CLOSED", "UNKNOWN"]
+    # Raw codes preserved; default field set requested from the reader.
+    assert [r["account_status"] for r in rows] == [1, 101, 555]
+    assert reader.calls == [("list_ad_accounts", (), {"fields": _account_discovery.DEFAULT_AD_ACCOUNT_FIELDS})]
+
+
+def test_list_ad_accounts_empty_reach_returns_empty_list() -> None:
+    # An empty /me/adaccounts (token reaches no accounts) is [], never an exception.
+    reader = FakeMetaReader(list_ad_accounts=[])
+    assert _account_discovery.list_ad_accounts(reader) == []
+
+
+def test_list_ad_accounts_honors_explicit_fields_override() -> None:
+    reader = FakeMetaReader(list_ad_accounts=lambda *, fields: [{"account_id": "1", "fields": fields}])
+    rows = _account_discovery.list_ad_accounts(reader, fields=["account_id"])
+    assert rows[0]["fields"] == ["account_id"]
+    assert reader.calls[0] == ("list_ad_accounts", (), {"fields": ["account_id"]})
+
+
+def test_list_ad_accounts_propagates_meta_api_error_unchanged() -> None:
+    # A permission/Graph failure propagates as MetaApiError (the ToolError mapping is the FastMCP
+    # layer's job); the pure discovery library does not swallow it.
+    import pytest
+
+    def _denied(*, fields):
+        raise MetaApiError("(#200) The user lacks permission to list ad accounts")
+
+    reader = FakeMetaReader(list_ad_accounts=_denied)
+    with pytest.raises(MetaApiError) as excinfo:
+        _account_discovery.list_ad_accounts(reader)
+    assert "permission" in str(excinfo.value)
+
+
+def test_build_discovery_tools_returns_normalized_rows_and_is_not_a_read_tool() -> None:
+    reader = FakeMetaReader(
+        list_ad_accounts=[{"account_id": "1", "name": "Acme", "account_status": 1}]
+    )
+    discovery = _mcp_server.build_discovery_tools(reader)
+    # The discovery tool takes NO account argument and returns normalized rows.
+    rows = discovery["list_ad_accounts"]()
+    assert rows == [
+        {"account_id": "1", "name": "Acme", "account_status": 1, "account_status_label": "ACTIVE"}
+    ]
+    # It is a discovery tool, NOT a 1:1 read tool.
+    assert "list_ad_accounts" not in _mcp_server.build_read_tools(FakeMetaReader())
+    assert "list_ad_accounts" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+
+
+def test_discovery_tool_mock_smoke_returns_single_seeded_account() -> None:
+    # --mock: build_mock_reader + the discovery tool both return the single seeded ACTIVE account
+    # with zero live calls (FakeMetaReader never touches the network).
+    reader = _mcp_server.build_mock_reader()
+    rows = _mcp_server.build_discovery_tools(reader)["list_ad_accounts"]()
+    assert len(rows) == 1
+    assert rows[0]["id"] == _mcp_server.MOCK_ACCOUNT_ID
+    assert rows[0]["account_status_label"] == "ACTIVE"
 
 
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
@@ -9457,14 +9583,16 @@ def test_read_tools_register_on_real_fastmcp_and_map_errors(monkeypatch) -> None
     mcp = _mcp_server.build_server("127.0.0.1", 8765)
     tool_manager = mcp._tool_manager
     names = {t.name for t in tool_manager.list_tools()}
-    # server_info plus all 14 reads AND the guarded write surface registered; the escape hatch is not.
+    # server_info plus all 14 reads, the discovery surface, AND the guarded write surface registered;
+    # the raw escape hatch is not.
+    reader_for_names = _mcp_server.DirectMetaReader(_MixedClient())
     write_names = set(
-        _mcp_server.build_write_tools(
-            _mcp_server.DirectMetaReader(_MixedClient()), _mcp_server.proposals.PlanStatusApprovalGate()
-        )
+        _mcp_server.build_write_tools(reader_for_names, _mcp_server.proposals.PlanStatusApprovalGate())
     )
-    assert names == {"server_info", *_mcp_server.READ_TOOL_METHODS, *write_names}
+    discovery_names = set(_mcp_server.build_discovery_tools(reader_for_names))
+    assert names == {"server_info", *_mcp_server.READ_TOOL_METHODS, *discovery_names, *write_names}
     assert "execute_plan" in names and "propose_set_status" in names
+    assert "list_ad_accounts" in names  # discovery tool registered
     assert "iter_paginated" not in names
     # Schema derived from the wrapper's real signature (functools.wraps preserved it).
     assert set(tool_manager.get_tool("fetch_ads").parameters["properties"]) == {"ad_account_id", "fields"}
@@ -10665,6 +10793,9 @@ def test_build_mock_reader_all_stubs_present() -> None:
     assert reader.list_campaigns("act_mock001", fields=["id"]) == [_mcp_server.MOCK_CAMPAIGN]
     # iter_paginated is seeded as a CALLABLE (FakeMetaReader invokes callable stubs with the path arg).
     assert list(reader.iter_paginated("/act_mock001/ads", params={"limit": 1})) == [_mcp_server.MOCK_AD]
+    # The discovery read (list_ad_accounts) is stubbed too — it is NOT in READ_TOOL_METHODS, so the
+    # loop above never exercises it; assert it explicitly returns the single seeded account.
+    assert reader.list_ad_accounts(fields=["account_id"]) == [_mcp_server.MOCK_ACCOUNT]
 
 
 def test_mock_write_client_update_returns_success_and_records() -> None:

@@ -3,8 +3,10 @@
 This is our own Meta MCP server: a process that starts, reports health, and can be connected
 to from an MCP client over HTTP. Alongside the ``server_info`` health tool it exposes the live
 Meta **read** surface — one tool per :data:`READ_TOOL_METHODS` entry (14 reads), each bound to a
-shared :class:`~meta_ads_analysis.reader_provider.DirectMetaReader` — plus the guarded **write**
-surface (``propose_* → preview_plan → execute_plan``). Every write travels through the same
+shared :class:`~meta_ads_analysis.reader_provider.DirectMetaReader` — a **discovery** surface
+(``list_ad_accounts``, which takes no account argument and normalizes the token's reachable
+accounts; see :func:`build_discovery_tools`) — plus the guarded **write** surface
+(``propose_* → preview_plan → execute_plan``). Every write travels through the same
 propose → human-approve → validate → execute → verify pipeline as the CLI: a ``propose_*`` tool
 grounds + reviews the op and persists a proposal, returning only a ``plan_id`` reference; ``execute_
 plan`` is the *only* tool that writes, and it refuses a plan with zero approved ops. The write
@@ -40,7 +42,15 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only without the `se
 
 from datetime import UTC, datetime
 
-from . import __version__, account_registry, authoring, control, proposals, rotation
+from . import (
+    __version__,
+    account_discovery,
+    account_registry,
+    authoring,
+    control,
+    proposals,
+    rotation,
+)
 from .meta_api import MetaApiError, meta_api_version_from_env
 from .reader_provider import (
     READ_METHODS,
@@ -54,10 +64,16 @@ SERVER_NAME = "meta-ads-mcp"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
-# The read surface we expose as MCP tools: every read in READ_METHODS **except** the raw
-# ``iter_paginated`` escape hatch (a Graph-path/params primitive with no natural tool shape —
-# the high-level reads drain pagination internally). This mirrors what ``MCPMetaReader`` omits.
-READ_TOOL_METHODS: tuple[str, ...] = tuple(m for m in READ_METHODS if m != "iter_paginated")
+# The read surface we expose as 1:1 MCP tools (via ``build_read_tools``): every read in
+# READ_METHODS **except** two. ``iter_paginated`` is the raw Graph-path/params escape hatch (no
+# natural tool shape — the high-level reads drain pagination internally). ``list_ad_accounts`` is
+# surfaced separately via ``build_discovery_tools`` because it takes no ``account`` argument and
+# adds a status-label normalization on top of the reader row — neither fits the 1:1
+# ``build_read_tools`` seam (whose tools must return exactly what the reader returns). This mirrors
+# what ``MCPMetaReader`` omits from its high-level reads.
+READ_TOOL_METHODS: tuple[str, ...] = tuple(
+    m for m in READ_METHODS if m not in ("iter_paginated", "list_ad_accounts")
+)
 
 # reader-method -> MCP tool name. Identity, because each tool is named **exactly** for its reader
 # method (see the plan's decision 1: natural, self-describing names, not the community package's
@@ -122,7 +138,8 @@ MOCK_AD: dict[str, Any] = {
     "adset_id": "adset_mock001",
 }
 MOCK_ACCOUNT: dict[str, Any] = {
-    "id": MOCK_ACCOUNT_ID, "name": "Demo Account", "account_status": 1, "currency": "USD",
+    "id": MOCK_ACCOUNT_ID, "account_id": "mock001", "name": "Demo Account",
+    "account_status": 1, "currency": "USD",
 }
 MOCK_INSIGHT: dict[str, Any] = {
     "date_start": "2026-06-01", "date_stop": "2026-06-30", "spend": "100.00",
@@ -244,6 +261,7 @@ def build_mock_reader(entities: dict[str, dict[str, Any]] | None = None) -> Fake
         search_targeting=[],
         get_delivery_estimate=dict(MOCK_DELIVERY_ESTIMATE),
         get_activity_log=[],
+        list_ad_accounts=lambda *a, **k: [dict(MOCK_ACCOUNT)],
     )
 
 
@@ -398,6 +416,38 @@ def build_read_tools(reader: MetaReaderProvider) -> dict[str, Callable[..., Any]
         f"missing={set(READ_TOOL_METHODS) - set(tools)}, extra={set(tools) - set(READ_TOOL_METHODS)}"
     )
     return tools
+
+
+# Short human descriptions for the discovery surface (surfaced to the MCP client / calling LLM).
+# Discovery tools are the reads that take NO ``account`` argument and add a light normalization on
+# top of the reader row (a human-readable status label) — they do not fit the 1:1 ``build_read_tools``
+# seam, so they live in ``build_discovery_tools``. Reads reach every account the token sees (no
+# registry gate). The follow-up ticket adds ``cross_account_spend_summary`` here.
+DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "list_ad_accounts": (
+        "List every ad account this access token can reach (no account argument needed). "
+        "Returns account id, name, currency, and a human-readable status for each — use it to "
+        "discover accounts before any are added to the config file."
+    ),
+}
+
+
+def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[..., Any]]:
+    """Return ``{tool_name: callable}`` for the token-scoped **discovery** reads, bound to ``reader``.
+
+    Discovery reads work before any config exists: they take no ``account`` argument and reach every
+    account the token can see (no registry gate — plan decision). Unlike ``build_read_tools``, whose
+    wrappers return exactly what the reader returns, a discovery wrapper delegates to
+    :mod:`meta_ads_analysis.account_discovery`, which normalizes each raw Graph row (adding a
+    human-readable ``account_status_label`` alongside the raw ``account_status``).
+
+    PURE: no FastMCP import, no socket, no token lookup — unit-testable with a ``FakeMetaReader``.
+    """
+
+    def list_ad_accounts(fields: list[str] | None = None) -> list[dict[str, Any]]:
+        return account_discovery.list_ad_accounts(reader, fields=fields)
+
+    return {"list_ad_accounts": list_ad_accounts}
 
 
 # Short human descriptions for the guarded-write surface (surfaced to the MCP client / calling LLM).
@@ -901,6 +951,15 @@ def build_server(host: str, port: int, *, mock: bool = False):
             _wrap_tool_errors(func),
             name=name,
             description=READ_TOOL_DESCRIPTIONS.get(name) or f"Meta read: {name}",
+        )
+
+    # Discovery surface: token-scoped reads with no account argument (e.g. list_ad_accounts).
+    # _wrap_tool_errors maps a permission/Graph MetaApiError (or ValueError) to a clean ToolError.
+    for name, func in build_discovery_tools(reader).items():
+        mcp.add_tool(
+            _wrap_tool_errors(func),
+            name=name,
+            description=DISCOVERY_TOOL_DESCRIPTIONS.get(name) or f"Meta discovery: {name}",
         )
 
     # Guarded write surface. The approval gate is selected from the environment: with META_APPROVAL_SECRET
