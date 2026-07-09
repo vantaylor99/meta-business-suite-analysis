@@ -257,7 +257,8 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the `list_ad_accounts` discovery tool (no `account` argument), and the
+plus any of the 14 read tools, the two discovery tools (`list_ad_accounts` and
+`cross_account_spend_summary` — neither takes an `account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
 

@@ -170,11 +170,18 @@ def cross_account_spend_summary(
             (_ad_account_id_from_row(row), row) for row in discovered
         ]
     else:
-        reachable_count = len(account_ids)
-        targets = [
-            (account_registry._normalize_ad_account_id(str(raw or "").strip()), None)
-            for raw in account_ids
-        ]
+        # De-duplicate after normalization (order-preserving) so a caller passing the same account
+        # twice — including once bare and once as ``act_`` (``"1"`` and ``"act_1"``) — is fanned out
+        # and subtotaled exactly once; summing an account twice would be wrong and has no valid use.
+        seen: set[str] = set()
+        normalized_ids: list[str] = []
+        for raw in account_ids:
+            norm = account_registry._normalize_ad_account_id(str(raw or "").strip())
+            if norm not in seen:
+                seen.add(norm)
+                normalized_ids.append(norm)
+        reachable_count = len(normalized_ids)
+        targets = [(norm, None) for norm in normalized_ids]
 
     accounts: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []

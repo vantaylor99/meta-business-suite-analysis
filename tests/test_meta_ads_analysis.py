@@ -9549,6 +9549,31 @@ def test_cross_account_summary_explicit_ids_use_get_account_and_skip_discovery()
     assert labels == {"act_1": "ACTIVE", "act_9": "DISABLED"}
 
 
+def test_cross_account_summary_explicit_duplicate_ids_counted_once() -> None:
+    # A caller passing the same account twice — bare "1" and "act_1" both normalize to act_1 — must
+    # be fanned out and subtotaled exactly once, never double-counted.
+    account = {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}
+    calls: list[str] = []
+
+    def _get_account(ad_account_id, *, fields):
+        calls.append(ad_account_id)
+        return dict(account)
+
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [{"spend": "10.00", "impressions": "100", "clicks": "5"}]
+
+    reader = FakeMetaReader(get_account=_get_account, fetch_insights=_fetch_insights)
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=["1", "act_1"]
+    )
+    assert summary["account_count"] == summary["reachable_count"] == 1
+    assert len(summary["accounts"]) == 1
+    assert calls == ["act_1"]  # get_account hit once, not twice
+    assert summary["totals_by_currency"]["USD"] == {
+        "spend": 10.0, "impressions": 100, "clicks": 5, "account_count": 1
+    }
+
+
 def test_cross_account_summary_explicit_id_unreadable_is_partial_failure() -> None:
     # An explicit id the token cannot read fails its get_account -> same per-account error path.
     def _get_account(ad_account_id, *, fields):
@@ -9655,6 +9680,23 @@ def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
     assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
     assert "cross_account_spend_summary" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+
+
+def test_cross_account_summary_insight_fields_restricts_metrics_summed() -> None:
+    # The library-only insight_fields param narrows both the fields requested from fetch_insights
+    # and the metrics subtotaled: with ["spend"] alone, impressions/clicks never enter the output.
+    reader = _summary_reader()
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30", insight_fields=["spend"]
+    )
+    usd = summary["totals_by_currency"]["USD"]
+    assert usd == {"spend": 150.75, "account_count": 2}  # only spend + the count bookkeeping key
+    assert "impressions" not in usd and "clicks" not in usd
+    usd_rows = [r for r in summary["accounts"] if r["currency"] == "USD"]
+    assert all("impressions" not in r and "clicks" not in r for r in usd_rows)
+    # The narrowed field set is what gets requested from Meta (no over-fetching).
+    insight_calls = [c for c in reader.calls if c[0] == "fetch_insights"]
+    assert insight_calls and all(c[2]["fields"] == ["spend"] for c in insight_calls)
 
 
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
