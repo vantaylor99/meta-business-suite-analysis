@@ -1,8 +1,22 @@
-description: Right now, if a specialist's Meta token can reach more ad accounts than the one they're supposed to manage, nothing in our code stops it from being used on those other accounts — this makes that an actual hard limit instead of just something we hope the token permissions get right.
+description: Right now, if a specialist's Meta token can reach more ad accounts than the one they're supposed to manage, nothing in our code stops a change from being made on those other accounts — this makes the configured-accounts list a real hard limit for write actions instead of just something we hope the token permissions get right.
 prereq:
 files: src/meta_ads_analysis/mcp_server.py, src/meta_ads_analysis/account_registry.py, docs/META_API_SETUP.md, docs/SPECIALIST_ONBOARDING.md
 difficulty: medium
 ----
+## Scope narrowed 2026-07-09 — WRITES ONLY
+
+Originally this ticket proposed locking **both reads and writes** to
+`config/meta_ads_accounts.json`. The operator has since decided the opposite for reads:
+**reads are intentionally open to every account the token can reach** — cross-account discovery and
+analysis is now a wanted feature (see `mcp-cross-account-read-tools`, which adds `list_ad_accounts`
+and cross-account aggregate reads). Do **not** add a registry gate to the read tools.
+
+This ticket is therefore reduced to **hard write-enforcement only**, and it stays in `backlog` (not
+active) because the current decision is to keep writes **soft**: the write/propose tools resolve
+through the config first but still accept a raw `act_<id>` fallback. This ticket is the future
+"make writes a hard wall" concern; promote it when that guarantee is actually wanted (likely
+alongside `mcp-role-based-access-tiers`).
+
 ## Why
 
 Found 2026-07-07 while onboarding Matthew (single-account case, Seattle Mission): confirmed via
@@ -25,11 +39,12 @@ Two distinct pieces — **do both, not just one**; a warning alone doesn't actua
 it just gives an early heads-up an overwhelmed non-technical user could easily miss or not
 understand the significance of:
 
-1. **Enforcement (the actual protection):** every MCP tool that takes an `ad_account_id`/`account`
-   argument should reject any value not present in that machine's local
+1. **Enforcement (the actual protection):** every MCP **write/propose** tool that takes an
+   `account` argument should reject any value not present in that machine's local
    `config/meta_ads_accounts.json`, full stop — no raw-`act_<id>` fallback bypassing the registry.
-   This is what makes the single-account scoping real regardless of how broad the underlying token
-   turns out to be.
+   This is what makes the single-account scoping real for *changes* regardless of how broad the
+   underlying token turns out to be. (Reads are deliberately exempt — they are open to every account
+   the token can reach; see the scope note above.)
 2. **Onboarding-time cross-check + warning (early detection, not a substitute for #1):** right
    after a token is entered (in `scripts/onboard_specialist.sh` or an MCP-side equivalent), fetch
    `/me/adaccounts` with it and (a) confirm the expected account is actually reachable — fail loudly
