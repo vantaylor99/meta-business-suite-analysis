@@ -2102,3 +2102,152 @@ def _build_pacing_rollup(accounts: list[dict[str, Any]], reporting: str) -> dict
         ],
         "excluded_from_rollup": len(accounts) - len(fx_projectable),
     }
+
+
+# --------------------------------------------------------------------------- #
+# RANK ACCOUNTS: sort the whole fleet by a single metric for a date range.
+#
+# A *pure post-processor* over cross_account_performance — exactly the same relationship
+# account_benchmark and flag_accounts_needing_attention have to that tool. Calls it once,
+# splits rows into rankable (have the metric value) vs unranked (missing value or no-FX twin
+# for money metrics), sorts, assigns 1-based ranks (ties share strictly-better count + 1), and
+# truncates to the requested limit. No new Meta read shape.
+# --------------------------------------------------------------------------- #
+
+# Maps every accepted metric name (including aliases) to its canonical internal field name.
+RANK_METRIC_ALIASES: dict[str, str] = {
+    "spend": "spend",
+    "cpm": "cpm",
+    "cpc": "cpc",
+    "cost_per_result": "cost_per_result",
+    "cpl": "cost_per_result",
+    "cpa": "cost_per_result",
+    "ctr": "ctr",
+    "roas": "roas",
+    "impressions": "impressions",
+    "clicks": "clicks",
+    "results": "results",
+}
+
+# Money metrics are ranked on their normalized twin (reporting_currency).
+_RANK_MONEY_METRICS: frozenset[str] = frozenset({"spend", "cpm", "cpc", "cost_per_result"})
+
+
+def rank_accounts(
+    reader: "MetaReaderProvider",
+    *,
+    date_from: str,
+    date_to: str,
+    metric: str,
+    order: str = "desc",
+    limit: int = 10,
+    account_ids: list[str] | None = None,
+    reporting_currency: str = "USD",
+    fx_table: FxTable | None = None,
+) -> dict[str, Any]:
+    """Rank every reachable ad account by a single efficiency or spend metric.
+
+    A **pure post-processor** over :func:`cross_account_performance`: calls it once, splits the
+    per-account rows into rankable (metric value present) vs unranked (missing value or no-FX
+    normalized twin for money metrics), sorts, assigns 1-based ranks (ties share the
+    strictly-better count + 1 convention, tiebroken by ``ad_account_id`` ascending for
+    determinism), and truncates to ``limit``.
+
+    ``metric`` is normalized to lowercase before lookup and resolved through
+    :data:`RANK_METRIC_ALIASES` (so ``"cpl"`` and ``"cpa"`` resolve to ``"cost_per_result"``);
+    the canonical name appears in the output. Money metrics (spend/CPM/CPC/cost_per_result) are
+    ranked on each row's ``*_normalized`` twin so accounts in different currencies are directly
+    comparable; ``value_native`` carries the native figure for reference. Ratio and count metrics
+    (CTR/ROAS/impressions/clicks/results) are ranked natively (currency-invariant).
+
+    An unknown ``reporting_currency`` or a whole-discovery failure propagate unchanged from the
+    prereq. ``fx_table`` is a test-only injection seam — not exposed to the LLM.
+    """
+    canonical = RANK_METRIC_ALIASES.get(str(metric or "").lower())
+    if canonical is None:
+        valid = sorted(RANK_METRIC_ALIASES)
+        raise ValueError(f"Unknown metric {metric!r}; valid names: {', '.join(valid)}")
+    if order not in ("asc", "desc"):
+        raise ValueError(f"order must be 'asc' or 'desc'; got {order!r}")
+    if limit <= 0:
+        raise ValueError(f"limit must be a positive integer; got {limit}")
+
+    is_money = canonical in _RANK_MONEY_METRICS
+    sort_field = f"{canonical}_normalized" if is_money else canonical
+
+    perf = cross_account_performance(
+        reader,
+        date_from=date_from,
+        date_to=date_to,
+        account_ids=account_ids,
+        reporting_currency=reporting_currency,
+        fx_table=fx_table,
+    )
+
+    # Partition rows into rankable and unranked.
+    rankable: list[tuple[float, str, dict[str, Any]]] = []
+    unranked: list[dict[str, Any]] = []
+
+    for row in perf["accounts"]:
+        ad_account_id = row["ad_account_id"]
+        sort_value = row.get(sort_field)
+        if sort_value is not None:
+            rankable.append((float(sort_value), ad_account_id, row))
+        else:
+            if is_money and canonical in row:
+                # Native value present but no normalized twin → no FX rate for this currency.
+                reason = f"no FX rate for {row.get('currency', 'UNKNOWN')}"
+            else:
+                reason = "metric unavailable"
+            unranked.append({
+                "ad_account_id": ad_account_id,
+                "name": row.get("name"),
+                "reason": reason,
+            })
+
+    # Sort: flip sort_value sign for desc so both directions use the same ascending tuple sort.
+    # Tiebreak: ad_account_id ascending → stable, deterministic total order run-to-run.
+    if order == "desc":
+        rankable.sort(key=lambda t: (-t[0], t[1]))
+    else:
+        rankable.sort(key=lambda t: (t[0], t[1]))
+
+    # Assign 1-based ranks: ties share strictly-better count + 1. Since the list is already sorted
+    # by value, the first occurrence of a value is at index = count of strictly-better entries.
+    ranked: list[dict[str, Any]] = []
+    current_rank: int = 1
+    prev_value: float | None = None
+    for i, (sort_value, ad_account_id, row) in enumerate(rankable):
+        if prev_value is None or sort_value != prev_value:
+            current_rank = i + 1
+        prev_value = sort_value
+
+        entry: dict[str, Any] = {
+            "rank": current_rank,
+            "ad_account_id": ad_account_id,
+            "account_id": row.get("account_id"),
+            "name": row.get("name"),
+            "currency": row.get("currency"),
+            "value": sort_value,
+        }
+        if is_money:
+            entry["value_native"] = row.get(canonical)
+        ranked.append(entry)
+
+    ranked_total = len(ranked)
+
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "metric": canonical,
+        "order": order,
+        "limit": limit,
+        "reporting_currency": perf["reporting_currency"],
+        "fx_as_of": perf["fx_as_of"],
+        "fx_note": perf["fx_note"],
+        "account_count": perf["account_count"],
+        "ranked": ranked[:limit],
+        "ranked_total": ranked_total,
+        "unranked": unranked,
+        "errors": perf["errors"],
+    }

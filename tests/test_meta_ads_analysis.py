@@ -9676,7 +9676,7 @@ def test_cross_account_summary_mock_smoke_single_usd_account() -> None:
 def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     reader = _summary_reader()
     discovery = _mcp_server.build_discovery_tools(reader)
-    # All six discovery tools are exposed.
+    # All seven discovery tools are exposed.
     assert set(discovery) == {
         "list_ad_accounts",
         "cross_account_spend_summary",
@@ -9684,6 +9684,7 @@ def test_build_discovery_tools_exposes_cross_account_summary() -> None:
         "account_benchmark",
         "flag_accounts_needing_attention",
         "pacing_report",
+        "rank_accounts",
     }
     summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
     assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
@@ -11782,6 +11783,268 @@ def test_pacing_report_as_of_none_defaults_to_utc_today(monkeypatch) -> None:
     )
     assert out["as_of"] == "2026-07-14"
     assert out["accounts"][0]["status"] == "on_track"
+
+
+# --- rank_accounts: pure post-processor over cross_account_performance ---
+
+
+def test_rank_accounts_descending_by_spend(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "Low", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "High", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "Mid", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "10"}],
+        "act_2": [{"spend": "500.00", "impressions": "5000", "clicks": "50"}],
+        "act_3": [{"spend": "300.00", "impressions": "3000", "clicks": "30"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    assert out["metric"] == "spend"
+    assert out["order"] == "desc"
+    assert out["ranked_total"] == 3
+    assert out["unranked"] == []
+    assert len(out["ranked"]) == 3
+    # Ranks: act_2 (500) → 1, act_3 (300) → 2, act_1 (100) → 3
+    ranked_ids = [r["ad_account_id"] for r in out["ranked"]]
+    assert ranked_ids == ["act_2", "act_3", "act_1"]
+    assert out["ranked"][0]["rank"] == 1
+    assert out["ranked"][1]["rank"] == 2
+    assert out["ranked"][2]["rank"] == 3
+    # value is the normalized spend (USD → USD = same rate)
+    assert out["ranked"][0]["value"] == pytest.approx(500.0)
+    # value_native present for money metrics
+    assert "value_native" in out["ranked"][0]
+    assert out["ranked"][0]["value_native"] == pytest.approx(500.0)
+    assert out["account_count"] == 3
+
+
+def test_rank_accounts_ascending_by_cpc(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "C", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "10"}],   # cpc 10.0
+        "act_2": [{"spend": "100.00", "impressions": "1000", "clicks": "100"}],  # cpc 1.0
+        "act_3": [{"spend": "100.00", "impressions": "1000", "clicks": "20"}],   # cpc 5.0
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="cpc", order="asc", limit=10, fx_table=_fx()
+    )
+    assert out["order"] == "asc"
+    ranked_ids = [r["ad_account_id"] for r in out["ranked"]]
+    # asc: lowest cpc first (best = cheapest)
+    assert ranked_ids == ["act_2", "act_3", "act_1"]
+    assert out["ranked"][0]["rank"] == 1
+    assert out["ranked"][0]["value"] == pytest.approx(1.0)
+
+
+def test_rank_accounts_money_metric_uses_normalized_for_ranking(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "USD", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "MXN", "account_status": 1, "currency": "MXN"},
+    ]
+    # act_1: native cpc 2.0 USD; act_2: native cpc 10.0 MXN = 0.55 USD
+    insights = {
+        "act_1": [{"spend": "200.00", "impressions": "10000", "clicks": "100"}],
+        "act_2": [{"spend": "1000.00", "impressions": "50000", "clicks": "100"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="cpc", order="asc", limit=10, fx_table=_fx()
+    )
+    # act_2 normalized cpc = 10.0 * 0.055 = 0.55 USD (cheaper); act_1 = 2.0 USD
+    ranked_ids = [r["ad_account_id"] for r in out["ranked"]]
+    assert ranked_ids == ["act_2", "act_1"]
+    assert out["ranked"][0]["value"] == pytest.approx(0.55)   # normalized
+    assert out["ranked"][0]["value_native"] == pytest.approx(10.0)  # native MXN
+    assert out["ranked"][1]["value"] == pytest.approx(2.0)
+    assert out["ranked"][1]["value_native"] == pytest.approx(2.0)
+    # value and value_native are distinct for the MXN account
+    assert out["ranked"][0]["value"] != out["ranked"][0]["value_native"]
+
+
+def test_rank_accounts_no_fx_account_lands_in_unranked(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "USD", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "JPY", "account_status": 1, "currency": "JPY"},
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "10"}],
+        "act_2": [{"spend": "5000.00", "impressions": "2000", "clicks": "40"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    # JPY has no FX rate in _fx() → act_2 goes to unranked for a money metric
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="cpc", order="asc", limit=10, fx_table=_fx()
+    )
+    assert len(out["ranked"]) == 1
+    assert out["ranked"][0]["ad_account_id"] == "act_1"
+    assert len(out["unranked"]) == 1
+    assert out["unranked"][0]["ad_account_id"] == "act_2"
+    assert "no FX rate" in out["unranked"][0]["reason"]
+
+
+def test_rank_accounts_missing_metric_lands_in_unranked(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+    ]
+    # act_2 has zero impressions → ctr is not computable → absent from the row
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],
+        "act_2": [{"spend": "50.00", "impressions": "0", "clicks": "0"}],  # ctr = 0/0 → absent
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="ctr", order="desc", limit=10, fx_table=_fx()
+    )
+    assert len(out["ranked"]) == 1
+    assert out["ranked"][0]["ad_account_id"] == "act_1"
+    assert len(out["unranked"]) == 1
+    assert out["unranked"][0]["ad_account_id"] == "act_2"
+    assert out["unranked"][0]["reason"] == "metric unavailable"
+
+
+def test_rank_accounts_limit_larger_than_scope_returns_all(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    insights = {f"act_{i}": [{"spend": f"{i * 100}.00", "impressions": "1000", "clicks": "10"}] for i in range(1, 4)}
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=100, fx_table=_fx()
+    )
+    assert len(out["ranked"]) == 3
+    assert out["ranked_total"] == 3
+
+
+def test_rank_accounts_limit_zero_raises() -> None:
+    import pytest
+
+    reader = _perf_reader([], {})
+    with pytest.raises(ValueError, match="limit must be a positive integer"):
+        _account_discovery.rank_accounts(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            metric="spend", limit=0, fx_table=_fx()
+        )
+
+
+def test_rank_accounts_unknown_metric_raises() -> None:
+    import pytest
+
+    reader = _perf_reader([], {})
+    with pytest.raises(ValueError, match="foobar"):
+        _account_discovery.rank_accounts(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            metric="foobar", fx_table=_fx()
+        )
+
+
+def test_rank_accounts_invalid_order_raises() -> None:
+    import pytest
+
+    reader = _perf_reader([], {})
+    with pytest.raises(ValueError, match="order must be"):
+        _account_discovery.rank_accounts(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            metric="spend", order="sideways", fx_table=_fx()
+        )
+
+
+def test_rank_accounts_ties_are_stable_by_account_id(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_2", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+        {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "C", "account_status": 1, "currency": "USD"},
+    ]
+    # act_1 and act_2 have identical spend; act_3 has lower spend
+    insights = {
+        "act_1": [{"spend": "200.00", "impressions": "1000", "clicks": "10"}],
+        "act_2": [{"spend": "200.00", "impressions": "1000", "clicks": "10"}],
+        "act_3": [{"spend": "100.00", "impressions": "1000", "clicks": "10"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    ranked_ids = [r["ad_account_id"] for r in out["ranked"]]
+    # Ties on spend → tiebreak by ad_account_id ascending: act_1 before act_2
+    assert ranked_ids == ["act_1", "act_2", "act_3"]
+    # Both tied accounts share rank 1; act_3 gets rank 3 (2 strictly better)
+    assert out["ranked"][0]["rank"] == 1
+    assert out["ranked"][1]["rank"] == 1
+    assert out["ranked"][2]["rank"] == 3
+
+
+def test_rank_accounts_alias_cpl_canonical_name_in_output(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+        }]
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="cpl", order="desc", limit=10, fx_table=_fx()
+    )
+    # Alias cpl → canonical "cost_per_result" in output
+    assert out["metric"] == "cost_per_result"
+
+
+def test_build_discovery_tools_exposes_rank_accounts(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "10"}],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "20"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    tools = _mcp_server.build_discovery_tools(reader)
+    # rank_accounts is present in both the callable dict and the description map
+    assert "rank_accounts" in tools
+    assert "rank_accounts" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    # The MCP wrapper passes fx_table from config (not test-injected), so call it via fx injection
+    # by calling the underlying function directly to verify wiring:
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    assert out["ranked"][0]["ad_account_id"] == "act_2"
+    assert out["ranked_total"] == 2
 
 
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:

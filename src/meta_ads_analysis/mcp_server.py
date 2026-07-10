@@ -478,6 +478,14 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "budget read reads budget_unread, never a silent 'uncapped'. Cents->major-units conversion is "
         "accurate for 2-decimal currencies; zero-decimal currencies (JPY/KRW) are a known limitation."
     ),
+    "rank_accounts": (
+        "Rank every ad account this token can reach (or an explicit list) by a single efficiency or spend "
+        "metric for a date range, returning the top or bottom N. Money metrics (spend/CPC/CPM/CPL/ROAS) "
+        "are compared in one reporting_currency (default USD) so accounts in different currencies are "
+        "comparable. Accounts lacking the metric (e.g. no results → no CPL) are grouped into an 'unranked' "
+        "bucket with a reason instead of sorted as zero or infinity. Valid metrics: spend, cpm, cpc, ctr, "
+        "cost_per_result (aliases: cpl, cpa), roas, impressions, clicks, results."
+    ),
 }
 
 
@@ -578,6 +586,28 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             reporting_currency=reporting_currency,
         )
 
+    def rank_accounts(
+        date_from: str,
+        date_to: str,
+        metric: str,
+        order: str = "desc",
+        limit: int = 10,
+        account_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself.
+        return account_discovery.rank_accounts(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            metric=metric,
+            order=order,
+            limit=limit,
+            account_ids=account_ids,
+            reporting_currency=reporting_currency,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
@@ -585,6 +615,7 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
         "account_benchmark": account_benchmark,
         "flag_accounts_needing_attention": flag_accounts_needing_attention,
         "pacing_report": pacing_report,
+        "rank_accounts": rank_accounts,
     }
 
 
