@@ -2074,8 +2074,9 @@ def _build_pacing_rollup(accounts: list[dict[str, Any]], reporting: str) -> dict
         if e["period_budget_normalized"] is not None
         and e["projected_spend_normalized"] is not None
     ]
-    total_budget = sum(e["period_budget_normalized"] for e in fx_projectable)
-    total_projected = sum(e["projected_spend_normalized"] for e in fx_projectable)
+    # Start at 0.0 so the totals are always float, even when nothing qualified (bare sum([]) is int 0).
+    total_budget = sum((e["period_budget_normalized"] for e in fx_projectable), 0.0)
+    total_projected = sum((e["projected_spend_normalized"] for e in fx_projectable), 0.0)
     overall_variance = (
         (total_projected - total_budget) / total_budget if total_budget > 0 else None
     )

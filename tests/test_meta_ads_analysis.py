@@ -11752,6 +11752,38 @@ def test_build_discovery_tools_pacing_report_mock_smoke(monkeypatch) -> None:
     assert out["rollup"]["status_counts"]["on_track"] == 1
 
 
+def test_pacing_report_as_of_none_defaults_to_utc_today(monkeypatch) -> None:
+    # as_of=None is the tool's ONLY clock touch: it must default to today (UTC). Freeze the clock so
+    # the otherwise-untested default branch is exercised deterministically (mirrors the 14/31 window).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+
+    class _Frozen:
+        @staticmethod
+        def now(tz=None):
+            class _Stamp:
+                @staticmethod
+                def date():
+                    return date(2026, 7, 14)
+
+            return _Stamp()
+
+    monkeypatch.setattr(_account_discovery, "datetime", _Frozen)
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    reader = _pacing_reader(
+        accounts,
+        {"act_1": [{"spend": "4200.00"}]},
+        {"act_1": [_pc_camp("c1", daily="30000")]},
+        {},
+        {"act_1": {}},
+    )
+    # as_of omitted entirely -> the frozen UTC "today" (2026-07-14) drives the window.
+    out = _account_discovery.pacing_report(
+        reader, date_from="2026-07-01", date_to="2026-07-31", fx_table=_fx()
+    )
+    assert out["as_of"] == "2026-07-14"
+    assert out["accounts"][0]["status"] == "on_track"
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from
