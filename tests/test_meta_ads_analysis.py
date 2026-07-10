@@ -9900,6 +9900,29 @@ def test_cross_account_summary_discovery_never_calls_get_account() -> None:
     assert not any(c[0] == "get_account" for c in reader.calls)
 
 
+def test_cross_account_summary_non_meta_error_surfaces_end_to_end() -> None:
+    # A real bug (non-MetaApiError) raised inside a worker must fail the whole call, not land in
+    # ``errors`` — the concurrency swap must not mask it. Guards the stated correctness requirement
+    # end-to-end (fan_out proves it in isolation; this proves the wired path preserves it).
+    import pytest
+
+    accounts = _summary_accounts()
+
+    def _fetch_insights(ad_account_id, **k):
+        if ad_account_id == "act_2":
+            raise ValueError("real bug, not a Meta API error")
+        return [dict(r) for r in _SUMMARY_INSIGHTS[ad_account_id]]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch_insights,
+    )
+    with pytest.raises(ValueError, match="real bug"):
+        _account_discovery.cross_account_spend_summary(
+            reader, date_from="2026-06-01", date_to="2026-06-30"
+        )
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from
