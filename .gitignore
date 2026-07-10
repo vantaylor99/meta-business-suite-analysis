@@ -37,3 +37,7 @@ knowledge/accounts/seattle_mission/
 # Never shared, never committed; every machine (yours or a specialist's) generates its own.
 local/*
 !local/.gitkeep
+
+# graphify knowledge-graph output — generated, bulky (HTML/JSON/cache), derived from the
+# codebase (can embed client specifics). Regenerate locally with /graphify; never commit.
+graphify-out/
