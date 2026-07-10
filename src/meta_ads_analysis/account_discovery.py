@@ -24,9 +24,19 @@ import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any
 
 from . import account_registry
+from .config import (
+    ATTENTION_CPC_DEGRADE_PCT,
+    ATTENTION_CPR_DEGRADE_PCT,
+    ATTENTION_CTR_DROP_PCT,
+    ATTENTION_MIN_RESULTS_FLOOR,
+    ATTENTION_MIN_SPEND,
+    ATTENTION_SPEND_COLLAPSE_PCT,
+    ATTENTION_SPEND_SPIKE_PCT,
+)
 from .currency import FxTable, load_fx_table
 from .meta_api import MetaApiError
 from .sync_api import (
@@ -1061,4 +1071,511 @@ def account_benchmark(
     result["benchmarks"] = benchmarks
     if too_small:
         result["note"] = "cohort too small for a meaningful percentile"
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# ATTENTION SCAN: the handful of accounts that changed and need a human NOW.
+#
+# A *pure post-processor* over cross_account_performance — exactly the relationship account_benchmark
+# has to that tool. It calls cross_account_performance TWICE over the SAME resolved scope (once per
+# window), joins the two per-account metric rows by ad_account_id, and runs a pure flag-evaluation over
+# each pair. So it inherits — for free — FX normalization, Simpson's-paradox-safe derived metrics
+# (compute_derived_metrics never zero/inf-fills), per-account partial-failure isolation, and the
+# deterministic bounded-concurrency fan-out. No new Meta read shape is introduced.
+#
+# SCOPE: budget-pacing (spend-to-date vs configured budget) is a DIFFERENT question over a DIFFERENT
+# surface and is owned by the sibling `pacing_report` tool — this tool never reads budget config.
+# Ad-level creative/disapproval problems need a per-account ad-level fan-out (heavy) and are parked in
+# a backlog ticket. What ships here is purely the two performance reads + each row's account-status
+# label, so every flag is zero extra reads beyond the two fan-outs.
+# --------------------------------------------------------------------------- #
+
+# Severity rank: high(3) > medium(2) > low(1) > info(0). An account's severity is the max over its
+# fired flags; ``flagged`` collects severity >= medium, ``informational`` the info-only accounts.
+_SEVERITY_RANK: dict[str, int] = {"info": 0, "low": 1, "medium": 2, "high": 3}
+_RANK_TO_SEVERITY: dict[int, str] = {rank: name for name, rank in _SEVERITY_RANK.items()}
+_MEDIUM_RANK = _SEVERITY_RANK["medium"]
+
+# account_status_label buckets for the account_status_alert flag (see ACCOUNT_STATUS_LABELS above).
+_STATUS_ALERT_HIGH: frozenset[str] = frozenset({"DISABLED", "PENDING_CLOSURE", "CLOSED"})
+_STATUS_ALERT_MEDIUM: frozenset[str] = frozenset(
+    {"UNSETTLED", "PENDING_RISK_REVIEW", "PENDING_SETTLEMENT", "IN_GRACE_PERIOD"}
+)
+
+
+@dataclass(frozen=True)
+class AttentionThresholds:
+    """Overridable thresholds for the attention scan.
+
+    Defaults come from the ``ATTENTION_*`` constants in :mod:`config` so no magic numbers live in the
+    engine. Injectable for tests; the MCP wrapper always uses :meth:`defaults` — this is a
+    programmatic/test seam, exactly like ``fx_table`` on :func:`cross_account_performance`.
+
+    - Percent knees (``*_pct``) are FRACTIONS: ``0.5`` == a 50% move, ``0.3`` == a 30% move.
+    - ``min_spend_floor`` gates on a NORMALIZED (reporting-currency) spend figure so "$100 of spend"
+      means the same across a USD and an MXN account (native fallback for a no-FX account).
+    - ``min_results_floor`` is the cost-degradation significance floor: BOTH windows must clear it
+      before a cost-per-result flag fires.
+    """
+
+    spend_spike_pct: float
+    spend_collapse_pct: float
+    cost_per_result_degrade_pct: float
+    cpc_degrade_pct: float
+    ctr_drop_pct: float
+    min_spend_floor: float
+    min_results_floor: float
+
+    @classmethod
+    def defaults(cls) -> "AttentionThresholds":
+        """The committed defaults from :mod:`config` (50% spend move / 30% efficiency degradation)."""
+        return cls(
+            spend_spike_pct=ATTENTION_SPEND_SPIKE_PCT,
+            spend_collapse_pct=ATTENTION_SPEND_COLLAPSE_PCT,
+            cost_per_result_degrade_pct=ATTENTION_CPR_DEGRADE_PCT,
+            cpc_degrade_pct=ATTENTION_CPC_DEGRADE_PCT,
+            ctr_drop_pct=ATTENTION_CTR_DROP_PCT,
+            min_spend_floor=ATTENTION_MIN_SPEND,
+            min_results_floor=ATTENTION_MIN_RESULTS_FLOOR,
+        )
+
+
+def prior_window(current_from: str, current_to: str) -> tuple[str, str]:
+    """The immediately-preceding window of equal length.
+
+    Pure and clock-free: parses ISO ``YYYY-MM-DD``, takes the inclusive length
+    ``(to - from).days + 1``, and returns the equal-length span ending the day before ``current_from``::
+
+        prior_window("2026-06-08", "2026-06-14")  ->  ("2026-06-01", "2026-06-07")   # 7 days
+
+    Raises ``ValueError`` on unparseable dates (via :meth:`date.fromisoformat`) or ``from > to``.
+    """
+    start = date.fromisoformat(current_from)
+    end = date.fromisoformat(current_to)
+    if start > end:
+        raise ValueError(
+            f"current window from ({current_from}) is after to ({current_to}); cannot derive a "
+            "prior window."
+        )
+    length = (end - start).days + 1
+    baseline_to = start - timedelta(days=1)
+    baseline_from = baseline_to - timedelta(days=length - 1)
+    return baseline_from.isoformat(), baseline_to.isoformat()
+
+
+def _spend_for_floor(row: dict[str, Any] | None) -> float | None:
+    """The spend figure a floor is compared against: NORMALIZED preferred, native fallback (no-FX)."""
+    if not row:
+        return None
+    value = row.get("spend_normalized")
+    return value if value is not None else row.get("spend")
+
+
+def _normalized_spend(row: dict[str, Any] | None) -> float | None:
+    """Reporting-currency spend for the deterministic sort tiebreak (native fallback for a no-FX row)."""
+    return _spend_for_floor(row)
+
+
+def _at_or_above(value: float | None, floor: float) -> bool:
+    """True iff ``value`` is present and clears ``floor`` (an absent metric never clears a floor)."""
+    return value is not None and value >= floor
+
+
+def _flag(
+    name: str,
+    severity: str,
+    *,
+    current: Any,
+    baseline: Any,
+    delta: float | None,
+    delta_pct: float | None,
+    detail: str,
+) -> dict[str, Any]:
+    """One fired flag. ``delta_pct`` is a FRACTION (0.6 == +60%); ``None`` when a % is undefined."""
+    return {
+        "name": name,
+        "severity": severity,
+        "current": current,
+        "baseline": baseline,
+        "delta": delta,
+        "delta_pct": delta_pct,
+        "detail": detail,
+    }
+
+
+def _account_status_flag(label: Any) -> dict[str, Any] | None:
+    """The ``account_status_alert`` flag for an account-status label, or ``None`` when the account is
+    in a healthy/unknown status. Baseline-independent — derived purely from the current row's label."""
+    if label in _STATUS_ALERT_HIGH:
+        severity = "high"
+    elif label in _STATUS_ALERT_MEDIUM:
+        severity = "medium"
+    else:
+        return None
+    return _flag(
+        "account_status_alert",
+        severity,
+        current=label,
+        baseline=None,
+        delta=None,
+        delta_pct=None,
+        detail=f"account status is {label}",
+    )
+
+
+def evaluate_attention_flags(
+    current_row: dict[str, Any] | None,
+    baseline_row: dict[str, Any] | None,
+    thresholds: AttentionThresholds,
+) -> list[dict[str, Any]]:
+    """PURE flag evaluation over two per-account metric rows (as emitted by
+    :func:`cross_account_performance`).
+
+    Fully unit-testable with hand-built dict fixtures — no reader. Returns the fired flags, each a
+    ``{name, severity, current, baseline, delta, delta_pct, detail}`` dict.
+
+    Key correctness rules baked in here:
+
+    - ``compute_derived_metrics`` OMITS (never zero/inf-fills) any ratio whose denominator is 0 or
+      whose component is absent, so a row simply *lacks* ``cost_per_result``/``cpc``/``ctr`` when
+      undefined — a missing key means "cannot compute this flag," never 0.
+    - Every ``/ baseline`` is guarded: a zero/absent/below-floor baseline yields ``insufficient_history``
+      or ``newly_active`` (info), never an ``inf`` % spike.
+    - Percent moves are computed on NATIVE figures (currency-invariant for one account across two
+      windows); absolute floors compare on the NORMALIZED figure (native fallback for a no-FX account).
+    - ``stalled_delivery`` fires only when the account reads ``ACTIVE``; a DISABLED/paused account with
+      zero delivery surfaces via ``account_status_alert`` instead. (It cannot distinguish a deliberate
+      all-ads pause on an ACTIVE account from a real stall — that needs ad-level reads, out of scope.)
+    """
+    cur = current_row or {}
+    base = baseline_row
+
+    flags: list[dict[str, Any]] = []
+
+    # 1. account_status_alert — baseline-independent, fires even for a new/insufficient account.
+    status_flag = _account_status_flag(cur.get("account_status_label"))
+    if status_flag is not None:
+        flags.append(status_flag)
+
+    cur_floor_spend = _spend_for_floor(cur)
+    base_floor_spend = _spend_for_floor(base)
+    cur_native_spend = cur.get("spend")
+    base_native_spend = base.get("spend") if base else None
+
+    cur_spend_ok = _at_or_above(cur_floor_spend, thresholds.min_spend_floor)
+    base_spend_ok = _at_or_above(base_floor_spend, thresholds.min_spend_floor)
+
+    # 2. No usable baseline (absent row, or spend below the material floor): the account is either
+    # newly active (material NOW, ~nothing before) or simply has too little history to compare. Either
+    # way NO %-move / cost-degradation flag can fire (they would divide by a ~0 baseline).
+    if base is None or not base_spend_ok:
+        if cur_spend_ok:
+            flags.append(
+                _flag(
+                    "newly_active",
+                    "info",
+                    current=cur_native_spend,
+                    baseline=base_native_spend,
+                    delta=None,
+                    delta_pct=None,
+                    detail="material spend now with little/no spend in the baseline window",
+                )
+            )
+        else:
+            flags.append(
+                _flag(
+                    "insufficient_history",
+                    "info",
+                    current=cur_native_spend,
+                    baseline=base_native_spend,
+                    delta=None,
+                    delta_pct=None,
+                    detail="baseline window has too little spend to compare against",
+                )
+            )
+        return flags
+
+    # 3. Baseline is usable (>= floor, so it was genuinely delivering). Compare the windows. Percent
+    # moves use NATIVE spend (present whenever floor spend is), currency-invariant for one account.
+    base_s = base_native_spend
+    cur_s = cur_native_spend
+
+    # spend_spike — BOTH windows material AND current up beyond the spike knee.
+    if cur_spend_ok and base_s and cur_s is not None:
+        move = (cur_s - base_s) / base_s
+        if move >= thresholds.spend_spike_pct:
+            severity = "high" if move >= 2 * thresholds.spend_spike_pct else "medium"
+            flags.append(
+                _flag(
+                    "spend_spike",
+                    severity,
+                    current=cur_s,
+                    baseline=base_s,
+                    delta=cur_s - base_s,
+                    delta_pct=move,
+                    detail=f"spend up {move * 100:.0f}% vs. the baseline window",
+                )
+            )
+
+    # spend_collapse — baseline material AND current down past the collapse knee (current may fall
+    # below the floor; that is the collapse). NATIVE spend, absent current treated as 0.
+    if base_s:
+        cur_s0 = cur_s if cur_s is not None else 0.0
+        move = (cur_s0 - base_s) / base_s
+        if move <= -thresholds.spend_collapse_pct:
+            flags.append(
+                _flag(
+                    "spend_collapse",
+                    "high",
+                    current=cur_s0,
+                    baseline=base_s,
+                    delta=cur_s0 - base_s,
+                    delta_pct=move,
+                    detail=f"spend down {abs(move) * 100:.0f}% vs. the baseline window",
+                )
+            )
+
+    # stalled_delivery — an ACTIVE account that WAS delivering (baseline >= floor, guaranteed here) and
+    # now has essentially no delivery (spend AND impressions ~0). Status gate is the key disambiguation
+    # from a deliberately DISABLED account (which surfaces via account_status_alert).
+    cur_impr0 = cur.get("impressions") or 0
+    cur_spend0 = cur_s if cur_s is not None else 0.0
+    if cur.get("account_status_label") == "ACTIVE" and cur_spend0 <= 0 and cur_impr0 <= 0:
+        flags.append(
+            _flag(
+                "stalled_delivery",
+                "high",
+                current=cur_spend0,
+                baseline=base_s,
+                delta=cur_spend0 - base_s,
+                delta_pct=-1.0,
+                detail="account was delivering but has ~zero spend and impressions now",
+            )
+        )
+
+    # cost_per_result_degraded — both rows have cost_per_result, BOTH windows cleared the results floor
+    # (the low-volume noise guard), and cpr rose past the degrade knee (higher cpr == worse).
+    cur_cpr = cur.get("cost_per_result")
+    base_cpr = base.get("cost_per_result")
+    if (
+        cur_cpr is not None
+        and base_cpr
+        and _at_or_above(cur.get("results"), thresholds.min_results_floor)
+        and _at_or_above(base.get("results"), thresholds.min_results_floor)
+    ):
+        move = (cur_cpr - base_cpr) / base_cpr
+        if move >= thresholds.cost_per_result_degrade_pct:
+            flags.append(
+                _flag(
+                    "cost_per_result_degraded",
+                    "high",
+                    current=cur_cpr,
+                    baseline=base_cpr,
+                    delta=cur_cpr - base_cpr,
+                    delta_pct=move,
+                    detail=f"cost per result up {move * 100:.0f}% vs. the baseline window",
+                )
+            )
+
+    # cpc_degraded — both rows have cpc, both windows material (spend floor is the volume proxy), cpc up
+    # past the degrade knee.
+    cur_cpc = cur.get("cpc")
+    base_cpc = base.get("cpc")
+    if cur_cpc is not None and base_cpc and cur_spend_ok:
+        move = (cur_cpc - base_cpc) / base_cpc
+        if move >= thresholds.cpc_degrade_pct:
+            flags.append(
+                _flag(
+                    "cpc_degraded",
+                    "medium",
+                    current=cur_cpc,
+                    baseline=base_cpc,
+                    delta=cur_cpc - base_cpc,
+                    delta_pct=move,
+                    detail=f"cost per click up {move * 100:.0f}% vs. the baseline window",
+                )
+            )
+
+    # ctr_dropped — both rows have ctr, current down past the drop knee (a stalled account has no
+    # current ctr — impressions denominator absent — so it never double-fires here).
+    cur_ctr = cur.get("ctr")
+    base_ctr = base.get("ctr")
+    if cur_ctr is not None and base_ctr:
+        move = (cur_ctr - base_ctr) / base_ctr
+        if move <= -thresholds.ctr_drop_pct:
+            flags.append(
+                _flag(
+                    "ctr_dropped",
+                    "medium",
+                    current=cur_ctr,
+                    baseline=base_ctr,
+                    delta=cur_ctr - base_ctr,
+                    delta_pct=move,
+                    detail=f"click-through rate down {abs(move) * 100:.0f}% vs. the baseline window",
+                )
+            )
+
+    return flags
+
+
+def _attention_account_entry(
+    current_row: dict[str, Any],
+    baseline_row: dict[str, Any] | None,
+    flags: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble a flagged/informational account entry from its row + fired flags (severity = max)."""
+    max_rank = max(_SEVERITY_RANK.get(f["severity"], 0) for f in flags)
+    # Deterministic sort tiebreak: absolute normalized-spend delta between the windows (native
+    # fallback), then ad_account_id — a stable total order so ties never reorder run-to-run.
+    cur_norm = _normalized_spend(current_row) or 0.0
+    base_norm = _normalized_spend(baseline_row) or 0.0
+    return {
+        "ad_account_id": current_row.get("ad_account_id"),
+        "account_id": current_row.get("account_id"),
+        "name": current_row.get("name"),
+        "currency": current_row.get("currency"),
+        "account_status_label": current_row.get("account_status_label"),
+        "severity": _RANK_TO_SEVERITY[max_rank],
+        "flags": flags,
+        "_sort_rank": max_rank,
+        "_sort_delta": abs(cur_norm - base_norm),
+    }
+
+
+def flag_accounts_needing_attention(
+    reader: "MetaReaderProvider",
+    *,
+    current_from: str,
+    current_to: str,
+    account_ids: list[str] | None = None,
+    baseline_from: str | None = None,
+    baseline_to: str | None = None,
+    reporting_currency: str = "USD",
+    thresholds: AttentionThresholds | None = None,
+    fx_table: FxTable | None = None,
+) -> dict[str, Any]:
+    """Surface the handful of accounts that changed and need a human's attention right now.
+
+    A **pure post-processor** over :func:`cross_account_performance`: it calls that tool TWICE over the
+    same resolved scope — once for the current window, once for a prior baseline window of equal length
+    — joins the per-account rows by ``ad_account_id``, and runs :func:`evaluate_attention_flags` over
+    each pair. It inherits FX normalization, Simpson's-paradox-safe derived metrics, per-account
+    partial-failure isolation, and the deterministic fan-out from the prereq; it introduces no new Meta
+    read shape.
+
+    **Baseline resolution.** Both ``baseline_from``/``baseline_to`` omitted -> :func:`prior_window` of
+    the current window. Both given -> used verbatim (overlap with the current window is allowed but not
+    corrected — the caller's explicit choice). Exactly one given -> ``ValueError`` (ambiguous).
+
+    **Currency discipline.** The FX table is loaded once here and passed to BOTH reads so they
+    normalize against one table; an invalid ``reporting_currency`` fails the whole call with the same
+    ``ValueError`` contract as the prereq. Percent deltas are native (currency-invariant for one
+    account); absolute spend floors compare on ``spend_normalized`` (native fallback for a no-FX
+    account).
+
+    **Read cost (documented, not a bug).** This issues ``2x`` the per-account insight reads of a single
+    :func:`cross_account_performance` (one fan-out per window) — ~400 reads for a 200-account scope
+    under the bounded pool. Acceptable; a single multi-window read is a future optimization out of
+    scope here.
+
+    **Not in scope:** budget pacing (spend-to-date vs. configured budget) is a separate tool
+    (``pacing_report``); ad-level creative/disapproval detection is parked in backlog. Account-level
+    health is covered by the ``account_status_alert`` flag at zero extra read cost.
+    """
+    thr = thresholds if thresholds is not None else AttentionThresholds.defaults()
+
+    # Baseline resolution — validate BEFORE any read so an ambiguous/invalid window fails fast.
+    if baseline_from is None and baseline_to is None:
+        resolved_from, resolved_to = prior_window(current_from, current_to)
+    elif baseline_from is not None and baseline_to is not None:
+        resolved_from, resolved_to = baseline_from, baseline_to
+    else:
+        raise ValueError(
+            "baseline_from and baseline_to must be provided together (or both omitted to derive the "
+            "immediately-preceding window of equal length)."
+        )
+
+    # Load the FX table once and share it across both reads so a single table validates
+    # reporting_currency and normalizes both windows (an invalid currency raises inside the first call).
+    table = fx_table if fx_table is not None else load_fx_table()
+
+    current = cross_account_performance(
+        reader,
+        date_from=current_from,
+        date_to=current_to,
+        account_ids=account_ids,
+        reporting_currency=reporting_currency,
+        fx_table=table,
+    )
+    baseline = cross_account_performance(
+        reader,
+        date_from=resolved_from,
+        date_to=resolved_to,
+        account_ids=account_ids,
+        reporting_currency=reporting_currency,
+        fx_table=table,
+    )
+
+    cur_rows = {r["ad_account_id"]: r for r in current["accounts"]}
+    base_rows = {r["ad_account_id"]: r for r in baseline["accounts"]}
+
+    # Merge both reads' errors, tagging each with the window it came from. An account with NO row in a
+    # window (a genuine read failure) cannot be compared -> excluded from flagging (it surfaces here).
+    # A no-FX account carries a native row AND an errors entry: it is still readable/flagged (native
+    # spend feeds its floor), and its FX-gap note is surfaced here too.
+    errors: list[dict[str, Any]] = []
+    for window, read in (("current", current), ("baseline", baseline)):
+        for entry in read["errors"]:
+            errors.append(
+                {
+                    "ad_account_id": entry.get("ad_account_id"),
+                    "window": window,
+                    "error": entry.get("error"),
+                }
+            )
+
+    flagged: list[dict[str, Any]] = []
+    informational: list[dict[str, Any]] = []
+    clean_count = 0
+
+    # Iterate in current-window scope order (deterministic); evaluate only accounts readable in BOTH
+    # windows. The join/sort is order-deterministic, so identical inputs -> identical buckets and order.
+    for ad_account_id, current_row in cur_rows.items():
+        baseline_row = base_rows.get(ad_account_id)
+        if baseline_row is None:
+            # Read-failed in the baseline window -> already surfaced in errors; cannot compare.
+            continue
+        flags = evaluate_attention_flags(current_row, baseline_row, thr)
+        if not flags:
+            clean_count += 1
+            continue
+        entry = _attention_account_entry(current_row, baseline_row, flags)
+        if entry["_sort_rank"] >= _MEDIUM_RANK:
+            flagged.append(entry)
+        else:
+            informational.append(entry)
+
+    # flagged: (severity desc, |normalized-spend delta| desc, ad_account_id asc) — a stable total order.
+    flagged.sort(key=lambda e: (-e["_sort_rank"], -e["_sort_delta"], e["ad_account_id"] or ""))
+    informational.sort(key=lambda e: (e["ad_account_id"] or ""))
+    for entry in (*flagged, *informational):
+        del entry["_sort_rank"]
+        del entry["_sort_delta"]
+
+    result: dict[str, Any] = {
+        "current_window": {"date_from": current_from, "date_to": current_to},
+        "baseline_window": {"date_from": resolved_from, "date_to": resolved_to},
+        "reporting_currency": current["reporting_currency"],
+        "fx_as_of": current["fx_as_of"],
+        "fx_note": current["fx_note"],
+        "account_count": current["account_count"],
+        "reachable_count": current["reachable_count"],
+        "flagged": flagged,
+        "informational": informational,
+        "clean_count": clean_count,
+        "errors": errors,
+    }
+    if current.get("note"):
+        result["note"] = current["note"]
     return result

@@ -451,6 +451,17 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "(default USD); cohort size and any excluded accounts are surfaced, and a cohort below the "
         "reliability floor is flagged rather than hidden."
     ),
+    "flag_accounts_needing_attention": (
+        "Scan every ad account this token can reach (or an explicit list) and surface only the handful "
+        "that CHANGED and need a human now — instead of eyeballing hundreds. Compares a current window "
+        "against the immediately-preceding equal-length window (override with baseline_from/baseline_to) "
+        "and flags sudden spend spikes/collapses, worsening cost-per-result/CPC, dropping CTR, stalled "
+        "delivery on an ACTIVE account, and account-status problems (DISABLED/UNSETTLED/etc.). Defaults: "
+        "a 50% spend move or 30% cost/quality degradation is 'noticeable'; results are bucketed into "
+        "flagged (medium+ severity, worst-first), informational (newly-active / too-little-history), and "
+        "a clean count. Money floors compare in one reporting_currency (default USD). NOTE: budget "
+        "pacing (spend-to-date vs. configured budget) is a SEPARATE tool (pacing_report), not this one."
+    ),
 }
 
 
@@ -512,11 +523,32 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             reporting_currency=reporting_currency,
         )
 
+    def flag_accounts_needing_attention(
+        current_from: str,
+        current_to: str,
+        account_ids: list[str] | None = None,
+        baseline_from: str | None = None,
+        baseline_to: str | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``thresholds`` and ``fx_table`` are test-only/programmatic seams and are deliberately NOT
+        # exposed to the LLM; the tool uses the committed defaults and loads config/fx_rates.json itself.
+        return account_discovery.flag_accounts_needing_attention(
+            reader,
+            current_from=current_from,
+            current_to=current_to,
+            account_ids=account_ids,
+            baseline_from=baseline_from,
+            baseline_to=baseline_to,
+            reporting_currency=reporting_currency,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
         "cross_account_performance": cross_account_performance,
         "account_benchmark": account_benchmark,
+        "flag_accounts_needing_attention": flag_accounts_needing_attention,
     }
 
 

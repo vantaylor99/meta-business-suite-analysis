@@ -9676,18 +9676,20 @@ def test_cross_account_summary_mock_smoke_single_usd_account() -> None:
 def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     reader = _summary_reader()
     discovery = _mcp_server.build_discovery_tools(reader)
-    # All four discovery tools are exposed.
+    # All five discovery tools are exposed.
     assert set(discovery) == {
         "list_ad_accounts",
         "cross_account_spend_summary",
         "cross_account_performance",
         "account_benchmark",
+        "flag_accounts_needing_attention",
     }
     summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
     assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
     assert "cross_account_spend_summary" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "cross_account_performance" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "account_benchmark" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "flag_accounts_needing_attention" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
 
 
 def test_cross_account_summary_insight_fields_restricts_metrics_summed() -> None:
@@ -10881,6 +10883,362 @@ def test_account_benchmark_unknown_currency_target_money_reason(monkeypatch) -> 
         assert entry["reason"] == "no FX rate for UNKNOWN"
     # ctr is currency-invariant -> still benchmarks (target present in the ratio cohort).
     assert out["benchmarks"]["ctr"]["percentile"] is not None
+
+
+# --- flag_accounts_needing_attention: pure prior_window ---
+
+
+def test_prior_window_seven_day_span() -> None:
+    # A 7-day current window -> the immediately-preceding 7-day span.
+    assert _account_discovery.prior_window("2026-06-08", "2026-06-14") == ("2026-06-01", "2026-06-07")
+
+
+def test_prior_window_thirty_day_and_single_day() -> None:
+    # A 30-day window -> the preceding 30-day span (inclusive length preserved).
+    assert _account_discovery.prior_window("2026-06-01", "2026-06-30") == ("2026-05-02", "2026-05-31")
+    # A 1-day window -> the single prior day.
+    assert _account_discovery.prior_window("2026-06-10", "2026-06-10") == ("2026-06-09", "2026-06-09")
+
+
+def test_prior_window_crosses_month_boundary() -> None:
+    # The preceding span reaches back into a shorter month without arithmetic error (Feb 2026 = 28d).
+    assert _account_discovery.prior_window("2026-03-01", "2026-03-07") == ("2026-02-22", "2026-02-28")
+
+
+def test_prior_window_from_after_to_and_unparseable_raise() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        _account_discovery.prior_window("2026-06-14", "2026-06-08")  # from > to
+    with pytest.raises(ValueError):
+        _account_discovery.prior_window("not-a-date", "2026-06-08")  # unparseable
+
+
+# --- flag_accounts_needing_attention: pure evaluate_attention_flags (dict fixtures, no reader) ---
+
+
+def _thr():
+    return _account_discovery.AttentionThresholds.defaults()
+
+
+def _flags_by_name(current_row, baseline_row):
+    return {f["name"]: f for f in _account_discovery.evaluate_attention_flags(current_row, baseline_row, _thr())}
+
+
+def test_evaluate_flags_spend_spike_severity_and_boundary() -> None:
+    import pytest
+
+    base = {"account_status_label": "ACTIVE", "spend": 200.0, "spend_normalized": 200.0, "impressions": 2000}
+    # +50% == exactly the knee -> fires medium.
+    cur = {"account_status_label": "ACTIVE", "spend": 300.0, "spend_normalized": 300.0, "impressions": 3000}
+    spike = _flags_by_name(cur, base)["spend_spike"]
+    assert spike["severity"] == "medium"
+    assert spike["delta_pct"] == pytest.approx(0.5)
+    # Just below the knee (+49%) -> silent.
+    cur_below = {**cur, "spend": 298.0, "spend_normalized": 298.0}
+    assert "spend_spike" not in _flags_by_name(cur_below, base)
+    # >= 2x the knee (+100%) -> escalates to high.
+    cur_high = {**cur, "spend": 400.0, "spend_normalized": 400.0}
+    assert _flags_by_name(cur_high, base)["spend_spike"]["severity"] == "high"
+
+
+def test_evaluate_flags_spend_collapse_and_boundary() -> None:
+    base = {"account_status_label": "ACTIVE", "spend": 200.0, "spend_normalized": 200.0, "impressions": 2000}
+    # -50% exactly -> fires high.
+    cur = {"account_status_label": "ACTIVE", "spend": 100.0, "spend_normalized": 100.0, "impressions": 1000}
+    assert _flags_by_name(cur, base)["spend_collapse"]["severity"] == "high"
+    # -49% -> silent.
+    cur_above = {**cur, "spend": 102.0, "spend_normalized": 102.0}
+    assert "spend_collapse" not in _flags_by_name(cur_above, base)
+
+
+def test_evaluate_flags_stalled_only_when_active_else_status_alert() -> None:
+    base = {"account_status_label": "ACTIVE", "spend": 500.0, "spend_normalized": 500.0, "impressions": 5000}
+    # ACTIVE account, zero current delivery (no spend/impressions rows) -> stalled_delivery.
+    active_zero = {"account_status_label": "ACTIVE"}
+    active_flags = _flags_by_name(active_zero, base)
+    assert "stalled_delivery" in active_flags
+    assert "account_status_alert" not in active_flags
+    # Same zero delivery but DISABLED -> account_status_alert (high), NOT a false stall.
+    disabled_zero = {"account_status_label": "DISABLED"}
+    disabled_flags = _flags_by_name(disabled_zero, base)
+    assert "stalled_delivery" not in disabled_flags
+    assert disabled_flags["account_status_alert"]["severity"] == "high"
+
+
+def test_evaluate_flags_cost_per_result_degraded_and_volume_gate() -> None:
+    import pytest
+
+    base = {"account_status_label": "ACTIVE", "spend": 300.0, "spend_normalized": 300.0,
+            "impressions": 6000, "results": 30, "cost_per_result": 10.0}
+    cur = {"account_status_label": "ACTIVE", "spend": 420.0, "spend_normalized": 420.0,
+           "impressions": 6000, "results": 30, "cost_per_result": 14.0}
+    cpr = _flags_by_name(cur, base)["cost_per_result_degraded"]
+    assert cpr["severity"] == "high"
+    assert cpr["delta_pct"] == pytest.approx(0.4)
+    # Current results below the floor (25) -> the flag is suppressed (low-volume noise guard).
+    assert "cost_per_result_degraded" not in _flags_by_name({**cur, "results": 20}, base)
+    # Baseline results below the floor -> also suppressed.
+    assert "cost_per_result_degraded" not in _flags_by_name(cur, {**base, "results": 10})
+
+
+def test_evaluate_flags_cpc_degraded_and_ctr_dropped_boundaries() -> None:
+    base = {"account_status_label": "ACTIVE", "spend": 200.0, "spend_normalized": 200.0,
+            "impressions": 4000, "cpc": 1.0, "ctr": 2.0}
+    # cpc +30% exactly and ctr -30% exactly -> both fire medium.
+    cur = {"account_status_label": "ACTIVE", "spend": 200.0, "spend_normalized": 200.0,
+           "impressions": 4000, "cpc": 1.3, "ctr": 1.4}
+    fired = _flags_by_name(cur, base)
+    assert fired["cpc_degraded"]["severity"] == "medium"
+    assert fired["ctr_dropped"]["severity"] == "medium"
+    # Just inside the knees -> silent.
+    cur_below = {**cur, "cpc": 1.29, "ctr": 1.45}
+    quiet = _flags_by_name(cur_below, base)
+    assert "cpc_degraded" not in quiet and "ctr_dropped" not in quiet
+
+
+def test_evaluate_flags_insufficient_history_absent_and_below_floor() -> None:
+    cur = {"account_status_label": "ACTIVE", "spend": 50.0, "spend_normalized": 50.0, "impressions": 500}
+    # Baseline row absent + current below floor -> insufficient_history (info), no % delta.
+    absent = _flags_by_name(cur, None)
+    assert set(absent) == {"insufficient_history"}
+    assert absent["insufficient_history"]["severity"] == "info"
+    assert absent["insufficient_history"]["delta_pct"] is None
+    # Baseline present but below floor, current below floor -> still insufficient_history.
+    below = {"account_status_label": "ACTIVE", "spend": 20.0, "spend_normalized": 20.0}
+    assert set(_flags_by_name(cur, below)) == {"insufficient_history"}
+
+
+def test_evaluate_flags_newly_active_never_infinite_spike() -> None:
+    cur = {"account_status_label": "ACTIVE", "spend": 500.0, "spend_normalized": 500.0, "impressions": 5000}
+    # Baseline absent + material current -> newly_active (info), never a spend_spike / inf delta.
+    absent = _flags_by_name(cur, None)
+    assert set(absent) == {"newly_active"}
+    assert absent["newly_active"]["severity"] == "info"
+    assert absent["newly_active"]["delta_pct"] is None
+    # Baseline of ~0 spend -> still newly_active, never a divide-by-zero spike.
+    zero_base = {"account_status_label": "ACTIVE", "spend": 0.0, "spend_normalized": 0.0}
+    assert set(_flags_by_name(cur, zero_base)) == {"newly_active"}
+
+
+def test_evaluate_flags_status_alert_medium_alongside_comparison_flag() -> None:
+    base = {"account_status_label": "ACTIVE", "spend": 200.0, "spend_normalized": 200.0, "impressions": 2000}
+    # UNSETTLED -> medium status alert; +100% spend -> high spike. Both fire; account severity is max.
+    cur = {"account_status_label": "UNSETTLED", "spend": 400.0, "spend_normalized": 400.0, "impressions": 4000}
+    fired = _flags_by_name(cur, base)
+    assert fired["account_status_alert"]["severity"] == "medium"
+    assert fired["spend_spike"]["severity"] == "high"
+
+
+def test_evaluate_flags_metric_absent_in_one_window_cannot_compute_no_crash() -> None:
+    # cost_per_result tracked only in the current window (baseline lacks it) -> the cpr flag is skipped
+    # (cannot compute), never a spurious inf degradation and never a crash.
+    base = {"account_status_label": "ACTIVE", "spend": 300.0, "spend_normalized": 300.0, "impressions": 6000}
+    cur = {"account_status_label": "ACTIVE", "spend": 300.0, "spend_normalized": 300.0,
+           "impressions": 6000, "results": 40, "cost_per_result": 7.5}
+    assert "cost_per_result_degraded" not in _flags_by_name(cur, base)
+
+
+# --- flag_accounts_needing_attention: integration over a windowed FakeMetaReader (MOCKS ONLY) ---
+
+
+def _attention_reader(accounts, rows_by_window, **overrides):
+    """A FakeMetaReader whose insight row varies by ``date_from`` (window), like the existing fakes.
+
+    ``rows_by_window`` maps ``date_from -> {ad_account_id: [insight_row, ...]}``.
+    """
+
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        window = rows_by_window.get(date_from, {})
+        return [dict(r) for r in window.get(ad_account_id, [])]
+
+    stubs = {
+        "list_ad_accounts": lambda *, fields: [dict(a) for a in accounts],
+        "fetch_insights": _fetch_insights,
+    }
+    stubs.update(overrides)
+    return FakeMetaReader(**stubs)
+
+
+def test_flag_accounts_attention_spike_collapse_clean_sorted(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "Collapse", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "Clean", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {
+        "act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_2": [{"spend": "400.00", "impressions": "4000", "clicks": "200"}],
+        "act_3": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],
+    }
+    current_rows = {
+        "act_1": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],   # +200% spike (high)
+        "act_2": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],    # -75% collapse (high)
+        "act_3": [{"spend": "310.00", "impressions": "3100", "clicks": "155"}],   # ~+3% -> clean
+    }
+    reader = _attention_reader(accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows})
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+    assert out["current_window"] == {"date_from": "2026-06-08", "date_to": "2026-06-14"}
+    assert out["baseline_window"] == {"date_from": "2026-06-01", "date_to": "2026-06-07"}
+    assert out["account_count"] == out["reachable_count"] == 3
+    assert out["clean_count"] == 1
+    # Both flagged accounts are high severity -> tiebreak on |normalized-spend delta| desc:
+    # act_1 delta 400 > act_2 delta 300, so act_1 sorts first.
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_1", "act_2"]
+    assert out["flagged"][0]["severity"] == "high"
+    by_id = {e["ad_account_id"]: e for e in out["flagged"]}
+    assert "spend_spike" in {f["name"] for f in by_id["act_1"]["flags"]}
+    assert "spend_collapse" in {f["name"] for f in by_id["act_2"]["flags"]}
+    assert out["informational"] == [] and out["errors"] == []
+    # Internal sort keys never leak into the output.
+    assert "_sort_rank" not in out["flagged"][0] and "_sort_delta" not in out["flagged"][0]
+
+
+def test_flag_accounts_attention_baseline_error_isolated(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "Err", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {"act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}]}
+    current_rows = {
+        "act_1": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],
+        "act_2": [{"spend": "500.00", "impressions": "5000", "clicks": "250"}],
+    }
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        if ad_account_id == "act_2" and date_from == "2026-06-01":
+            raise MetaApiError("(#200) denied for act_2 baseline")
+        window = {"2026-06-01": baseline_rows, "2026-06-08": current_rows}[date_from]
+        return [dict(r) for r in window.get(ad_account_id, [])]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts], fetch_insights=_fetch
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+    # act_2 failed the baseline read -> excluded from flagging, surfaced in errors tagged "baseline".
+    assert {e["ad_account_id"] for e in out["flagged"]} == {"act_1"}
+    assert {
+        "ad_account_id": "act_2", "window": "baseline", "error": "(#200) denied for act_2 baseline"
+    } in out["errors"]
+    assert all(e["ad_account_id"] != "act_2" for e in out["informational"])
+    assert out["clean_count"] == 0  # act_2 never silently counted as clean
+    assert out["account_count"] == 2
+
+
+def test_flag_accounts_attention_deterministic(monkeypatch) -> None:
+    import time
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 5)
+    ]
+    baseline_rows = {
+        f"act_{i}": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}] for i in range(1, 5)
+    }
+    # All four spike by the same +200% -> identical severity AND |delta| -> ties broken by ad_account_id.
+    current_rows = {
+        f"act_{i}": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}] for i in range(1, 5)
+    }
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        idx = int(ad_account_id.split("_")[1])
+        time.sleep((5 - idx) * 0.005)  # reverse the finish order to stress determinism
+        window = {"2026-06-01": baseline_rows, "2026-06-08": current_rows}[date_from]
+        return [dict(r) for r in window[ad_account_id]]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts], fetch_insights=_fetch
+    )
+    kwargs = dict(current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx())
+    out1 = _account_discovery.flag_accounts_needing_attention(reader, **kwargs)
+    out2 = _account_discovery.flag_accounts_needing_attention(reader, **kwargs)
+    assert out1 == out2
+    assert [e["ad_account_id"] for e in out1["flagged"]] == ["act_1", "act_2", "act_3", "act_4"]
+
+
+def test_flag_accounts_attention_explicit_baseline_and_one_bound_error(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    rows = {
+        "2026-05-01": {"act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}]},
+        "2026-06-08": {"act_1": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}]},
+    }
+    reader = _attention_reader(accounts, rows)
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        baseline_from="2026-05-01", baseline_to="2026-05-07", fx_table=_fx(),
+    )
+    # Explicit baseline is honored verbatim (not the derived prior window).
+    assert out["baseline_window"] == {"date_from": "2026-05-01", "date_to": "2026-05-07"}
+    assert {e["ad_account_id"] for e in out["flagged"]} == {"act_1"}  # 100 -> 300 = +200% spike
+    # Exactly one baseline bound -> ValueError (ambiguous), raised before any read.
+    with pytest.raises(ValueError):
+        _account_discovery.flag_accounts_needing_attention(
+            reader, current_from="2026-06-08", current_to="2026-06-14",
+            baseline_from="2026-05-01", fx_table=_fx(),
+        )
+
+
+def test_flag_accounts_attention_invalid_currency_raises(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    reader = _attention_reader(
+        accounts,
+        {"2026-06-01": {"act_1": [{"spend": "100.00"}]}, "2026-06-08": {"act_1": [{"spend": "100.00"}]}},
+    )
+    with pytest.raises(ValueError):
+        _account_discovery.flag_accounts_needing_attention(
+            reader, current_from="2026-06-08", current_to="2026-06-14",
+            reporting_currency="JPY", fx_table=_fx(),
+        )
+
+
+def test_flag_accounts_attention_no_fx_account_flags_on_native_spend(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "JP", "account_status": 1, "currency": "JPY"}]
+    baseline_rows = {"act_1": [{"spend": "20000.00", "impressions": "2000", "clicks": "100"}]}
+    current_rows = {"act_1": [{"spend": "60000.00", "impressions": "6000", "clicks": "300"}]}
+    reader = _attention_reader(accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows})
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+    # JPY has no FX rate -> no spend_normalized twin; the floor falls back to native spend (both >> 100)
+    # so the account is still evaluated and flagged.
+    assert {e["ad_account_id"] for e in out["flagged"]} == {"act_1"}
+    assert out["flagged"][0]["currency"] == "JPY"
+    assert "spend_spike" in {f["name"] for f in out["flagged"][0]["flags"]}
+    # The no-FX gap is still surfaced in errors (both windows), but does NOT exclude the account.
+    assert any(e["ad_account_id"] == "act_1" and "FX" in (e["error"] or "") for e in out["errors"])
+
+
+def test_build_discovery_tools_flag_accounts_attention_mock_smoke(monkeypatch) -> None:
+    # The wired discovery tool returns a well-formed payload over the single mock USD account. The mock
+    # insight is identical across both windows, so nothing moves -> the account is clean, not flagged.
+    def _boom(*a, **k):
+        raise FileNotFoundError("no config in mock")
+
+    monkeypatch.setattr(_account_discovery.account_registry, "load_account_registry", _boom)
+    reader = _mcp_server.build_mock_reader()
+    tools = _mcp_server.build_discovery_tools(reader)
+    out = tools["flag_accounts_needing_attention"]("2026-06-08", "2026-06-14")
+    assert out["current_window"] == {"date_from": "2026-06-08", "date_to": "2026-06-14"}
+    assert out["baseline_window"] == {"date_from": "2026-06-01", "date_to": "2026-06-07"}
+    assert out["account_count"] == out["reachable_count"] == 1
+    assert out["fx_as_of"]  # surfaced from the committed table
+    assert out["flagged"] == [] and out["informational"] == []
+    assert out["clean_count"] == 1
+    assert out["errors"] == []
 
 
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:

@@ -257,8 +257,9 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the four discovery tools (`list_ad_accounts`,
-`cross_account_spend_summary`, `cross_account_performance`, and `account_benchmark` — none takes an
+plus any of the 14 read tools, the five discovery tools (`list_ad_accounts`,
+`cross_account_spend_summary`, `cross_account_performance`, `account_benchmark`, and
+`flag_accounts_needing_attention` — none takes an
 `account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
@@ -302,6 +303,30 @@ percentile is ambiguous. It surfaces the cohort size and any excluded accounts (
 currency with no FX rate), and a cohort with fewer than `MIN_COHORT_FOR_PERCENTILE` (5) readable
 accounts is **flagged** (`too_small` / per-metric `unreliable`) rather than hidden — the numbers are
 still returned, just labeled as thin.
+
+`flag_accounts_needing_attention` turns a full-fleet review into a short **attention list** — "which of
+my 200 accounts changed and need me *now*?". Like `account_benchmark` it is a pure post-processor over
+`cross_account_performance`, but it calls it **twice**: once for a current window and once for the
+immediately-preceding **equal-length** baseline window (override with `baseline_from` / `baseline_to`;
+supplying exactly one of the two is an error). It joins the per-account rows by account and flags the
+ones that *moved or breached a threshold*: `spend_spike` / `spend_collapse` (default a **50%** move),
+`cost_per_result_degraded` / `cpc_degraded` / `ctr_dropped` (default a **30%** degradation),
+`stalled_delivery` (an account that was delivering but now shows ~zero spend **and** impressions —
+fired only when the account still reads `ACTIVE`, so a deliberately DISABLED account is not a false
+stall), and `account_status_alert` (DISABLED / UNSETTLED / PENDING_RISK_REVIEW / … straight off each
+row's status label). Low-volume windows are gated out (both windows must clear the material-spend floor,
+and a cost-per-result flag needs enough results in both) so a 2→1 result swing on trivial spend never
+trips an alarm; a brand-new account with no baseline reads `insufficient_history` or `newly_active`
+(info), never a false ∞% spike. Output is bucketed **worst-first**: `flagged` (medium+ severity, sorted
+by severity then absolute normalized-spend move then account id), `informational` (info-only), and a
+`clean_count`; per-account read failures are isolated into `errors` (tagged with the window). Money
+floors compare in one `reporting_currency` (default USD) via the same static FX table, and percent
+moves use native figures (currency-invariant for a single account across two windows). Because it runs
+two fan-outs it issues **~2× the per-account reads** of a single `cross_account_performance`
+(~400 reads for a 200-account scope) — acceptable and documented. **Budget pacing is deliberately NOT
+here:** spend-to-date vs. the configured budget is a different question over a different surface, owned
+by the `pacing_report` tool; ad-level creative/disapproval detection (a heavier per-ad fan-out) is
+parked for a later ticket.
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the

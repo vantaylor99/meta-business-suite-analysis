@@ -36,6 +36,32 @@ CONFIDENCE_RECENCY_STALE_DAYS = 14
 # ("insufficient data") instead of being scored as a confident pause/scale.
 CONFIDENCE_CONVERSIONS_FLOOR = 25
 
+# Attention scan (see account_discovery.flag_accounts_needing_attention). The fifth discovery tool
+# turns a full-fleet review into a short attention list: it compares a current window against the
+# immediately-preceding equal-length baseline and flags accounts whose behavior moved or breached a
+# threshold. Two of the knees are DELIBERATELY not new magic numbers — they reference existing floors
+# so the whole system shares one definition of "material":
+#   - ATTENTION_MIN_SPEND: the material-spend floor below which a window is too small to judge (a
+#     window under it reads as ``insufficient_history``). Same magnitude/rationale as MIN_WASTE_SPEND
+#     ($100); referenced (not re-typed) so the two stay in lockstep.
+#   - ATTENTION_MIN_RESULTS_FLOOR: the cost-degradation significance floor — BOTH windows must clear it
+#     before a cost-per-result flag fires, so a 2→1 result swing on trivial volume never trips an
+#     alarm. Reuses CONFIDENCE_CONVERSIONS_FLOOR (25), the same "low-volume % deltas are noise" guard
+#     the confidence engine already applies.
+# The percent knees below ARE new. Each is the "noticeable move, not noise" threshold for its metric —
+# a window-over-window swing has to clear it to be worth a human's attention:
+#   - 50% for spend (spike / collapse): a spend figure that swings by half is a real budget or
+#     delivery event, not day-to-day variance.
+#   - 30% for the efficiency metrics (cost-per-result, CPC, CTR): these are already smoothed ratios, so
+#     a 30% degradation is a clear worsening rather than sampling noise.
+ATTENTION_MIN_SPEND = MIN_WASTE_SPEND
+ATTENTION_MIN_RESULTS_FLOOR = CONFIDENCE_CONVERSIONS_FLOOR
+ATTENTION_SPEND_SPIKE_PCT = 0.5
+ATTENTION_SPEND_COLLAPSE_PCT = 0.5
+ATTENTION_CPR_DEGRADE_PCT = 0.3
+ATTENTION_CPC_DEGRADE_PCT = 0.3
+ATTENTION_CTR_DROP_PCT = 0.3
+
 # Knowledge-vault staleness (see knowledge_provenance.py / the `lint-vault` checker). A `fast`
 # learning whose **Verified:** date is older than this many days before `today` is flagged
 # "⏳ re-verify" (a warning, not a fatal error). Deliberately LONGER than

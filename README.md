@@ -60,7 +60,18 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   **percentiles within a cohort** of its peers (default: every reachable account, or an explicit list),
   so a bare number like "cost-per-lead $18" becomes interpretable ("72nd percentile — better than most
   peers"). A high percentile always means good, for both cost and quality metrics; money is compared in
-  one `reporting_currency`; and a cohort too small to be reliable is flagged rather than hidden.
+  one `reporting_currency`; and a cohort too small to be reliable is flagged rather than hidden. Finally,
+  the `flag_accounts_needing_attention` tool turns a full-fleet review into a short **attention list**:
+  it compares a current window against the immediately-preceding **equal-length** baseline (override
+  with `baseline_from` / `baseline_to`) and flags only the accounts that *moved* — sudden spend
+  spikes/collapses, worsening cost-per-result/CPC, dropping CTR, delivery that stalled on an otherwise
+  ACTIVE account, and account-status problems (DISABLED / UNSETTLED / …). Defaults treat a **50% spend
+  move** or **30% cost/quality degradation** as "noticeable, not noise" (low-volume windows are gated
+  out so a 2→1 result swing never trips an alarm), and results are bucketed **worst-first** into
+  `flagged` (medium+ severity), `informational` (newly-active / too-little-history), and a `clean_count`.
+  It is a pure post-processor over `cross_account_performance` (two reads — one per window). **Budget
+  pacing is a separate concern:** spend-to-date vs. the configured budget is answered by the
+  `pacing_report` tool, not this one.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable
