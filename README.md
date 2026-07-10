@@ -55,7 +55,12 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   `config/fx_rates.json`** whose `as_of` date and "approximate — not live" caveat are surfaced in the
   output; an account in a currency missing from that table keeps its native figures and is reported in
   `errors`. (Live/Meta FX is deliberately deferred — the table is a committed reference, not a billing
-  rate.)
+  rate.) The `account_benchmark` tool is the **specialist-facing** counterpart to
+  `cross_account_performance` — "how do I stack up?": it ranks *one* account's efficiency metrics as
+  **percentiles within a cohort** of its peers (default: every reachable account, or an explicit list),
+  so a bare number like "cost-per-lead $18" becomes interpretable ("72nd percentile — better than most
+  peers"). A high percentile always means good, for both cost and quality metrics; money is compared in
+  one `reporting_currency`; and a cohort too small to be reliable is flagged rather than hidden.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

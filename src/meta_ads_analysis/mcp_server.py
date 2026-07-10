@@ -442,6 +442,15 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "its as-of date. Accounts in a currency with no FX rate keep native figures and are reported "
         "in errors; per-account read failures are isolated, not fatal."
     ),
+    "account_benchmark": (
+        "Show how ONE ad account's efficiency stacks up against its peers for a date range — e.g. "
+        "'is this account's cost-per-lead good or bad?'. Ranks the account's CPM/CPC/cost-per-result/"
+        "CTR/ROAS as percentiles within a cohort (default: every account the token can reach; or pass "
+        "an explicit cohort_ids list — the target is always included). A HIGH percentile always means "
+        "good, for both cost and quality metrics. Money metrics are compared in one reporting_currency "
+        "(default USD); cohort size and any excluded accounts are surfaced, and a cohort below the "
+        "reliability floor is flagged rather than hidden."
+    ),
 }
 
 
@@ -485,10 +494,29 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             level=level,
         )
 
+    def account_benchmark(
+        account_id: str,
+        date_from: str,
+        date_to: str,
+        cohort_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself (and passes it through to the prereq).
+        return account_discovery.account_benchmark(
+            reader,
+            account_id=account_id,
+            date_from=date_from,
+            date_to=date_to,
+            cohort_ids=cohort_ids,
+            reporting_currency=reporting_currency,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
         "cross_account_performance": cross_account_performance,
+        "account_benchmark": account_benchmark,
     }
 
 

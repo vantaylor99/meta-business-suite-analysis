@@ -20,6 +20,7 @@ here (plan decision, ``mcp-cross-account-read-tools``).
 from __future__ import annotations
 
 import concurrent.futures
+import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -795,3 +796,269 @@ def _finalize_normalized_total(norm: dict[str, Any], reporting: str) -> dict[str
     out["excluded_no_fx"] = norm["excluded_no_fx"]
     out.update(compute_derived_metrics(base))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Single-account BENCHMARK: one account's efficiency as percentiles within a cohort.
+#
+# This is a *pure post-processor* over cross_account_performance — it re-reads nothing from Meta.
+# It calls that tool once for the cohort (target included) and computes percentiles / quartiles over
+# the per-account rows it already returned, so it inherits FX normalization, Simpson's-paradox-safe
+# derived metrics, per-account partial-failure isolation, and the bounded-concurrency fan-out for
+# free. The only new logic here is the percentile math and the per-metric assembly.
+# --------------------------------------------------------------------------- #
+
+# The efficiency metrics benchmarked, mapped to their directionality. VOLUME metrics (spend /
+# impressions / clicks / results / purchase_value) are deliberately NOT benchmarked — "is my spend in
+# a good percentile?" is ambiguous (volume, not efficiency). Percentiles are oriented so a HIGH
+# percentile always means "good", for both directions: a low cost and a high quality ratio both land
+# in a high percentile.
+BENCHMARK_METRIC_DIRECTION: dict[str, str] = {
+    "cpm": "lower_is_better",
+    "cpc": "lower_is_better",
+    "cost_per_result": "lower_is_better",
+    "ctr": "higher_is_better",
+    "roas": "higher_is_better",
+}
+# Money metrics are compared via each row's reporting-currency twin (``f"{metric}_normalized"``) so a
+# USD account benchmarks correctly against a peer set in other currencies; ratio metrics are
+# currency-invariant and compared on their native value.
+_BENCHMARK_MONEY_METRICS: frozenset[str] = frozenset({"cpm", "cpc", "cost_per_result"})
+_BENCHMARK_RATIO_METRICS: frozenset[str] = frozenset({"ctr", "roas"})
+
+# Documented reliability floor: below this many peers with a valid value, a percentile is still
+# computed but flagged ``unreliable`` (per metric) / ``too_small`` (whole cohort).
+MIN_COHORT_FOR_PERCENTILE: int = 5
+
+
+def quantiles(values: list[float], q: float | list[float]) -> float | list[float] | None:
+    """Hand-rolled linear-interpolation quantile(s) over ``values`` (no numpy dependency).
+
+    ``q`` may be a single quantile in ``[0, 1]`` (returns one ``float``) or a sequence of them
+    (returns a list, one per ``q``). The estimator sorts ascending, computes ``rank = q * (n - 1)``
+    and interpolates between the two straddling order statistics — e.g.
+    ``quantiles([10, 20, 30, 40], 0.25) == 17.5``, ``median == 25.0``, ``0.75 == 32.5``.
+
+    ``n == 1`` returns the single value for every ``q``; an empty ``values`` returns ``None`` (or a
+    list of ``None`` for a list ``q``) — never raises.
+    """
+    single = isinstance(q, (int, float)) and not isinstance(q, bool)
+    qs: list[float] = [float(q)] if single else [float(x) for x in q]  # type: ignore[arg-type]
+    ordered = sorted(values)
+    n = len(ordered)
+
+    out: list[float | None] = []
+    for quantile in qs:
+        if n == 0:
+            out.append(None)
+        elif n == 1:
+            out.append(ordered[0])
+        else:
+            rank = quantile * (n - 1)
+            lo = int(math.floor(rank))
+            hi = int(math.ceil(rank))
+            if lo == hi:
+                out.append(ordered[lo])
+            else:
+                out.append(ordered[lo] + (rank - lo) * (ordered[hi] - ordered[lo]))
+    return out[0] if single else out
+
+
+def percentile_rank(
+    cohort_values: list[float], value: float, *, higher_is_better: bool
+) -> float | None:
+    """Percentile rank of ``value`` within ``cohort_values`` (which INCLUDES ``value`` itself).
+
+    Oriented so a HIGH percentile always means "good": for ``higher_is_better`` a large value ranks
+    high; for ``lower_is_better`` a small value ranks high. Uses the mid-rank convention so ties share
+    a percentile::
+
+        pr = 100 * (L + 0.5 * E) / N        N = len(cohort_values)
+          higher_is_better:  L = count strictly LESS than value;    E = count EQUAL (incl. self)
+          lower_is_better:   L = count strictly GREATER than value;  E = count EQUAL (incl. self)
+
+    Guarantees a unique best in ``N == 10`` reads ``95.0``, a unique worst ``5.0``, an exact median
+    ``~50``, and a two-way tie ``50.0`` each. Returns ``None`` when ``N < 1`` (nothing to rank).
+    """
+    n = len(cohort_values)
+    if n < 1:
+        return None
+    equal = sum(1 for v in cohort_values if v == value)
+    if higher_is_better:
+        beaten = sum(1 for v in cohort_values if v < value)
+    else:
+        beaten = sum(1 for v in cohort_values if v > value)
+    return 100.0 * (beaten + 0.5 * equal) / n
+
+
+def _benchmark_verdict(pr: float) -> str:
+    """Plain-language verdict from an (already good=high) percentile — a pure function of ``pr``."""
+    if pr >= 75:
+        return "better than most peers"
+    if pr >= 50:
+        return "above the cohort median"
+    if pr >= 25:
+        return "below the cohort median"
+    return "worse than most peers"
+
+
+def account_benchmark(
+    reader: "MetaReaderProvider",
+    *,
+    account_id: str,
+    date_from: str,
+    date_to: str,
+    cohort_ids: list[str] | None = None,
+    reporting_currency: str = "USD",
+    fx_table: FxTable | None = None,
+) -> dict[str, Any]:
+    """Rank ONE account's efficiency metrics as percentiles within a comparison cohort.
+
+    The specialist-facing counterpart to :func:`cross_account_performance` (manager-facing ranking):
+    same underlying metric rows, inverted point of view — one account vs. the field. It is a **pure
+    post-processor**: it calls :func:`cross_account_performance` once for the cohort (target always
+    included) and computes percentiles over the rows that call already returned, inheriting FX
+    normalization, Simpson's-paradox-safe derived metrics, per-account failure isolation, and the
+    determinism of the fan-out.
+
+    Cohort resolution:
+
+    - ``cohort_ids is None`` -> the whole reach (``account_ids=None``); the target is naturally
+      included if reachable. If the target is NOT among the reachable rows, ``account`` is ``None`` and
+      a ``note`` says it was not found.
+    - ``cohort_ids`` given -> the union of that list and the target; the target is **force-added if
+      absent** (the specialist's own account must be in its own comparison — a decision, not an error).
+
+    Only the efficiency metrics in :data:`BENCHMARK_METRIC_DIRECTION` are benchmarked; volume metrics
+    are not (a "good" spend percentile is ambiguous). Money metrics compare on each row's
+    ``*_normalized`` twin (reporting currency); ratio metrics on their native value. Percentiles are
+    oriented so a high percentile is always "good". A metric the target lacks, or with no peers, carries
+    a ``reason`` instead of a percentile block; every metric key is always present. A cohort with fewer
+    than :data:`MIN_COHORT_FOR_PERCENTILE` readable accounts still returns numbers but flags them
+    ``unreliable`` / ``too_small``.
+
+    An invalid ``reporting_currency`` (absent from the FX table) propagates as ``ValueError`` from
+    :func:`cross_account_performance` — the same whole-call contract as the prereq. ``fx_table`` is a
+    test-injection seam (not exposed to the LLM); when ``None`` the committed table is loaded once and
+    passed through to the prereq so both sides share one table.
+    """
+    target_id = account_registry._normalize_ad_account_id(str(account_id or "").strip())
+    # Load the FX table here (once) and pass it down so the same table validates reporting_currency,
+    # normalizes the rows, AND tells us whether the TARGET's own currency has a rate.
+    table = fx_table if fx_table is not None else load_fx_table()
+
+    # Explicit cohort -> force-add the target (resolve_scope normalizes + dedups, so a redundant id is
+    # safe). Whole-reach cohort -> None (the reachable target is included naturally).
+    scope_ids = None if cohort_ids is None else [*cohort_ids, target_id]
+
+    perf = cross_account_performance(
+        reader,
+        date_from=date_from,
+        date_to=date_to,
+        account_ids=scope_ids,
+        reporting_currency=reporting_currency,
+        fx_table=table,
+    )
+
+    rows: list[dict[str, Any]] = perf["accounts"]
+    perf_errors: list[dict[str, Any]] = perf["errors"]
+    target_row = next((r for r in rows if r.get("ad_account_id") == target_id), None)
+    read_ok = len(rows)
+    too_small = read_ok < MIN_COHORT_FOR_PERCENTILE
+
+    result: dict[str, Any] = {
+        "account_id": target_id,
+        "date_from": date_from,
+        "date_to": date_to,
+        "reporting_currency": perf["reporting_currency"],
+        "fx_as_of": perf["fx_as_of"],
+        "fx_note": perf["fx_note"],
+        "account": target_row,
+        "cohort": {
+            # accounts resolved into the cohort (attempted, incl. target).
+            "count": perf["account_count"],
+            # rows successfully read (a no-FX account still counts here — it has a native row).
+            "read_ok": read_ok,
+            # every prereq error (unreadable account / no-FX currency), surfaced not silent.
+            "excluded": [
+                {"ad_account_id": e.get("ad_account_id"), "reason": e.get("error")}
+                for e in perf_errors
+            ],
+            "too_small": too_small,
+            "min_for_percentile": MIN_COHORT_FOR_PERCENTILE,
+        },
+        "errors": perf_errors,
+    }
+
+    # Target could not be located among the read rows: distinguish unreadable (an error row exists) from
+    # simply not-in-reach. Either way every metric key is still present, carrying a read-level reason.
+    if target_row is None:
+        if any(e.get("ad_account_id") == target_id for e in perf_errors):
+            reason = "target account could not be read"
+            result["note"] = f"target account {target_id} could not be read"
+        else:
+            reason = "target account not found in cohort"
+            result["note"] = f"target account {target_id} not found in cohort"
+        result["benchmarks"] = {
+            metric: {"value": None, "direction": direction, "reason": reason}
+            for metric, direction in BENCHMARK_METRIC_DIRECTION.items()
+        }
+        return result
+
+    # Target present: benchmark each efficiency metric against the cohort's values for that metric.
+    target_currency = target_row.get("currency") or "UNKNOWN"
+    target_no_fx = not table.has(target_currency)
+
+    benchmarks: dict[str, Any] = {}
+    for metric, direction in BENCHMARK_METRIC_DIRECTION.items():
+        is_money = metric in _BENCHMARK_MONEY_METRICS
+        field = f"{metric}_normalized" if is_money else metric
+        target_value = target_row.get(field)
+
+        if target_value is None:
+            # Money twin absent because the target is in a no-FX currency vs. Meta simply not
+            # returning the metric — two distinct, both-honest reasons.
+            if is_money and target_no_fx:
+                reason = f"no FX rate for {target_currency}"
+            else:
+                reason = f"account missing {metric}"
+            benchmarks[metric] = {"value": None, "direction": direction, "reason": reason}
+            continue
+
+        # A row lacking the needed field is excluded from THIS metric's cohort (per-metric N varies).
+        cohort_values = [v for v in (r.get(field) for r in rows) if v is not None]
+        cohort_n = len(cohort_values)
+        if cohort_n < 2:
+            benchmarks[metric] = {
+                "value": target_value,
+                "direction": direction,
+                "reason": f"no peers with {metric} in cohort",
+            }
+            continue
+
+        higher = direction == "higher_is_better"
+        percentile = percentile_rank(cohort_values, target_value, higher_is_better=higher)
+        p25, median, p75 = quantiles(cohort_values, [0.25, 0.5, 0.75])  # type: ignore[misc]
+        # rank: 1 = best; ties share the count-of-strictly-better + 1.
+        if higher:
+            strictly_better = sum(1 for v in cohort_values if v > target_value)
+        else:
+            strictly_better = sum(1 for v in cohort_values if v < target_value)
+        benchmarks[metric] = {
+            "value": target_value,
+            "direction": direction,
+            "cohort_n": cohort_n,
+            "percentile": percentile,
+            "rank": strictly_better + 1,
+            "rank_of": cohort_n,
+            "median": median,
+            "p25": p25,
+            "p75": p75,
+            "verdict": _benchmark_verdict(percentile),
+            "unreliable": cohort_n < MIN_COHORT_FOR_PERCENTILE,
+        }
+
+    result["benchmarks"] = benchmarks
+    if too_small:
+        result["note"] = "cohort too small for a meaningful percentile"
+    return result

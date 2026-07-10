@@ -257,8 +257,9 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the three discovery tools (`list_ad_accounts`,
-`cross_account_spend_summary`, and `cross_account_performance` — none takes an `account` argument), and the
+plus any of the 14 read tools, the four discovery tools (`list_ad_accounts`,
+`cross_account_spend_summary`, `cross_account_performance`, and `account_benchmark` — none takes an
+`account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
 
@@ -284,6 +285,23 @@ in `errors`, and is excluded from `normalized_total` (counted in `excluded_no_fx
 event per account comes from the config registry's `primary_result_action_type` when the account is
 configured, and is otherwise inferred from the account's own `actions` — so the tool works before any
 account is added to the config file.
+
+`account_benchmark` is the **specialist-facing** counterpart to that manager-facing ranking view: it
+answers "how does *this one* account stack up?" — e.g. "is this account's cost-per-lead good or bad
+compared to its peers?". It is a pure post-processor over `cross_account_performance` (it re-reads
+nothing from Meta): it calls that tool once for the cohort (the target account always included) and
+ranks the target's efficiency metrics (CPM, CPC, cost-per-result, CTR, ROAS) as **percentiles within
+the cohort**. A **high percentile always means "good"** for *both* cost metrics (a low CPM ranks high)
+and quality metrics (a high ROAS ranks high), so the verdict ("better than most peers" … "worse than
+most peers") reads the same direction everywhere. The cohort defaults to every account the token can
+reach, or you can pass an explicit `cohort_ids` list. Money metrics are compared in one
+`reporting_currency` (default USD) via the same static FX table, so a USD account benchmarks correctly
+against peers billing in other currencies; ratio metrics (CTR/ROAS) are currency-invariant. Volume
+metrics (spend/impressions/clicks/results) are deliberately **not** benchmarked — a "good" spend
+percentile is ambiguous. It surfaces the cohort size and any excluded accounts (unreadable, or in a
+currency with no FX rate), and a cohort with fewer than `MIN_COHORT_FOR_PERCENTILE` (5) readable
+accounts is **flagged** (`too_small` / per-metric `unreliable`) rather than hidden — the numbers are
+still returned, just labeled as thin.
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the

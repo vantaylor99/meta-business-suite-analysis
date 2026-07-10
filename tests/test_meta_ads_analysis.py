@@ -9676,16 +9676,18 @@ def test_cross_account_summary_mock_smoke_single_usd_account() -> None:
 def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     reader = _summary_reader()
     discovery = _mcp_server.build_discovery_tools(reader)
-    # All three discovery tools are exposed.
+    # All four discovery tools are exposed.
     assert set(discovery) == {
         "list_ad_accounts",
         "cross_account_spend_summary",
         "cross_account_performance",
+        "account_benchmark",
     }
     summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
     assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
     assert "cross_account_spend_summary" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "cross_account_performance" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "account_benchmark" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
 
 
 def test_cross_account_summary_insight_fields_restricts_metrics_summed() -> None:
@@ -10488,6 +10490,345 @@ def test_cross_account_performance_mock_smoke(monkeypatch) -> None:
     assert not any(c[0] == "get_account" for c in reader.calls)  # discovery path, not get_account
 
 
+# --- account_benchmark: pure stats helpers (percentile_rank / quantiles) ---
+
+
+def test_percentile_rank_orientation_ties_and_guard() -> None:
+    import pytest
+
+    pr = _account_discovery.percentile_rank
+    ten = [float(i) for i in range(1, 11)]  # 1..10, ten distinct values
+    # higher_is_better: unique best (10) -> 95.0, unique worst (1) -> 5.0.
+    assert pr(ten, 10.0, higher_is_better=True) == pytest.approx(95.0)
+    assert pr(ten, 1.0, higher_is_better=True) == pytest.approx(5.0)
+    # lower_is_better inverts which END is the high percentile.
+    assert pr(ten, 1.0, higher_is_better=False) == pytest.approx(95.0)
+    assert pr(ten, 10.0, higher_is_better=False) == pytest.approx(5.0)
+    # A two-way tie shares a mid-rank -> 50.0 each, regardless of direction.
+    assert pr([5.0, 5.0], 5.0, higher_is_better=True) == pytest.approx(50.0)
+    assert pr([5.0, 5.0], 5.0, higher_is_better=False) == pytest.approx(50.0)
+    # Exact median in an odd cohort ~ 50.
+    assert pr([1.0, 2.0, 3.0], 2.0, higher_is_better=True) == pytest.approx(50.0)
+    # N < 1 -> None (nothing to rank), never a divide-by-zero.
+    assert pr([], 1.0, higher_is_better=True) is None
+
+
+def test_quantiles_linear_interpolation_and_guards() -> None:
+    import pytest
+
+    q = _account_discovery.quantiles
+    # The worked example that pins the interpolation.
+    assert q([10, 20, 30, 40], 0.25) == pytest.approx(17.5)
+    assert q([10, 20, 30, 40], 0.5) == pytest.approx(25.0)
+    assert q([10, 20, 30, 40], 0.75) == pytest.approx(32.5)
+    # List form -> one value per quantile, in order.
+    assert q([10, 20, 30, 40], [0.25, 0.5, 0.75]) == pytest.approx([17.5, 25.0, 32.5])
+    # n == 1 -> the single value for every quantile.
+    assert q([42.0], 0.25) == 42.0
+    assert q([42.0], [0.25, 0.5, 0.75]) == [42.0, 42.0, 42.0]
+    # Empty -> None (single) / list of None (list); never raises.
+    assert q([], 0.5) is None
+    assert q([], [0.25, 0.75]) == [None, None]
+
+
+# --- account_benchmark: end-to-end over a mocked cohort (MOCKS ONLY, no live call) ---
+
+
+def test_account_benchmark_direction_cost_vs_quality(monkeypatch) -> None:
+    # The ticket's must-have: a HIGH percentile always means "good". The target has the LOWEST
+    # cost_per_result (a cost -> best -> high percentile + "better than most peers") AND the LOWEST
+    # roas (a quality ratio -> worst -> low percentile + "worse than most peers"), so an inverted sign
+    # on EITHER direction is caught by the same target row.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 6)
+    ]
+    # results fixed at 10 each; spend and purchase_value climb so cpr climbs and roas climbs together.
+    plan = {1: (50, 50), 2: (200, 800), 3: (300, 1500), 4: (400, 2400), 5: (500, 3500)}
+    insights = {
+        f"act_{i}": [{
+            "spend": f"{spend}.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+            "action_values": [{"action_type": "purchase", "value": str(pv)}],
+        }]
+        for i, (spend, pv) in plan.items()
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    assert out["account"]["ad_account_id"] == "act_1"
+    assert out["cohort"]["count"] == 5 and out["cohort"]["read_ok"] == 5
+    assert out["cohort"]["too_small"] is False
+
+    cpr = out["benchmarks"]["cost_per_result"]
+    assert cpr["value"] == pytest.approx(5.0)  # 50 / 10
+    assert cpr["percentile"] >= 75
+    assert cpr["verdict"] == "better than most peers"
+    assert cpr["rank"] == 1 and cpr["rank_of"] == 5
+    assert cpr["unreliable"] is False
+
+    roas = out["benchmarks"]["roas"]
+    assert roas["value"] == pytest.approx(1.0)  # 50 / 50
+    assert roas["percentile"] < 25
+    assert roas["verdict"] == "worse than most peers"
+    assert roas["rank"] == 5
+
+
+def test_account_benchmark_ranks_on_normalized_money(monkeypatch) -> None:
+    # A USD target benchmarked against an MXN + EUR cohort ranks on the *_normalized money values, so a
+    # peer with a huge NATIVE cpc (MXN) that normalizes to the cheapest USD cpc reorders the field: the
+    # target is rank 1 on raw native numbers but rank 2 once normalized.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "US", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "MX", "account_status": 1, "currency": "MXN"},
+        {"id": "act_3", "account_id": "3", "name": "EU", "account_status": 1, "currency": "EUR"},
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "100"}],   # cpc 1.0 USD
+        "act_2": [{"spend": "1000.00", "impressions": "1000", "clicks": "100"}],  # cpc 10.0 MXN -> 0.55 USD
+        "act_3": [{"spend": "100.00", "impressions": "1000", "clicks": "100"}],   # cpc 1.0 EUR -> 1.08 USD
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    cpc = out["benchmarks"]["cpc"]
+    assert cpc["value"] == pytest.approx(1.0)  # target's cpc_normalized (USD -> USD)
+    # Normalized cohort [1.0(target), 0.55(MX), 1.08(EU)]; lower_is_better -> target is the MIDDLE.
+    assert cpc["cohort_n"] == 3
+    assert cpc["rank"] == 2  # MX normalizes to the cheapest, so the target is not best
+    assert cpc["percentile"] == pytest.approx(50.0)
+    # Had we (wrongly) ranked NATIVE cpc [1.0, 10.0, 1.0], the target would tie for best (pr ~66.7).
+    assert cpc["percentile"] != pytest.approx(100 * (1 + 0.5 * 2) / 3)
+
+
+def test_account_benchmark_tiny_cohort_flags_unreliable(monkeypatch) -> None:
+    # A cohort below MIN_COHORT_FOR_PERCENTILE still returns numbers but flags them, never hides them.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    insights = {
+        f"act_{i}": [{"spend": f"{i * 100}.00", "impressions": "1000", "clicks": "100"}]
+        for i in range(1, 4)
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    assert out["cohort"]["too_small"] is True
+    assert out["cohort"]["min_for_percentile"] == 5
+    cpc = out["benchmarks"]["cpc"]
+    assert cpc["unreliable"] is True
+    assert cpc["percentile"] is not None  # still computed
+    assert out["note"] == "cohort too small for a meaningful percentile"
+
+
+def test_account_benchmark_target_missing_metric(monkeypatch) -> None:
+    # A metric the target lacks (money AND ratio families) carries {value: null, reason}, no percentile.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    insights = {
+        # Target: zero clicks -> no cpc; no actions/action_values -> no results/roas. cpm/ctr present.
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "0"}],
+        "act_2": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],
+        "act_3": [{"spend": "200.00", "impressions": "1000", "clicks": "50"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    cpc = out["benchmarks"]["cpc"]  # money family
+    assert cpc["value"] is None and cpc["reason"] == "account missing cpc"
+    assert "percentile" not in cpc
+    cpr = out["benchmarks"]["cost_per_result"]  # money family, no results
+    assert cpr["value"] is None and cpr["reason"] == "account missing cost_per_result"
+    roas = out["benchmarks"]["roas"]  # ratio family
+    assert roas["value"] is None and roas["reason"] == "account missing roas"
+    assert "percentile" not in roas
+    # Every metric key is always present so a consumer never has to guess.
+    assert set(out["benchmarks"]) == set(_account_discovery.BENCHMARK_METRIC_DIRECTION)
+
+
+def test_account_benchmark_no_fx_cohort_member_excluded_from_money_only(monkeypatch) -> None:
+    # A no-FX cohort MEMBER drops out of the money-metric cohort (no *_normalized twin) but still
+    # benchmarks on currency-invariant ratios, and its exclusion is surfaced (not silent).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "US", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "US2", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "JP", "account_status": 1, "currency": "JPY"},
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],   # cpc 2.0, ctr 5.0
+        "act_2": [{"spend": "200.00", "impressions": "1000", "clicks": "50"}],   # cpc 4.0, ctr 5.0
+        "act_3": [{"spend": "5000.00", "impressions": "2000", "clicks": "80"}],  # no FX -> no cpc_norm
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    # Money cohort excludes the JPY member; ratio cohort keeps it (ctr is currency-invariant).
+    assert out["benchmarks"]["cpc"]["cohort_n"] == 2
+    assert out["benchmarks"]["ctr"]["cohort_n"] == 3
+    # Surfaced in cohort.excluded AND errors (verbatim from the prereq).
+    assert any(
+        e["ad_account_id"] == "act_3" and "no FX rate" in (e["reason"] or "")
+        for e in out["cohort"]["excluded"]
+    )
+    assert any(
+        e["ad_account_id"] == "act_3" and "no FX rate" in (e["error"] or "") for e in out["errors"]
+    )
+
+
+def test_account_benchmark_no_fx_target_money_reason_ratios_still_computed(monkeypatch) -> None:
+    # A no-FX TARGET: money metrics carry a "no FX rate" reason, but ctr/roas (currency-invariant)
+    # still benchmark against the USD peers.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "JP", "account_status": 1, "currency": "JPY"},
+        {"id": "act_2", "account_id": "2", "name": "US", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "US2", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "5000.00", "impressions": "2000", "clicks": "80",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+            "action_values": [{"action_type": "purchase", "value": "10000"}],
+        }],
+        "act_2": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+            "action_values": [{"action_type": "purchase", "value": "500"}],
+        }],
+        "act_3": [{
+            "spend": "200.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+            "action_values": [{"action_type": "purchase", "value": "400"}],
+        }],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    assert out["account"] is not None  # native row still returned
+    for money_metric in ("cpm", "cpc", "cost_per_result"):
+        entry = out["benchmarks"][money_metric]
+        assert entry["value"] is None
+        assert entry["reason"] == "no FX rate for JPY"
+    # Ratio metrics are currency-invariant -> still computed for the JPY target.
+    assert out["benchmarks"]["ctr"]["percentile"] is not None
+    assert out["benchmarks"]["roas"]["percentile"] is not None
+
+
+def test_account_benchmark_target_forced_into_explicit_cohort(monkeypatch) -> None:
+    # A target absent from the explicit cohort_ids is force-added (the specialist's own account must be
+    # in its own comparison), so it still gets a row + percentiles and cohort.count reflects the union.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts_by_id = {
+        f"act_{i}": {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}",
+                     "account_status": 1, "currency": "USD"}
+        for i in range(1, 6)
+    }
+    insights = {
+        f"act_{i}": [{"spend": f"{i * 100}.00", "impressions": "1000", "clicks": "100"}]
+        for i in range(1, 6)
+    }
+    reader = FakeMetaReader(
+        get_account=lambda ad_account_id, *, fields: dict(accounts_by_id[ad_account_id]),
+        fetch_insights=lambda ad_account_id, **k: [dict(r) for r in insights[ad_account_id]],
+    )
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30",
+        cohort_ids=["2", "3", "4", "5"], fx_table=_fx(),  # target "1" intentionally omitted
+    )
+    assert out["account"] is not None and out["account"]["ad_account_id"] == "act_1"
+    assert out["cohort"]["count"] == 5  # union of the four peers + the force-added target
+    cpc = out["benchmarks"]["cpc"]
+    assert cpc["cohort_n"] == 5
+    assert cpc["value"] == pytest.approx(1.0)  # target's cpc = 100/100, the lowest
+    assert cpc["percentile"] >= 75 and cpc["unreliable"] is False
+    # Explicit-id path uses get_account, never list_ad_accounts.
+    assert not any(c[0] == "list_ad_accounts" for c in reader.calls)
+
+
+def test_account_benchmark_target_unreadable(monkeypatch) -> None:
+    # The target itself fails to read: account is None, a note explains it, every metric carries the
+    # read-failure reason, and the prereq error is passed through in errors.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts_by_id = {
+        "act_2": {"id": "act_2", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+        "act_3": {"id": "act_3", "account_id": "3", "name": "C", "account_status": 1, "currency": "USD"},
+    }
+
+    def _get_account(ad_account_id, *, fields):
+        if ad_account_id == "act_1":
+            raise MetaApiError("(#100) target unreadable")
+        return dict(accounts_by_id[ad_account_id])
+
+    reader = FakeMetaReader(
+        get_account=_get_account,
+        fetch_insights=lambda ad_account_id, **k: [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],
+    )
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30",
+        cohort_ids=["2", "3"], fx_table=_fx(),
+    )
+    assert out["account"] is None
+    assert out["note"] == "target account act_1 could not be read"
+    for metric in _account_discovery.BENCHMARK_METRIC_DIRECTION:
+        assert out["benchmarks"][metric]["reason"] == "target account could not be read"
+    assert any(
+        e["ad_account_id"] == "act_1" and "unreadable" in e["error"] for e in out["errors"]
+    )
+
+
+def test_account_benchmark_unknown_reporting_currency_raises() -> None:
+    import pytest
+
+    reader = _perf_reader([], {})
+    with pytest.raises(ValueError, match="reporting_currency"):
+        _account_discovery.account_benchmark(
+            reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30",
+            reporting_currency="JPY", fx_table=_fx(),
+        )
+
+
+def test_build_discovery_tools_account_benchmark_mock_smoke(monkeypatch) -> None:
+    # The wired discovery tool returns a well-formed payload over the single mock USD account. With a
+    # cohort of one, metrics the account HAS have no peers; metrics it lacks carry an account-missing
+    # reason. Every metric key is present regardless.
+    def _boom(*a, **k):
+        raise FileNotFoundError("no config in mock")
+
+    monkeypatch.setattr(_account_discovery.account_registry, "load_account_registry", _boom)
+    reader = _mcp_server.build_mock_reader()
+    tools = _mcp_server.build_discovery_tools(reader)
+    out = tools["account_benchmark"]("act_mock001", "2026-06-01", "2026-06-30")
+    assert out["account_id"] == "act_mock001"
+    assert out["account"] is not None and out["account"]["currency"] == "USD"
+    assert set(out["benchmarks"]) == set(_account_discovery.BENCHMARK_METRIC_DIRECTION)
+    assert out["cohort"]["read_ok"] == 1 and out["cohort"]["too_small"] is True
+    assert out["note"] == "cohort too small for a meaningful percentile"
+    # A single-account cohort -> no peers for a metric the account HAS (cpm/cpc/ctr).
+    assert out["benchmarks"]["cpm"]["reason"] == "no peers with cpm in cohort"
+    # A metric the account LACKS (no actions in MOCK_INSIGHT) -> account-missing reason.
+    assert out["benchmarks"]["roas"]["reason"] == "account missing roas"
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from
@@ -10672,6 +11013,7 @@ def test_read_tools_register_on_real_fastmcp_and_map_errors(monkeypatch) -> None
     assert "list_ad_accounts" in names  # discovery tool registered
     assert "cross_account_spend_summary" in names  # cross-account aggregate discovery tool registered
     assert "cross_account_performance" in names  # cross-account efficiency discovery tool registered
+    assert "account_benchmark" in names  # single-account benchmark discovery tool registered
     assert "iter_paginated" not in names
     # Schema derived from the wrapper's real signature (functools.wraps preserved it).
     assert set(tool_manager.get_tool("fetch_ads").parameters["properties"]) == {"ad_account_id", "fields"}
