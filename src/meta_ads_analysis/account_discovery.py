@@ -26,7 +26,16 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from . import account_registry
+from .currency import FxTable, load_fx_table
 from .meta_api import MetaApiError
+from .sync_api import (
+    PURCHASE_KEYS,
+    _find_metric,
+    _infer_primary_result_action,
+    _label_for_action,
+    _metric_blob_list,
+    _number,
+)
 
 if TYPE_CHECKING:  # typing only — keep this module import-light (no reader construction here)
     from .reader_provider import MetaReaderProvider
@@ -388,3 +397,401 @@ def cross_account_spend_summary(
     if scope.requested_all and not scope.account_ids:
         result["note"] = "no accounts reachable"
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Cross-account PERFORMANCE: efficiency metrics + currency normalization.
+#
+# Where cross_account_spend_summary returns only raw additive totals grouped by currency, this
+# adds per-account *efficiency* metrics (cpm/cpc/ctr/cost_per_result/roas) recomputed from summed
+# base components — never averaged across accounts (Simpson's-paradox-safe) — plus money metrics
+# normalized to a single reporting currency via the static FX table (config/fx_rates.json).
+# --------------------------------------------------------------------------- #
+
+# Base metrics fetched per account for the performance read (account-level, all_days -> one row).
+DEFAULT_PERFORMANCE_INSIGHT_FIELDS: list[str] = [
+    "spend",
+    "impressions",
+    "clicks",
+    "actions",
+    "action_values",
+]
+
+# The money metrics that get a ``*_normalized`` twin in the reporting currency. ``ctr`` and ``roas``
+# are currency-invariant ratios — they are NEVER normalized (no ``*_normalized`` key).
+_NORMALIZED_MONEY_DERIVED: tuple[str, ...] = ("cpm", "cpc", "cost_per_result")
+
+
+def compute_derived_metrics(base: dict[str, float | int | None]) -> dict[str, float]:
+    """Recompute ratio efficiency metrics from summed/native base components.
+
+    NEVER averages a ratio across accounts: every ratio is recomputed from its numerator and
+    denominator, so the same helper is correct for a single account's native base, a per-currency
+    summed base, or the summed normalized base (the single point that guarantees Simpson's-paradox
+    safety). A metric whose denominator is zero, or whose needed component is missing (``None``), is
+    **omitted** from the result — never emitted as ``inf`` / ``NaN`` / ``0``.
+
+    Inputs consumed (any may be missing/``None``): ``spend``, ``impressions``, ``clicks``,
+    ``results``, ``purchase_value``. Outputs (each present only when defined):
+    ``cpm = spend/impressions*1000``, ``cpc = spend/clicks``, ``ctr = clicks/impressions*100``,
+    ``cost_per_result = spend/results``, ``roas = purchase_value/spend``.
+    """
+    out: dict[str, float] = {}
+    spend = base.get("spend")
+    impressions = base.get("impressions")
+    clicks = base.get("clicks")
+    results = base.get("results")
+    purchase_value = base.get("purchase_value")
+
+    # impressions is the denominator for cpm and ctr; a zero/absent denominator drops both.
+    if impressions:
+        if spend is not None:
+            out["cpm"] = spend / impressions * 1000
+        if clicks is not None:
+            out["ctr"] = clicks / impressions * 100
+    if clicks and spend is not None:
+        out["cpc"] = spend / clicks
+    if results and spend is not None:
+        out["cost_per_result"] = spend / results
+    if spend and purchase_value is not None:
+        out["roas"] = purchase_value / spend
+    return out
+
+
+def _as_count(value: float | None) -> int | float | None:
+    """Present a count metric as ``int`` when it is a whole number, else the ``float`` unchanged.
+
+    Money metrics (spend / purchase_value / the derived ratios) stay ``float``; only additive counts
+    (impressions / clicks / results) run through this so the output mirrors Meta's integer counts.
+    """
+    if value is None:
+        return None
+    return int(value) if float(value).is_integer() else value
+
+
+def _registry_by_ad_account_id() -> dict[str, account_registry.MetaAdsAccount]:
+    """Best-effort ``{ad_account_id: MetaAdsAccount}`` map, reversed from the slug-keyed registry.
+
+    The config registry (``config/meta_ads_accounts.json``) is gitignored and **absent in
+    mock/unattended runs**, so a missing or invalid config yields an empty map rather than an error —
+    consulting it must never break an otherwise-open read.
+    """
+    try:
+        registry = account_registry.load_account_registry()
+    except (FileNotFoundError, ValueError):
+        return {}
+    return {account.ad_account_id: account for account in registry.values()}
+
+
+def _resolve_result_key(
+    ad_account_id: str,
+    actions: list[dict[str, Any]],
+    registry_by_id: dict[str, account_registry.MetaAdsAccount],
+) -> tuple[str | None, str | None]:
+    """Resolve ``(primary_result_action_type, label)`` for an account: config first, else inference.
+
+    Uses the account's configured ``primary_result_action_type`` when the account is in the registry;
+    otherwise infers the key from the account's own ``actions`` blob (so the mock/no-config path still
+    works). Returns ``(None, None)`` when neither yields a key — the caller then leaves ``results`` /
+    ``result_label`` / ``cost_per_result`` absent rather than zero-filling a misleading ratio.
+    """
+    account = registry_by_id.get(ad_account_id)
+    if account is not None and account.primary_result_action_type:
+        key = account.primary_result_action_type
+        return key, account.primary_result_label or _label_for_action(key)
+    key = _infer_primary_result_action(actions)
+    return key, (_label_for_action(key) if key else None)
+
+
+def cross_account_performance(
+    reader: "MetaReaderProvider",
+    *,
+    date_from: str,
+    date_to: str,
+    account_ids: list[str] | None = None,
+    reporting_currency: str = "USD",
+    level: str = "account",
+    fx_table: FxTable | None = None,
+) -> dict[str, Any]:
+    """Per-account efficiency metrics + currency-normalized totals across the reachable accounts.
+
+    Rides the same fan-out engine as :func:`cross_account_spend_summary` (``resolve_scope`` ->
+    :func:`fan_out_accounts` -> main-thread assembly), so it inherits determinism (identical output
+    regardless of worker completion order) and per-account partial-failure isolation. For each account
+    it reads one aggregated account-level insights row (``spend, impressions, clicks, actions,
+    action_values``; ``time_increment="all_days"``) and:
+
+    - recomputes the efficiency metrics (``cpm``/``cpc``/``ctr``/``cost_per_result``/``roas``) from the
+      account's own base components via :func:`compute_derived_metrics` — never an averaged ratio;
+    - normalizes the money metrics (``spend``, ``cpm``, ``cpc``, ``cost_per_result``,
+      ``purchase_value``) into ``reporting_currency`` (default USD) using the static FX table
+      (``config/fx_rates.json``); ``ctr`` and ``roas`` are currency-invariant and get no twin.
+
+    ``totals_by_currency`` subtotals the native base per currency and recomputes the derived metrics
+    from those sums. ``normalized_total`` sums the normalized money base plus the currency-invariant
+    counts across accounts that HAD an FX rate and recomputes the derived metrics in the reporting
+    currency; accounts whose currency is absent from the FX table keep their native figures, record an
+    ``errors`` entry, and are excluded from ``normalized_total`` (counted in ``excluded_no_fx``).
+
+    ``level`` accepts only ``"account"`` for now (a future ticket can add campaign/adset roll-ups); any
+    other value raises ``ValueError``. A ``reporting_currency`` absent from the FX table is a whole-call
+    ``ValueError`` — nothing could be normalized. ``fx_table`` is injectable for tests; when ``None`` the
+    committed table is loaded once before the fan-out (never per worker).
+    """
+    if level != "account":
+        raise ValueError(
+            f"cross_account_performance supports only level='account'; got {level!r}. "
+            "Campaign/adset roll-ups are a future enhancement."
+        )
+    reporting = str(reporting_currency or "").strip().upper()
+    table = fx_table if fx_table is not None else load_fx_table()
+    if not table.has(reporting):
+        raise ValueError(
+            f"reporting_currency {reporting!r} has no rate in the FX table (as_of {table.as_of}); "
+            "cannot normalize to it."
+        )
+
+    registry_by_id = _registry_by_ad_account_id()
+    scope = resolve_scope(reader, account_ids)  # discovery path may raise -> whole-call failure
+
+    def read_one(ad_account_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        meta_row = scope.metadata_by_id.get(ad_account_id)
+        if meta_row is None:
+            meta_row = normalize_ad_account(
+                reader.get_account(ad_account_id, fields=DEFAULT_AD_ACCOUNT_FIELDS)
+            )
+        insight_rows = reader.fetch_insights(
+            ad_account_id,
+            fields=DEFAULT_PERFORMANCE_INSIGHT_FIELDS,
+            date_from=date_from,
+            date_to=date_to,
+            level="account",
+            time_increment="all_days",
+        )
+        return meta_row, insight_rows
+
+    results = fan_out_accounts(read_one, scope.account_ids)
+
+    accounts: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    # Per-currency native accumulators; ``_results``/``_pv`` carry contributor counts so a metric no
+    # account reported stays ABSENT (never a 0 that would fabricate a cost_per_result / roas).
+    currency_acc: dict[str, dict[str, Any]] = {}
+    # normalized_total accumulators (only accounts that had an FX rate contribute).
+    norm = {
+        "spend": 0.0,
+        "impressions": 0.0,
+        "clicks": 0.0,
+        "results": 0.0,
+        "results_contrib": 0,
+        "purchase_value": 0.0,
+        "pv_contrib": 0,
+        "account_count": 0,
+        "excluded_no_fx": 0,
+    }
+
+    for ad_account_id, payload, error in results:
+        if error is not None:
+            errors.append({"ad_account_id": ad_account_id, "error": error})
+            continue
+
+        meta_row, insight_rows = payload
+        # account-level all_days yields one aggregated row; no delivery in range -> no row -> absent.
+        insight_row = insight_rows[0] if insight_rows else {}
+        currency = meta_row.get("currency") or "UNKNOWN"
+        actions = _metric_blob_list(insight_row.get("actions"))
+        action_values = _metric_blob_list(insight_row.get("action_values"))
+
+        # Native base metrics as float | None (None = Meta returned nothing, distinct from a real 0).
+        spend = _number(insight_row.get("spend"))
+        impressions = _number(insight_row.get("impressions"))
+        clicks = _number(insight_row.get("clicks"))
+        result_key, result_label = _resolve_result_key(ad_account_id, actions, registry_by_id)
+        results_value = _find_metric(actions, [result_key]) if result_key else None
+        purchase_value = _find_metric(action_values, PURCHASE_KEYS)
+
+        native_base = {
+            "spend": spend,
+            "impressions": impressions,
+            "clicks": clicks,
+            "results": results_value,
+            "purchase_value": purchase_value,
+        }
+        native_derived = compute_derived_metrics(native_base)
+
+        row: dict[str, Any] = {
+            "ad_account_id": ad_account_id,
+            "account_id": meta_row.get("account_id"),
+            "name": meta_row.get("name"),
+            "currency": currency,
+            "account_status": meta_row.get("account_status"),
+            "account_status_label": meta_row.get("account_status_label"),
+        }
+        # Native base: omit a metric Meta left blank; counts as int, money as float.
+        if spend is not None:
+            row["spend"] = spend
+        if impressions is not None:
+            row["impressions"] = _as_count(impressions)
+        if clicks is not None:
+            row["clicks"] = _as_count(clicks)
+        if results_value is not None:
+            row["results"] = _as_count(results_value)
+        if result_key:
+            row["result_label"] = result_label
+        if purchase_value is not None:
+            row["purchase_value"] = purchase_value
+        row.update(native_derived)  # cpm/cpc/ctr/cost_per_result/roas (absent omitted)
+
+        # Per-currency native subtotal accumulation (every account, including no-FX ones).
+        acc = currency_acc.setdefault(
+            currency,
+            {
+                "spend": 0.0,
+                "impressions": 0.0,
+                "clicks": 0.0,
+                "results": 0.0,
+                "results_contrib": 0,
+                "purchase_value": 0.0,
+                "pv_contrib": 0,
+                "account_count": 0,
+            },
+        )
+        acc["spend"] += spend or 0.0
+        acc["impressions"] += impressions or 0.0
+        acc["clicks"] += clicks or 0.0
+        if results_value is not None:
+            acc["results"] += results_value
+            acc["results_contrib"] += 1
+        if purchase_value is not None:
+            acc["purchase_value"] += purchase_value
+            acc["pv_contrib"] += 1
+        acc["account_count"] += 1
+
+        # Currency normalization: money twins + normalized_total inclusion, or a no-FX error.
+        if table.has(currency):
+            spend_norm = (
+                table.convert(spend, from_currency=currency, to_currency=reporting)
+                if spend is not None
+                else None
+            )
+            pv_norm = (
+                table.convert(purchase_value, from_currency=currency, to_currency=reporting)
+                if purchase_value is not None
+                else None
+            )
+            # Recompute derived from the NORMALIZED base (single-point recompute); take money twins.
+            norm_derived = compute_derived_metrics(
+                {
+                    "spend": spend_norm,
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "results": results_value,
+                    "purchase_value": pv_norm,
+                }
+            )
+            if spend_norm is not None:
+                row["spend_normalized"] = spend_norm
+            for metric in _NORMALIZED_MONEY_DERIVED:
+                if metric in norm_derived:
+                    row[f"{metric}_normalized"] = norm_derived[metric]
+            if pv_norm is not None:
+                row["purchase_value_normalized"] = pv_norm
+
+            norm["account_count"] += 1
+            norm["spend"] += spend_norm or 0.0
+            norm["impressions"] += impressions or 0.0
+            norm["clicks"] += clicks or 0.0
+            if results_value is not None:
+                norm["results"] += results_value
+                norm["results_contrib"] += 1
+            if pv_norm is not None:
+                norm["purchase_value"] += pv_norm
+                norm["pv_contrib"] += 1
+        else:
+            errors.append(
+                {
+                    "ad_account_id": ad_account_id,
+                    "error": f"no FX rate for currency '{currency}' (as_of {table.as_of})",
+                }
+            )
+            norm["excluded_no_fx"] += 1
+
+        accounts.append(row)
+
+    totals_by_currency = {cur: _finalize_subtotal(acc) for cur, acc in currency_acc.items()}
+    normalized_total = _finalize_normalized_total(norm, reporting)
+
+    result: dict[str, Any] = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "level": level,
+        "reporting_currency": reporting,
+        "fx_as_of": table.as_of,
+        "fx_note": table.note,
+        "account_count": len(scope.account_ids),
+        "reachable_count": len(scope.account_ids),
+        "accounts": accounts,
+        "totals_by_currency": totals_by_currency,
+        "normalized_total": normalized_total,
+        "errors": errors,
+    }
+    if scope.requested_all and not scope.account_ids:
+        result["note"] = "no accounts reachable"
+    return result
+
+
+def _finalize_subtotal(acc: dict[str, Any]) -> dict[str, Any]:
+    """Turn a per-currency native accumulator into the emitted subtotal (summed base + derived).
+
+    ``results``/``purchase_value`` are emitted (and feed the derived recompute) only when at least one
+    account in the group contributed them, so a group where nobody reported results/revenue simply
+    lacks ``cost_per_result``/``roas`` rather than showing a fabricated zero.
+    """
+    base = {
+        "spend": acc["spend"],
+        "impressions": acc["impressions"],
+        "clicks": acc["clicks"],
+        "results": acc["results"] if acc["results_contrib"] else None,
+        "purchase_value": acc["purchase_value"] if acc["pv_contrib"] else None,
+    }
+    out: dict[str, Any] = {
+        "spend": acc["spend"],
+        "impressions": _as_count(acc["impressions"]),
+        "clicks": _as_count(acc["clicks"]),
+    }
+    if acc["results_contrib"]:
+        out["results"] = _as_count(acc["results"])
+    if acc["pv_contrib"]:
+        out["purchase_value"] = acc["purchase_value"]
+    out["account_count"] = acc["account_count"]
+    out.update(compute_derived_metrics(base))
+    return out
+
+
+def _finalize_normalized_total(norm: dict[str, Any], reporting: str) -> dict[str, Any]:
+    """Turn the normalized accumulator into ``normalized_total`` (summed normalized base + derived).
+
+    Present-but-empty when every account was excluded / none were reachable: zeroed base, no derived
+    keys, and ``excluded_no_fx`` reflecting the count.
+    """
+    base = {
+        "spend": norm["spend"],
+        "impressions": norm["impressions"],
+        "clicks": norm["clicks"],
+        "results": norm["results"] if norm["results_contrib"] else None,
+        "purchase_value": norm["purchase_value"] if norm["pv_contrib"] else None,
+    }
+    out: dict[str, Any] = {
+        "reporting_currency": reporting,
+        "spend": norm["spend"],
+        "impressions": _as_count(norm["impressions"]),
+        "clicks": _as_count(norm["clicks"]),
+    }
+    if norm["results_contrib"]:
+        out["results"] = _as_count(norm["results"])
+    if norm["pv_contrib"]:
+        out["purchase_value"] = norm["purchase_value"]
+    out["account_count"] = norm["account_count"]
+    out["excluded_no_fx"] = norm["excluded_no_fx"]
+    out.update(compute_derived_metrics(base))
+    return out

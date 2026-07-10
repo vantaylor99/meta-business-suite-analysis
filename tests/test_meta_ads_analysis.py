@@ -8999,6 +8999,7 @@ def test_followups_mark_done_missing_ok_is_idempotent(tmp_path: Path) -> None:
 # --- Custom Meta MCP server scaffold (MOCKS ONLY: zero live Meta calls, no socket bound) ---
 
 from meta_ads_analysis import account_discovery as _account_discovery  # noqa: E402
+from meta_ads_analysis import currency as _currency  # noqa: E402
 from meta_ads_analysis import mcp_server as _mcp_server  # noqa: E402
 from meta_ads_analysis.meta_api import access_token_from_env, meta_api_version_from_env  # noqa: E402
 from meta_ads_analysis.reader_provider import reader_backend_from_env  # noqa: E402
@@ -9675,11 +9676,16 @@ def test_cross_account_summary_mock_smoke_single_usd_account() -> None:
 def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     reader = _summary_reader()
     discovery = _mcp_server.build_discovery_tools(reader)
-    # Both discovery tools are exposed.
-    assert set(discovery) == {"list_ad_accounts", "cross_account_spend_summary"}
+    # All three discovery tools are exposed.
+    assert set(discovery) == {
+        "list_ad_accounts",
+        "cross_account_spend_summary",
+        "cross_account_performance",
+    }
     summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
     assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
     assert "cross_account_spend_summary" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "cross_account_performance" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
 
 
 def test_cross_account_summary_insight_fields_restricts_metrics_summed() -> None:
@@ -9923,6 +9929,520 @@ def test_cross_account_summary_non_meta_error_surfaces_end_to_end() -> None:
         )
 
 
+# --- currency.py: static FX table load + convert (MOCKS ONLY, no network) ---
+
+
+def _fx(**extra_rates: float) -> "_currency.FxTable":
+    """A small in-test FX table (rate-to-USD multipliers) injected so tool tests never touch disk."""
+    rates = {"USD": 1.0, "EUR": 1.08, "MXN": 0.055, "GBP": 1.27}
+    rates.update(extra_rates)
+    return _currency.FxTable(as_of="2026-07-01", base="USD", note="test fx", rates=rates)
+
+
+def test_load_fx_table_reads_committed_default() -> None:
+    # The committed config/fx_rates.json loads with its as_of, base, note and seed currencies.
+    table = _currency.load_fx_table()
+    assert table.as_of == "2026-07-01"
+    assert table.base == "USD"
+    assert table.rates["USD"] == 1.0
+    assert table.has("mxn") and table.has("EUR")  # case-insensitive
+    assert "not live" in (table.note or "").lower()
+
+
+def test_load_fx_table_failure_modes(tmp_path) -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="not found"):
+        _currency.load_fx_table(tmp_path / "nope.json")
+
+    missing_as_of = tmp_path / "no_as_of.json"
+    missing_as_of.write_text(json.dumps({"base": "USD", "rates": {"USD": 1.0}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="as_of"):
+        _currency.load_fx_table(missing_as_of)
+
+    empty_rates = tmp_path / "empty_rates.json"
+    empty_rates.write_text(json.dumps({"as_of": "2026-07-01", "rates": {}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="rates"):
+        _currency.load_fx_table(empty_rates)
+
+    non_numeric = tmp_path / "non_numeric.json"
+    non_numeric.write_text(
+        json.dumps({"as_of": "2026-07-01", "rates": {"USD": 1.0, "EUR": "x"}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="must be a number"):
+        _currency.load_fx_table(non_numeric)
+
+    # bool is an int subclass -> must still be rejected as non-numeric.
+    bool_rate = tmp_path / "bool_rate.json"
+    bool_rate.write_text(
+        json.dumps({"as_of": "2026-07-01", "rates": {"USD": 1.0, "EUR": True}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="must be a number"):
+        _currency.load_fx_table(bool_rate)
+
+    for bad in (0, -1.0):
+        neg = tmp_path / f"neg_{bad}.json"
+        neg.write_text(
+            json.dumps({"as_of": "2026-07-01", "rates": {"USD": 1.0, "EUR": bad}}), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="positive"):
+            _currency.load_fx_table(neg)
+
+
+def test_fx_table_convert_present_absent_and_other_reporting() -> None:
+    import pytest
+
+    table = _fx()
+    # MXN -> USD: native * rate[MXN] / rate[USD].
+    assert table.convert(1000.0, from_currency="MXN", to_currency="USD") == pytest.approx(55.0)
+    # MXN -> EUR: native * rate[MXN] / rate[EUR].
+    assert table.convert(1000.0, from_currency="MXN", to_currency="EUR") == pytest.approx(
+        1000 * 0.055 / 1.08
+    )
+    # Case-insensitive lookup.
+    assert table.convert(100.0, from_currency="usd", to_currency="usd") == 100.0
+    # Either currency absent -> None (never a guess, never a silent pass-through).
+    assert table.convert(100.0, from_currency="JPY", to_currency="USD") is None
+    assert table.convert(100.0, from_currency="USD", to_currency="JPY") is None
+    assert table.has("USD") and not table.has("JPY")
+
+
+# --- compute_derived_metrics: recompute-from-components, divide-by-zero-safe ---
+
+
+def test_compute_derived_metrics_recomputes_not_averages() -> None:
+    import pytest
+
+    derived = _account_discovery.compute_derived_metrics(
+        {"spend": 300.0, "impressions": 30000, "clicks": 150, "results": 30, "purchase_value": 900.0}
+    )
+    assert derived["cpm"] == pytest.approx(300 / 30000 * 1000)  # 10.0
+    assert derived["cpc"] == pytest.approx(2.0)
+    assert derived["ctr"] == pytest.approx(150 / 30000 * 100)  # 0.5
+    assert derived["cost_per_result"] == pytest.approx(10.0)
+    assert derived["roas"] == pytest.approx(3.0)
+
+
+def test_compute_derived_metrics_divide_by_zero_guards() -> None:
+    import math
+
+    import pytest
+
+    # Zero impressions -> no cpm / ctr; cpc unaffected.
+    d = _account_discovery.compute_derived_metrics({"spend": 100.0, "impressions": 0, "clicks": 10})
+    assert "cpm" not in d and "ctr" not in d
+    assert d["cpc"] == pytest.approx(10.0)
+
+    # Zero clicks -> no cpc; cpm present, ctr present as 0.0 (0 clicks / impressions).
+    d = _account_discovery.compute_derived_metrics({"spend": 100.0, "impressions": 1000, "clicks": 0})
+    assert "cpc" not in d
+    assert d["cpm"] == pytest.approx(100.0) and d["ctr"] == 0.0
+
+    # Absent results -> no cost_per_result; absent revenue -> no roas.
+    d = _account_discovery.compute_derived_metrics({"spend": 100.0, "impressions": 1000, "clicks": 10})
+    assert "cost_per_result" not in d and "roas" not in d
+
+    # Zero spend -> no roas even when revenue present; nothing is inf / NaN / 0-filled.
+    d = _account_discovery.compute_derived_metrics(
+        {"spend": 0.0, "impressions": 1000, "clicks": 10, "results": 5, "purchase_value": 50.0}
+    )
+    assert "roas" not in d and "cost_per_result" in d  # cost_per_result = 0/5 = 0.0 is defined
+    assert all(math.isfinite(v) for v in d.values())
+
+
+# --- cross_account_performance: efficiency metrics + FX normalization (MOCKS ONLY) ---
+
+
+def _perf_reader(accounts, insights, **overrides):
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [dict(r) for r in insights.get(ad_account_id, [])]
+
+    stubs = {
+        "list_ad_accounts": lambda *, fields: [dict(a) for a in accounts],
+        "fetch_insights": _fetch_insights,
+    }
+    stubs.update(overrides)
+    return FakeMetaReader(**stubs)
+
+
+def test_cross_account_performance_simpsons_paradox_totals_recompute_not_average(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "100"}],  # cpc 1.0
+        "act_2": [{"spend": "300.00", "impressions": "1000", "clicks": "50"}],   # cpc 6.0
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    usd = out["totals_by_currency"]["USD"]
+    # The subtotal cpc is sum(spend)/sum(clicks) = 400/150, NOT mean(1.0, 6.0) = 3.5.
+    assert usd["cpc"] == pytest.approx(400 / 150)
+    assert usd["cpc"] != pytest.approx(3.5)
+    assert usd["account_count"] == 2
+    rows = {r["ad_account_id"]: r for r in out["accounts"]}
+    assert rows["act_1"]["cpc"] == pytest.approx(1.0)
+    assert rows["act_2"]["cpc"] == pytest.approx(6.0)
+
+
+def test_cross_account_performance_normalizes_money_to_usd(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "MX", "account_status": 1, "currency": "MXN"},
+        {"id": "act_2", "account_id": "2", "name": "EU", "account_status": 1, "currency": "EUR"},
+    ]
+    insights = {
+        "act_1": [{"spend": "1000.00", "impressions": "50000", "clicks": "800"}],
+        "act_2": [{"spend": "200.00", "impressions": "10000", "clicks": "100"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    rows = {r["ad_account_id"]: r for r in out["accounts"]}
+    # spend_normalized == native spend * rate[cur] (base USD).
+    assert rows["act_1"]["spend_normalized"] == pytest.approx(1000 * 0.055)  # 55.0
+    assert rows["act_2"]["spend_normalized"] == pytest.approx(200 * 1.08)    # 216.0
+    # normalized_total.spend is the sum of NORMALIZED spends, not a raw sum of unlike native spends.
+    assert out["normalized_total"]["spend"] == pytest.approx(55.0 + 216.0)
+    assert out["normalized_total"]["reporting_currency"] == "USD"
+    assert out["normalized_total"]["account_count"] == 2
+    assert out["normalized_total"]["excluded_no_fx"] == 0
+    assert out["fx_as_of"] == "2026-07-01"
+    assert out["fx_note"] == "test fx"
+    # ctr / roas are currency-invariant -> no *_normalized twin.
+    assert "ctr_normalized" not in rows["act_1"] and "roas_normalized" not in rows["act_1"]
+    # cpm normalized twin = cpm recomputed from the normalized base.
+    native_cpm = 1000 / 50000 * 1000  # 20.0 MXN
+    assert rows["act_1"]["cpm"] == pytest.approx(native_cpm)
+    assert rows["act_1"]["cpm_normalized"] == pytest.approx(native_cpm * 0.055)
+
+
+def test_cross_account_performance_currency_absent_from_fx(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "US", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "JP", "account_status": 1, "currency": "JPY"},
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],
+        "act_2": [{"spend": "5000.00", "impressions": "2000", "clicks": "80"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    rows = {r["ad_account_id"]: r for r in out["accounts"]}
+    jpy = rows["act_2"]
+    # Native figures + native derived still present...
+    assert jpy["spend"] == 5000.0
+    assert jpy["cpm"] == pytest.approx(5000 / 2000 * 1000)
+    # ...but no normalized twins.
+    assert "spend_normalized" not in jpy and "cpm_normalized" not in jpy
+    # An errors entry records the missing currency (native figures still returned).
+    assert {
+        "ad_account_id": "act_2",
+        "error": "no FX rate for currency 'JPY' (as_of 2026-07-01)",
+    } in out["errors"]
+    # Excluded from normalized_total (counted), still present in its native totals_by_currency group.
+    assert out["normalized_total"]["excluded_no_fx"] == 1
+    assert out["normalized_total"]["account_count"] == 1  # only USD contributed
+    assert out["normalized_total"]["spend"] == pytest.approx(100.0)
+    assert out["totals_by_currency"]["JPY"]["spend"] == 5000.0
+
+
+def test_cross_account_performance_reporting_currency_eur(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "MX", "account_status": 1, "currency": "MXN"}]
+    insights = {"act_1": [{"spend": "1080.00", "impressions": "10000", "clicks": "100"}]}
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        reporting_currency="EUR", fx_table=_fx(),
+    )
+    row = out["accounts"][0]
+    # Conversion uses rate[MXN] / rate[EUR].
+    assert row["spend_normalized"] == pytest.approx(1080 * 0.055 / 1.08)
+    assert out["reporting_currency"] == "EUR"
+    assert out["normalized_total"]["reporting_currency"] == "EUR"
+    assert out["fx_as_of"] == "2026-07-01"
+
+
+def test_cross_account_performance_unknown_reporting_currency_raises() -> None:
+    import pytest
+
+    reader = _perf_reader([], {})
+    with pytest.raises(ValueError, match="reporting_currency"):
+        _account_discovery.cross_account_performance(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            reporting_currency="JPY", fx_table=_fx(),
+        )
+
+
+def test_cross_account_performance_rejects_non_account_level() -> None:
+    import pytest
+
+    reader = _perf_reader([], {})
+    with pytest.raises(ValueError, match="level='account'"):
+        _account_discovery.cross_account_performance(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            level="campaign", fx_table=_fx(),
+        )
+
+
+def test_cross_account_performance_results_from_actions_and_missing(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "20"}],
+            "action_values": [{"action_type": "purchase", "value": "500"}],
+        }],
+        "act_2": [{
+            "spend": "80.00", "impressions": "800", "clicks": "40",
+            "actions": [{"action_type": "link_click", "value": "40"}],  # no result-bearing key
+        }],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    rows = {r["ad_account_id"]: r for r in out["accounts"]}
+    # act_1: purchase inferred -> results, label, cost_per_result, roas.
+    assert rows["act_1"]["results"] == 20
+    assert rows["act_1"]["result_label"] == "Purchases"
+    assert rows["act_1"]["cost_per_result"] == pytest.approx(5.0)
+    assert rows["act_1"]["roas"] == pytest.approx(5.0)
+    # act_2: no resolvable result key -> results / result_label / cost_per_result all absent.
+    assert "results" not in rows["act_2"]
+    assert "result_label" not in rows["act_2"]
+    assert "cost_per_result" not in rows["act_2"]
+    assert "roas" not in rows["act_2"]  # no revenue either
+
+
+def test_cross_account_performance_uses_configured_result_key(monkeypatch) -> None:
+    import pytest
+
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    insights = {"act_1": [{
+        "spend": "100.00", "impressions": "1000", "clicks": "50",
+        # Naive inference would pick 'purchase' (5); config optimizes a custom lead event (40).
+        "actions": [
+            {"action_type": "purchase", "value": "5"},
+            {"action_type": "offsite_conversion.custom.lead", "value": "40"},
+        ],
+    }]}
+    reader = _perf_reader(accounts, insights)
+    fake_registry = {
+        "act_1": MetaAdsAccount(
+            account_slug="a", account_name="A", ad_account_id="act_1",
+            primary_result_action_type="offsite_conversion.custom.lead",
+            primary_result_label="Leads",
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: fake_registry)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    row = out["accounts"][0]
+    # Results reflect the CONFIGURED optimization event (40), not naive purchase (5).
+    assert row["results"] == 40
+    assert row["result_label"] == "Leads"
+    assert row["cost_per_result"] == pytest.approx(100 / 40)
+
+
+def test_registry_by_ad_account_id_empty_when_no_config(monkeypatch) -> None:
+    def _boom(*a, **k):
+        raise FileNotFoundError("no config")
+
+    monkeypatch.setattr(_account_discovery.account_registry, "load_account_registry", _boom)
+    assert _account_discovery._registry_by_ad_account_id() == {}
+
+
+def test_cross_account_performance_works_without_config(monkeypatch) -> None:
+    # Missing config -> empty registry map -> inference from the actions blob; tool still works.
+    def _boom(*a, **k):
+        raise FileNotFoundError("no config")
+
+    monkeypatch.setattr(_account_discovery.account_registry, "load_account_registry", _boom)
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    insights = {"act_1": [{
+        "spend": "100.00", "impressions": "1000", "clicks": "50",
+        "actions": [{"action_type": "purchase", "value": "10"}],
+    }]}
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    row = out["accounts"][0]
+    assert row["results"] == 10  # inferred, no config needed
+    assert row["result_label"] == "Purchases"
+
+
+def test_cross_account_performance_partial_failure_and_determinism(monkeypatch) -> None:
+    import time
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1,
+         "currency": "USD" if i % 2 else "MXN"}
+        for i in range(1, 5)
+    ]
+    insights = {
+        f"act_{i}": [{"spend": f"{i * 100}.00", "impressions": str(i * 1000), "clicks": str(i * 10)}]
+        for i in range(1, 5)
+    }
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        idx = int(ad_account_id.split("_")[1])
+        time.sleep((5 - idx) * 0.005)  # later ids finish first -> exercises reordering
+        if ad_account_id == "act_3":
+            raise MetaApiError("(#200) denied for act_3")
+        return [dict(r) for r in insights[ad_account_id]]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch,
+    )
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    # act_3 failed -> recorded + excluded; survivors stay in scope order regardless of finish order.
+    assert [r["ad_account_id"] for r in out["accounts"]] == ["act_1", "act_2", "act_4"]
+    assert {"ad_account_id": "act_3", "error": "(#200) denied for act_3"} in out["errors"]
+    assert out["account_count"] == out["reachable_count"] == 4
+
+
+def test_cross_account_performance_non_meta_error_propagates(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+    ]
+
+    def _fetch(ad_account_id, **k):
+        if ad_account_id == "act_2":
+            raise ValueError("real bug")
+        return [{"spend": "10.00", "impressions": "100", "clicks": "5"}]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts], fetch_insights=_fetch
+    )
+    with pytest.raises(ValueError, match="real bug"):
+        _account_discovery.cross_account_performance(
+            reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+        )
+
+
+def test_cross_account_performance_discovery_failure_propagates(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+
+    def _denied(*, fields):
+        raise MetaApiError("(#190) Invalid OAuth access token")
+
+    reader = FakeMetaReader(list_ad_accounts=_denied)
+    with pytest.raises(MetaApiError, match="Invalid OAuth"):
+        _account_discovery.cross_account_performance(
+            reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+        )
+
+
+def test_cross_account_performance_empty_reach_note(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    reader = FakeMetaReader(list_ad_accounts=[])
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    assert out["accounts"] == []
+    assert out["totals_by_currency"] == {}
+    assert out["note"] == "no accounts reachable"
+    # normalized_total present-but-empty: zeroed base, no derived keys.
+    nt = out["normalized_total"]
+    assert nt["spend"] == 0.0 and nt["account_count"] == 0 and nt["excluded_no_fx"] == 0
+    assert "cpm" not in nt and "roas" not in nt
+    assert nt["reporting_currency"] == "USD"
+    assert out["reachable_count"] == out["account_count"] == 0
+
+
+def test_cross_account_performance_explicit_ids_use_get_account(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts_by_id = {
+        "act_1": {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        "act_9": {"id": "act_9", "account_id": "9", "name": "B", "account_status": 2, "currency": "MXN"},
+    }
+    insights = {
+        "act_1": [{"spend": "10.00", "impressions": "100", "clicks": "5"}],
+        "act_9": [{"spend": "2000.00", "impressions": "5000", "clicks": "80"}],
+    }
+    # list_ad_accounts intentionally unstubbed: if the explicit path touched it -> NotImplementedError.
+    reader = FakeMetaReader(
+        get_account=lambda ad_account_id, *, fields: dict(accounts_by_id[ad_account_id]),
+        fetch_insights=lambda ad_account_id, **k: [dict(r) for r in insights[ad_account_id]],
+    )
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        account_ids=["1", "act_9"], fx_table=_fx(),
+    )
+    assert {r["ad_account_id"] for r in out["accounts"]} == {"act_1", "act_9"}
+    assert not any(c[0] == "list_ad_accounts" for c in reader.calls)
+    assert {c[1][0] for c in reader.calls if c[0] == "get_account"} == {"act_1", "act_9"}
+    labels = {r["ad_account_id"]: r["account_status_label"] for r in out["accounts"]}
+    assert labels == {"act_1": "ACTIVE", "act_9": "DISABLED"}
+    assert set(out["totals_by_currency"]) == {"USD", "MXN"}
+
+
+def test_cross_account_performance_mock_smoke(monkeypatch) -> None:
+    import pytest
+
+    # --mock reader (act_mock001, USD) with the REAL committed FX table (USD present); no config,
+    # no network -> a stable USD row with spend_normalized == spend.
+    def _boom(*a, **k):
+        raise FileNotFoundError("no config in mock")
+
+    monkeypatch.setattr(_account_discovery.account_registry, "load_account_registry", _boom)
+    reader = _mcp_server.build_mock_reader()
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    assert len(out["accounts"]) == 1
+    row = out["accounts"][0]
+    assert row["currency"] == "USD"
+    assert row["spend"] == 100.0
+    assert row["spend_normalized"] == pytest.approx(100.0)  # USD -> USD factor 1
+    assert row["cpm"] == pytest.approx(20.0) and row["cpc"] == pytest.approx(0.5)
+    assert row["ctr"] == pytest.approx(4.0)
+    # MOCK_INSIGHT carries no actions -> results / roas absent.
+    assert "results" not in row and "roas" not in row
+    assert out["fx_as_of"]  # surfaced from the committed table
+    assert out["reporting_currency"] == "USD"
+    assert out["errors"] == []
+    assert not any(c[0] == "get_account" for c in reader.calls)  # discovery path, not get_account
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from
@@ -10106,6 +10626,7 @@ def test_read_tools_register_on_real_fastmcp_and_map_errors(monkeypatch) -> None
     assert "execute_plan" in names and "propose_set_status" in names
     assert "list_ad_accounts" in names  # discovery tool registered
     assert "cross_account_spend_summary" in names  # cross-account aggregate discovery tool registered
+    assert "cross_account_performance" in names  # cross-account efficiency discovery tool registered
     assert "iter_paginated" not in names
     # Schema derived from the wrapper's real signature (functools.wraps preserved it).
     assert set(tool_manager.get_tool("fetch_ads").parameters["properties"]) == {"ad_account_id", "fields"}

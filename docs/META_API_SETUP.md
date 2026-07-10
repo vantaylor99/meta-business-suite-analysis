@@ -257,8 +257,8 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the two discovery tools (`list_ad_accounts` and
-`cross_account_spend_summary` — neither takes an `account` argument), and the
+plus any of the 14 read tools, the three discovery tools (`list_ad_accounts`,
+`cross_account_spend_summary`, and `cross_account_performance` — none takes an `account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
 
@@ -268,6 +268,22 @@ finishes in tens of seconds instead of timing out on a serial walk. The pool siz
 `META_FANOUT_MAX_WORKERS` (default `8`, clamped to `1`–`32`); raise it for a very large fleet, lower it
 to be gentler on rate limits. It never silently drops accounts — every resolved account is covered,
 and any it could not read is reported in `errors`.
+
+`cross_account_performance` rides the same fan-out engine but reports **efficiency, not just raw
+totals**: per-account CPM, CPC, CTR, cost-per-result, and ROAS, each **recomputed from summed base
+components** (never an averaged ratio — Simpson's-paradox-safe). It also **normalizes money metrics
+into a single `reporting_currency`** (default `USD`) so accounts billing in different currencies are
+comparable; `ctr` and `roas` are currency-invariant and get no normalized twin. Conversion rates come
+from a **static table checked into `config/fx_rates.json`** — a committed reference file (unlike the
+gitignored `config/meta_ads_accounts.json`), seeded with USD/EUR/GBP/BRL/MXN/CAD/AUD. **These rates
+are approximate and NOT live FX** — do not use them for billing or precise financial reporting; the
+tool surfaces the table's `as_of` date (`fx_as_of`) and its caveat (`fx_note`) in every response so no
+consumer mistakes them for live rates. **Live/Meta FX is deliberately deferred.** An account whose
+currency is absent from the table keeps its native figures and native efficiency metrics, is reported
+in `errors`, and is excluded from `normalized_total` (counted in `excluded_no_fx`). The primary-result
+event per account comes from the config registry's `primary_result_action_type` when the account is
+configured, and is otherwise inferred from the account's own `actions` — so the tool works before any
+account is added to the config file.
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the

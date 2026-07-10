@@ -47,7 +47,15 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   not read instead of failing the whole call. It fans out over the accounts **concurrently** (a
   bounded thread pool) so an all-accounts call over a large fleet completes in tens of seconds rather
   than timing out; `META_FANOUT_MAX_WORKERS` (default `8`, clamped to `1`–`32`) tunes the pool for very
-  large fleets.
+  large fleets. The `cross_account_performance` tool goes one step further: it reports **efficiency**,
+  not just raw totals — CPM, CPC, CTR, cost-per-result, and ROAS, each **recomputed from summed
+  components** (never an averaged ratio, so it is Simpson's-paradox-safe) — and lets you compare
+  accounts that bill in different currencies by **normalizing money metrics into one
+  `reporting_currency`** (default USD). Conversion uses a small **static FX table checked into
+  `config/fx_rates.json`** whose `as_of` date and "approximate — not live" caveat are surfaced in the
+  output; an account in a currency missing from that table keeps its native figures and is reported in
+  `errors`. (Live/Meta FX is deliberately deferred — the table is a committed reference, not a billing
+  rate.)
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

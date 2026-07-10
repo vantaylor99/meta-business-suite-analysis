@@ -434,6 +434,14 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "list of account ids) for a date range. Groups totals by currency and never sums across "
         "different currencies; reports any accounts that could not be read."
     ),
+    "cross_account_performance": (
+        "Compare efficiency (not just raw spend) across every ad account this token can reach (or an "
+        "explicit list) for a date range. Returns per-account CPM/CPC/CTR/cost-per-result/ROAS "
+        "recomputed from summed components (never an averaged ratio), and normalizes money metrics "
+        "into one reporting_currency (default USD) using a static approximate FX table — surfacing "
+        "its as-of date. Accounts in a currency with no FX rate keep native figures and are reported "
+        "in errors; per-account read failures are isolated, not fatal."
+    ),
 }
 
 
@@ -459,9 +467,28 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             reader, date_from=date_from, date_to=date_to, account_ids=account_ids
         )
 
+    def cross_account_performance(
+        date_from: str,
+        date_to: str,
+        account_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+        level: str = "account",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself.
+        return account_discovery.cross_account_performance(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            account_ids=account_ids,
+            reporting_currency=reporting_currency,
+            level=level,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
+        "cross_account_performance": cross_account_performance,
     }
 
 
