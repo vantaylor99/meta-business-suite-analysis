@@ -480,9 +480,10 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "rank_accounts": (
         "Rank every ad account this token can reach (or an explicit list) by a single efficiency or spend "
-        "metric for a date range, returning the top or bottom N. Money metrics (spend/CPC/CPM/CPL/ROAS) "
+        "metric for a date range, returning the top or bottom N. Money metrics (spend/CPC/CPM/CPL) "
         "are compared in one reporting_currency (default USD) so accounts in different currencies are "
-        "comparable. Accounts lacking the metric (e.g. no results → no CPL) are grouped into an 'unranked' "
+        "comparable; ratio and count metrics (CTR/ROAS/impressions/clicks/results) are currency-invariant "
+        "and ranked as-is. Accounts lacking the metric (e.g. no results → no CPL) are grouped into an 'unranked' "
         "bucket with a reason instead of sorted as zero or infinity. Valid metrics: spend, cpm, cpc, ctr, "
         "cost_per_result (aliases: cpl, cpa), roas, impressions, clicks, results."
     ),

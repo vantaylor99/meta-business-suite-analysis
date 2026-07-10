@@ -2228,7 +2228,9 @@ def rank_accounts(
             "account_id": row.get("account_id"),
             "name": row.get("name"),
             "currency": row.get("currency"),
-            "value": sort_value,
+            # Emit the row's original-typed value (int for counts, float for money-normalized),
+            # not the float()-coerced sort key, so counts stay integers like everywhere else.
+            "value": row.get(sort_field),
         }
         if is_money:
             entry["value_native"] = row.get(canonical)

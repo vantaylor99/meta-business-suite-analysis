@@ -90,6 +90,16 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   spend read plus a per-account campaigns + ad-sets + account read); a per-account budget read that
   fails is reported `budget_unread`, never a silent "uncapped". Cents→major-unit conversion is exact
   for 2-decimal currencies; **zero-decimal currencies (JPY, KRW) are a known 100× limitation.**
+  Finally, the `rank_accounts` tool is the seventh discovery tool and the manager's "who's top/bottom?"
+  shortlist: another **pure post-processor over `cross_account_performance`** (one read), it sorts the
+  whole reachable fleet — or an explicit `account_ids` subset — by a **single** metric (spend, CPM, CPC,
+  CTR, cost-per-result [aliases `cpl`/`cpa`], ROAS, impressions, clicks, or results) and returns the top
+  or bottom N. Money metrics are ranked on their **`reporting_currency`-normalized twin** so accounts in
+  different currencies are directly comparable (`value` is normalized, `value_native` keeps the native
+  figure); ratio and count metrics are currency-invariant and ranked as-is. Ties share a rank (1-based,
+  strictly-better + 1), and accounts that lack the metric — no delivery, or a money metric in a currency
+  missing from the FX table — land in a separate `unranked` bucket with a reason rather than being sorted
+  as a misleading zero or infinity.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

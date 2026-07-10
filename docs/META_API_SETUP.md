@@ -257,9 +257,9 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the six discovery tools (`list_ad_accounts`,
+plus any of the 14 read tools, the seven discovery tools (`list_ad_accounts`,
 `cross_account_spend_summary`, `cross_account_performance`, `account_benchmark`,
-`flag_accounts_needing_attention`, and `pacing_report` — none takes an
+`flag_accounts_needing_attention`, `pacing_report`, and `rank_accounts` — none takes an
 `account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
@@ -352,6 +352,23 @@ N-account scope — the same accepted posture as the attention tool's 2× note; 
 per-account read is a future optimization. Cents→major-unit conversion divides by 100, exact for
 2-decimal currencies; **zero-decimal currencies (JPY, KRW) and 3-decimal currencies are a known 100×
 inaccuracy** flagged for a follow-up.
+
+`rank_accounts` answers the manager's "who's top/bottom?" — it ranks the whole reachable fleet (or an
+explicit `account_ids` subset) by a **single** metric and returns the top or bottom `limit` (default
+10). Like `account_benchmark` and `flag_accounts_needing_attention` it is a **pure post-processor over
+`cross_account_performance`** (one call, no new read shape). Accepted metrics are `spend`, `cpm`, `cpc`,
+`ctr`, `cost_per_result` (aliases `cpl`/`cpa` resolve to it; the canonical name appears in the output),
+`roas`, `impressions`, `clicks`, and `results`; an unknown metric, a bad `order` (must be `asc`/`desc`),
+or a non-positive `limit` is a fail-fast `ValueError` raised **before** any Meta read. Money metrics
+(`spend`/`cpm`/`cpc`/`cost_per_result`) are ranked on their **`reporting_currency`-normalized twin** so
+cross-currency accounts compare directly — `value` carries the normalized figure and `value_native` the
+account's own-currency figure; ratio and count metrics (CTR/ROAS/impressions/clicks/results) are
+currency-invariant and ranked as-is (no `value_native`). Ranks are 1-based with the strictly-better + 1
+tie convention (ties share a rank, tiebroken by `ad_account_id` ascending for run-to-run determinism),
+and the returned list is truncated to `limit` while `ranked_total` reports the full rankable count. An
+account that lacks the metric — no delivery in range, or a money metric in a currency missing from the
+FX table — is not sorted as a misleading `0`/`∞`; it lands in a separate `unranked` bucket tagged with
+its reason (`metric unavailable` vs `no FX rate for <currency>`).
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the

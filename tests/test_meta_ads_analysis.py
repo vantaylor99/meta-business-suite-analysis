@@ -12047,6 +12047,73 @@ def test_build_discovery_tools_exposes_rank_accounts(monkeypatch) -> None:
     assert out["ranked_total"] == 2
 
 
+def test_build_discovery_tools_rank_accounts_mock_smoke(monkeypatch) -> None:
+    # End-to-end through the MCP wrapper: it exposes metric/order/limit but NOT fx_table (test-only
+    # seam), loading the committed config/fx_rates.json itself. USD accounts keep this deterministic
+    # against whatever rates the committed table ships. Exercises the real callable, not the library.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "10"}],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "20"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    tools = _mcp_server.build_discovery_tools(reader)
+    out = tools["rank_accounts"]("2026-06-01", "2026-06-30", "spend", "desc", 10)
+    assert out["ranked"][0]["ad_account_id"] == "act_2"
+    assert out["ranked"][0]["rank"] == 1
+    assert out["ranked_total"] == 2
+    assert out["reporting_currency"] == "USD"
+
+
+def test_rank_accounts_count_metric_value_is_int(monkeypatch) -> None:
+    # Count metrics (impressions/clicks/results) must surface as ints in ``value`` — mirroring how
+    # cross_account_performance emits them via _as_count — not float()-coerced sort keys.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    insights = {"act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "10"}]}
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="impressions", order="desc", limit=10, fx_table=_fx()
+    )
+    assert out["ranked"][0]["value"] == 1000
+    assert isinstance(out["ranked"][0]["value"], int)
+    # Money metrics stay float (normalized twin), value_native mirrors the native figure.
+    assert "value_native" not in out["ranked"][0]  # count metric → no native twin
+
+
+def test_rank_accounts_respects_account_ids_subset(monkeypatch) -> None:
+    # An explicit account_ids subset is passed straight through to cross_account_performance (which
+    # takes the get_account path, NOT list_ad_accounts), so only the named accounts are ranked.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts_by_id = {
+        "act_1": {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+        "act_3": {"id": "act_3", "account_id": "3", "name": "C", "account_status": 1, "currency": "USD"},
+    }
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "10"}],
+        "act_3": [{"spend": "300.00", "impressions": "3000", "clicks": "30"}],
+    }
+    # list_ad_accounts intentionally unstubbed: the explicit path must not touch it.
+    reader = FakeMetaReader(
+        get_account=lambda ad_account_id, *, fields: dict(accounts_by_id[ad_account_id]),
+        fetch_insights=lambda ad_account_id, **k: [dict(r) for r in insights[ad_account_id]],
+    )
+    out = _account_discovery.rank_accounts(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, account_ids=["act_1", "act_3"], fx_table=_fx()
+    )
+    ranked_ids = [r["ad_account_id"] for r in out["ranked"]]
+    assert ranked_ids == ["act_3", "act_1"]  # only the named subset is ranked
+    assert out["ranked_total"] == 2
+    assert out["account_count"] == 2
+    assert not any(c[0] == "list_ad_accounts" for c in reader.calls)
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from
