@@ -10161,6 +10161,51 @@ def test_cross_account_performance_currency_absent_from_fx(monkeypatch) -> None:
     assert out["totals_by_currency"]["JPY"]["spend"] == 5000.0
 
 
+def test_cross_account_performance_partial_contributor_normalized_total(monkeypatch) -> None:
+    # Portfolio aggregation semantics when only SOME accounts report results/revenue: the aggregate
+    # base sums spend/impressions/clicks over ALL FX-eligible accounts but results/purchase_value
+    # over only the contributors. cost_per_result / roas are therefore portfolio-spend over the
+    # contributing accounts' results/revenue (a known, deliberate aggregate semantic) — never a 0
+    # fabricated for the non-contributors, and never absent just because coverage is partial.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1,
+         "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    insights = {
+        # Only act_1 carries a result-bearing action + revenue; act_2/act_3 report spend only.
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+            "action_values": [{"action_type": "purchase", "value": "500"}],
+        }],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_3": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    nt = out["normalized_total"]
+    assert nt["account_count"] == 3 and nt["excluded_no_fx"] == 0
+    # Base: spend/impressions/clicks summed over all three; results/purchase_value from act_1 only.
+    assert nt["spend"] == pytest.approx(600.0)
+    assert nt["impressions"] == 6000 and nt["clicks"] == 300
+    assert nt["results"] == 10
+    assert nt["purchase_value"] == pytest.approx(500.0)
+    # Derived from that mixed base: portfolio spend over the single contributor's results/revenue.
+    assert nt["cpm"] == pytest.approx(100.0) and nt["cpc"] == pytest.approx(2.0)
+    assert nt["cost_per_result"] == pytest.approx(600 / 10)  # 60.0, NOT 100/10 from act_1 alone
+    assert nt["roas"] == pytest.approx(500 / 600)
+    # The same partial-contributor shape holds for the per-currency subtotal.
+    usd = out["totals_by_currency"]["USD"]
+    assert usd["results"] == 10 and usd["purchase_value"] == pytest.approx(500.0)
+    assert usd["cost_per_result"] == pytest.approx(60.0)
+
+
 def test_cross_account_performance_reporting_currency_eur(monkeypatch) -> None:
     import pytest
 
