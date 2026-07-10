@@ -11241,6 +11241,55 @@ def test_build_discovery_tools_flag_accounts_attention_mock_smoke(monkeypatch) -
     assert out["errors"] == []
 
 
+def test_flag_accounts_attention_stall_informational_and_current_error(monkeypatch) -> None:
+    # Integration coverage for three join/bucket paths the unit tests exercise only in isolation:
+    #   * stalled_delivery via the real two-window join (ACTIVE, delivering baseline, empty current row),
+    #   * the informational bucket (newly_active: no baseline delivery, material current),
+    #   * a CURRENT-window-only read failure (account present in baseline but not current) -> excluded
+    #     from every bucket, surfaced in errors tagged "current".
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_stall", "account_id": "1", "name": "Stall", "account_status": 1, "currency": "USD"},
+        {"id": "act_new", "account_id": "2", "name": "New", "account_status": 1, "currency": "USD"},
+        {"id": "act_err", "account_id": "3", "name": "Err", "account_status": 1, "currency": "USD"},
+    ]
+    # act_stall delivered in baseline; act_new had nothing; act_err has a baseline row (fails current).
+    baseline_rows = {
+        "act_stall": [{"spend": "500.00", "impressions": "5000", "clicks": "250"}],
+        "act_err": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],
+    }
+    # Current: act_stall delivers nothing (no row -> empty insight), act_new is now material.
+    current_rows = {
+        "act_new": [{"spend": "500.00", "impressions": "5000", "clicks": "250"}],
+    }
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        if ad_account_id == "act_err" and date_from == "2026-06-08":
+            raise MetaApiError("(#200) denied for act_err current")
+        window = {"2026-06-01": baseline_rows, "2026-06-08": current_rows}[date_from]
+        return [dict(r) for r in window.get(ad_account_id, [])]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts], fetch_insights=_fetch
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+    # act_stall: ACTIVE + delivering baseline + ~zero current -> high stalled_delivery -> flagged.
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_stall"]
+    assert out["flagged"][0]["severity"] == "high"
+    assert "stalled_delivery" in {f["name"] for f in out["flagged"][0]["flags"]}
+    # act_new: no baseline delivery + material current -> newly_active (info) -> informational bucket.
+    assert [e["ad_account_id"] for e in out["informational"]] == ["act_new"]
+    assert {f["name"] for f in out["informational"][0]["flags"]} == {"newly_active"}
+    # act_err: current-window read failed -> in no bucket, never counted clean, surfaced in errors.
+    assert {
+        "ad_account_id": "act_err", "window": "current", "error": "(#200) denied for act_err current"
+    } in out["errors"]
+    assert all(e["ad_account_id"] != "act_err" for e in (*out["flagged"], *out["informational"]))
+    assert out["clean_count"] == 0
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from
