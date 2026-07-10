@@ -71,7 +71,25 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   `flagged` (medium+ severity), `informational` (newly-active / too-little-history), and a `clean_count`.
   It is a pure post-processor over `cross_account_performance` (two reads — one per window). **Budget
   pacing is a separate concern:** spend-to-date vs. the configured budget is answered by the
-  `pacing_report` tool, not this one.
+  `pacing_report` tool, not this one. That sixth discovery tool answers "will each account land
+  **over**, **under**, or **on** its budget for the month?" across the whole fleet: you give it the
+  full reporting period (`date_from`/`date_to`) and, optionally, the day to measure spend through
+  (`as_of`, default today), and it reports each account's spend-to-date, its **projected**
+  end-of-period spend (`spend_to_date ÷ elapsed_fraction`), and a verdict. The pacing denominator is
+  the sum of each account's **ACTIVE daily budgets**, **CBO-deduplicated** — a campaign-budget-
+  optimization campaign contributes its campaign-level budget and its ad-set budgets are ignored, so a
+  naïve sum never double-counts — times the number of days in the period. The account spend cap is a
+  *lifetime* ceiling, so it is surfaced as context but is **never** the pacing denominator; a
+  lifetime-only account is `budget_not_projectable` (prorating a lifetime budget against an arbitrary
+  reporting window is a deliberate non-goal here), an uncapped account is `no_budget_set`, and a
+  paused/closed account is `account_inactive` — none of these are miscounted as "under-pacing". Money
+  is normalized into one `reporting_currency` (default USD) for the rollup (status counts + worst
+  over/under shortlists); native and normalized give the same variance since it is a same-currency
+  ratio. Unlike the pure post-processors, pacing genuinely needs a **second read surface** (budget
+  config is not in the insights row), so it costs **~1 + 4N** reads for an N-account scope (the shared
+  spend read plus a per-account campaigns + ad-sets + account read); a per-account budget read that
+  fails is reported `budget_unread`, never a silent "uncapped". Cents→major-unit conversion is exact
+  for 2-decimal currencies; **zero-decimal currencies (JPY, KRW) are a known 100× limitation.**
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

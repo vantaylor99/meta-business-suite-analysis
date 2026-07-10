@@ -9676,13 +9676,14 @@ def test_cross_account_summary_mock_smoke_single_usd_account() -> None:
 def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     reader = _summary_reader()
     discovery = _mcp_server.build_discovery_tools(reader)
-    # All five discovery tools are exposed.
+    # All six discovery tools are exposed.
     assert set(discovery) == {
         "list_ad_accounts",
         "cross_account_spend_summary",
         "cross_account_performance",
         "account_benchmark",
         "flag_accounts_needing_attention",
+        "pacing_report",
     }
     summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
     assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
@@ -9690,6 +9691,7 @@ def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     assert "cross_account_performance" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "account_benchmark" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "flag_accounts_needing_attention" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "pacing_report" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
 
 
 def test_cross_account_summary_insight_fields_restricts_metrics_summed() -> None:
@@ -11288,6 +11290,466 @@ def test_flag_accounts_attention_stall_informational_and_current_error(monkeypat
     } in out["errors"]
     assert all(e["ad_account_id"] != "act_err" for e in (*out["flagged"], *out["informational"]))
     assert out["clean_count"] == 0
+
+
+# --- pacing_report: pure helpers (clock-free, no reader) --------------------
+
+
+def test_pacing_period_mid_completed_notstarted_singleday() -> None:
+    import pytest
+
+    # Mid-period: 14 of 31 days elapsed (the ticket's worked example).
+    p = _account_discovery.pacing_period("2026-07-01", "2026-07-31", "2026-07-14")
+    assert p["total_days"] == 31
+    assert p["elapsed_days"] == 14
+    assert p["elapsed_fraction"] == pytest.approx(14 / 31)
+    assert p["effective_as_of"] == "2026-07-14"
+
+    # as_of exactly at start -> day 1 (elapsed_fraction > 0, projection possible).
+    d1 = _account_discovery.pacing_period("2026-07-01", "2026-07-31", "2026-07-01")
+    assert d1["elapsed_days"] == 1 and d1["elapsed_fraction"] == pytest.approx(1 / 31)
+
+    # Not started (as_of before the period): elapsed 0, effective clamped to the day before start.
+    ns = _account_discovery.pacing_period("2026-07-01", "2026-07-31", "2026-06-15")
+    assert ns["elapsed_days"] == 0 and ns["elapsed_fraction"] == 0.0
+    assert ns["effective_as_of"] == "2026-06-30"
+
+    # Completed (as_of at/after end): elapsed == total, fraction 1.0, effective clamped to the end.
+    done = _account_discovery.pacing_period("2026-07-01", "2026-07-31", "2026-08-10")
+    assert done["elapsed_days"] == 31 and done["elapsed_fraction"] == 1.0
+    assert done["effective_as_of"] == "2026-07-31"
+
+    # Single-day period.
+    one = _account_discovery.pacing_period("2026-07-05", "2026-07-05", "2026-07-05")
+    assert one["total_days"] == 1 and one["elapsed_fraction"] == 1.0
+
+
+def test_pacing_period_from_after_to_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        _account_discovery.pacing_period("2026-07-31", "2026-07-01", "2026-07-15")
+
+
+def test_project_spend_normal_and_zero_guard() -> None:
+    import pytest
+
+    assert _account_discovery.project_spend(4200.0, 14 / 31) == pytest.approx(9300.0)
+    assert _account_discovery.project_spend(100.0, 0.0) is None  # divide-by-zero guard
+    assert _account_discovery.project_spend(100.0, 1.0) == pytest.approx(100.0)  # completed == actual
+
+
+def test_minor_to_major_cents_and_blank() -> None:
+    import pytest
+
+    assert _account_discovery._minor_to_major("30000") == pytest.approx(300.0)
+    assert _account_discovery._minor_to_major(5000) == pytest.approx(50.0)
+    assert _account_discovery._minor_to_major(None) is None
+    assert _account_discovery._minor_to_major("") is None
+    assert _account_discovery._minor_to_major("0") == 0.0
+
+
+def _pc_camp(cid, status="ACTIVE", daily=None, lifetime=None):
+    row = {"id": cid, "effective_status": status}
+    if daily is not None:
+        row["daily_budget"] = daily
+    if lifetime is not None:
+        row["lifetime_budget"] = lifetime
+    return row
+
+
+def _pc_adset(aid, campaign_id, status="ACTIVE", daily=None, lifetime=None):
+    row = {"id": aid, "campaign_id": campaign_id, "effective_status": status}
+    if daily is not None:
+        row["daily_budget"] = daily
+    if lifetime is not None:
+        row["lifetime_budget"] = lifetime
+    return row
+
+
+def test_summarize_account_budget_cbo_dedup_precedence() -> None:
+    import pytest
+
+    S = _account_discovery.summarize_account_budget
+
+    # CBO daily: campaign holds the daily budget; its adset budget is IGNORED (double-count guard).
+    cbo_daily = S([_pc_camp("c1", daily="30000")], [_pc_adset("as1", "c1", daily="50000")])
+    assert cbo_daily["active_daily"] == pytest.approx(300.0)
+    assert cbo_daily["lifetime_total"] == 0.0
+
+    # CBO lifetime: campaign holds a lifetime budget -> lifetime_total (not active_daily); adset ignored.
+    cbo_life = S([_pc_camp("c1", lifetime="700000")], [_pc_adset("as1", "c1", daily="50000")])
+    assert cbo_life["active_daily"] == 0.0 and cbo_life["lifetime_total"] == pytest.approx(7000.0)
+
+    # Non-CBO: no campaign budget -> each ACTIVE adset's daily budget is summed.
+    non_cbo = S(
+        [_pc_camp("c1")],
+        [_pc_adset("as1", "c1", daily="20000"), _pc_adset("as2", "c1", daily="10000")],
+    )
+    assert non_cbo["active_daily"] == pytest.approx(300.0) and non_cbo["lifetime_total"] == 0.0
+
+    # Paused campaign: its ACTIVE adset is ignored (the parent gates delivery).
+    paused_camp = S([_pc_camp("c1", status="PAUSED", daily="30000")], [_pc_adset("as1", "c1", daily="20000")])
+    assert paused_camp["active_daily"] == 0.0
+
+    # Paused adset under an ACTIVE non-CBO campaign: only the ACTIVE sibling counts.
+    paused_adset = S(
+        [_pc_camp("c1")],
+        [_pc_adset("as1", "c1", status="PAUSED", daily="20000"), _pc_adset("as2", "c1", daily="10000")],
+    )
+    assert paused_adset["active_daily"] == pytest.approx(100.0)
+
+    # Mixed: one CBO-daily campaign ($300, adset ignored) + one non-CBO campaign whose adset adds $150.
+    mixed = S(
+        [_pc_camp("c1", daily="30000"), _pc_camp("c2")],
+        [_pc_adset("as1", "c1", daily="99999"), _pc_adset("as2", "c2", daily="15000")],
+    )
+    assert mixed["active_daily"] == pytest.approx(450.0)
+
+
+def test_classify_pacing_status_enum_and_boundaries() -> None:
+    C = _account_discovery.classify_pacing
+    common = dict(elapsed_fraction=0.5, account_status_label="ACTIVE", lifetime_budget_total=0.0,
+                  spend_cap=None, active_daily_budget=10.0)
+
+    # variance exactly +tolerance (0.05) -> on_track (over is strictly '>').
+    assert C(**common, period_budget=100.0, projected_spend=105.0) == {"status": "on_track", "variance_pct": 0.05}
+    # just over the knee -> over.
+    over = C(**common, period_budget=100.0, projected_spend=106.0)
+    assert over["status"] == "over"
+    # variance exactly -tolerance -> on_track; just past -> under.
+    assert C(**common, period_budget=100.0, projected_spend=95.0)["status"] == "on_track"
+    assert C(**common, period_budget=100.0, projected_spend=94.0)["status"] == "under"
+
+    # no_budget_set: nothing configured (no daily, no lifetime, no cap).
+    assert C(elapsed_fraction=0.5, account_status_label="ACTIVE", active_daily_budget=0.0,
+             lifetime_budget_total=0.0, spend_cap=None, period_budget=0.0,
+             projected_spend=10.0)["status"] == "no_budget_set"
+    # budget_not_projectable: lifetime-only (has a lifetime budget but zero active daily).
+    assert C(elapsed_fraction=0.5, account_status_label="ACTIVE", active_daily_budget=0.0,
+             lifetime_budget_total=5000.0, spend_cap=None, period_budget=0.0,
+             projected_spend=10.0)["status"] == "budget_not_projectable"
+    # account_inactive short-circuits even with a real budget.
+    assert C(**{**common, "account_status_label": "DISABLED"},
+             period_budget=100.0, projected_spend=200.0)["status"] == "account_inactive"
+    # not_started short-circuits before everything else.
+    assert C(**{**common, "elapsed_fraction": 0.0},
+             period_budget=100.0, projected_spend=200.0)["status"] == "not_started"
+
+
+# --- pacing_report: integration over a FakeMetaReader (MOCKS ONLY) ----------
+
+_PACING_KW = dict(date_from="2026-07-01", date_to="2026-07-31", as_of="2026-07-14")
+_EF = 14 / 31  # elapsed fraction for the window above (14 of 31 days)
+
+
+def _pacing_reader(accounts, insights, campaigns, adsets, caps, **overrides):
+    """A reader for pacing_report: list_ad_accounts (scope) + per-account fetch_insights (spend) +
+    per-account list_campaigns/list_adsets/get_account (budget config). MOCKS ONLY."""
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [dict(r) for r in insights.get(ad_account_id, [])]
+
+    stubs = {
+        "list_ad_accounts": lambda *, fields: [dict(a) for a in accounts],
+        "fetch_insights": _fetch,
+        "list_campaigns": lambda ad_account_id, *, fields, effective_status=None: [
+            dict(c) for c in campaigns.get(ad_account_id, [])
+        ],
+        "list_adsets": lambda ad_account_id, *, fields, effective_status=None: [
+            dict(a) for a in adsets.get(ad_account_id, [])
+        ],
+        "get_account": lambda ad_account_id, *, fields: dict(caps.get(ad_account_id, {})),
+    }
+    stubs.update(overrides)
+    return FakeMetaReader(**stubs)
+
+
+def test_pacing_report_end_to_end_statuses_rollup_and_shortlists(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_ontrack", "account_id": "1", "name": "OnTrack", "account_status": 1, "currency": "USD"},
+        {"id": "act_over", "account_id": "2", "name": "Over", "account_status": 1, "currency": "USD"},
+        {"id": "act_under", "account_id": "3", "name": "Under", "account_status": 1, "currency": "USD"},
+        {"id": "act_uncapped", "account_id": "4", "name": "Uncapped", "account_status": 1, "currency": "USD"},
+        {"id": "act_lifetime", "account_id": "5", "name": "Lifetime", "account_status": 1, "currency": "USD"},
+        {"id": "act_paused", "account_id": "6", "name": "Paused", "account_status": 2, "currency": "USD"},
+    ]
+    insights = {
+        "act_ontrack": [{"spend": "4200.00"}],   # daily 300 -> budget 9300 -> projected 9300 -> on_track
+        "act_over": [{"spend": "2000.00"}],       # daily 100 -> budget 3100 -> projected ~4428 -> over
+        "act_under": [{"spend": "1000.00"}],      # daily 200 -> budget 6200 -> projected ~2214 -> under
+        "act_uncapped": [{"spend": "500.00"}],    # no budget -> no_budget_set
+        "act_lifetime": [{"spend": "800.00"}],    # lifetime only -> budget_not_projectable
+        "act_paused": [{"spend": "300.00"}],      # DISABLED -> account_inactive (even with a budget)
+    }
+    campaigns = {
+        # CBO daily; decoy adset budget must be ignored (integration double-count guard).
+        "act_ontrack": [_pc_camp("c1", daily="30000")],
+        "act_over": [_pc_camp("c2", daily="10000")],
+        "act_under": [_pc_camp("c3", daily="20000")],
+        "act_uncapped": [],
+        "act_lifetime": [_pc_camp("c5", lifetime="500000")],
+        "act_paused": [_pc_camp("c6", daily="15000")],
+    }
+    adsets = {
+        "act_ontrack": [_pc_adset("as1", "c1", daily="99999999")],  # ignored under CBO
+    }
+    caps = {a["id"]: {"currency": "USD", "amount_spent": "5100000"} for a in accounts}
+
+    reader = _pacing_reader(accounts, insights, campaigns, adsets, caps)
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
+
+    assert out["total_days"] == 31 and out["as_of"] == "2026-07-14"
+    assert out["account_count"] == 6
+    by_id = {a["ad_account_id"]: a for a in out["accounts"]}
+    assert by_id["act_ontrack"]["status"] == "on_track"
+    assert by_id["act_ontrack"]["period_budget"] == pytest.approx(9300.0)
+    assert by_id["act_ontrack"]["projected_spend"] == pytest.approx(9300.0)
+    assert by_id["act_ontrack"]["active_daily_budget"] == pytest.approx(300.0)  # adset decoy ignored
+    assert by_id["act_ontrack"]["elapsed_fraction"] == pytest.approx(_EF)
+    assert by_id["act_over"]["status"] == "over"
+    assert by_id["act_under"]["status"] == "under"
+    assert by_id["act_uncapped"]["status"] == "no_budget_set"
+    assert by_id["act_lifetime"]["status"] == "budget_not_projectable"
+    assert by_id["act_lifetime"]["lifetime_budget_total"] == pytest.approx(5000.0)
+    assert by_id["act_lifetime"]["spend_cap"] is None
+    assert by_id["act_paused"]["status"] == "account_inactive"
+    assert by_id["act_paused"]["variance_pct"] is None
+
+    rollup = out["rollup"]
+    assert rollup["status_counts"] == {
+        "over": 1, "under": 1, "on_track": 1, "no_budget_set": 1,
+        "budget_not_projectable": 1, "account_inactive": 1, "not_started": 0, "budget_unread": 0,
+    }
+    # worst_over: variance desc; worst_under: variance asc (mirror image over the 3 projectable rows).
+    assert [s["ad_account_id"] for s in rollup["worst_over_pacers"]] == ["act_over", "act_ontrack", "act_under"]
+    assert [s["ad_account_id"] for s in rollup["worst_under_pacers"]] == ["act_under", "act_ontrack", "act_over"]
+    # Normalized totals sum ONLY the projectable USD accounts (9300 + 3100 + 6200).
+    assert rollup["total_period_budget_normalized"] == pytest.approx(18600.0)
+    assert rollup["total_projected_normalized"] == pytest.approx(9300.0 + 2000 / _EF + 1000 / _EF)
+    assert rollup["overall_variance_pct"] == pytest.approx(
+        (9300.0 + 2000 / _EF + 1000 / _EF - 18600.0) / 18600.0
+    )
+    assert rollup["excluded_from_rollup"] == 3  # uncapped + lifetime + paused
+    assert out["errors"] == []
+
+
+def test_pacing_report_shortlist_tiebreak_by_account_id(monkeypatch) -> None:
+    # Two accounts with IDENTICAL variance must order by ad_account_id asc in the shortlists.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_bbb", "account_id": "2", "name": "B", "account_status": 1, "currency": "USD"},
+        {"id": "act_aaa", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {"act_bbb": [{"spend": "2000.00"}], "act_aaa": [{"spend": "2000.00"}]}
+    campaigns = {"act_bbb": [_pc_camp("cb", daily="10000")], "act_aaa": [_pc_camp("ca", daily="10000")]}
+    reader = _pacing_reader(accounts, insights, campaigns, {}, {"act_bbb": {}, "act_aaa": {}})
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
+    assert [s["ad_account_id"] for s in out["rollup"]["worst_over_pacers"]] == ["act_aaa", "act_bbb"]
+    assert [s["ad_account_id"] for s in out["rollup"]["worst_under_pacers"]] == ["act_aaa", "act_bbb"]
+
+
+def test_pacing_report_no_fx_account_native_only_in_shortlist_not_normalized_totals(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_usd", "account_id": "1", "name": "USD", "account_status": 1, "currency": "USD"},
+        {"id": "act_aud", "account_id": "2", "name": "AUD", "account_status": 1, "currency": "AUD"},
+    ]
+    insights = {"act_usd": [{"spend": "4200.00"}], "act_aud": [{"spend": "2000.00"}]}
+    campaigns = {
+        "act_usd": [_pc_camp("c1", daily="30000")],  # on_track
+        "act_aud": [_pc_camp("c2", daily="10000")],  # over (native variance, FX-invariant)
+    }
+    reader = _pacing_reader(accounts, insights, campaigns, {}, {"act_usd": {}, "act_aud": {}})
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)  # AUD absent from _fx()
+
+    by_id = {a["ad_account_id"]: a for a in out["accounts"]}
+    aud = by_id["act_aud"]
+    # Native figures kept + a real verdict; normalized twins are None (no FX rate).
+    assert aud["status"] == "over"
+    assert aud["variance_pct"] is not None
+    assert aud["spend_to_date_normalized"] is None
+    assert aud["period_budget_normalized"] is None
+    assert aud["projected_spend_normalized"] is None
+    # It IS in the shortlist (native variance is FX-invariant)...
+    assert "act_aud" in {s["ad_account_id"] for s in out["rollup"]["worst_over_pacers"]}
+    # ...but excluded from the normalized totals (only the USD account contributes).
+    assert out["rollup"]["total_period_budget_normalized"] == pytest.approx(9300.0)
+    assert out["rollup"]["excluded_from_rollup"] == 1
+    # The FX gap surfaced in errors (inherited verbatim from step 1).
+    assert any("AUD" in str(e.get("error", "")) for e in out["errors"])
+
+
+def test_pacing_report_budget_read_failure_marks_budget_unread(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_ok", "account_id": "1", "name": "OK", "account_status": 1, "currency": "USD"},
+        {"id": "act_bud", "account_id": "2", "name": "BudFail", "account_status": 1, "currency": "USD"},
+    ]
+
+    def _campaigns(ad_account_id, *, fields, effective_status=None):
+        if ad_account_id == "act_bud":
+            raise MetaApiError("(#100) campaigns denied for act_bud")
+        return [_pc_camp("c1", daily="10000")]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=lambda ad_account_id, **k: [{"spend": "1000.00"}],
+        list_campaigns=_campaigns,
+        list_adsets=lambda ad_account_id, *, fields, effective_status=None: [],
+        get_account=lambda ad_account_id, *, fields: {"currency": "USD"},
+    )
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
+
+    by_id = {a["ad_account_id"]: a for a in out["accounts"]}
+    assert set(by_id) == {"act_ok", "act_bud"}  # both read OK in step 1 -> both present
+    assert by_id["act_bud"]["status"] == "budget_unread"
+    assert by_id["act_bud"]["variance_pct"] is None
+    assert by_id["act_bud"]["period_budget"] is None
+    # A distinct, stage-tagged errors entry — exactly once (never double-reported).
+    budget_errs = [e for e in out["errors"] if e.get("stage") == "budget"]
+    assert budget_errs == [
+        {"stage": "budget", "ad_account_id": "act_bud", "error": "(#100) campaigns denied for act_bud"}
+    ]
+    assert sum(1 for e in out["errors"] if e.get("ad_account_id") == "act_bud") == 1
+    # Excluded from the over/under math + shortlists.
+    assert out["rollup"]["status_counts"]["budget_unread"] == 1
+    assert all(s["ad_account_id"] != "act_bud" for s in out["rollup"]["worst_over_pacers"])
+
+
+def test_pacing_report_insights_failure_skips_budget_read(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_ok", "account_id": "1", "name": "OK", "account_status": 1, "currency": "USD"},
+        {"id": "act_bad", "account_id": "2", "name": "Bad", "account_status": 1, "currency": "USD"},
+    ]
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        if ad_account_id == "act_bad":
+            raise MetaApiError("(#200) denied for act_bad")
+        return [{"spend": "1400.00"}]
+
+    budget_calls: list[str] = []
+
+    def _campaigns(ad_account_id, *, fields, effective_status=None):
+        budget_calls.append(ad_account_id)
+        return [_pc_camp("c1", daily="10000")]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch,
+        list_campaigns=_campaigns,
+        list_adsets=lambda ad_account_id, *, fields, effective_status=None: [],
+        get_account=lambda ad_account_id, *, fields: {"currency": "USD"},
+    )
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
+
+    assert [a["ad_account_id"] for a in out["accounts"]] == ["act_ok"]  # act_bad absent
+    # Single step-1 error, verbatim (no stage tag), and NO budget read attempted for the failed account.
+    assert {"ad_account_id": "act_bad", "error": "(#200) denied for act_bad"} in out["errors"]
+    assert budget_calls == ["act_ok"]
+
+
+def test_pacing_report_deterministic_under_reordering(monkeypatch) -> None:
+    import time
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 5)
+    ]
+    insights = {f"act_{i}": [{"spend": f"{i * 500}.00"}] for i in range(1, 5)}
+    campaigns = {f"act_{i}": [_pc_camp(f"c{i}", daily="10000")] for i in range(1, 5)}
+
+    def _make(reverse: bool) -> "FakeMetaReader":
+        def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+            idx = int(ad_account_id.split("_")[1])
+            time.sleep(((5 - idx) if reverse else idx) * 0.004)  # opposite finish orders
+            return [dict(r) for r in insights[ad_account_id]]
+
+        return FakeMetaReader(
+            list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+            fetch_insights=_fetch,
+            list_campaigns=lambda ad_account_id, *, fields, effective_status=None: [
+                dict(c) for c in campaigns[ad_account_id]
+            ],
+            list_adsets=lambda ad_account_id, *, fields, effective_status=None: [],
+            get_account=lambda ad_account_id, *, fields: {"currency": "USD"},
+        )
+
+    out1 = _account_discovery.pacing_report(_make(reverse=True), fx_table=_fx(), **_PACING_KW)
+    out2 = _account_discovery.pacing_report(_make(reverse=False), fx_table=_fx(), **_PACING_KW)
+    assert [a["ad_account_id"] for a in out1["accounts"]] == ["act_1", "act_2", "act_3", "act_4"]
+    assert json.dumps(out1, sort_keys=True) == json.dumps(out2, sort_keys=True)
+
+
+def test_pacing_report_not_started_note_and_no_projection(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    reads: list[tuple[str, str]] = []
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        reads.append((date_from, date_to))  # the read window must never invert
+        return [{"spend": "10.00"}]
+
+    reader = _pacing_reader(
+        accounts, {}, {"act_1": [_pc_camp("c1", daily="10000")]}, {}, {"act_1": {}},
+        fetch_insights=_fetch,
+    )
+    out = _account_discovery.pacing_report(
+        reader, date_from="2026-08-01", date_to="2026-08-31", as_of="2026-07-15", fx_table=_fx()
+    )
+    assert out["accounts"][0]["status"] == "not_started"
+    assert out["accounts"][0]["projected_spend"] is None
+    assert "has not started" in out["note"]
+    # The spend read window was NOT inverted (read_to clamped up to date_from, not date_from-1).
+    assert reads and all(df <= dt for df, dt in reads)
+
+
+def test_pacing_report_invalid_currency_raises(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    reader = FakeMetaReader(list_ad_accounts=lambda *, fields: [])
+    with pytest.raises(ValueError, match="ZZZ"):
+        _account_discovery.pacing_report(
+            reader, date_from="2026-07-01", date_to="2026-07-31", as_of="2026-07-14",
+            reporting_currency="ZZZ", fx_table=_fx(),
+        )
+
+
+def test_pacing_report_from_after_to_raises_before_any_read() -> None:
+    import pytest
+
+    reader = FakeMetaReader()  # nothing stubbed: a read would raise NotImplementedError first
+    with pytest.raises(ValueError):
+        _account_discovery.pacing_report(
+            reader, date_from="2026-07-31", date_to="2026-07-01", as_of="2026-07-14", fx_table=_fx()
+        )
+    assert reader.calls == []  # failed fast, before touching the reader
+
+
+def test_build_discovery_tools_pacing_report_mock_smoke(monkeypatch) -> None:
+    # The MCP wrapper exposes pacing_report with as_of but NOT fx_table (test-only seam); it loads the
+    # committed FX table itself and returns a well-formed report over a single seeded USD account.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [
+            {"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}
+        ],
+        fetch_insights=lambda ad_account_id, **k: [{"spend": "4200.00"}],
+        list_campaigns=lambda ad_account_id, *, fields, effective_status=None: [_pc_camp("c1", daily="30000")],
+        list_adsets=lambda ad_account_id, *, fields, effective_status=None: [],
+        get_account=lambda ad_account_id, *, fields: {"currency": "USD"},
+    )
+    tools = _mcp_server.build_discovery_tools(reader)
+    out = tools["pacing_report"]("2026-07-01", "2026-07-31", None, "2026-07-14")
+    assert out["accounts"][0]["status"] == "on_track"
+    assert out["rollup"]["status_counts"]["on_track"] == 1
 
 
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:

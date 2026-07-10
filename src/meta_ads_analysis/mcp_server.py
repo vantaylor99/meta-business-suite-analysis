@@ -462,6 +462,22 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "a clean count. Money floors compare in one reporting_currency (default USD). NOTE: budget "
         "pacing (spend-to-date vs. configured budget) is a SEPARATE tool (pacing_report), not this one."
     ),
+    "pacing_report": (
+        "Tell whether each ad account is on track to spend its configured budget for a reporting "
+        "period — which are OVER-pacing, which are UNDER-pacing, which are on track, and the projected "
+        "end-of-period spend — across every account the token can reach (or an explicit list). "
+        "date_from/date_to are the FULL period (e.g. a month); as_of is the day spend is measured "
+        "through (defaults to today). The period budget is the sum of ACTIVE daily budgets "
+        "(CBO-deduplicated so a campaign-budget-optimization campaign is never double-counted with its "
+        "ad sets) x the period length; the account spend cap is reported as context but is a lifetime "
+        "ceiling, never the pacing denominator. Lifetime budgets are reported but not projected "
+        "(budget_not_projectable); uncapped accounts read no_budget_set; paused/closed accounts read "
+        "account_inactive — none of these are counted as under-pacing. Money is normalized into one "
+        "reporting_currency (default USD); a rollup gives status counts and worst over/under shortlists. "
+        "Costs ~1+4N reads for N accounts (spend read + a per-account budget-config read); a failed "
+        "budget read reads budget_unread, never a silent 'uncapped'. Cents->major-units conversion is "
+        "accurate for 2-decimal currencies; zero-decimal currencies (JPY/KRW) are a known limitation."
+    ),
 }
 
 
@@ -543,12 +559,32 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             reporting_currency=reporting_currency,
         )
 
+    def pacing_report(
+        date_from: str,
+        date_to: str,
+        account_ids: list[str] | None = None,
+        as_of: str | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself. ``as_of`` IS exposed (defaults to
+        # today) so an operator can pace a period as-of a past date.
+        return account_discovery.pacing_report(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            account_ids=account_ids,
+            as_of=as_of,
+            reporting_currency=reporting_currency,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
         "cross_account_performance": cross_account_performance,
         "account_benchmark": account_benchmark,
         "flag_accounts_needing_attention": flag_accounts_needing_attention,
+        "pacing_report": pacing_report,
     }
 
 

@@ -24,7 +24,7 @@ import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from . import account_registry
@@ -36,6 +36,8 @@ from .config import (
     ATTENTION_MIN_SPEND,
     ATTENTION_SPEND_COLLAPSE_PCT,
     ATTENTION_SPEND_SPIKE_PCT,
+    PACING_ON_TRACK_TOLERANCE_PCT,
+    PACING_SHORTLIST_LIMIT,
 )
 from .currency import FxTable, load_fx_table
 from .meta_api import MetaApiError
@@ -1579,3 +1581,523 @@ def flag_accounts_needing_attention(
     if current.get("note"):
         result["note"] = current["note"]
     return result
+
+
+# --------------------------------------------------------------------------- #
+# PACING REPORT: is each account on track to spend its budget for the period?
+#
+# Unlike account_benchmark / flag_accounts_needing_attention (pure post-processors that add NO new
+# Meta read shape), pacing genuinely needs a SECOND data surface — the account's *budget config*
+# (campaign/adset daily & lifetime budgets + the account spend cap). Spend-to-date comes from the
+# existing insights read; budget config is a new per-account campaign+adset+account read. So this is a
+# TWO-SOURCE JOIN, not a post-processor:
+#
+#   1. Spend-to-date + FX + scope: one cross_account_performance over [date_from, effective_as_of] —
+#      inherits scope resolution, one insights row per account, native + normalized spend, currency,
+#      account_status_label, the shared fx_table, and per-account error isolation, all for free.
+#   2. Budget config: a SECOND fan_out_accounts over the accounts that read OK in step 1, each reading
+#      list_campaigns + list_adsets (budget fields only) + get_account (spend_cap/amount_spent) and
+#      computing the CBO-deduplicated ACTIVE daily-budget sum for that account.
+#   3. Join + project + classify by ad_account_id -> a scope view + worst-pacer shortlists.
+#
+# READ COST (documented, accepted — same posture as the attention tool's 2x note): step 2 issues 3
+# extra reads per readable account on top of cross_account_performance's 1 + N, so a scope of N
+# accounts costs ~1 + 4N reads. A single combined per-account read is a future optimization, out of
+# scope here.
+# --------------------------------------------------------------------------- #
+
+# Budget-only field lists for the step-2 config read. Deliberately NOT the heavier control.*_FIELDS
+# (which carry targeting/objective) — pacing needs only the budget shape + status + parentage.
+PACING_CAMPAIGN_FIELDS: list[str] = ["id", "effective_status", "daily_budget", "lifetime_budget"]
+PACING_ADSET_FIELDS: list[str] = [
+    "id",
+    "campaign_id",
+    "effective_status",
+    "daily_budget",
+    "lifetime_budget",
+]
+# Cap fields fetched per account in the budget worker. The perf["accounts"] rows carry only
+# account_id/name/currency/account_status[_label] (see the row built above), so the spend cap +
+# lifetime spend must be fetched here rather than bloating DEFAULT_AD_ACCOUNT_FIELDS.
+PACING_ACCOUNT_FIELDS: list[str] = ["currency", "spend_cap", "amount_spent"]
+
+# Canonical status enum, ordered — the rollup's status_counts is initialised from this so every count
+# is present (0 when unused) and the output is deterministic. The first five are classify_pacing's
+# documented enum; ``budget_unread`` is the orchestration-only status for a step-2 read failure (kept
+# distinct from a genuinely uncapped account so a failed read is never reported as "no budget set").
+_PACING_STATUSES: tuple[str, ...] = (
+    "over",
+    "under",
+    "on_track",
+    "no_budget_set",
+    "budget_not_projectable",
+    "account_inactive",
+    "not_started",
+    "budget_unread",
+)
+_PACING_PROJECTABLE: frozenset[str] = frozenset({"over", "under", "on_track"})
+
+
+def pacing_period(date_from: str, date_to: str, as_of: str) -> dict[str, Any]:
+    """The clock-free pacing arithmetic for one period measured *through* ``as_of``.
+
+    ``date_from..date_to`` is the FULL reporting period (inclusive, ``YYYY-MM-DD``); ``as_of`` is the
+    day spend is measured through. This separates "the period we pace against" from "how far into it
+    we are," so the only clock touch in the whole tool is :func:`pacing_report`'s ``as_of=None`` ->
+    today default (this helper always takes an explicit ``as_of`` and is fully unit-testable).
+
+    - ``effective_as_of`` = ``as_of`` clamped to ``[date_from - 1 day, date_to]``.
+    - ``total_days`` = ``(date_to - date_from).days + 1``.
+    - ``elapsed_days`` = ``(effective_as_of - date_from).days + 1`` clamped to ``[0, total_days]``.
+    - ``elapsed_fraction`` = ``elapsed_days / total_days``.
+
+    So ``as_of`` before the period -> ``elapsed_fraction == 0`` (not started, no divide-by-zero);
+    ``as_of`` at/after ``date_to`` -> ``elapsed_fraction == 1`` (completed, projection == actual).
+    Raises :class:`ValueError` on unparseable dates (via :meth:`date.fromisoformat`) or
+    ``date_from > date_to``.
+    """
+    start = date.fromisoformat(date_from)
+    end = date.fromisoformat(date_to)
+    if start > end:
+        raise ValueError(
+            f"date_from ({date_from}) is after date_to ({date_to}); the reporting period is empty."
+        )
+    as_of_date = date.fromisoformat(as_of)
+
+    floor = start - timedelta(days=1)
+    if as_of_date < floor:
+        effective = floor
+    elif as_of_date > end:
+        effective = end
+    else:
+        effective = as_of_date
+
+    total_days = (end - start).days + 1
+    elapsed_days = max(0, min((effective - start).days + 1, total_days))
+    return {
+        "total_days": total_days,
+        "elapsed_days": elapsed_days,
+        "elapsed_fraction": elapsed_days / total_days,
+        "effective_as_of": effective.isoformat(),
+    }
+
+
+def project_spend(spend_to_date: float, elapsed_fraction: float) -> float | None:
+    """Linear end-of-period projection: ``spend_to_date / elapsed_fraction``.
+
+    Returns ``None`` when ``elapsed_fraction <= 0`` (the not-started guard against divide-by-zero) so
+    the caller classifies the account ``not_started`` rather than projecting. A completed period
+    (``elapsed_fraction == 1``) projects to exactly ``spend_to_date`` (actuals).
+    """
+    if elapsed_fraction <= 0:
+        return None
+    return spend_to_date / elapsed_fraction
+
+
+def _minor_to_major(value: Any) -> float | None:
+    """Meta budget/cap minor units (cents) -> major currency units; ``None`` for missing/blank.
+
+    Correct for 2-decimal currencies (USD/EUR/GBP/… — the vast majority). **Zero-decimal (JPY, KRW)
+    and 3-decimal currencies are a KNOWN 100x inaccuracy** here — a currency-aware minor-unit divisor
+    is a backlog follow-up; do NOT silently guess the exponent per currency.
+    """
+    num = _number(value)
+    if num is None:
+        return None
+    return num / 100.0
+
+
+def summarize_account_budget(
+    campaigns: list[dict[str, Any]], adsets: list[dict[str, Any]]
+) -> dict[str, float]:
+    """CBO-deduplicated ACTIVE budget for an account: ``{active_daily, lifetime_total}`` (major units).
+
+    Native minor units in (Meta ``daily_budget`` / ``lifetime_budget`` are cents), native MAJOR units
+    out. Only ``effective_status == "ACTIVE"`` entities count — a paused campaign/adset does not
+    deliver. Per **ACTIVE** campaign, the precedence (this is the double-counting guard):
+
+    - campaign ``daily_budget > 0`` -> **CBO daily**: add the campaign daily to ``active_daily`` and
+      **ignore its adsets** (their budgets are null under CBO; guarded anyway — naive summing would
+      double-count here).
+    - elif campaign ``lifetime_budget > 0`` -> **CBO lifetime**: add to ``lifetime_total``; ignore adsets.
+    - else (**non-CBO** campaign) -> for each **ACTIVE** adset under it: adset ``daily_budget > 0`` ->
+      ``active_daily``; elif adset ``lifetime_budget > 0`` -> ``lifetime_total``.
+
+    Adsets whose parent campaign is not ACTIVE are ignored (the parent gates delivery). This mirrors
+    :func:`control.classify_adset_budget`'s adset-daily-first-else-campaign shape rather than a
+    contradictory rule. Lifetime budgets are summed for *reporting* only — they are NOT projected
+    against an arbitrary reporting period (a lifetime budget spans the entity's own schedule; prorating
+    it needs campaign start/stop times not read here — a backlog follow-up).
+    """
+    active_daily = 0.0
+    lifetime_total = 0.0
+
+    # Group ACTIVE adsets by parent campaign id for O(1) lookup inside the non-CBO branch.
+    active_adsets_by_campaign: dict[str, list[dict[str, Any]]] = {}
+    for adset in adsets:
+        if str(adset.get("effective_status") or "").upper() != "ACTIVE":
+            continue
+        campaign_id = str(adset.get("campaign_id") or "")
+        active_adsets_by_campaign.setdefault(campaign_id, []).append(adset)
+
+    for campaign in campaigns:
+        if str(campaign.get("effective_status") or "").upper() != "ACTIVE":
+            continue  # paused campaign -> no delivery; its adsets are gated off too.
+        campaign_id = str(campaign.get("id") or "")
+        camp_daily = _minor_to_major(campaign.get("daily_budget")) or 0.0
+        camp_lifetime = _minor_to_major(campaign.get("lifetime_budget")) or 0.0
+
+        if camp_daily > 0:
+            active_daily += camp_daily  # CBO daily — ignore adsets (double-count guard).
+            continue
+        if camp_lifetime > 0:
+            lifetime_total += camp_lifetime  # CBO lifetime — ignore adsets.
+            continue
+        # Non-CBO campaign: budget lives on each ACTIVE adset (adset daily first, else adset lifetime).
+        for adset in active_adsets_by_campaign.get(campaign_id, []):
+            adset_daily = _minor_to_major(adset.get("daily_budget")) or 0.0
+            adset_lifetime = _minor_to_major(adset.get("lifetime_budget")) or 0.0
+            if adset_daily > 0:
+                active_daily += adset_daily
+            elif adset_lifetime > 0:
+                lifetime_total += adset_lifetime
+
+    return {"active_daily": active_daily, "lifetime_total": lifetime_total}
+
+
+def classify_pacing(
+    *,
+    elapsed_fraction: float,
+    account_status_label: str | None,
+    active_daily_budget: float,
+    lifetime_budget_total: float,
+    spend_cap: float | None,
+    period_budget: float,
+    projected_spend: float | None,
+    tolerance: float = PACING_ON_TRACK_TOLERANCE_PCT,
+) -> dict[str, Any]:
+    """Pure status + variance for one account, checked in the documented order.
+
+    1. ``not_started`` — global ``elapsed_fraction <= 0`` (as_of before the period). No projection.
+    2. ``account_inactive`` — ``account_status_label != "ACTIVE"`` (a paused account is not
+       "under-pacing"). Excluded from the over/under math; spend-to-date is still reported.
+    3. ``no_budget_set`` — no active daily budget, no lifetime budget, no spend cap (uncapped / free
+       delivery). Excluded from over/under; reported explicitly (never counted as under-pacing).
+    4. ``budget_not_projectable`` — has a lifetime budget and/or spend cap but ZERO active daily budget
+       (can't project against the period). Excluded from over/under.
+    5. ``over`` / ``under`` / ``on_track`` — ``variance_pct = (projected_spend - period_budget) /
+       period_budget``; ``over`` if ``> +tolerance``, ``under`` if ``< -tolerance``, else ``on_track``.
+
+    ``variance_pct`` is a ratio of two same-currency figures -> **FX-invariant** (compute once from
+    native; the normalized twins give the same value). Returned as ``None`` for statuses 1-4.
+    """
+    if elapsed_fraction <= 0:
+        return {"status": "not_started", "variance_pct": None}
+    if account_status_label != "ACTIVE":
+        return {"status": "account_inactive", "variance_pct": None}
+
+    has_cap = spend_cap is not None and spend_cap > 0
+    if active_daily_budget <= 0 and lifetime_budget_total <= 0 and not has_cap:
+        return {"status": "no_budget_set", "variance_pct": None}
+    if active_daily_budget <= 0 or period_budget <= 0 or projected_spend is None:
+        # A lifetime/cap-only account (or a defensively-zero period budget) can't be projected.
+        return {"status": "budget_not_projectable", "variance_pct": None}
+
+    variance_pct = (projected_spend - period_budget) / period_budget
+    if variance_pct > tolerance:
+        status = "over"
+    elif variance_pct < -tolerance:
+        status = "under"
+    else:
+        status = "on_track"
+    return {"status": status, "variance_pct": variance_pct}
+
+
+def _pacing_shortlist_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """The compact per-account row carried in the rollup's worst-pacer shortlists."""
+    return {
+        "ad_account_id": entry["ad_account_id"],
+        "name": entry["name"],
+        "variance_pct": entry["variance_pct"],
+        "projected_spend_normalized": entry["projected_spend_normalized"],
+        "period_budget_normalized": entry["period_budget_normalized"],
+    }
+
+
+def pacing_report(
+    reader: "MetaReaderProvider",
+    *,
+    date_from: str,
+    date_to: str,
+    account_ids: list[str] | None = None,
+    as_of: str | None = None,
+    reporting_currency: str = "USD",
+    fx_table: FxTable | None = None,
+) -> dict[str, Any]:
+    """Is each account on track to spend its configured budget for the reporting period?
+
+    A **two-source join** (NOT a pure post-processor — budget config is not in the insights row):
+
+    1. **Spend-to-date** — one :func:`cross_account_performance` over ``[date_from, effective_as_of]``
+       resolves scope, reads one insights row per account, and yields native + normalized ``spend``,
+       ``currency``, ``account_status_label``, the shared ``fx_table``, and per-account error
+       isolation — all inherited.
+    2. **Budget config** — a second :func:`fan_out_accounts` over the accounts that read OK in step 1,
+       each reading ``list_campaigns`` + ``list_adsets`` (budget fields only) + ``get_account``
+       (``spend_cap`` / ``amount_spent``) and computing the CBO-deduplicated ACTIVE daily-budget sum
+       via :func:`summarize_account_budget`.
+    3. **Join + project + classify** by ``ad_account_id``.
+
+    **Dates (the three-date problem).** ``date_from..date_to`` is the full period (e.g. a month);
+    ``as_of`` is the day spend is measured through (``None`` -> today, UTC — the only clock touch;
+    tests always pass an explicit ``as_of``). :func:`pacing_period` clamps and derives
+    ``elapsed_fraction``; :func:`project_spend` extrapolates ``spend_to_date / elapsed_fraction``.
+
+    **Authoritative period budget = ACTIVE daily-budget sum (CBO-deduped) x total_days.** The account
+    spend cap is a *lifetime* ceiling, so it is reported as context, **never the denominator**.
+    **Lifetime budgets are reported but NOT projected** (they span the entity's own schedule, not this
+    period) — a lifetime-only account is ``budget_not_projectable`` (prorating lifetime budgets via
+    campaign start/stop times is a backlog follow-up).
+
+    **Units.** Budget/cap/amount_spent are minor units (cents); insights ``spend`` is major units.
+    :func:`_minor_to_major` divides by 100 — correct for 2-decimal currencies; **zero-/3-decimal
+    currencies (JPY/KRW/…) are a known 100x inaccuracy** (backlog follow-up). Currency discipline: a
+    budget is only ever compared to spend in the SAME (native) currency per account; only the rollup
+    uses normalized figures.
+
+    **Read cost** ~``1 + 4N`` for an N-account scope (``cross_account_performance``'s ``1 + N`` plus 3
+    per readable account) — documented, accepted; a single combined per-account read is a future
+    optimization. Budget pacing lives HERE — :func:`flag_accounts_needing_attention` deliberately does
+    not read budget config (see its ``NOTE``).
+
+    **Errors.** Step-1 insight failures and no-FX accounts flow through
+    :func:`cross_account_performance`'s ``errors`` verbatim (an account that failed step 1 gets no
+    step-2 read). Step-2 budget failures are isolated per account into an ``errors`` entry tagged
+    ``{"stage": "budget", …}`` and the account is reported ``status: "budget_unread"`` (distinct from a
+    genuinely uncapped ``no_budget_set``). An invalid ``reporting_currency`` (absent from the FX table)
+    is a whole-call ``ValueError`` inherited from the prereq; ``date_from > date_to`` raises before any
+    read. ``fx_table`` is a test-only seam (not exposed to the LLM).
+    """
+    # Fail fast on an empty period and resolve the pacing arithmetic BEFORE any read. ``as_of=None``
+    # -> today (UTC) is the single clock touch in this tool.
+    effective_as_of_input = as_of or datetime.now(tz=timezone.utc).date().isoformat()
+    period = pacing_period(date_from, date_to, effective_as_of_input)
+    total_days = period["total_days"]
+    elapsed_fraction = period["elapsed_fraction"]
+    effective_as_of = period["effective_as_of"]
+
+    reporting = str(reporting_currency or "").strip().upper()
+    table = fx_table if fx_table is not None else load_fx_table()
+
+    # Spend-to-date read window: never invert. When the period has not started (effective_as_of is the
+    # day before date_from), read a single [date_from, date_from] window — the projection is suppressed
+    # to None anyway, so the reported spend is immaterial. cross_account_performance validates the FX
+    # table / reporting_currency (raising ValueError on an unknown currency — the inherited contract).
+    read_to = date_from if elapsed_fraction <= 0 else effective_as_of
+    perf = cross_account_performance(
+        reader,
+        date_from=date_from,
+        date_to=read_to,
+        account_ids=account_ids,
+        reporting_currency=reporting,
+        fx_table=table,
+    )
+
+    # Step 2: budget fan-out over the accounts that read OK in step 1 (in scope order). One worker per
+    # account issues all three reads so the fan-out stays 3 reads/account and their failures isolate
+    # together; an account that failed step 1 is absent here (never double-reported).
+    perf_account_ids = [row["ad_account_id"] for row in perf["accounts"]]
+
+    def read_budget(
+        ad_account_id: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        campaigns = reader.list_campaigns(ad_account_id, fields=PACING_CAMPAIGN_FIELDS)
+        adsets = reader.list_adsets(ad_account_id, fields=PACING_ADSET_FIELDS)
+        account = reader.get_account(ad_account_id, fields=PACING_ACCOUNT_FIELDS)
+        return campaigns, adsets, account
+
+    budget_results = fan_out_accounts(read_budget, perf_account_ids)
+    budget_by_id: dict[str, tuple[Any, Any, Any]] = {}
+    errors: list[dict[str, Any]] = list(perf["errors"])  # step-1 errors verbatim (no-FX + read fails)
+    for ad_account_id, payload, error in budget_results:
+        if error is not None:
+            errors.append({"stage": "budget", "ad_account_id": ad_account_id, "error": error})
+            continue
+        budget_by_id[ad_account_id] = payload
+
+    accounts: list[dict[str, Any]] = []
+    # Main-thread assembly over the scope-ordered perf rows -> deterministic output.
+    for row in perf["accounts"]:
+        ad_account_id = row["ad_account_id"]
+        currency = row.get("currency") or "UNKNOWN"
+        status_label = row.get("account_status_label")
+        spend_native = row.get("spend")
+        spend_to_date = spend_native if spend_native is not None else 0.0
+        spend_to_date_norm = row.get("spend_normalized")  # None when the currency had no FX rate.
+
+        base_entry: dict[str, Any] = {
+            "ad_account_id": ad_account_id,
+            "account_id": row.get("account_id"),
+            "name": row.get("name"),
+            "currency": currency,
+            "account_status_label": status_label,
+            "spend_to_date": spend_to_date,
+            "spend_to_date_normalized": spend_to_date_norm,
+        }
+
+        payload = budget_by_id.get(ad_account_id)
+        if payload is None:
+            # Step-2 read failed -> distinct from a genuinely uncapped account. Budget-derived fields
+            # are unknown (None); the account is excluded from the over/under math.
+            accounts.append(
+                {
+                    **base_entry,
+                    "period_budget": None,
+                    "period_budget_normalized": None,
+                    "elapsed_fraction": elapsed_fraction,
+                    "projected_spend": None,
+                    "projected_spend_normalized": None,
+                    "status": "budget_unread",
+                    "variance_pct": None,
+                    "active_daily_budget": None,
+                    "lifetime_budget_total": None,
+                    "spend_cap": None,
+                    "amount_spent": None,
+                }
+            )
+            continue
+
+        campaigns, adsets, account = payload
+        budget = summarize_account_budget(campaigns, adsets)
+        active_daily = budget["active_daily"]
+        lifetime_total = budget["lifetime_total"]
+        spend_cap = _minor_to_major(account.get("spend_cap"))
+        if spend_cap is not None and spend_cap <= 0:
+            spend_cap = None  # 0 / absent -> uncapped.
+        amount_spent = _minor_to_major(account.get("amount_spent"))
+
+        period_budget = active_daily * total_days
+        projected = project_spend(spend_to_date, elapsed_fraction)
+
+        verdict = classify_pacing(
+            elapsed_fraction=elapsed_fraction,
+            account_status_label=status_label,
+            active_daily_budget=active_daily,
+            lifetime_budget_total=lifetime_total,
+            spend_cap=spend_cap,
+            period_budget=period_budget,
+            projected_spend=projected,
+        )
+
+        # Normalized twins: convert native period budget + projection into the reporting currency; a
+        # no-FX account keeps native figures only (None twins, already surfaced in step-1 errors).
+        if table.has(currency):
+            period_budget_norm = table.convert(
+                period_budget, from_currency=currency, to_currency=reporting
+            )
+            projected_norm = (
+                table.convert(projected, from_currency=currency, to_currency=reporting)
+                if projected is not None
+                else None
+            )
+        else:
+            period_budget_norm = None
+            projected_norm = None
+
+        accounts.append(
+            {
+                **base_entry,
+                "period_budget": period_budget,
+                "period_budget_normalized": period_budget_norm,
+                "elapsed_fraction": elapsed_fraction,
+                "projected_spend": projected,
+                "projected_spend_normalized": projected_norm,
+                "status": verdict["status"],
+                "variance_pct": verdict["variance_pct"],
+                "active_daily_budget": active_daily,
+                "lifetime_budget_total": lifetime_total,
+                "spend_cap": spend_cap,
+                "amount_spent": amount_spent,
+            }
+        )
+
+    rollup = _build_pacing_rollup(accounts, reporting)
+
+    result: dict[str, Any] = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "as_of": effective_as_of,
+        "reporting_currency": perf["reporting_currency"],
+        "fx_as_of": perf["fx_as_of"],
+        "fx_note": perf["fx_note"],
+        "total_days": total_days,
+        "account_count": perf["account_count"],
+        "accounts": accounts,
+        "rollup": rollup,
+        "errors": errors,
+    }
+
+    notes: list[str] = []
+    if perf.get("note"):
+        notes.append(perf["note"])
+    if elapsed_fraction <= 0:
+        notes.append(
+            f"reporting period ({date_from}..{date_to}) has not started as of {effective_as_of}; "
+            "every account is not_started and no projection is computed."
+        )
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
+
+
+def _build_pacing_rollup(accounts: list[dict[str, Any]], reporting: str) -> dict[str, Any]:
+    """Roll per-account pacing entries up to a scope view + worst-pacer shortlists (deterministic).
+
+    - ``total_period_budget_normalized`` / ``total_projected_normalized`` sum ONLY projectable
+      (``over``/``under``/``on_track``) accounts that also had an FX rate (normalized twins present);
+      ``overall_variance_pct`` is derived from those totals (``None`` when nothing qualified).
+    - ``status_counts`` counts EVERY account by status (all enum keys present, 0 when unused).
+    - ``worst_over_pacers`` / ``worst_under_pacers`` = projectable accounts sorted by ``variance_pct``
+      desc / asc (native variance is FX-invariant, so no-FX accounts are eligible), tiebroken by
+      ``ad_account_id`` asc, capped at ``PACING_SHORTLIST_LIMIT``.
+    - ``excluded_from_rollup`` = accounts not contributing to the normalized totals.
+    """
+    status_counts: dict[str, int] = {status: 0 for status in _PACING_STATUSES}
+    for entry in accounts:
+        status = entry["status"]
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    projectable = [e for e in accounts if e["status"] in _PACING_PROJECTABLE]
+    fx_projectable = [
+        e
+        for e in projectable
+        if e["period_budget_normalized"] is not None
+        and e["projected_spend_normalized"] is not None
+    ]
+    total_budget = sum(e["period_budget_normalized"] for e in fx_projectable)
+    total_projected = sum(e["projected_spend_normalized"] for e in fx_projectable)
+    overall_variance = (
+        (total_projected - total_budget) / total_budget if total_budget > 0 else None
+    )
+
+    over_sorted = sorted(
+        projectable, key=lambda e: (-e["variance_pct"], e["ad_account_id"] or "")
+    )
+    under_sorted = sorted(
+        projectable, key=lambda e: (e["variance_pct"], e["ad_account_id"] or "")
+    )
+
+    return {
+        "reporting_currency": reporting,
+        "total_period_budget_normalized": total_budget,
+        "total_projected_normalized": total_projected,
+        "overall_variance_pct": overall_variance,
+        "status_counts": status_counts,
+        "worst_over_pacers": [
+            _pacing_shortlist_entry(e) for e in over_sorted[:PACING_SHORTLIST_LIMIT]
+        ],
+        "worst_under_pacers": [
+            _pacing_shortlist_entry(e) for e in under_sorted[:PACING_SHORTLIST_LIMIT]
+        ],
+        "excluded_from_rollup": len(accounts) - len(fx_projectable),
+    }

@@ -257,9 +257,9 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the five discovery tools (`list_ad_accounts`,
-`cross_account_spend_summary`, `cross_account_performance`, `account_benchmark`, and
-`flag_accounts_needing_attention` — none takes an
+plus any of the 14 read tools, the six discovery tools (`list_ad_accounts`,
+`cross_account_spend_summary`, `cross_account_performance`, `account_benchmark`,
+`flag_accounts_needing_attention`, and `pacing_report` — none takes an
 `account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
@@ -327,6 +327,31 @@ two fan-outs it issues **~2× the per-account reads** of a single `cross_account
 here:** spend-to-date vs. the configured budget is a different question over a different surface, owned
 by the `pacing_report` tool; ad-level creative/disapproval detection (a heavier per-ad fan-out) is
 parked for a later ticket.
+
+`pacing_report` answers the manager's month-end question — "will each account land **over**, **under**,
+or **on** its budget?" — across every account the token can reach (or an explicit list). Unlike
+`account_benchmark` and `flag_accounts_needing_attention` (pure post-processors that add no new read
+shape), pacing is a **two-source join**, because the budget configuration is not in the insights row.
+Step 1 calls `cross_account_performance` once over `[date_from, effective_as_of]` for spend-to-date +
+FX + scope; step 2 fans out a **second** read over the accounts that read OK — each reading
+`list_campaigns` + `list_adsets` (budget fields only) + `get_account` (spend cap / lifetime spend) —
+and joins the two by account. `date_from`/`date_to` are the **full reporting period** (e.g. a month);
+`as_of` is the day spend is measured **through** (defaults to today, UTC) — the tool projects
+end-of-period spend as `spend_to_date ÷ elapsed_fraction`. The pacing denominator is the sum of each
+account's **ACTIVE daily budgets, CBO-deduplicated** (a campaign-budget-optimization campaign
+contributes its campaign budget and its ad-set budgets are ignored — the double-count guard) × the
+period length. The account **spend cap is a lifetime ceiling, reported as context but never the
+denominator**; **lifetime budgets are reported but not projected** against an arbitrary period, so a
+lifetime-only account is `budget_not_projectable`. Uncapped → `no_budget_set`, paused/closed →
+`account_inactive`, and a per-account budget read that fails → `budget_unread` (distinct from a
+genuinely uncapped account, so a read failure is never silently reported as "no budget"); none of
+these are counted as under-pacing. Money is normalized into one `reporting_currency` (default USD) for
+the rollup (status counts + worst over/under shortlists). Because step 2 issues **3 extra reads per
+readable account** on top of step 1's `1 + N`, the whole call costs **~1 + 4N** reads for an
+N-account scope — the same accepted posture as the attention tool's 2× note; a single combined
+per-account read is a future optimization. Cents→major-unit conversion divides by 100, exact for
+2-decimal currencies; **zero-decimal currencies (JPY, KRW) and 3-decimal currencies are a known 100×
+inaccuracy** flagged for a follow-up.
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the

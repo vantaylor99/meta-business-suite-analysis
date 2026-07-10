@@ -62,6 +62,19 @@ ATTENTION_CPR_DEGRADE_PCT = 0.3
 ATTENTION_CPC_DEGRADE_PCT = 0.3
 ATTENTION_CTR_DROP_PCT = 0.3
 
+# Pacing report (see account_discovery.pacing_report). The sixth discovery tool answers "given how
+# much each account has spent so far this period and its configured (active daily) budget, will it
+# land over / under / on target?". These two knobs mirror the ATTENTION_* pattern — no magic numbers
+# in the engine:
+#   - PACING_ON_TRACK_TOLERANCE_PCT: the +/- band (as a FRACTION of the period budget) inside which a
+#     projected spend counts as "on track". 5% — a projection within a twentieth of the budget is
+#     effectively on target, not worth flagging as over/under. A projected variance ABOVE +tolerance
+#     is "over", BELOW -tolerance is "under".
+#   - PACING_SHORTLIST_LIMIT: how many accounts the rollup's worst-over / worst-under shortlists carry
+#     (10) so a manager sees the handful that matter, not the whole fleet.
+PACING_ON_TRACK_TOLERANCE_PCT = 0.05
+PACING_SHORTLIST_LIMIT = 10
+
 # Knowledge-vault staleness (see knowledge_provenance.py / the `lint-vault` checker). A `fast`
 # learning whose **Verified:** date is older than this many days before `today` is flagged
 # "⏳ re-verify" (a warning, not a fatal error). Deliberately LONGER than
