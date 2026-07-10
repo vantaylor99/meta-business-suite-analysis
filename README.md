@@ -44,7 +44,10 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   accounts before any are added to the config file. The `cross_account_spend_summary` tool builds on it:
   a one-call cross-account spend view for a date range that subtotals **per currency** (never summing
   across different currencies, so there is no misleading grand total) and reports any account it could
-  not read instead of failing the whole call.
+  not read instead of failing the whole call. It fans out over the accounts **concurrently** (a
+  bounded thread pool) so an all-accounts call over a large fleet completes in tens of seconds rather
+  than timing out; `META_FANOUT_MAX_WORKERS` (default `8`, clamped to `1`–`32`) tunes the pool for very
+  large fleets.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

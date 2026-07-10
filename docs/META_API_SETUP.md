@@ -262,6 +262,13 @@ plus any of the 14 read tools, the two discovery tools (`list_ad_accounts` and
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
 
+`cross_account_spend_summary` fans out over the target accounts **concurrently** (a bounded thread
+pool over the synchronous reader), so an all-accounts call over a large fleet (hundreds of accounts)
+finishes in tens of seconds instead of timing out on a serial walk. The pool size is
+`META_FANOUT_MAX_WORKERS` (default `8`, clamped to `1`–`32`); raise it for a very large fleet, lower it
+to be gentler on rate limits. It never silently drops accounts — every resolved account is covered,
+and any it could not read is reported in `errors`.
+
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the
 process first** (`meta_mcp_server --mock` for mock mode, or with a real `META_ACCESS_TOKEN` for live), so

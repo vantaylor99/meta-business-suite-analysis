@@ -9699,6 +9699,207 @@ def test_cross_account_summary_insight_fields_restricts_metrics_summed() -> None
     assert insight_calls and all(c[2]["fields"] == ["spend"] for c in insight_calls)
 
 
+# --- resolve_scope + bounded fan-out engine (MOCKS ONLY: no live Meta call is ever made) ---
+
+
+def test_resolve_scope_discovery_returns_ids_metadata_and_flag() -> None:
+    # account_ids=None -> ids from list_ad_accounts in row order, keyed metadata, requested_all True.
+    reader = _summary_reader()
+    scope = _account_discovery.resolve_scope(reader)
+    assert scope.account_ids == ["act_1", "act_2", "act_3"]
+    assert scope.requested_all is True
+    assert set(scope.metadata_by_id) == {"act_1", "act_2", "act_3"}
+    # metadata rows are the *normalized* /me/adaccounts rows (they carry the status label).
+    assert scope.metadata_by_id["act_1"]["account_status_label"] == "ACTIVE"
+    assert scope.metadata_by_id["act_1"]["currency"] == "USD"
+    # Discovery consulted list_ad_accounts once and never get_account.
+    assert [c for c in reader.calls if c[0] == "list_ad_accounts"]
+    assert not any(c[0] == "get_account" for c in reader.calls)
+
+
+def test_resolve_scope_explicit_normalizes_and_dedups() -> None:
+    # ["1","act_1","2"] -> ["act_1","act_2"] (bare-vs-act_ collapse), no metadata, requested_all False.
+    reader = FakeMetaReader()  # explicit-scope resolution makes no reads at all
+    scope = _account_discovery.resolve_scope(reader, ["1", "act_1", "2"])
+    assert scope.account_ids == ["act_1", "act_2"]
+    assert scope.metadata_by_id == {}
+    assert scope.requested_all is False
+    assert reader.calls == []
+
+
+def test_fan_out_accounts_preserves_input_order() -> None:
+    # Later ids finish first (index 0 sleeps longest); results must still be in input order.
+    import time
+
+    n = 6
+
+    def read_one(ad_account_id):
+        idx = int(ad_account_id.split("_")[1])
+        time.sleep((n - idx) * 0.005)
+        return f"result-{ad_account_id}"
+
+    ids = [f"act_{i}" for i in range(n)]
+    results = _account_discovery.fan_out_accounts(read_one, ids)
+    assert [aid for aid, _, _ in results] == ids
+    assert [res for _, res, _ in results] == [f"result-act_{i}" for i in range(n)]
+    assert all(err is None for _, _, err in results)
+
+
+def test_fan_out_accounts_runs_concurrently_and_bounded() -> None:
+    # A barrier forces the first batch to overlap (proves > 1, i.e. not serial); a lock-guarded
+    # high-water mark proves the bound (<= max_workers). Barrier has a timeout so a regression to
+    # serial fails loudly instead of hanging.
+    import threading
+    import time
+
+    lock = threading.Lock()
+    current = 0
+    max_seen = 0
+    barrier = threading.Barrier(4, timeout=5)
+
+    def read_one(ad_account_id):
+        nonlocal current, max_seen
+        with lock:
+            current += 1
+            max_seen = max(max_seen, current)
+        try:
+            barrier.wait()  # first 4 workers meet here simultaneously
+        except threading.BrokenBarrierError:
+            pass
+        time.sleep(0.01)
+        with lock:
+            current -= 1
+        return ad_account_id
+
+    ids = [f"act_{i}" for i in range(8)]
+    results = _account_discovery.fan_out_accounts(read_one, ids, max_workers=4)
+    assert [aid for aid, _, _ in results] == ids
+    assert max_seen > 1  # genuinely concurrent, not serial
+    assert max_seen <= 4  # respects the max_workers bound
+
+
+def test_fan_out_accounts_empty_input_short_circuits() -> None:
+    # Empty scope -> [] and read_one is never invoked (no pool constructed).
+    calls: list[str] = []
+
+    def read_one(ad_account_id):
+        calls.append(ad_account_id)
+        return ad_account_id
+
+    assert _account_discovery.fan_out_accounts(read_one, []) == []
+    assert calls == []
+
+
+def test_fan_out_accounts_meta_error_recorded_not_raised() -> None:
+    # A per-account MetaApiError lands in the error slot; other accounts still return.
+    def read_one(ad_account_id):
+        if ad_account_id == "act_2":
+            raise MetaApiError("(#200) denied for act_2")
+        return f"ok-{ad_account_id}"
+
+    results = _account_discovery.fan_out_accounts(read_one, ["act_1", "act_2", "act_3"])
+    assert results == [
+        ("act_1", "ok-act_1", None),
+        ("act_2", None, "(#200) denied for act_2"),
+        ("act_3", "ok-act_3", None),
+    ]
+
+
+def test_fan_out_accounts_non_meta_error_propagates() -> None:
+    # A non-MetaApiError is a real bug and must NOT be swallowed into the error slot.
+    import pytest
+
+    def read_one(ad_account_id):
+        if ad_account_id == "act_2":
+            raise ValueError("boom")
+        return ad_account_id
+
+    with pytest.raises(ValueError, match="boom"):
+        _account_discovery.fan_out_accounts(read_one, ["act_1", "act_2", "act_3"])
+
+
+def test_fanout_max_workers_from_env_default_and_clamps(monkeypatch) -> None:
+    env = _account_discovery.FANOUT_MAX_WORKERS_ENV
+    monkeypatch.delenv(env, raising=False)
+    assert (
+        _account_discovery.fanout_max_workers_from_env()
+        == _account_discovery.DEFAULT_FANOUT_MAX_WORKERS
+        == 8
+    )
+    monkeypatch.setenv(env, "1")
+    assert _account_discovery.fanout_max_workers_from_env() == 1
+    monkeypatch.setenv(env, "32")
+    assert _account_discovery.fanout_max_workers_from_env() == 32
+    monkeypatch.setenv(env, "999")
+    assert _account_discovery.fanout_max_workers_from_env() == 32  # clamped to the cap
+    monkeypatch.setenv(env, "0")
+    assert _account_discovery.fanout_max_workers_from_env() == 1  # clamped to the floor
+    monkeypatch.setenv(env, "garbage")
+    assert _account_discovery.fanout_max_workers_from_env() == 8  # non-int -> default, never raises
+
+
+def test_cross_account_summary_deterministic_under_reordering() -> None:
+    # 5 accounts across 2 currencies with reordering delays: accounts stay in scope order and
+    # per-currency subtotals are byte-identical to the sequential expectation.
+    import time
+
+    accounts = [
+        {
+            "id": f"act_{i}",
+            "account_id": str(i),
+            "name": f"A{i}",
+            "account_status": 1,
+            "currency": "USD" if i % 2 else "EUR",
+        }
+        for i in range(1, 6)
+    ]
+    insights = {
+        f"act_{i}": [{"spend": f"{i}.00", "impressions": str(i * 10), "clicks": str(i)}]
+        for i in range(1, 6)
+    }
+
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        idx = int(ad_account_id.split("_")[1])
+        time.sleep((6 - idx) * 0.005)  # later ids finish first
+        return [dict(r) for r in insights[ad_account_id]]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch_insights,
+    )
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    assert [r["ad_account_id"] for r in summary["accounts"]] == [
+        "act_1", "act_2", "act_3", "act_4", "act_5",
+    ]
+    # USD = odd ids 1,3,5 ; EUR = even ids 2,4 — subtotaled per currency, never merged.
+    assert summary["totals_by_currency"]["USD"] == {
+        "spend": 9.0, "impressions": 90, "clicks": 9, "account_count": 3
+    }
+    assert summary["totals_by_currency"]["EUR"] == {
+        "spend": 6.0, "impressions": 60, "clicks": 6, "account_count": 2
+    }
+    assert summary["errors"] == []
+    assert summary["reachable_count"] == summary["account_count"] == 5
+
+
+def test_cross_account_summary_discovery_never_calls_get_account() -> None:
+    # Built-in regression guard: get_account is left UNSTUBBED, so if the discovery path ever
+    # touched it the worker would raise NotImplementedError and fail the whole call.
+    accounts = _summary_accounts()
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=lambda ad_account_id, **k: [dict(r) for r in _SUMMARY_INSIGHTS[ad_account_id]],
+    )
+    summary = _account_discovery.cross_account_spend_summary(
+        reader, date_from="2026-06-01", date_to="2026-06-30"
+    )
+    assert len(summary["accounts"]) == 3
+    assert summary["errors"] == []
+    assert not any(c[0] == "get_account" for c in reader.calls)
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from
