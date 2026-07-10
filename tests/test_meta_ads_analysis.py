@@ -10829,6 +10829,60 @@ def test_build_discovery_tools_account_benchmark_mock_smoke(monkeypatch) -> None
     assert out["benchmarks"]["roas"]["reason"] == "account missing roas"
 
 
+def test_account_benchmark_empty_cohort_ids_degenerates_to_target_only(monkeypatch) -> None:
+    # An explicit ``cohort_ids=[]`` still force-adds the target, so it degenerates to a target-only
+    # cohort: the target is read (via get_account, not discovery) and every metric it HAS reports
+    # "no peers" rather than crashing or hiding the account.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts_by_id = {
+        "act_1": {"id": "act_1", "account_id": "1", "name": "A1", "account_status": 1, "currency": "USD"}
+    }
+    reader = FakeMetaReader(
+        get_account=lambda ad_account_id, *, fields: dict(accounts_by_id[ad_account_id]),
+        fetch_insights=lambda ad_account_id, **k: [{"spend": "100.00", "impressions": "1000", "clicks": "100"}],
+    )
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30",
+        cohort_ids=[], fx_table=_fx(),
+    )
+    assert out["cohort"]["count"] == 1 and out["cohort"]["read_ok"] == 1
+    assert out["account"] is not None and out["account"]["ad_account_id"] == "act_1"
+    cpc = out["benchmarks"]["cpc"]
+    assert cpc["value"] == pytest.approx(1.0) and cpc["reason"] == "no peers with cpc in cohort"
+    assert "percentile" not in cpc
+    assert set(out["benchmarks"]) == set(_account_discovery.BENCHMARK_METRIC_DIRECTION)
+    # Explicit path -> get_account, never discovery.
+    assert not any(c[0] == "list_ad_accounts" for c in reader.calls)
+
+
+def test_account_benchmark_unknown_currency_target_money_reason(monkeypatch) -> None:
+    # A target whose currency Meta omitted (-> "UNKNOWN") is treated as no-FX: money metrics carry a
+    # "no FX rate for UNKNOWN" reason while currency-invariant ratios still benchmark against peers.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A1", "account_status": 1, "currency": None},
+        {"id": "act_2", "account_id": "2", "name": "A2", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "A3", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        f"act_{i}": [{"spend": f"{i * 100}.00", "impressions": "1000", "clicks": "50"}]
+        for i in range(1, 4)
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.account_benchmark(
+        reader, account_id="1", date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    assert out["account"] is not None  # native row still returned
+    for money_metric in ("cpm", "cpc", "cost_per_result"):
+        entry = out["benchmarks"][money_metric]
+        assert entry["value"] is None
+        assert entry["reason"] == "no FX rate for UNKNOWN"
+    # ctr is currency-invariant -> still benchmarks (target present in the ratio cohort).
+    assert out["benchmarks"]["ctr"]["percentile"] is not None
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from
