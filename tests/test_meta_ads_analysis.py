@@ -11807,7 +11807,7 @@ def test_ad_health_flags_unit_disapproved_notdelivering_pause_empty() -> None:
     s = stalled[0]
     assert s["name"] == "ads_not_delivering" and s["severity"] == "medium"
     assert s["current"] == 2
-    assert s["detail"] == "2 of 2 ACTIVE-configured ads are not delivering (blocked/pending)"
+    assert s["detail"] == "2 of 2 ads are ACTIVE-configured but not delivering (blocked/pending)"
 
     # Delivering (ACTIVE/IN_PROCESS) and deliberate pauses -> NO flag. A paused ad is intentional, not
     # a stall: status==ACTIVE+effective PAUSED/CAMPAIGN_PAUSED/ADSET_PAUSED, AND status==PAUSED entirely.

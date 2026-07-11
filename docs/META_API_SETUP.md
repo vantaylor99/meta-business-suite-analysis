@@ -332,8 +332,17 @@ pacing's own 5% tolerance). Because that flag is baseline-independent, it can be
 account and promote an otherwise-clean or informational account into `flagged`; its per-account pacing
 errors are surfaced tagged `stage:"pacing"`. Turning it on adds pacing's own **~1 + 4N** reads on top
 (of which the current-window insight read duplicates the scan's own — an accepted, documented duplicate).
-For period (e.g. month) pacing, call `pacing_report` directly. Ad-level creative/disapproval detection
-(a heavier per-ad fan-out) is parked for a later ticket.
+For period (e.g. month) pacing, call `pacing_report` directly. **Ad-level health is likewise off by
+default but opt-in:** pass `include_ad_health=true` and, *after* the flagged list is finalized, the scan
+fans out a per-ad enumeration into **only the already-flagged accounts** (never the full fleet) and
+attaches up to two flags per account — `ads_disapproved` (**high**, ads blocked by policy) and
+`ads_not_delivering` (**medium**, ACTIVE-configured ads stuck not delivering: pending review/billing,
+etc.). An `ads_disapproved` flag can itself promote a medium account to high (severity is recomputed and
+the flagged list re-sorted); `ad_health_scanned_count` reports how many accounts were ad-scanned (present
+only when the opt-in is on), and per-account ad-read failures are surfaced tagged `stage:"ad_health"`.
+Because the fan-out is gated on the flagged set, a fleet where 3 of 200 accounts surface pays 3 ad
+enumerations, not 200 — the deliberate tradeoff is that a window-over-window clean **and** on-pace
+account with disapproved ads is never flagged, so never ad-scanned, and its disapprovals stay hidden.
 
 `pacing_report` answers the manager's month-end question — "will each account land **over**, **under**,
 or **on** its budget?" — across every account the token can reach (or an explicit list). Unlike

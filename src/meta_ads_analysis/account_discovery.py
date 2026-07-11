@@ -1383,7 +1383,7 @@ def _ad_health_flags(
                 delta=None,
                 delta_pct=None,
                 detail=(
-                    f"{not_delivering} of {total} ACTIVE-configured ads are not delivering "
+                    f"{not_delivering} of {total} ads are ACTIVE-configured but not delivering "
                     "(blocked/pending)"
                 ),
             )

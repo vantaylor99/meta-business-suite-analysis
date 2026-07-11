@@ -73,7 +73,13 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   **Budget pacing is off by default and opt-in:** pass `include_pacing=true` to fold `pacing_report`'s
   current-window over/under verdict into the scan as a `budget_pacing_off` flag (materially
   over-spending → high, under-spending → medium), which can itself promote an otherwise-quiet account
-  into the `flagged` list; leaving it off keeps the two-read cost and byte-identical output. For period
+  into the `flagged` list; leaving it off keeps the two-read cost and byte-identical output. **Ad-level
+  health is also off by default and opt-in:** pass `include_ad_health=true` to fan out a per-ad
+  enumeration into **only the already-flagged accounts** and attach an `ads_disapproved` flag (high —
+  ads blocked by policy) and/or an `ads_not_delivering` flag (medium — ACTIVE ads stuck not delivering);
+  a disapproval can itself promote a medium account to high, and `ad_health_scanned_count` reports how
+  many accounts were ad-scanned. Gating on the flagged set keeps the cost bounded (a disapproved ad on
+  an otherwise-clean, on-pace account is deliberately not surfaced). For period
   (e.g. month) pacing, call the `pacing_report` tool directly. That sixth discovery tool answers "will each account land
   **over**, **under**, or **on** its budget for the month?" across the whole fleet: you give it the
   full reporting period (`date_from`/`date_to`) and, optionally, the day to measure spend through
