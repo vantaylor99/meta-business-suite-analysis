@@ -34,6 +34,7 @@ from .config import (
     ATTENTION_CTR_DROP_PCT,
     ATTENTION_MIN_RESULTS_FLOOR,
     ATTENTION_MIN_SPEND,
+    ATTENTION_PACING_VARIANCE_PCT,
     ATTENTION_SPEND_COLLAPSE_PCT,
     ATTENTION_SPEND_SPIKE_PCT,
     PACING_ON_TRACK_TOLERANCE_PCT,
@@ -1102,10 +1103,12 @@ def account_benchmark(
 # deterministic bounded-concurrency fan-out. No new Meta read shape is introduced.
 #
 # SCOPE: budget-pacing (spend-to-date vs configured budget) is a DIFFERENT question over a DIFFERENT
-# surface and is owned by the sibling `pacing_report` tool — this tool never reads budget config.
+# surface and is owned by the sibling `pacing_report` tool. By DEFAULT this tool never reads budget
+# config; when called with `include_pacing=True` it calls `pacing_report` ONCE over the same scope and
+# folds its per-account over/under verdict in as an opt-in `budget_pacing_off` flag (never re-reading
+# budget config itself — reuse, no cycle: attention -> pacing -> cross_account_performance).
 # Ad-level creative/disapproval problems need a per-account ad-level fan-out (heavy) and are parked in
-# a backlog ticket. What ships here is purely the two performance reads + each row's account-status
-# label, so every flag is zero extra reads beyond the two fan-outs.
+# a backlog ticket. With pacing off, every flag is zero extra reads beyond the two fan-outs.
 # --------------------------------------------------------------------------- #
 
 # Severity rank: high(3) > medium(2) > low(1) > info(0). An account's severity is the max over its
@@ -1134,6 +1137,10 @@ class AttentionThresholds:
       means the same across a USD and an MXN account (native fallback for a no-FX account).
     - ``min_results_floor`` is the cost-degradation significance floor: BOTH windows must clear it
       before a cost-per-result flag fires.
+    - ``pacing_variance_pct`` is the "materially off-pace" knee for the opt-in ``budget_pacing_off``
+      flag (only consulted when ``flag_accounts_needing_attention`` is called with
+      ``include_pacing=True``). Larger than pacing's own 5% on_track tolerance — a small variance is
+      not attention-worthy.
     """
 
     spend_spike_pct: float
@@ -1143,10 +1150,12 @@ class AttentionThresholds:
     ctr_drop_pct: float
     min_spend_floor: float
     min_results_floor: float
+    pacing_variance_pct: float
 
     @classmethod
     def defaults(cls) -> "AttentionThresholds":
-        """The committed defaults from :mod:`config` (50% spend move / 30% efficiency degradation)."""
+        """The committed defaults from :mod:`config` (50% spend move / 30% efficiency degradation;
+        25% budget-pacing variance knee)."""
         return cls(
             spend_spike_pct=ATTENTION_SPEND_SPIKE_PCT,
             spend_collapse_pct=ATTENTION_SPEND_COLLAPSE_PCT,
@@ -1155,6 +1164,7 @@ class AttentionThresholds:
             ctr_drop_pct=ATTENTION_CTR_DROP_PCT,
             min_spend_floor=ATTENTION_MIN_SPEND,
             min_results_floor=ATTENTION_MIN_RESULTS_FLOOR,
+            pacing_variance_pct=ATTENTION_PACING_VARIANCE_PCT,
         )
 
 
@@ -1238,6 +1248,56 @@ def _account_status_flag(label: Any) -> dict[str, Any] | None:
         delta=None,
         delta_pct=None,
         detail=f"account status is {label}",
+    )
+
+
+def _budget_pacing_flag(
+    pacing_entry: dict[str, Any], thresholds: AttentionThresholds
+) -> dict[str, Any] | None:
+    """The ``budget_pacing_off`` flag for one :func:`pacing_report` per-account entry, or ``None``.
+
+    Baseline-independent (derived purely from the pacing verdict), so — like
+    :func:`_account_status_flag` — it is appended by the orchestrator rather than produced inside the
+    pure :func:`evaluate_attention_flags`. Pure and unit-testable with a hand-built pacing entry (no
+    reader).
+
+    Fires **only** when the entry's pacing ``status`` is ``over`` or ``under`` AND
+    ``abs(variance_pct) >= thresholds.pacing_variance_pct`` (a larger knee than pacing's own 5%
+    on_track tolerance — a tiny variance is not attention-worthy). Every other status
+    (``on_track`` / ``no_budget_set`` / ``budget_not_projectable`` / ``account_inactive`` /
+    ``not_started`` / ``budget_unread``) -> ``None``.
+
+    Severity mirrors the ticket's mapping: ``over`` -> **high** (over-spend burns budget fast —
+    urgent), ``under`` -> **medium** (under-delivery is a missed-pacing concern, less urgent).
+
+    ``variance_pct`` is a same-currency ratio -> **FX-invariant**, used directly as ``delta_pct``.
+    ``current`` / ``baseline`` use the normalized projected-spend / period-budget twins with a native
+    fallback for a no-FX account, exactly as :func:`_flag` shapes the behavior flags.
+    """
+    status = pacing_entry.get("status")
+    if status not in ("over", "under"):
+        return None
+    variance_pct = pacing_entry.get("variance_pct")
+    if variance_pct is None or abs(variance_pct) < thresholds.pacing_variance_pct:
+        return None
+
+    projected = pacing_entry.get("projected_spend_normalized")
+    if projected is None:
+        projected = pacing_entry.get("projected_spend")
+    budget = pacing_entry.get("period_budget_normalized")
+    if budget is None:
+        budget = pacing_entry.get("period_budget")
+    delta = projected - budget if projected is not None and budget is not None else None
+
+    severity = "high" if status == "over" else "medium"
+    return _flag(
+        "budget_pacing_off",
+        severity,
+        current=projected,
+        baseline=budget,
+        delta=delta,
+        delta_pct=variance_pct,
+        detail=f"projected to spend {abs(variance_pct) * 100:.0f}% {status} the period budget",
     )
 
 
@@ -1469,6 +1529,7 @@ def flag_accounts_needing_attention(
     baseline_from: str | None = None,
     baseline_to: str | None = None,
     reporting_currency: str = "USD",
+    include_pacing: bool = False,
     thresholds: AttentionThresholds | None = None,
     fx_table: FxTable | None = None,
 ) -> dict[str, Any]:
@@ -1491,14 +1552,29 @@ def flag_accounts_needing_attention(
     account); absolute spend floors compare on ``spend_normalized`` (native fallback for a no-FX
     account).
 
-    **Read cost (documented, not a bug).** This issues ``2x`` the per-account insight reads of a single
-    :func:`cross_account_performance` (one fan-out per window) — ~400 reads for a 200-account scope
-    under the bounded pool. Acceptable; a single multi-window read is a future optimization out of
-    scope here.
+    **Opt-in budget pacing (``include_pacing``).** Off by default. When ``True``, :func:`pacing_report`
+    is called ONCE over the SAME resolved scope / ``reporting_currency`` / shared ``fx_table``, pacing
+    the **current** window (``date_from=current_from``, ``date_to=current_to``, ``as_of=current_to``).
+    ``as_of=current_to`` makes the period *complete* (``elapsed_fraction == 1``) so
+    ``projected_spend == spend_to_date`` and ``variance_pct`` is the realized actual-vs-budgeted
+    variance for that window — a well-defined off-pace signal (an operator wanting month-pacing calls
+    :func:`pacing_report` directly). Each account whose pacing status is ``over``/``under`` past
+    ``thresholds.pacing_variance_pct`` gains a :func:`_budget_pacing_flag` (``budget_pacing_off``),
+    which — because it can be the only fired flag — can promote a *clean* or *informational* account
+    into ``flagged``. There is no cycle (attention -> pacing -> cross_account_performance; pacing never
+    calls attention). An off-pace account unreadable in BOTH attention windows is not surfaced (the
+    join skips it — attention is fundamentally a window-comparison tool); it appears only via errors.
 
-    **Not in scope:** budget pacing (spend-to-date vs. configured budget) is a separate tool
-    (``pacing_report``); ad-level creative/disapproval detection is parked in backlog. Account-level
-    health is covered by the ``account_status_alert`` flag at zero extra read cost.
+    **Read cost (documented, not a bug).** With pacing off this issues ``2x`` the per-account insight
+    reads of a single :func:`cross_account_performance` (one fan-out per window) — ~400 reads for a
+    200-account scope; a hard regression guard. With ``include_pacing=True`` add pacing's own
+    ``~1 + 4N`` (its ``cross_account_performance`` ``1 + N`` + a ``3N`` budget fan-out), of which the
+    current-window insight read (``N``) duplicates attention's own current read — an accepted, documented
+    duplicate (threading a shared perf into :func:`pacing_report` is a future optimization out of scope).
+
+    **Not in scope:** ad-level creative/disapproval detection is parked in backlog. Account-level
+    health is covered by the ``account_status_alert`` flag at zero extra read cost. Budget pacing is
+    off by default; pass ``include_pacing=True`` to fold ``pacing_report``'s over/under verdict in.
     """
     thr = thresholds if thresholds is not None else AttentionThresholds.defaults()
 
@@ -1552,18 +1628,51 @@ def flag_accounts_needing_attention(
                 }
             )
 
+    # Opt-in budget pacing. Pace the CURRENT window with as_of=current_to (elapsed_fraction == 1, so
+    # the projection equals the realized spend) over the SAME scope / currency / shared fx_table. Only
+    # over/under accounts that clear the pacing-variance knee yield a flag; pacing errors are merged
+    # tagged stage:"pacing" (distinct from the window-tagged attention errors above).
+    pacing_flag_by_id: dict[str, dict[str, Any]] = {}
+    if include_pacing:
+        pacing = pacing_report(
+            reader,
+            date_from=current_from,
+            date_to=current_to,
+            account_ids=account_ids,
+            as_of=current_to,
+            reporting_currency=reporting_currency,
+            fx_table=table,
+        )
+        for entry in pacing["accounts"]:
+            pacing_flag = _budget_pacing_flag(entry, thr)
+            if pacing_flag is not None:
+                pacing_flag_by_id[entry["ad_account_id"]] = pacing_flag
+        for entry in pacing["errors"]:
+            errors.append(
+                {
+                    "ad_account_id": entry.get("ad_account_id"),
+                    "stage": "pacing",
+                    "error": entry.get("error"),
+                }
+            )
+
     flagged: list[dict[str, Any]] = []
     informational: list[dict[str, Any]] = []
     clean_count = 0
 
     # Iterate in current-window scope order (deterministic); evaluate only accounts readable in BOTH
     # windows. The join/sort is order-deterministic, so identical inputs -> identical buckets and order.
+    # Bucketing follows behavior-flag evaluation AND the pacing-flag append (two-phase): a pacing flag
+    # can be the ONLY fired flag, promoting an otherwise-clean/informational account into flagged.
     for ad_account_id, current_row in cur_rows.items():
         baseline_row = base_rows.get(ad_account_id)
         if baseline_row is None:
             # Read-failed in the baseline window -> already surfaced in errors; cannot compare.
             continue
         flags = evaluate_attention_flags(current_row, baseline_row, thr)
+        pacing_flag = pacing_flag_by_id.get(ad_account_id)
+        if pacing_flag is not None:
+            flags = [*flags, pacing_flag]
         if not flags:
             clean_count += 1
             continue

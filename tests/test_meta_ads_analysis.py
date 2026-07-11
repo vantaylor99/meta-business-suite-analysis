@@ -11520,6 +11520,262 @@ def test_flag_accounts_attention_stall_informational_and_current_error(monkeypat
     assert out["clean_count"] == 0
 
 
+# --- flag_accounts_needing_attention: opt-in budget_pacing_off (include_pacing) ---
+
+
+def test_budget_pacing_flag_unit_over_under_knee_and_statuses() -> None:
+    import pytest
+
+    thr = _account_discovery.AttentionThresholds.defaults()
+    F = _account_discovery._budget_pacing_flag
+
+    def entry(status, variance_pct, **extra):
+        base = {
+            "ad_account_id": "act_x",
+            "status": status,
+            "variance_pct": variance_pct,
+            "projected_spend": 1200.0,
+            "projected_spend_normalized": 1300.0,
+            "period_budget": 1000.0,
+            "period_budget_normalized": 1050.0,
+        }
+        base.update(extra)
+        return base
+
+    # over past the 25% knee -> high; NORMALIZED twins feed current/baseline; variance is delta_pct.
+    over = F(entry("over", 0.5), thr)
+    assert over is not None
+    assert over["name"] == "budget_pacing_off" and over["severity"] == "high"
+    assert over["current"] == 1300.0 and over["baseline"] == 1050.0
+    assert over["delta"] == pytest.approx(1300.0 - 1050.0)
+    assert over["delta_pct"] == pytest.approx(0.5)
+    assert "50% over" in over["detail"]
+
+    # under past the knee -> medium (under-delivery is less urgent than over-spend).
+    under = F(entry("under", -0.4), thr)
+    assert under is not None and under["severity"] == "medium"
+    assert "40% under" in under["detail"]
+
+    # exactly at the knee fires (>=); just below the knee does not (pacing's own 5% must not leak in).
+    assert F(entry("over", 0.25), thr) is not None
+    assert F(entry("over", 0.10), thr) is None
+    assert F(entry("under", -0.24), thr) is None
+    assert F(entry("over", None), thr) is None  # missing variance -> defensive None
+
+    # every non-over/under status -> None regardless of variance magnitude.
+    for status in (
+        "on_track", "no_budget_set", "budget_not_projectable",
+        "account_inactive", "not_started", "budget_unread",
+    ):
+        assert F(entry(status, 0.9), thr) is None
+
+    # No-FX account: normalized twins absent -> native fallback for current/baseline/delta.
+    native = F(
+        entry("over", 0.6, projected_spend_normalized=None, period_budget_normalized=None), thr
+    )
+    assert native["current"] == 1200.0 and native["baseline"] == 1000.0
+    assert native["delta"] == pytest.approx(200.0)
+
+
+def _attention_pacing_reader(accounts, window_rows, campaigns, adsets, caps, **overrides):
+    """A reader that serves BOTH attention's two windowed insight reads AND pacing's budget fan-out.
+
+    ``window_rows`` maps ``date_from -> {ad_account_id: [insight_row, ...]}`` (the pacing insight read
+    for the current window shares the current-window key). ``campaigns``/``adsets``/``caps`` are the
+    per-account budget-config stubs pacing_report needs. MOCKS ONLY.
+    """
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [dict(r) for r in window_rows.get(date_from, {}).get(ad_account_id, [])]
+
+    stubs = {
+        "list_ad_accounts": lambda *, fields: [dict(a) for a in accounts],
+        "fetch_insights": _fetch,
+        "list_campaigns": lambda ad_account_id, *, fields, effective_status=None: [
+            dict(c) for c in campaigns.get(ad_account_id, [])
+        ],
+        "list_adsets": lambda ad_account_id, *, fields, effective_status=None: [
+            dict(a) for a in adsets.get(ad_account_id, [])
+        ],
+        "get_account": lambda ad_account_id, *, fields: dict(caps.get(ad_account_id, {})),
+    }
+    stubs.update(overrides)
+    return FakeMetaReader(**stubs)
+
+
+def test_flag_accounts_attention_pacing_promotes_clean_account(monkeypatch) -> None:
+    # A behaviorally-clean account (identical spend in both windows) that is materially over-pacing is
+    # promoted OUT of the clean count INTO flagged by the opt-in budget_pacing_off flag; an on-track
+    # peer stays clean (clean_count decrements to exactly the on-track count, not zero).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_over", "account_id": "1", "name": "OverPace", "account_status": 1, "currency": "USD"},
+        {"id": "act_clean", "account_id": "2", "name": "OnTrack", "account_status": 1, "currency": "USD"},
+    ]
+    # Same spend both windows -> no behavior flag for either account.
+    rows = {
+        "act_over": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}],
+        "act_clean": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}],
+    }
+    window_rows = {"2026-06-01": rows, "2026-06-08": rows}
+    # 7-day current window; as_of=current_to -> elapsed_fraction 1, projected == spend_to_date (700).
+    campaigns = {
+        "act_over": [_pc_camp("c1", daily="5000")],   # $50/day -> period 350 -> +100% over (high)
+        "act_clean": [_pc_camp("c2", daily="10000")],  # $100/day -> period 700 -> on_track (no flag)
+    }
+    caps = {"act_over": {"currency": "USD"}, "act_clean": {"currency": "USD"}}
+    reader = _attention_pacing_reader(accounts, window_rows, campaigns, {}, caps)
+
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_pacing=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_over"]
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"budget_pacing_off"}
+    assert out["flagged"][0]["severity"] == "high"
+    assert out["clean_count"] == 1  # act_clean stays clean; act_over promoted out of the clean count
+    assert out["informational"] == []
+    assert all("stage" not in e for e in out["errors"]) and out["errors"] == []
+
+
+def test_flag_accounts_attention_pacing_promotes_informational_account(monkeypatch) -> None:
+    # An info-only account (newly_active) that is also over-pacing lands in flagged (high pacing
+    # severity wins over info) and is listed exactly once — never double-listed across buckets.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_new", "account_id": "1", "name": "New", "account_status": 1, "currency": "USD"}]
+    window_rows = {
+        "2026-06-01": {},  # no baseline delivery -> newly_active (info)
+        "2026-06-08": {"act_new": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}]},
+    }
+    campaigns = {"act_new": [_pc_camp("c1", daily="5000")]}  # over-pacing -> high budget_pacing_off
+    reader = _attention_pacing_reader(accounts, window_rows, campaigns, {}, {"act_new": {"currency": "USD"}})
+
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_pacing=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_new"]
+    assert out["flagged"][0]["severity"] == "high"
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"newly_active", "budget_pacing_off"}
+    assert out["informational"] == []  # not double-listed
+    assert out["clean_count"] == 0
+
+
+def test_flag_accounts_attention_pacing_off_issues_no_budget_reads(monkeypatch) -> None:
+    # Regression guard: the DEFAULT path (include_pacing omitted) is byte-identical to today — no
+    # pacing read is issued, so NO list_campaigns/list_adsets/get_account call reaches the reader.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    rows = {"act_1": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}]}
+    budget_calls: list[tuple[str, str]] = []
+
+    def _rec(name):
+        def _f(ad_account_id, *, fields, effective_status=None):
+            budget_calls.append((name, ad_account_id))
+            return []
+        return _f
+
+    def _get_account(ad_account_id, *, fields):
+        budget_calls.append(("get_account", ad_account_id))
+        return {"currency": "USD"}
+
+    reader = _attention_reader(
+        accounts, {"2026-06-01": rows, "2026-06-08": rows},
+        list_campaigns=_rec("list_campaigns"),
+        list_adsets=_rec("list_adsets"),
+        get_account=_get_account,
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+    assert budget_calls == []  # no budget-config read at all
+    assert out["clean_count"] == 1  # unchanged behavior
+    assert out["flagged"] == [] and out["informational"] == []
+    assert all("stage" not in e for e in out["errors"])  # no pacing-stage errors
+
+
+def test_flag_accounts_attention_pacing_budget_read_failure_tagged(monkeypatch) -> None:
+    # A per-account pacing (budget) read failure -> that account reads budget_unread inside pacing ->
+    # no budget_pacing_off flag for it; the failure is surfaced tagged stage:"pacing", never dropped.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_ok", "account_id": "1", "name": "OK", "account_status": 1, "currency": "USD"},
+        {"id": "act_bud", "account_id": "2", "name": "BudFail", "account_status": 1, "currency": "USD"},
+    ]
+    rows = {
+        "act_ok": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}],
+        "act_bud": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}],
+    }
+
+    def _campaigns(ad_account_id, *, fields, effective_status=None):
+        if ad_account_id == "act_bud":
+            raise MetaApiError("(#100) campaigns denied for act_bud")
+        return [_pc_camp("c1", daily="5000")]  # act_ok: over-pacing -> high budget_pacing_off
+
+    reader = _attention_pacing_reader(
+        accounts, {"2026-06-01": rows, "2026-06-08": rows}, {}, {},
+        {"act_ok": {"currency": "USD"}, "act_bud": {"currency": "USD"}},
+        list_campaigns=_campaigns,
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_pacing=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_ok"]
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"budget_pacing_off"}
+    assert out["clean_count"] == 1  # act_bud has no pacing flag -> stays clean
+    assert {
+        "ad_account_id": "act_bud", "stage": "pacing",
+        "error": "(#100) campaigns denied for act_bud",
+    } in out["errors"]
+
+
+def test_flag_accounts_attention_pacing_deterministic(monkeypatch) -> None:
+    # With pacing joined, identical inputs -> identical buckets/order. All three accounts are
+    # behaviorally clean but over-pace by the same amount (same severity + zero spend-delta), so the
+    # flagged order falls to the ad_account_id tiebreak and must be stable run-to-run.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    rows = {f"act_{i}": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}] for i in range(1, 4)}
+    campaigns = {f"act_{i}": [_pc_camp(f"c{i}", daily="5000")] for i in range(1, 4)}
+    caps = {f"act_{i}": {"currency": "USD"} for i in range(1, 4)}
+    reader = _attention_pacing_reader(accounts, {"2026-06-01": rows, "2026-06-08": rows}, campaigns, {}, caps)
+
+    kwargs = dict(current_from="2026-06-08", current_to="2026-06-14", include_pacing=True, fx_table=_fx())
+    out1 = _account_discovery.flag_accounts_needing_attention(reader, **kwargs)
+    out2 = _account_discovery.flag_accounts_needing_attention(reader, **kwargs)
+    assert out1 == out2
+    assert [e["ad_account_id"] for e in out1["flagged"]] == ["act_1", "act_2", "act_3"]
+    assert all({f["name"] for f in e["flags"]} == {"budget_pacing_off"} for e in out1["flagged"])
+
+
+def test_build_discovery_tools_flag_accounts_attention_pacing_smoke(monkeypatch) -> None:
+    # The wired MCP discovery tool threads include_pacing through and loads the committed FX table
+    # itself (fx_table stays a test-only seam). An over-pacing account surfaces via budget_pacing_off.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [{"spend": "700.00", "impressions": "7000", "clicks": "350"}]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch,
+        list_campaigns=lambda ad_account_id, *, fields, effective_status=None: [_pc_camp("c1", daily="5000")],
+        list_adsets=lambda ad_account_id, *, fields, effective_status=None: [],
+        get_account=lambda ad_account_id, *, fields: {"currency": "USD"},
+    )
+    tools = _mcp_server.build_discovery_tools(reader)
+    out = tools["flag_accounts_needing_attention"]("2026-06-08", "2026-06-14", include_pacing=True)
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_1"]
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"budget_pacing_off"}
+    # Default (pacing off) leaves the account clean -> confirms the opt-in is what surfaced it.
+    out_off = tools["flag_accounts_needing_attention"]("2026-06-08", "2026-06-14")
+    assert out_off["flagged"] == [] and out_off["clean_count"] == 1
+
+
 # --- pacing_report: pure helpers (clock-free, no reader) --------------------
 
 

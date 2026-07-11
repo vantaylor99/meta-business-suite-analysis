@@ -459,8 +459,12 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "delivery on an ACTIVE account, and account-status problems (DISABLED/UNSETTLED/etc.). Defaults: "
         "a 50% spend move or 30% cost/quality degradation is 'noticeable'; results are bucketed into "
         "flagged (medium+ severity, worst-first), informational (newly-active / too-little-history), and "
-        "a clean count. Money floors compare in one reporting_currency (default USD). NOTE: budget "
-        "pacing (spend-to-date vs. configured budget) is a SEPARATE tool (pacing_report), not this one."
+        "a clean count. Money floors compare in one reporting_currency (default USD). Budget pacing "
+        "(spend-to-date vs. configured budget) is off by default; pass include_pacing=true to fold "
+        "pacing_report's over/under verdict for the current window in as a budget_pacing_off flag "
+        "(materially over-spending → high, materially under-spending → medium), which can itself "
+        "promote an otherwise-quiet account into the flagged list. For period (e.g. month) pacing, "
+        "call pacing_report directly."
     ),
     "pacing_report": (
         "Tell whether each ad account is on track to spend its configured budget for a reporting "
@@ -560,9 +564,11 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
         baseline_from: str | None = None,
         baseline_to: str | None = None,
         reporting_currency: str = "USD",
+        include_pacing: bool = False,
     ) -> dict[str, Any]:
         # ``thresholds`` and ``fx_table`` are test-only/programmatic seams and are deliberately NOT
         # exposed to the LLM; the tool uses the committed defaults and loads config/fx_rates.json itself.
+        # ``include_pacing`` IS exposed (off by default) so an operator can fold pacing into the scan.
         return account_discovery.flag_accounts_needing_attention(
             reader,
             current_from=current_from,
@@ -571,6 +577,7 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             baseline_from=baseline_from,
             baseline_to=baseline_to,
             reporting_currency=reporting_currency,
+            include_pacing=include_pacing,
         )
 
     def pacing_report(
