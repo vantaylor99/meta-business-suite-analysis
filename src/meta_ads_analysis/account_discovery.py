@@ -777,6 +777,8 @@ def _finalize_subtotal(acc: dict[str, Any]) -> dict[str, Any]:
     if acc["pv_contrib"]:
         out["purchase_value"] = acc["purchase_value"]
     out["account_count"] = acc["account_count"]
+    out["results_accounts"] = acc["results_contrib"]
+    out["purchase_value_accounts"] = acc["pv_contrib"]
     out.update(compute_derived_metrics(base))
     return out
 
@@ -806,6 +808,8 @@ def _finalize_normalized_total(norm: dict[str, Any], reporting: str) -> dict[str
         out["purchase_value"] = norm["purchase_value"]
     out["account_count"] = norm["account_count"]
     out["excluded_no_fx"] = norm["excluded_no_fx"]
+    out["results_accounts"] = norm["results_contrib"]
+    out["purchase_value_accounts"] = norm["pv_contrib"]
     out.update(compute_derived_metrics(base))
     return out
 

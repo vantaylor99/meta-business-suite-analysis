@@ -10213,6 +10213,201 @@ def test_cross_account_performance_partial_contributor_normalized_total(monkeypa
     assert usd["cost_per_result"] == pytest.approx(60.0)
 
 
+def test_coverage_counts_partial_results(monkeypatch) -> None:
+    # 3 USD accounts; only 1 contributes results + purchase_value.
+    # coverage keys should reflect 1-of-3, and zero purchase_value_accounts when no action_values.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+            "action_values": [{"action_type": "purchase", "value": "500"}],
+        }],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_3": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    usd = out["totals_by_currency"]["USD"]
+    assert usd["account_count"] == 3
+    assert usd["results_accounts"] == 1
+    assert usd["purchase_value_accounts"] == 1
+
+    nt = out["normalized_total"]
+    assert nt["account_count"] == 3
+    assert nt["results_accounts"] == 1
+    assert nt["purchase_value_accounts"] == 1
+
+    # Separate check: results only (no action_values) → purchase_value_accounts == 0.
+    insights_results_only = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+        }],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_3": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],
+    }
+    out2 = _account_discovery.cross_account_performance(
+        _perf_reader(accounts, insights_results_only),
+        date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx(),
+    )
+    assert out2["totals_by_currency"]["USD"]["results_accounts"] == 1
+    assert out2["totals_by_currency"]["USD"]["purchase_value_accounts"] == 0
+    assert out2["normalized_total"]["results_accounts"] == 1
+    assert out2["normalized_total"]["purchase_value_accounts"] == 0
+
+
+def test_coverage_counts_all_accounts_contribute(monkeypatch) -> None:
+    # 2 USD accounts, both have results + purchase_value; coverage should equal account_count.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 3)
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "5"}],
+            "action_values": [{"action_type": "purchase", "value": "200"}],
+        }],
+        "act_2": [{
+            "spend": "200.00", "impressions": "2000", "clicks": "100",
+            "actions": [{"action_type": "purchase", "value": "8"}],
+            "action_values": [{"action_type": "purchase", "value": "400"}],
+        }],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    usd = out["totals_by_currency"]["USD"]
+    assert usd["account_count"] == 2
+    assert usd["results_accounts"] == 2
+    assert usd["purchase_value_accounts"] == 2
+
+    nt = out["normalized_total"]
+    assert nt["account_count"] == 2
+    assert nt["results_accounts"] == 2
+    assert nt["purchase_value_accounts"] == 2
+
+
+def test_coverage_counts_zero_contributions(monkeypatch) -> None:
+    # 2 USD accounts, neither has actions; coverage keys must be 0 and results/purchase_value absent.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 3)
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    usd = out["totals_by_currency"]["USD"]
+    assert usd["results_accounts"] == 0
+    assert usd["purchase_value_accounts"] == 0
+    assert "results" not in usd
+    assert "purchase_value" not in usd
+
+    nt = out["normalized_total"]
+    assert nt["results_accounts"] == 0
+    assert nt["purchase_value_accounts"] == 0
+    assert "results" not in nt
+    assert "purchase_value" not in nt
+
+
+def test_coverage_counts_multi_currency_independent(monkeypatch) -> None:
+    # 2 USD (1 with results) + 1 EUR (with results); each currency subtotal is independent,
+    # and normalized_total counts across both FX-eligible contributors.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A1", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "A2", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "A3", "account_status": 1, "currency": "EUR"},
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "5"}],
+            "action_values": [{"action_type": "purchase", "value": "200"}],
+        }],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_3": [{
+            "spend": "150.00", "impressions": "1500", "clicks": "75",
+            "actions": [{"action_type": "purchase", "value": "3"}],
+            "action_values": [{"action_type": "purchase", "value": "100"}],
+        }],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    usd = out["totals_by_currency"]["USD"]
+    assert usd["account_count"] == 2
+    assert usd["results_accounts"] == 1
+
+    eur = out["totals_by_currency"]["EUR"]
+    assert eur["account_count"] == 1
+    assert eur["results_accounts"] == 1
+
+    nt = out["normalized_total"]
+    # act_1 (USD) and act_3 (EUR) both contributed results — 2 accounts across both currencies.
+    assert nt["results_accounts"] == 2
+    assert nt["purchase_value_accounts"] == 2
+
+
+def test_coverage_counts_no_fx_excluded_from_normalized_total(monkeypatch) -> None:
+    # 1 USD account (results) + 1 JPY account (results, JPY absent from FX table).
+    # JPY counts in its own native subtotal but not in normalized_total.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A1", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "A2", "account_status": 1, "currency": "JPY"},
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "5"}],
+            "action_values": [{"action_type": "purchase", "value": "200"}],
+        }],
+        "act_2": [{
+            "spend": "5000.00", "impressions": "10000", "clicks": "200",
+            "actions": [{"action_type": "purchase", "value": "8"}],
+            "action_values": [{"action_type": "purchase", "value": "1000"}],
+        }],
+    }
+    reader = _perf_reader(accounts, insights)
+    # _fx() has no JPY rate, so act_2 is FX-excluded.
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    # JPY native subtotal correctly includes its own contributor.
+    jpy = out["totals_by_currency"]["JPY"]
+    assert jpy["results_accounts"] == 1
+    assert jpy["purchase_value_accounts"] == 1
+
+    # Normalized total excludes JPY: only USD's contributor counted.
+    nt = out["normalized_total"]
+    assert nt["excluded_no_fx"] == 1
+    assert nt["results_accounts"] == 1
+    assert nt["purchase_value_accounts"] == 1
+
+
 def test_cross_account_performance_reporting_currency_eur(monkeypatch) -> None:
     import pytest
 
