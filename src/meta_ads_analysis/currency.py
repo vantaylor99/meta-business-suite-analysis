@@ -124,3 +124,76 @@ def load_fx_table(path: Path | None = None) -> FxTable:
     note = payload.get("note")
     note_str = str(note) if isinstance(note, str) and note.strip() else None
     return FxTable(as_of=as_of.strip(), base=base, note=note_str, rates=rates)
+
+
+# --- ISO-4217 minor-unit exponents ------------------------------------------------------------
+#
+# Meta returns budget / spend-cap / amount-spent fields in the account currency's **minor unit**
+# (e.g. USD cents). Converting a minor-unit integer into major units is ``value / 10 ** exponent``.
+# The exponent is a stable, public, finite ISO-4217 fact — unlike the FX *rates* (which drift over
+# time and therefore live in the committed ``config/fx_rates.json``), the number of minor-unit
+# digits does not change, so it lives here as a Python constant: no network, no file I/O, no cache,
+# deterministic under mock/unattended runs. This is the exponent analogue of
+# :data:`meta_ads_analysis.account_discovery.ACCOUNT_STATUS_LABELS`.
+
+#: The ISO-4217 default minor-unit exponent — correct for the ~150 two-decimal currencies (USD, EUR,
+#: GBP, …). Everything NOT listed in :data:`CURRENCY_MINOR_UNIT_EXPONENTS` uses this.
+DEFAULT_MINOR_UNIT_EXPONENT = 2
+
+#: ISO-4217 minor-unit exceptions: currency code -> exponent. Only the NON-2-decimal currencies are
+#: stored; any code absent here defaults to :data:`DEFAULT_MINOR_UNIT_EXPONENT`. Keeping this complete
+#: matters — a stray missing entry silently reintroduces the wrong divisor for that currency.
+CURRENCY_MINOR_UNIT_EXPONENTS: dict[str, int] = {
+    # zero-decimal (minor unit == major unit; divisor 10**0 == 1)
+    "BIF": 0, "CLP": 0, "DJF": 0, "GNF": 0, "ISK": 0, "JPY": 0, "KMF": 0, "KRW": 0,
+    "PYG": 0, "RWF": 0, "UGX": 0, "VND": 0, "VUV": 0, "XAF": 0, "XOF": 0, "XPF": 0,
+    # three-decimal (divisor 10**3 == 1000)
+    "BHD": 3, "IQD": 3, "JOD": 3, "KWD": 3, "LYD": 3, "OMR": 3, "TND": 3,
+    # four-decimal (divisor 10**4 == 10000)
+    "CLF": 4, "UYW": 4,
+}
+
+#: Common 2-decimal currency codes we explicitly recognize. Everything here uses the 2-decimal
+#: default, so listing a code changes no arithmetic — it only distinguishes "known 2-decimal" from
+#: "unrecognized code, exponent *assumed* 2-decimal" (see :func:`minor_unit_exponent_is_known`, used
+#: by the pacing report's assumption note). This tuple MUST stay a superset of every code in
+#: ``config/fx_rates.json`` so an FX-supported account is never flagged as an assumption.
+_KNOWN_TWO_DECIMAL_CURRENCIES: tuple[str, ...] = (
+    # config/fx_rates.json codes (MUST remain a subset — guarded by a test):
+    "USD", "EUR", "GBP", "BRL", "MXN", "CAD", "AUD",
+    # other common Meta-supported 2-decimal currencies:
+    "AED", "ARS", "BDT", "BOB", "CHF", "CNY", "COP", "CRC", "CZK", "DKK", "DZD", "EGP",
+    "GTQ", "HKD", "HNL", "HUF", "IDR", "ILS", "INR", "KES", "LKR", "MOP", "MYR", "NGN",
+    "NIO", "NOK", "NZD", "PEN", "PHP", "PKR", "PLN", "QAR", "RON", "RUB", "SAR", "SEK",
+    "SGD", "THB", "TRY", "TWD", "UAH", "UYU", "VES", "ZAR",
+)
+
+#: Every currency code whose minor-unit exponent we recognize for sure: the ISO exceptions above
+#: plus the explicitly-listed common 2-decimal codes. A code outside this set falls through to the
+#: 2-decimal default, but that fallback is an *assumption* and is surfaced rather than silently made.
+KNOWN_MINOR_UNIT_CURRENCIES: frozenset[str] = frozenset(CURRENCY_MINOR_UNIT_EXPONENTS) | frozenset(
+    _KNOWN_TWO_DECIMAL_CURRENCIES
+)
+
+
+def minor_unit_exponent(currency: str) -> int:
+    """ISO-4217 minor-unit exponent for a currency code (case-insensitive); never raises.
+
+    Returns :data:`DEFAULT_MINOR_UNIT_EXPONENT` (2) for any code not in
+    :data:`CURRENCY_MINOR_UNIT_EXPONENTS` — including blank / ``None`` / ``"UNKNOWN"`` — because 2 is
+    both the ISO default and the correct answer for the ~150 two-decimal currencies. Intended as the
+    exponent of 10 in the minor->major divisor: ``value / 10 ** minor_unit_exponent(currency)``.
+    """
+    code = str(currency).strip().upper() if currency else ""
+    return CURRENCY_MINOR_UNIT_EXPONENTS.get(code, DEFAULT_MINOR_UNIT_EXPONENT)
+
+
+def minor_unit_exponent_is_known(currency: str) -> bool:
+    """True iff ``currency`` (case-insensitive) is a code whose minor-unit exponent we recognize.
+
+    Distinguishes "we know this currency is 2-decimal" from "unrecognized code, exponent assumed
+    2-decimal" so a caller can surface the assumption instead of guessing silently. A blank / ``None``
+    / ``"UNKNOWN"`` code is NOT known.
+    """
+    code = str(currency).strip().upper() if currency else ""
+    return code in KNOWN_MINOR_UNIT_CURRENCIES

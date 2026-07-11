@@ -459,8 +459,17 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "delivery on an ACTIVE account, and account-status problems (DISABLED/UNSETTLED/etc.). Defaults: "
         "a 50% spend move or 30% cost/quality degradation is 'noticeable'; results are bucketed into "
         "flagged (medium+ severity, worst-first), informational (newly-active / too-little-history), and "
-        "a clean count. Money floors compare in one reporting_currency (default USD). NOTE: budget "
-        "pacing (spend-to-date vs. configured budget) is a SEPARATE tool (pacing_report), not this one."
+        "a clean count. Money floors compare in one reporting_currency (default USD). Budget pacing "
+        "(spend-to-date vs. configured budget) is off by default; pass include_pacing=true to fold "
+        "pacing_report's over/under verdict for the current window in as a budget_pacing_off flag "
+        "(materially over-spending → high, materially under-spending → medium), which can itself "
+        "promote an otherwise-quiet account into the flagged list. For period (e.g. month) pacing, "
+        "call pacing_report directly. Ad-level health is off by default; pass include_ad_health=true to "
+        "add an ads_disapproved flag (high — ads blocked by policy) and an ads_not_delivering flag "
+        "(medium — ACTIVE ads stuck not delivering: pending review, billing, etc.) for each flagged "
+        "account. To keep it cheap, the per-ad read is issued ONLY for accounts the cheap account-level "
+        "scan already flagged (bounded cost; ad_health_scanned_count reports how many were scanned) — a "
+        "disapproved ad on an otherwise-clean, on-pace account is not surfaced."
     ),
     "pacing_report": (
         "Tell whether each ad account is on track to spend its configured budget for a reporting "
@@ -469,14 +478,19 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "date_from/date_to are the FULL period (e.g. a month); as_of is the day spend is measured "
         "through (defaults to today). The period budget is the sum of ACTIVE daily budgets "
         "(CBO-deduplicated so a campaign-budget-optimization campaign is never double-counted with its "
-        "ad sets) x the period length; the account spend cap is reported as context but is a lifetime "
-        "ceiling, never the pacing denominator. Lifetime budgets are reported but not projected "
-        "(budget_not_projectable); uncapped accounts read no_budget_set; paused/closed accounts read "
-        "account_inactive — none of these are counted as under-pacing. Money is normalized into one "
+        "ad sets) x the period length, plus any lifetime budgets prorated across the overlap of their "
+        "own start/stop schedule with the window; the account spend cap is reported as context but is a "
+        "lifetime ceiling, never the pacing denominator. A lifetime (or mixed daily+lifetime) account "
+        "gets a real over/under/on_track verdict from that proration; budget_not_projectable is now "
+        "reserved for accounts with no projectable schedule (open-ended lifetime budgets with no end "
+        "date, schedules that don't overlap the window, or spend-cap-only accounts). Uncapped accounts "
+        "read no_budget_set; paused/closed accounts read account_inactive — none of these are counted "
+        "as under-pacing. Money is normalized into one "
         "reporting_currency (default USD); a rollup gives status counts and worst over/under shortlists. "
         "Costs ~1+4N reads for N accounts (spend read + a per-account budget-config read); a failed "
-        "budget read reads budget_unread, never a silent 'uncapped'. Cents->major-units conversion is "
-        "accurate for 2-decimal currencies; zero-decimal currencies (JPY/KRW) are a known limitation."
+        "budget read reads budget_unread, never a silent 'uncapped'. The minor-units->major-units "
+        "divisor is ISO-4217 currency-aware (2/0/3-decimal, so JPY/KRW and BHD/KWD convert correctly); "
+        "an unrecognized currency code assumes 2 decimals and is surfaced in the report note."
     ),
     "rank_accounts": (
         "Rank every ad account this token can reach (or an explicit list) by a single efficiency or spend "
@@ -555,9 +569,13 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
         baseline_from: str | None = None,
         baseline_to: str | None = None,
         reporting_currency: str = "USD",
+        include_pacing: bool = False,
+        include_ad_health: bool = False,
     ) -> dict[str, Any]:
         # ``thresholds`` and ``fx_table`` are test-only/programmatic seams and are deliberately NOT
         # exposed to the LLM; the tool uses the committed defaults and loads config/fx_rates.json itself.
+        # ``include_pacing`` / ``include_ad_health`` ARE exposed (both off by default) so an operator can
+        # fold pacing and/or the ad-level health scan (only over already-flagged accounts) into the scan.
         return account_discovery.flag_accounts_needing_attention(
             reader,
             current_from=current_from,
@@ -566,6 +584,8 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             baseline_from=baseline_from,
             baseline_to=baseline_to,
             reporting_currency=reporting_currency,
+            include_pacing=include_pacing,
+            include_ad_health=include_ad_health,
         )
 
     def pacing_report(

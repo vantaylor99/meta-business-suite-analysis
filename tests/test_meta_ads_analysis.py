@@ -10014,6 +10014,36 @@ def test_fx_table_convert_present_absent_and_other_reporting() -> None:
     assert table.has("USD") and not table.has("JPY")
 
 
+def test_minor_unit_exponent_lookup_and_known_predicate() -> None:
+    me = _currency.minor_unit_exponent
+    known = _currency.minor_unit_exponent_is_known
+
+    # 2-decimal default (unlisted currencies), 0-decimal, 3-decimal, 4-decimal exceptions.
+    assert me("USD") == 2 and me("EUR") == 2
+    assert me("JPY") == 0 and me("KRW") == 0 and me("XOF") == 0
+    assert me("KWD") == 3 and me("BHD") == 3 and me("TND") == 3
+    assert me("CLF") == 4 and me("UYW") == 4
+
+    # Case-insensitive: lower/mixed case resolve identically.
+    assert me("jpy") == me("JPY") == 0
+    assert me("kwd") == me("KWD") == 3
+
+    # Blank / None / whitespace / unrecognized -> 2-decimal default (no raise, no guess).
+    assert me("") == 2 and me(None) == 2 and me("   ") == 2  # type: ignore[arg-type]
+    assert me("UNKNOWN") == 2 and me("XTS") == 2  # XTS: ISO test code, deliberately unlisted.
+
+    # Known-predicate: exceptions + common 2-decimal codes are known; unrecognized/blank are not.
+    assert known("JPY") and known("KWD") and known("USD") and known("aud")
+    assert not known("XTS") and not known("UNKNOWN") and not known("") and not known(None)  # type: ignore[arg-type]
+
+
+def test_fx_rates_codes_are_subset_of_known_minor_unit_currencies() -> None:
+    # Guard: every FX-supported currency must have a recognized minor-unit exponent, so an
+    # FX-normalizable account is NEVER flagged as an "assumed" exponent by the pacing note.
+    table = _currency.load_fx_table()
+    assert set(table.rates) <= _currency.KNOWN_MINOR_UNIT_CURRENCIES
+
+
 # --- compute_derived_metrics: recompute-from-components, divide-by-zero-safe ---
 
 
@@ -10211,6 +10241,201 @@ def test_cross_account_performance_partial_contributor_normalized_total(monkeypa
     usd = out["totals_by_currency"]["USD"]
     assert usd["results"] == 10 and usd["purchase_value"] == pytest.approx(500.0)
     assert usd["cost_per_result"] == pytest.approx(60.0)
+
+
+def test_coverage_counts_partial_results(monkeypatch) -> None:
+    # 3 USD accounts; only 1 contributes results + purchase_value.
+    # coverage keys should reflect 1-of-3, and zero purchase_value_accounts when no action_values.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+            "action_values": [{"action_type": "purchase", "value": "500"}],
+        }],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_3": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    usd = out["totals_by_currency"]["USD"]
+    assert usd["account_count"] == 3
+    assert usd["results_accounts"] == 1
+    assert usd["purchase_value_accounts"] == 1
+
+    nt = out["normalized_total"]
+    assert nt["account_count"] == 3
+    assert nt["results_accounts"] == 1
+    assert nt["purchase_value_accounts"] == 1
+
+    # Separate check: results only (no action_values) → purchase_value_accounts == 0.
+    insights_results_only = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "10"}],
+        }],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_3": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],
+    }
+    out2 = _account_discovery.cross_account_performance(
+        _perf_reader(accounts, insights_results_only),
+        date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx(),
+    )
+    assert out2["totals_by_currency"]["USD"]["results_accounts"] == 1
+    assert out2["totals_by_currency"]["USD"]["purchase_value_accounts"] == 0
+    assert out2["normalized_total"]["results_accounts"] == 1
+    assert out2["normalized_total"]["purchase_value_accounts"] == 0
+
+
+def test_coverage_counts_all_accounts_contribute(monkeypatch) -> None:
+    # 2 USD accounts, both have results + purchase_value; coverage should equal account_count.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 3)
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "5"}],
+            "action_values": [{"action_type": "purchase", "value": "200"}],
+        }],
+        "act_2": [{
+            "spend": "200.00", "impressions": "2000", "clicks": "100",
+            "actions": [{"action_type": "purchase", "value": "8"}],
+            "action_values": [{"action_type": "purchase", "value": "400"}],
+        }],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    usd = out["totals_by_currency"]["USD"]
+    assert usd["account_count"] == 2
+    assert usd["results_accounts"] == 2
+    assert usd["purchase_value_accounts"] == 2
+
+    nt = out["normalized_total"]
+    assert nt["account_count"] == 2
+    assert nt["results_accounts"] == 2
+    assert nt["purchase_value_accounts"] == 2
+
+
+def test_coverage_counts_zero_contributions(monkeypatch) -> None:
+    # 2 USD accounts, neither has actions; coverage keys must be 0 and results/purchase_value absent.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 3)
+    ]
+    insights = {
+        "act_1": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    usd = out["totals_by_currency"]["USD"]
+    assert usd["results_accounts"] == 0
+    assert usd["purchase_value_accounts"] == 0
+    assert "results" not in usd
+    assert "purchase_value" not in usd
+
+    nt = out["normalized_total"]
+    assert nt["results_accounts"] == 0
+    assert nt["purchase_value_accounts"] == 0
+    assert "results" not in nt
+    assert "purchase_value" not in nt
+
+
+def test_coverage_counts_multi_currency_independent(monkeypatch) -> None:
+    # 2 USD (1 with results) + 1 EUR (with results); each currency subtotal is independent,
+    # and normalized_total counts across both FX-eligible contributors.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A1", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "A2", "account_status": 1, "currency": "USD"},
+        {"id": "act_3", "account_id": "3", "name": "A3", "account_status": 1, "currency": "EUR"},
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "5"}],
+            "action_values": [{"action_type": "purchase", "value": "200"}],
+        }],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_3": [{
+            "spend": "150.00", "impressions": "1500", "clicks": "75",
+            "actions": [{"action_type": "purchase", "value": "3"}],
+            "action_values": [{"action_type": "purchase", "value": "100"}],
+        }],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    usd = out["totals_by_currency"]["USD"]
+    assert usd["account_count"] == 2
+    assert usd["results_accounts"] == 1
+
+    eur = out["totals_by_currency"]["EUR"]
+    assert eur["account_count"] == 1
+    assert eur["results_accounts"] == 1
+
+    nt = out["normalized_total"]
+    # act_1 (USD) and act_3 (EUR) both contributed results — 2 accounts across both currencies.
+    assert nt["results_accounts"] == 2
+    assert nt["purchase_value_accounts"] == 2
+
+
+def test_coverage_counts_no_fx_excluded_from_normalized_total(monkeypatch) -> None:
+    # 1 USD account (results) + 1 JPY account (results, JPY absent from FX table).
+    # JPY counts in its own native subtotal but not in normalized_total.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "A1", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "A2", "account_status": 1, "currency": "JPY"},
+    ]
+    insights = {
+        "act_1": [{
+            "spend": "100.00", "impressions": "1000", "clicks": "50",
+            "actions": [{"action_type": "purchase", "value": "5"}],
+            "action_values": [{"action_type": "purchase", "value": "200"}],
+        }],
+        "act_2": [{
+            "spend": "5000.00", "impressions": "10000", "clicks": "200",
+            "actions": [{"action_type": "purchase", "value": "8"}],
+            "action_values": [{"action_type": "purchase", "value": "1000"}],
+        }],
+    }
+    reader = _perf_reader(accounts, insights)
+    # _fx() has no JPY rate, so act_2 is FX-excluded.
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-06-01", date_to="2026-06-30", fx_table=_fx()
+    )
+    # JPY native subtotal correctly includes its own contributor.
+    jpy = out["totals_by_currency"]["JPY"]
+    assert jpy["results_accounts"] == 1
+    assert jpy["purchase_value_accounts"] == 1
+
+    # Normalized total excludes JPY: only USD's contributor counted.
+    nt = out["normalized_total"]
+    assert nt["excluded_no_fx"] == 1
+    assert nt["results_accounts"] == 1
+    assert nt["purchase_value_accounts"] == 1
 
 
 def test_cross_account_performance_reporting_currency_eur(monkeypatch) -> None:
@@ -10436,6 +10661,8 @@ def test_cross_account_performance_empty_reach_note(monkeypatch) -> None:
     nt = out["normalized_total"]
     assert nt["spend"] == 0.0 and nt["account_count"] == 0 and nt["excluded_no_fx"] == 0
     assert "cpm" not in nt and "roas" not in nt
+    # Empty fleet: coverage counts are present and zero (no contributor).
+    assert nt["results_accounts"] == 0 and nt["purchase_value_accounts"] == 0
     assert nt["reporting_currency"] == "USD"
     assert out["reachable_count"] == out["account_count"] == 0
 
@@ -11293,6 +11520,586 @@ def test_flag_accounts_attention_stall_informational_and_current_error(monkeypat
     assert out["clean_count"] == 0
 
 
+# --- flag_accounts_needing_attention: opt-in budget_pacing_off (include_pacing) ---
+
+
+def test_budget_pacing_flag_unit_over_under_knee_and_statuses() -> None:
+    import pytest
+
+    thr = _account_discovery.AttentionThresholds.defaults()
+    F = _account_discovery._budget_pacing_flag
+
+    def entry(status, variance_pct, **extra):
+        base = {
+            "ad_account_id": "act_x",
+            "status": status,
+            "variance_pct": variance_pct,
+            "projected_spend": 1200.0,
+            "projected_spend_normalized": 1300.0,
+            "period_budget": 1000.0,
+            "period_budget_normalized": 1050.0,
+        }
+        base.update(extra)
+        return base
+
+    # over past the 25% knee -> high; NORMALIZED twins feed current/baseline; variance is delta_pct.
+    over = F(entry("over", 0.5), thr)
+    assert over is not None
+    assert over["name"] == "budget_pacing_off" and over["severity"] == "high"
+    assert over["current"] == 1300.0 and over["baseline"] == 1050.0
+    assert over["delta"] == pytest.approx(1300.0 - 1050.0)
+    assert over["delta_pct"] == pytest.approx(0.5)
+    assert "50% over" in over["detail"]
+
+    # under past the knee -> medium (under-delivery is less urgent than over-spend).
+    under = F(entry("under", -0.4), thr)
+    assert under is not None and under["severity"] == "medium"
+    assert "40% under" in under["detail"]
+
+    # exactly at the knee fires (>=); just below the knee does not (pacing's own 5% must not leak in).
+    assert F(entry("over", 0.25), thr) is not None
+    assert F(entry("over", 0.10), thr) is None
+    assert F(entry("under", -0.24), thr) is None
+    assert F(entry("over", None), thr) is None  # missing variance -> defensive None
+
+    # every non-over/under status -> None regardless of variance magnitude.
+    for status in (
+        "on_track", "no_budget_set", "budget_not_projectable",
+        "account_inactive", "not_started", "budget_unread",
+    ):
+        assert F(entry(status, 0.9), thr) is None
+
+    # No-FX account: normalized twins absent -> native fallback for current/baseline/delta.
+    native = F(
+        entry("over", 0.6, projected_spend_normalized=None, period_budget_normalized=None), thr
+    )
+    assert native["current"] == 1200.0 and native["baseline"] == 1000.0
+    assert native["delta"] == pytest.approx(200.0)
+
+
+def _attention_pacing_reader(accounts, window_rows, campaigns, adsets, caps, **overrides):
+    """A reader that serves BOTH attention's two windowed insight reads AND pacing's budget fan-out.
+
+    ``window_rows`` maps ``date_from -> {ad_account_id: [insight_row, ...]}`` (the pacing insight read
+    for the current window shares the current-window key). ``campaigns``/``adsets``/``caps`` are the
+    per-account budget-config stubs pacing_report needs. MOCKS ONLY.
+    """
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [dict(r) for r in window_rows.get(date_from, {}).get(ad_account_id, [])]
+
+    stubs = {
+        "list_ad_accounts": lambda *, fields: [dict(a) for a in accounts],
+        "fetch_insights": _fetch,
+        "list_campaigns": lambda ad_account_id, *, fields, effective_status=None: [
+            dict(c) for c in campaigns.get(ad_account_id, [])
+        ],
+        "list_adsets": lambda ad_account_id, *, fields, effective_status=None: [
+            dict(a) for a in adsets.get(ad_account_id, [])
+        ],
+        "get_account": lambda ad_account_id, *, fields: dict(caps.get(ad_account_id, {})),
+    }
+    stubs.update(overrides)
+    return FakeMetaReader(**stubs)
+
+
+def test_flag_accounts_attention_pacing_promotes_clean_account(monkeypatch) -> None:
+    # A behaviorally-clean account (identical spend in both windows) that is materially over-pacing is
+    # promoted OUT of the clean count INTO flagged by the opt-in budget_pacing_off flag; an on-track
+    # peer stays clean (clean_count decrements to exactly the on-track count, not zero).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_over", "account_id": "1", "name": "OverPace", "account_status": 1, "currency": "USD"},
+        {"id": "act_clean", "account_id": "2", "name": "OnTrack", "account_status": 1, "currency": "USD"},
+    ]
+    # Same spend both windows -> no behavior flag for either account.
+    rows = {
+        "act_over": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}],
+        "act_clean": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}],
+    }
+    window_rows = {"2026-06-01": rows, "2026-06-08": rows}
+    # 7-day current window; as_of=current_to -> elapsed_fraction 1, projected == spend_to_date (700).
+    campaigns = {
+        "act_over": [_pc_camp("c1", daily="5000")],   # $50/day -> period 350 -> +100% over (high)
+        "act_clean": [_pc_camp("c2", daily="10000")],  # $100/day -> period 700 -> on_track (no flag)
+    }
+    caps = {"act_over": {"currency": "USD"}, "act_clean": {"currency": "USD"}}
+    reader = _attention_pacing_reader(accounts, window_rows, campaigns, {}, caps)
+
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_pacing=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_over"]
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"budget_pacing_off"}
+    assert out["flagged"][0]["severity"] == "high"
+    assert out["clean_count"] == 1  # act_clean stays clean; act_over promoted out of the clean count
+    assert out["informational"] == []
+    assert all("stage" not in e for e in out["errors"]) and out["errors"] == []
+
+
+def test_flag_accounts_attention_pacing_promotes_informational_account(monkeypatch) -> None:
+    # An info-only account (newly_active) that is also over-pacing lands in flagged (high pacing
+    # severity wins over info) and is listed exactly once — never double-listed across buckets.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_new", "account_id": "1", "name": "New", "account_status": 1, "currency": "USD"}]
+    window_rows = {
+        "2026-06-01": {},  # no baseline delivery -> newly_active (info)
+        "2026-06-08": {"act_new": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}]},
+    }
+    campaigns = {"act_new": [_pc_camp("c1", daily="5000")]}  # over-pacing -> high budget_pacing_off
+    reader = _attention_pacing_reader(accounts, window_rows, campaigns, {}, {"act_new": {"currency": "USD"}})
+
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_pacing=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_new"]
+    assert out["flagged"][0]["severity"] == "high"
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"newly_active", "budget_pacing_off"}
+    assert out["informational"] == []  # not double-listed
+    assert out["clean_count"] == 0
+
+
+def test_flag_accounts_attention_pacing_off_issues_no_budget_reads(monkeypatch) -> None:
+    # Regression guard: the DEFAULT path (include_pacing omitted) is byte-identical to today — no
+    # pacing read is issued, so NO list_campaigns/list_adsets/get_account call reaches the reader.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    rows = {"act_1": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}]}
+    budget_calls: list[tuple[str, str]] = []
+
+    def _rec(name):
+        def _f(ad_account_id, *, fields, effective_status=None):
+            budget_calls.append((name, ad_account_id))
+            return []
+        return _f
+
+    def _get_account(ad_account_id, *, fields):
+        budget_calls.append(("get_account", ad_account_id))
+        return {"currency": "USD"}
+
+    reader = _attention_reader(
+        accounts, {"2026-06-01": rows, "2026-06-08": rows},
+        list_campaigns=_rec("list_campaigns"),
+        list_adsets=_rec("list_adsets"),
+        get_account=_get_account,
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+    assert budget_calls == []  # no budget-config read at all
+    assert out["clean_count"] == 1  # unchanged behavior
+    assert out["flagged"] == [] and out["informational"] == []
+    assert all("stage" not in e for e in out["errors"])  # no pacing-stage errors
+
+
+def test_flag_accounts_attention_pacing_budget_read_failure_tagged(monkeypatch) -> None:
+    # A per-account pacing (budget) read failure -> that account reads budget_unread inside pacing ->
+    # no budget_pacing_off flag for it; the failure is surfaced tagged stage:"pacing", never dropped.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_ok", "account_id": "1", "name": "OK", "account_status": 1, "currency": "USD"},
+        {"id": "act_bud", "account_id": "2", "name": "BudFail", "account_status": 1, "currency": "USD"},
+    ]
+    rows = {
+        "act_ok": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}],
+        "act_bud": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}],
+    }
+
+    def _campaigns(ad_account_id, *, fields, effective_status=None):
+        if ad_account_id == "act_bud":
+            raise MetaApiError("(#100) campaigns denied for act_bud")
+        return [_pc_camp("c1", daily="5000")]  # act_ok: over-pacing -> high budget_pacing_off
+
+    reader = _attention_pacing_reader(
+        accounts, {"2026-06-01": rows, "2026-06-08": rows}, {}, {},
+        {"act_ok": {"currency": "USD"}, "act_bud": {"currency": "USD"}},
+        list_campaigns=_campaigns,
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_pacing=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_ok"]
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"budget_pacing_off"}
+    assert out["clean_count"] == 1  # act_bud has no pacing flag -> stays clean
+    assert {
+        "ad_account_id": "act_bud", "stage": "pacing",
+        "error": "(#100) campaigns denied for act_bud",
+    } in out["errors"]
+
+
+def test_flag_accounts_attention_pacing_deterministic(monkeypatch) -> None:
+    # With pacing joined, identical inputs -> identical buckets/order. All three accounts are
+    # behaviorally clean but over-pace by the same amount (same severity + zero spend-delta), so the
+    # flagged order falls to the ad_account_id tiebreak and must be stable run-to-run.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    rows = {f"act_{i}": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}] for i in range(1, 4)}
+    campaigns = {f"act_{i}": [_pc_camp(f"c{i}", daily="5000")] for i in range(1, 4)}
+    caps = {f"act_{i}": {"currency": "USD"} for i in range(1, 4)}
+    reader = _attention_pacing_reader(accounts, {"2026-06-01": rows, "2026-06-08": rows}, campaigns, {}, caps)
+
+    kwargs = dict(current_from="2026-06-08", current_to="2026-06-14", include_pacing=True, fx_table=_fx())
+    out1 = _account_discovery.flag_accounts_needing_attention(reader, **kwargs)
+    out2 = _account_discovery.flag_accounts_needing_attention(reader, **kwargs)
+    assert out1 == out2
+    assert [e["ad_account_id"] for e in out1["flagged"]] == ["act_1", "act_2", "act_3"]
+    assert all({f["name"] for f in e["flags"]} == {"budget_pacing_off"} for e in out1["flagged"])
+
+
+def test_build_discovery_tools_flag_accounts_attention_pacing_smoke(monkeypatch) -> None:
+    # The wired MCP discovery tool threads include_pacing through and loads the committed FX table
+    # itself (fx_table stays a test-only seam). An over-pacing account surfaces via budget_pacing_off.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [{"spend": "700.00", "impressions": "7000", "clicks": "350"}]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch,
+        list_campaigns=lambda ad_account_id, *, fields, effective_status=None: [_pc_camp("c1", daily="5000")],
+        list_adsets=lambda ad_account_id, *, fields, effective_status=None: [],
+        get_account=lambda ad_account_id, *, fields: {"currency": "USD"},
+    )
+    tools = _mcp_server.build_discovery_tools(reader)
+    out = tools["flag_accounts_needing_attention"]("2026-06-08", "2026-06-14", include_pacing=True)
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_1"]
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"budget_pacing_off"}
+    # Default (pacing off) leaves the account clean -> confirms the opt-in is what surfaced it.
+    out_off = tools["flag_accounts_needing_attention"]("2026-06-08", "2026-06-14")
+    assert out_off["flagged"] == [] and out_off["clean_count"] == 1
+
+
+# --- flag_accounts_needing_attention: opt-in ad health (include_ad_health) --
+
+
+def _ad(ad_id, status, effective_status):
+    """A hand-built ad dict as the ad-health scan reads it (status + effective_status only)."""
+    return {"id": ad_id, "name": ad_id, "status": status, "effective_status": effective_status}
+
+
+def test_ad_health_flags_unit_disapproved_notdelivering_pause_empty() -> None:
+    thr = _account_discovery.AttentionThresholds.defaults()
+    F = _account_discovery._ad_health_flags
+
+    # Empty ads -> no flags.
+    assert F([], thr) == []
+
+    # A DISAPPROVED ad -> ads_disapproved (high); counted regardless of status.
+    disapproved = F([_ad("a1", "ACTIVE", "DISAPPROVED"), _ad("a2", "PAUSED", "DISAPPROVED")], thr)
+    assert len(disapproved) == 1
+    d = disapproved[0]
+    assert d["name"] == "ads_disapproved" and d["severity"] == "high"
+    assert d["current"] == 2 and d["baseline"] is None and d["delta"] is None and d["delta_pct"] is None
+    assert d["detail"] == "2 of 2 ads are DISAPPROVED"
+
+    # ACTIVE-configured but not delivering (WITH_ISSUES / PENDING_REVIEW) -> ads_not_delivering (medium).
+    stalled = F(
+        [_ad("a1", "ACTIVE", "WITH_ISSUES"), _ad("a2", "ACTIVE", "PENDING_REVIEW")], thr
+    )
+    assert len(stalled) == 1
+    s = stalled[0]
+    assert s["name"] == "ads_not_delivering" and s["severity"] == "medium"
+    assert s["current"] == 2
+    assert s["detail"] == "2 of 2 ads are ACTIVE-configured but not delivering (blocked/pending)"
+
+    # Delivering (ACTIVE/IN_PROCESS) and deliberate pauses -> NO flag. A paused ad is intentional, not
+    # a stall: status==ACTIVE+effective PAUSED/CAMPAIGN_PAUSED/ADSET_PAUSED, AND status==PAUSED entirely.
+    clean = F(
+        [
+            _ad("a1", "ACTIVE", "ACTIVE"),
+            _ad("a2", "ACTIVE", "IN_PROCESS"),
+            _ad("a3", "ACTIVE", "PAUSED"),
+            _ad("a4", "ACTIVE", "CAMPAIGN_PAUSED"),
+            _ad("a5", "ACTIVE", "ADSET_PAUSED"),
+            _ad("a6", "PAUSED", "WITH_ISSUES"),  # operator turned it off -> not a stall
+        ],
+        thr,
+    )
+    assert clean == []
+
+    # A DISAPPROVED ad is NOT double-counted in ads_not_delivering even when status==ACTIVE.
+    both = F([_ad("a1", "ACTIVE", "DISAPPROVED"), _ad("a2", "ACTIVE", "PENDING_BILLING_INFO")], thr)
+    by_name = {f["name"]: f for f in both}
+    assert set(by_name) == {"ads_disapproved", "ads_not_delivering"}
+    assert by_name["ads_disapproved"]["current"] == 1
+    assert by_name["ads_not_delivering"]["current"] == 1  # the DISAPPROVED ad is excluded here
+
+    # The count knob gates firing: with min_count 2, a single bad ad of each kind fires nothing.
+    import dataclasses
+
+    thr2 = dataclasses.replace(thr, ad_health_min_count=2)
+    assert F([_ad("a1", "ACTIVE", "DISAPPROVED"), _ad("a2", "ACTIVE", "WITH_ISSUES")], thr2) == []
+
+
+def _attention_ad_health_reader(accounts, rows_by_window, ads_by_id, **overrides):
+    """An attention reader that also serves the ad-health fan-out's ``/{id}/ads`` enumeration.
+
+    ``ads_by_id`` maps ``ad_account_id -> [ad dict, ...]``. The iter_paginated stub dispatches on the
+    ``/{id}/ads`` path so each flagged account gets its own ad list; a path absent from the map means
+    that account was never scanned (used to assert the flagged-only gate). MOCKS ONLY.
+    """
+
+    def _iter(path, *, params=None):
+        # path is f"/{ad_account_id}/ads"; key back to the account id.
+        ad_account_id = path.strip("/").split("/")[0]
+        if ad_account_id not in ads_by_id:
+            raise AssertionError(f"unexpected ad-health scan of {ad_account_id} (path {path})")
+        return [dict(a) for a in ads_by_id[ad_account_id]]
+
+    overrides.setdefault("iter_paginated", _iter)
+    return _attention_reader(accounts, rows_by_window, **overrides)
+
+
+def test_flag_accounts_attention_ad_health_promotes_and_attaches(monkeypatch) -> None:
+    # A behaviorally MEDIUM account (a +60% spend spike -> medium) whose ads include a DISAPPROVED and a
+    # WITH_ISSUES ad gains BOTH ad-health flags and is PROMOTED to high; ad_health_scanned_count == 1.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"}]
+    # +60% across the board -> spend_spike medium only (cpc/ctr unchanged; no results -> no cpr flag).
+    baseline_rows = {"act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}]}
+    current_rows = {"act_1": [{"spend": "320.00", "impressions": "3200", "clicks": "160"}]}
+    ads = {"act_1": [_ad("a1", "ACTIVE", "DISAPPROVED"), _ad("a2", "ACTIVE", "WITH_ISSUES")]}
+    reader = _attention_ad_health_reader(
+        accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, ads
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_ad_health=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_1"]
+    entry = out["flagged"][0]
+    assert entry["severity"] == "high"  # promoted from the medium spend_spike by ads_disapproved
+    assert {f["name"] for f in entry["flags"]} == {"spend_spike", "ads_disapproved", "ads_not_delivering"}
+    by_name = {f["name"]: f for f in entry["flags"]}
+    assert by_name["ads_disapproved"]["current"] == 1 and by_name["ads_not_delivering"]["current"] == 1
+    assert out["ad_health_scanned_count"] == 1
+    assert all(e.get("stage") != "ad_health" for e in out["errors"])
+
+
+def test_flag_accounts_attention_ad_health_promotion_reorders_flagged(monkeypatch) -> None:
+    # An ad-health promotion RE-SORTS the flagged list. act_high is high on behavior alone but has a
+    # small spend delta; act_med is only medium on behavior but a larger delta. Without ad health,
+    # severity dominates -> [act_high, act_med]. Promoting act_med to high (disapproved ads) flips the
+    # order to the |delta| tiebreak -> [act_med, act_high], deterministically.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_high", "account_id": "1", "name": "High", "account_status": 1, "currency": "USD"},
+        {"id": "act_med", "account_id": "2", "name": "Med", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {
+        "act_high": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],
+        "act_med": [{"spend": "1000.00", "impressions": "10000", "clicks": "500"}],
+    }
+    current_rows = {
+        "act_high": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],   # +200% high, |Δ|=200
+        "act_med": [{"spend": "1600.00", "impressions": "16000", "clicks": "800"}],  # +60% medium, |Δ|=600
+    }
+    ads = {
+        "act_high": [_ad("a1", "ACTIVE", "ACTIVE")],           # healthy -> stays behavior-only high
+        "act_med": [_ad("b1", "ACTIVE", "DISAPPROVED")],       # -> ads_disapproved (high) promotion
+    }
+    kwargs = dict(current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx())
+
+    # Baseline (ad health off): severity dominates the sort -> act_high first.
+    reader_off = _attention_reader(accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows})
+    out_off = _account_discovery.flag_accounts_needing_attention(reader_off, **kwargs)
+    assert [e["ad_account_id"] for e in out_off["flagged"]] == ["act_high", "act_med"]
+
+    # With ad health: act_med promoted to high; both high now -> |delta| desc puts act_med first.
+    reader_on = _attention_ad_health_reader(
+        accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, ads
+    )
+    out_on = _account_discovery.flag_accounts_needing_attention(
+        reader_on, include_ad_health=True, **kwargs
+    )
+    assert [e["ad_account_id"] for e in out_on["flagged"]] == ["act_med", "act_high"]
+    assert out_on["flagged"][0]["severity"] == out_on["flagged"][1]["severity"] == "high"
+    # Determinism: identical inputs -> identical output regardless of fan-out completion order.
+    out_on2 = _account_discovery.flag_accounts_needing_attention(
+        _attention_ad_health_reader(
+            accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, ads
+        ),
+        include_ad_health=True, **kwargs
+    )
+    assert out_on == out_on2
+
+
+def test_flag_accounts_attention_ad_health_off_issues_no_ad_reads(monkeypatch) -> None:
+    # Regression guard: default (include_ad_health omitted) issues NO iter_paginated call and adds no
+    # ad_health_scanned_count key, even for an account that IS flagged (would otherwise be scanned).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"}]
+    baseline_rows = {"act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}]}
+    current_rows = {"act_1": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}]}  # +200% high
+    reader = _attention_reader(accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows})
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_1"]  # flagged -> would be scanned if on
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"spend_spike"}  # no ad-health flags
+    assert "ad_health_scanned_count" not in out  # key absent -> output shape unchanged from the prereq
+    assert not any(c[0] == "iter_paginated" for c in reader.calls)  # no ad read issued at all
+
+
+def test_flag_accounts_attention_ad_health_only_flagged_are_scanned(monkeypatch) -> None:
+    # A clean, on-pace account that HAS disapproved ads is never ad-scanned (it never became flagged),
+    # so no flag surfaces for it and it stays in clean_count; only the flagged account is scanned.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_flag", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"},
+        {"id": "act_clean", "account_id": "2", "name": "Clean", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {
+        "act_flag": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_clean": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],
+    }
+    current_rows = {
+        "act_flag": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],  # +200% -> flagged
+        "act_clean": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],  # unchanged -> clean
+    }
+    scanned_paths: list[str] = []
+
+    def _iter(path, *, params=None):
+        scanned_paths.append(path)
+        # act_flag's ads are healthy; act_clean would flag IF scanned (but must not be scanned).
+        if path == "/act_flag/ads":
+            return [_ad("a1", "ACTIVE", "ACTIVE")]
+        return [_ad("bad", "ACTIVE", "DISAPPROVED")]
+
+    reader = _attention_reader(
+        accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, iter_paginated=_iter
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_ad_health=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_flag"]
+    assert out["clean_count"] == 1  # act_clean stays clean, disapproved ads and all
+    assert scanned_paths == ["/act_flag/ads"]  # act_clean NEVER scanned (the documented limitation)
+    assert out["ad_health_scanned_count"] == 1
+    # act_flag's ads were healthy -> only its behavior flag, no ad-health flag.
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"spend_spike"}
+
+
+def test_flag_accounts_attention_ad_health_with_pacing_promotes_then_scans(monkeypatch) -> None:
+    # Composition: pacing PROMOTES a behaviorally-clean account into flagged, which then becomes eligible
+    # for the ad-health scan (order: behavior -> pacing -> finalize flagged -> ad-health fan-out).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_over", "account_id": "1", "name": "OverPace", "account_status": 1, "currency": "USD"}]
+    rows = {"act_over": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}]}  # same both windows
+    window_rows = {"2026-06-01": rows, "2026-06-08": rows}
+    campaigns = {"act_over": [_pc_camp("c1", daily="5000")]}  # $50/day -> +100% over -> high pacing flag
+    caps = {"act_over": {"currency": "USD"}}
+    ads = {"act_over": [_ad("a1", "ACTIVE", "PENDING_REVIEW")]}  # -> ads_not_delivering (medium)
+
+    def _iter(path, *, params=None):
+        return [dict(a) for a in ads[path.strip("/").split("/")[0]]]
+
+    reader = _attention_pacing_reader(
+        accounts, window_rows, campaigns, {}, caps, iter_paginated=_iter
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_pacing=True, include_ad_health=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_over"]
+    entry = out["flagged"][0]
+    assert entry["severity"] == "high"  # from the pacing flag
+    assert {f["name"] for f in entry["flags"]} == {"budget_pacing_off", "ads_not_delivering"}
+    assert out["ad_health_scanned_count"] == 1  # the pacing-promoted account WAS ad-scanned
+
+
+def test_flag_accounts_attention_ad_health_read_failure_tagged(monkeypatch) -> None:
+    # A per-account ad-enumeration failure -> error tagged stage:"ad_health"; other flagged accounts
+    # are unaffected and still get their ad-health flags. Both accounts are counted as fanned-into.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "S1", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "S2", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {
+        "act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+    }
+    current_rows = {  # both +200% -> both flagged (high spike)
+        "act_1": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],
+        "act_2": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],
+    }
+
+    def _iter(path, *, params=None):
+        if path == "/act_1/ads":
+            raise MetaApiError("(#17) user request limit reached for act_1 ads")
+        return [_ad("bad", "ACTIVE", "DISAPPROVED")]
+
+    reader = _attention_reader(
+        accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, iter_paginated=_iter
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_ad_health=True, fx_table=_fx(),
+    )
+    assert {e["ad_account_id"] for e in out["flagged"]} == {"act_1", "act_2"}
+    by_id = {e["ad_account_id"]: e for e in out["flagged"]}
+    assert {f["name"] for f in by_id["act_1"]["flags"]} == {"spend_spike"}  # ad read failed -> no ad flag
+    assert "ads_disapproved" in {f["name"] for f in by_id["act_2"]["flags"]}  # act_2 unaffected
+    assert {
+        "stage": "ad_health", "ad_account_id": "act_1",
+        "error": "(#17) user request limit reached for act_1 ads",
+    } in out["errors"]
+    assert out["ad_health_scanned_count"] == 2  # both accounts were fanned into (a failure still costs a read)
+
+
+def test_flag_accounts_attention_ad_health_no_flagged_no_fanout(monkeypatch) -> None:
+    # No flagged account -> no ad fan-out at all; ad_health_scanned_count == 0 and no iter_paginated call.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Clean", "account_status": 1, "currency": "USD"}]
+    rows = {"act_1": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}]}  # unchanged -> clean
+    reader = _attention_reader(accounts, {"2026-06-01": rows, "2026-06-08": rows})
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_ad_health=True, fx_table=_fx(),
+    )
+    assert out["flagged"] == [] and out["clean_count"] == 1
+    assert out["ad_health_scanned_count"] == 0
+    assert not any(c[0] == "iter_paginated" for c in reader.calls)
+
+
+def test_build_discovery_tools_flag_accounts_attention_ad_health_smoke(monkeypatch) -> None:
+    # The wired MCP discovery tool threads include_ad_health through; an ad read is issued only via the
+    # opt-in and only for the flagged account.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"}]
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        base = {"spend": "200.00", "impressions": "2000", "clicks": "100"}
+        cur = {"spend": "600.00", "impressions": "6000", "clicks": "300"}  # +200% -> flagged
+        return [base if date_from == "2026-06-01" else cur]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch,
+        iter_paginated=lambda path, *, params=None: [_ad("bad", "ACTIVE", "DISAPPROVED")],
+    )
+    tools = _mcp_server.build_discovery_tools(reader)
+    out = tools["flag_accounts_needing_attention"]("2026-06-08", "2026-06-14", include_ad_health=True)
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_1"]
+    assert "ads_disapproved" in {f["name"] for f in out["flagged"][0]["flags"]}
+    assert out["ad_health_scanned_count"] == 1
+    # Default (ad health off) issues no ad read and adds no scanned-count key.
+    ad_reads_before = sum(1 for c in reader.calls if c[0] == "iter_paginated")
+    out_off = tools["flag_accounts_needing_attention"]("2026-06-08", "2026-06-14")
+    assert "ad_health_scanned_count" not in out_off
+    ad_reads_after = sum(1 for c in reader.calls if c[0] == "iter_paginated")
+    assert ad_reads_after == ad_reads_before  # the off-path issued no additional ad read
+
+
 # --- pacing_report: pure helpers (clock-free, no reader) --------------------
 
 
@@ -11350,21 +12157,57 @@ def test_minor_to_major_cents_and_blank() -> None:
     assert _account_discovery._minor_to_major("0") == 0.0
 
 
-def _pc_camp(cid, status="ACTIVE", daily=None, lifetime=None):
+def test_minor_to_major_currency_aware_divisor() -> None:
+    import pytest
+
+    M = _account_discovery._minor_to_major
+
+    # Default currency is USD (2-decimal) -> /100, matching the bare-call behavior above.
+    assert M("30000") == pytest.approx(300.0)
+    assert M("30000", "USD") == pytest.approx(300.0)
+    assert M("30000", "EUR") == pytest.approx(300.0)
+
+    # Zero-decimal (JPY): minor unit == major unit -> divisor 1, NOT 100 (the bug this fixes).
+    assert M("30000", "JPY") == pytest.approx(30000.0)
+    assert M("30000", "jpy") == pytest.approx(30000.0)  # case-insensitive
+    assert M(30000, "KRW") == pytest.approx(30000.0)
+
+    # Three-decimal (KWD/BHD) -> /1000.
+    assert M("30000", "KWD") == pytest.approx(30.0)
+    assert M("30000", "BHD") == pytest.approx(30.0)
+
+    # Blank / None / UNKNOWN currency -> 2-decimal default (today's behavior; no raise).
+    assert M("30000", "") == pytest.approx(300.0)
+    assert M("30000", "UNKNOWN") == pytest.approx(300.0)
+
+    # spend_cap "0" is still 0 under a 0-decimal divisor (the uncapped guard survives the change).
+    assert M("0", "JPY") == 0.0
+
+
+def _pc_camp(cid, status="ACTIVE", daily=None, lifetime=None, start_time=None, stop_time=None):
     row = {"id": cid, "effective_status": status}
     if daily is not None:
         row["daily_budget"] = daily
     if lifetime is not None:
         row["lifetime_budget"] = lifetime
+    if start_time is not None:
+        row["start_time"] = start_time
+    if stop_time is not None:
+        row["stop_time"] = stop_time
     return row
 
 
-def _pc_adset(aid, campaign_id, status="ACTIVE", daily=None, lifetime=None):
+def _pc_adset(aid, campaign_id, status="ACTIVE", daily=None, lifetime=None,
+              start_time=None, stop_time=None):
     row = {"id": aid, "campaign_id": campaign_id, "effective_status": status}
     if daily is not None:
         row["daily_budget"] = daily
     if lifetime is not None:
         row["lifetime_budget"] = lifetime
+    if start_time is not None:
+        row["start_time"] = start_time
+    if stop_time is not None:
+        row["stop_time"] = stop_time
     return row
 
 
@@ -11408,6 +12251,138 @@ def test_summarize_account_budget_cbo_dedup_precedence() -> None:
     assert mixed["active_daily"] == pytest.approx(450.0)
 
 
+def test_summarize_account_budget_currency_aware() -> None:
+    import pytest
+
+    S = _account_discovery.summarize_account_budget
+
+    # Default USD (2-decimal): a "1000" daily budget -> 10.0 major units (unchanged).
+    usd = S([_pc_camp("c1", daily="1000")], [])
+    assert usd["active_daily"] == pytest.approx(10.0)
+
+    # JPY (0-decimal): a "1000" daily budget IS ¥1000 major units, not ¥10.
+    jpy = S([_pc_camp("c1", daily="1000")], [], "JPY")
+    assert jpy["active_daily"] == pytest.approx(1000.0)
+    assert jpy["lifetime_total"] == 0.0
+
+    # JPY lifetime budget threads the divisor too.
+    jpy_life = S([_pc_camp("c1", lifetime="500000")], [], "JPY")
+    assert jpy_life["lifetime_total"] == pytest.approx(500000.0)
+
+    # KWD (3-decimal): a "30000" adset daily under a non-CBO campaign -> 30.0 (/1000).
+    kwd = S([_pc_camp("c1")], [_pc_adset("as1", "c1", daily="30000")], "KWD")
+    assert kwd["active_daily"] == pytest.approx(30.0)
+
+
+def test_summarize_account_budget_lifetime_entities() -> None:
+    import pytest
+
+    S = _account_discovery.summarize_account_budget
+
+    # CBO-lifetime campaign: the CAMPAIGN owns the entity + carries its schedule (adsets ignored).
+    cbo_life = S(
+        [_pc_camp("c1", lifetime="700000", start_time="2026-07-01T00:00:00-0700",
+                  stop_time="2026-07-31T23:59:00-0700")],
+        [_pc_adset("as1", "c1", lifetime="999999")],  # ignored under CBO
+    )
+    assert cbo_life["lifetime_total"] == pytest.approx(7000.0)
+    assert cbo_life["lifetime_entities"] == [
+        {"lifetime_budget": pytest.approx(7000.0),
+         "start_time": "2026-07-01T00:00:00-0700", "stop_time": "2026-07-31T23:59:00-0700"}
+    ]
+
+    # Non-CBO campaign: each ACTIVE adset-lifetime emits its OWN entity + schedule (major units).
+    non_cbo = S(
+        [_pc_camp("c1")],
+        [
+            _pc_adset("as1", "c1", lifetime="160000", start_time="2026-07-05", stop_time="2026-07-20"),
+            _pc_adset("as2", "c1", lifetime="240000", start_time="2026-07-10", stop_time="2026-07-25"),
+        ],
+    )
+    assert non_cbo["lifetime_total"] == pytest.approx(4000.0)
+    assert non_cbo["lifetime_entities"] == [
+        {"lifetime_budget": pytest.approx(1600.0), "start_time": "2026-07-05", "stop_time": "2026-07-20"},
+        {"lifetime_budget": pytest.approx(2400.0), "start_time": "2026-07-10", "stop_time": "2026-07-25"},
+    ]
+
+    # A daily-only account emits NO lifetime entities.
+    daily = S([_pc_camp("c1", daily="30000")], [])
+    assert daily["lifetime_entities"] == []
+
+    # CBO-DAILY campaign: no lifetime entity even if a decoy adset carries one (double-count guard).
+    cbo_daily = S(
+        [_pc_camp("c1", daily="30000")],
+        [_pc_adset("as1", "c1", lifetime="500000", start_time="2026-07-01", stop_time="2026-07-31")],
+    )
+    assert cbo_daily["lifetime_entities"] == []
+
+    # A paused lifetime campaign contributes nothing (parent gates delivery).
+    paused = S([_pc_camp("c1", status="PAUSED", lifetime="500000",
+                         start_time="2026-07-01", stop_time="2026-07-31")], [])
+    assert paused["lifetime_entities"] == [] and paused["lifetime_total"] == 0.0
+
+
+def test_lifetime_pacing_proration() -> None:
+    import pytest
+
+    L = _account_discovery.lifetime_pacing
+    kw = dict(date_from="2026-07-01", date_to="2026-07-31", effective_as_of="2026-07-14")
+
+    def _ent(lifetime, start, stop):
+        return {"lifetime_budget": lifetime, "start_time": start, "stop_time": stop}
+
+    # Schedule == window (31 days): whole pot in-window; expected-to-date = 14/31 of it.
+    same = L([_ent(9300.0, "2026-07-01", "2026-07-31")], **kw)
+    assert same["period_budget"] == pytest.approx(9300.0)
+    assert same["expected_to_date"] == pytest.approx(9300.0 * 14 / 31)
+    assert same["n_entities"] == 1 and same["n_projectable"] == 1
+
+    # Schedule wholly inside the window (2026-07-05..2026-07-20 = 16 days): whole pot expected within
+    # the window; overlap_todate (07-05..07-14) = 10 days.
+    inside = L([_ent(1600.0, "2026-07-05", "2026-07-20")], **kw)
+    assert inside["period_budget"] == pytest.approx(1600.0)
+    assert inside["expected_to_date"] == pytest.approx(1600.0 * 10 / 16)
+
+    # Schedule straddling the start (2026-06-15..2026-07-20 = 36 days): overlap clipped to date_from.
+    # overlap_full = 07-01..07-20 = 20 days; overlap_todate = 07-01..07-14 = 14 days.
+    straddle = L([_ent(3600.0, "2026-06-15", "2026-07-20")], **kw)
+    assert straddle["period_budget"] == pytest.approx(3600.0 * 20 / 36)
+    assert straddle["expected_to_date"] == pytest.approx(3600.0 * 14 / 36)
+
+    # No overlap (wholly after the window) -> zeros, not projectable.
+    none = L([_ent(5000.0, "2026-08-01", "2026-08-31")], **kw)
+    assert none == {"period_budget": 0.0, "expected_to_date": 0.0, "n_entities": 1, "n_projectable": 0}
+
+    # Open-ended (stop_time None) -> non-projectable.
+    open_ended = L([_ent(5000.0, "2026-07-01", None)], **kw)
+    assert open_ended["period_budget"] == 0.0 and open_ended["n_projectable"] == 0
+
+    # Missing start -> non-projectable.
+    no_start = L([_ent(5000.0, None, "2026-07-31")], **kw)
+    assert no_start["n_projectable"] == 0
+
+    # stop <= start (bad data) -> non-projectable.
+    inverted = L([_ent(5000.0, "2026-07-20", "2026-07-05")], **kw)
+    assert inverted["n_projectable"] == 0
+
+    # Window elapsed but entity schedule not yet started (starts after as_of): overlap_full > 0 but
+    # overlap_todate == 0 -> contributes to period_budget, nothing to expected_to_date.
+    not_started_yet = L([_ent(1000.0, "2026-07-20", "2026-07-31")], **kw)
+    assert not_started_yet["period_budget"] == pytest.approx(1000.0)  # whole schedule in-window
+    assert not_started_yet["expected_to_date"] == 0.0
+    assert not_started_yet["n_projectable"] == 1
+
+    # Multiple entities aggregate (order-independent sum).
+    multi = L([_ent(9300.0, "2026-07-01", "2026-07-31"), _ent(1600.0, "2026-07-05", "2026-07-20")], **kw)
+    assert multi["period_budget"] == pytest.approx(9300.0 + 1600.0)
+    assert multi["expected_to_date"] == pytest.approx(9300.0 * 14 / 31 + 1600.0 * 10 / 16)
+    assert multi["n_entities"] == 2 and multi["n_projectable"] == 2
+
+    # Empty input -> zeros.
+    empty = L([], **kw)
+    assert empty == {"period_budget": 0.0, "expected_to_date": 0.0, "n_entities": 0, "n_projectable": 0}
+
+
 def test_classify_pacing_status_enum_and_boundaries() -> None:
     C = _account_discovery.classify_pacing
     common = dict(elapsed_fraction=0.5, account_status_label="ACTIVE", lifetime_budget_total=0.0,
@@ -11426,10 +12401,16 @@ def test_classify_pacing_status_enum_and_boundaries() -> None:
     assert C(elapsed_fraction=0.5, account_status_label="ACTIVE", active_daily_budget=0.0,
              lifetime_budget_total=0.0, spend_cap=None, period_budget=0.0,
              projected_spend=10.0)["status"] == "no_budget_set"
-    # budget_not_projectable: lifetime-only (has a lifetime budget but zero active daily).
+    # budget_not_projectable: lifetime-only with NO projectable overlap -> combined period_budget 0.
     assert C(elapsed_fraction=0.5, account_status_label="ACTIVE", active_daily_budget=0.0,
              lifetime_budget_total=5000.0, spend_cap=None, period_budget=0.0,
              projected_spend=10.0)["status"] == "budget_not_projectable"
+    # Relaxed guard: a lifetime-only account with ZERO active daily but a projectable combined
+    # period_budget > 0 and a non-None projection now gets a real over/under/on_track verdict.
+    proj_life = C(elapsed_fraction=0.5, account_status_label="ACTIVE", active_daily_budget=0.0,
+                  lifetime_budget_total=5000.0, spend_cap=None, period_budget=100.0,
+                  projected_spend=200.0)
+    assert proj_life == {"status": "over", "variance_pct": 1.0}
     # account_inactive short-circuits even with a real budget.
     assert C(**{**common, "account_status_label": "DISABLED"},
              period_budget=100.0, projected_spend=200.0)["status"] == "account_inactive"
@@ -11537,6 +12518,73 @@ def test_pacing_report_end_to_end_statuses_rollup_and_shortlists(monkeypatch) ->
     assert out["errors"] == []
 
 
+def test_pacing_report_jpy_zero_decimal_end_to_end(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_jpy", "account_id": "1", "name": "Tokyo", "account_status": 1, "currency": "JPY"},
+    ]
+    # Insights spend is ALREADY major units (¥420,000). Budget/cap/amount_spent are minor units, but
+    # JPY is 0-decimal so minor == major: "30000" is ¥30,000/day, not ¥300.
+    insights = {"act_jpy": [{"spend": "420000.00"}]}
+    campaigns = {"act_jpy": [_pc_camp("c1", daily="30000")]}  # CBO daily ¥30,000
+    caps = {"act_jpy": {"currency": "JPY", "spend_cap": "1500000", "amount_spent": "500000"}}
+
+    reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    # JPY must be in the FX table so the account is normalizable (not routed to no-FX errors).
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(JPY=0.0067), **_PACING_KW)
+
+    jpy = {a["ad_account_id"]: a for a in out["accounts"]}["act_jpy"]
+    # Corrected magnitudes: divisor 1 (not 100). Old buggy code would report /100 of each of these.
+    assert jpy["active_daily_budget"] == pytest.approx(30000.0)
+    assert jpy["period_budget"] == pytest.approx(930000.0)  # 30,000 * 31
+    assert jpy["spend_cap"] == pytest.approx(1500000.0)
+    assert jpy["amount_spent"] == pytest.approx(500000.0)
+    # Sane verdict: projected 420,000 / (14/31) == 930,000 == period_budget -> on_track, variance ~0.
+    assert jpy["projected_spend"] == pytest.approx(930000.0)
+    assert jpy["status"] == "on_track"
+    assert jpy["variance_pct"] == pytest.approx(0.0)
+    # Normalized twins use the injected JPY rate; variance ratio is FX-invariant regardless.
+    assert jpy["period_budget_normalized"] == pytest.approx(930000.0 * 0.0067)
+    # JPY is a recognized exponent -> NO assumption note.
+    assert "assumed 2-decimal" not in (out.get("note") or "")
+    assert out["errors"] == []
+
+
+def test_pacing_report_assumption_note_only_for_unrecognized_currency(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+
+    # Scope with a known currency (USD) plus two accounts in an unrecognized-but-FX-injected code
+    # (XTS, ISO test code) and one more unrecognized code (ZZZ) -> the note lists the assumed codes
+    # deduped and in deterministic (sorted) order; the known USD code is never listed.
+    accounts = [
+        {"id": "act_usd", "account_id": "1", "name": "USD", "account_status": 1, "currency": "USD"},
+        {"id": "act_x1", "account_id": "2", "name": "X1", "account_status": 1, "currency": "XTS"},
+        {"id": "act_x2", "account_id": "3", "name": "X2", "account_status": 1, "currency": "XTS"},
+        {"id": "act_z", "account_id": "4", "name": "Z", "account_status": 1, "currency": "ZZZ"},
+    ]
+    insights = {a["id"]: [{"spend": "1000.00"}] for a in accounts}
+    campaigns = {a["id"]: [_pc_camp(f"c_{a['id']}", daily="10000")] for a in accounts}
+    caps = {a["id"]: {} for a in accounts}
+    reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(XTS=0.5, ZZZ=0.4), **_PACING_KW)
+
+    note = out.get("note") or ""
+    assert "assumed 2-decimal minor units for unrecognized currency codes: XTS, ZZZ." in note
+    assert note.count("XTS") == 1  # deduped despite two XTS accounts
+    assert "USD" not in note  # a recognized code is never flagged as an assumption
+
+    # An all-recognized scope (USD only) must NOT emit the assumption note at all.
+    usd_only = [{"id": "act_only", "account_id": "1", "name": "U", "account_status": 1, "currency": "USD"}]
+    reader2 = _pacing_reader(
+        usd_only, {"act_only": [{"spend": "1000.00"}]},
+        {"act_only": [_pc_camp("c1", daily="10000")]}, {}, {"act_only": {}},
+    )
+    out2 = _account_discovery.pacing_report(reader2, fx_table=_fx(), **_PACING_KW)
+    assert "assumed 2-decimal" not in (out2.get("note") or "")
+
+
 def test_pacing_report_shortlist_tiebreak_by_account_id(monkeypatch) -> None:
     # Two accounts with IDENTICAL variance must order by ad_account_id asc in the shortlists.
     monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
@@ -11550,6 +12598,156 @@ def test_pacing_report_shortlist_tiebreak_by_account_id(monkeypatch) -> None:
     out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
     assert [s["ad_account_id"] for s in out["rollup"]["worst_over_pacers"]] == ["act_aaa", "act_bbb"]
     assert [s["ad_account_id"] for s in out["rollup"]["worst_under_pacers"]] == ["act_aaa", "act_bbb"]
+
+
+def test_pacing_report_prorates_lifetime_budgets_end_to_end(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    ef = _EF  # 14/31
+
+    accounts = [
+        # lifetime-only, schedule == window -> was budget_not_projectable, now a REAL verdict.
+        {"id": "act_life_ok", "account_id": "1", "name": "LifeOK", "account_status": 1, "currency": "USD"},
+        # lifetime-only, schedule wholly AFTER the window -> stays budget_not_projectable.
+        {"id": "act_life_no", "account_id": "2", "name": "LifeNo", "account_status": 1, "currency": "USD"},
+        # mixed: CBO-daily + a CBO-lifetime whose schedule straddles date_from (fractional overlap).
+        {"id": "act_mixed", "account_id": "3", "name": "Mixed", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_life_ok": [{"spend": "6300.00"}],
+        "act_life_no": [{"spend": "800.00"}],
+        "act_mixed": [{"spend": "2000.00"}],
+    }
+    campaigns = {
+        # 9300 lifetime over the full 31-day window: period_budget == 9300, expected == 9300*14/31.
+        "act_life_ok": [_pc_camp("cA", lifetime="930000",
+                                 start_time="2026-07-01", stop_time="2026-07-31")],
+        # 5000 lifetime entirely in August: no overlap with July window.
+        "act_life_no": [_pc_camp("cB", lifetime="500000",
+                                 start_time="2026-08-01", stop_time="2026-08-31")],
+        # CBO-daily 100/day (period 3100) + CBO-lifetime 6200 over 2026-06-16..2026-07-15 (30 days),
+        # of which July 1-15 (15 days) fall in-window -> prorated lifetime period budget 6200*15/30 == 3100.
+        "act_mixed": [
+            _pc_camp("cM1", daily="10000"),
+            _pc_camp("cM2", lifetime="620000", start_time="2026-06-16", stop_time="2026-07-15"),
+        ],
+    }
+    reader = _pacing_reader(accounts, insights, campaigns, {}, {})
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
+    by_id = {a["ad_account_id"]: a for a in out["accounts"]}
+
+    # (1) lifetime-only overlapping -> real verdict grounded in the prorated expectation.
+    ok = by_id["act_life_ok"]
+    assert ok["active_daily_budget"] == 0.0
+    assert ok["lifetime_budget_total"] == pytest.approx(9300.0)
+    assert ok["period_budget"] == pytest.approx(9300.0)                 # full pot in-window
+    assert ok["projected_spend"] == pytest.approx(6300.0 * 31 / 14)     # spend * pb / expected
+    assert ok["projected_spend"] == pytest.approx(13950.0)
+    assert ok["variance_pct"] == pytest.approx(0.5)
+    assert ok["status"] == "over"
+
+    # (2) lifetime-only, non-overlapping schedule -> stays budget_not_projectable (residual case).
+    no = by_id["act_life_no"]
+    assert no["status"] == "budget_not_projectable"
+    assert no["variance_pct"] is None
+    assert no["lifetime_budget_total"] == pytest.approx(5000.0)
+    assert no["period_budget"] == 0.0
+
+    # (3) mixed -> combined period_budget == daily period budget + prorated lifetime period budget.
+    mixed = by_id["act_mixed"]
+    assert mixed["active_daily_budget"] == pytest.approx(100.0)
+    assert mixed["lifetime_budget_total"] == pytest.approx(6200.0)
+    assert mixed["period_budget"] == pytest.approx(3100.0 + 3100.0)     # 100*31 + 6200*15/30
+    expected_to_date = 3100.0 * ef + 6200.0 * 14 / 30                   # daily + lifetime overlap-todate
+    assert mixed["projected_spend"] == pytest.approx(2000.0 * 6200.0 / expected_to_date)
+    assert mixed["status"] in {"over", "under", "on_track"}
+    assert mixed["status"] == "under"
+
+    # Rollup: the two projectable accounts now enter the normalized totals + shortlists; only the
+    # non-overlapping lifetime account is excluded.
+    rollup = out["rollup"]
+    assert rollup["status_counts"]["over"] == 1
+    assert rollup["status_counts"]["under"] == 1
+    assert rollup["status_counts"]["budget_not_projectable"] == 1
+    assert rollup["excluded_from_rollup"] == 1  # only act_life_no
+    assert rollup["total_period_budget_normalized"] == pytest.approx(9300.0 + 6200.0)  # USD rate 1
+    assert rollup["worst_over_pacers"][0]["ad_account_id"] == "act_life_ok"
+    assert out["errors"] == []
+
+
+def test_pacing_report_lifetime_residual_and_short_circuit_branches(monkeypatch) -> None:
+    """Residual branches the proration must NOT paper over (started-window, per-account):
+
+    - A pure-lifetime account whose schedule overlaps the window but has not STARTED as of ``as_of``
+      has ``period_budget > 0`` (whole pot in-window) yet ``expected_to_date == 0`` (nothing paced
+      yet), so the combined projection is None -> ``budget_not_projectable`` even though the window is
+      well underway. This is the ``expected_to_date == 0 with period_budget > 0`` case the unit test
+      covers on ``lifetime_pacing`` but which was never exercised end-to-end through ``pacing_report``.
+    - A PAUSED account with a fully-projectable lifetime schedule: proration is computed then ignored
+      because ``account_inactive`` short-circuits ``classify_pacing`` ahead of the budget verdict. It
+      must not leak an over/under verdict from the prorated numbers.
+    """
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+
+    accounts = [
+        # Lifetime schedule 2026-07-20..07-31 (starts AFTER as_of=07-14) -> overlaps window (period
+        # budget > 0) but nothing expected-to-date -> budget_not_projectable.
+        {"id": "act_life_future", "account_id": "1", "name": "LifeFuture", "account_status": 1, "currency": "USD"},
+        # ACTIVE account-level status but with a projectable lifetime schedule == window: real verdict
+        # (control that the two below differ only in what they should).
+        {"id": "act_life_active", "account_id": "2", "name": "LifeActive", "account_status": 1, "currency": "USD"},
+        # non-ACTIVE account (status 3 = UNSETTLED) whose CBO-lifetime campaign is a projectable schedule
+        # == window -> account_inactive wins; proration is computed-then-ignored.
+        {"id": "act_life_paused", "account_id": "3", "name": "LifePaused", "account_status": 3, "currency": "USD"},
+    ]
+    insights = {
+        "act_life_future": [{"spend": "500.00"}],
+        "act_life_active": [{"spend": "6300.00"}],
+        "act_life_paused": [{"spend": "400.00"}],
+    }
+    campaigns = {
+        "act_life_future": [_pc_camp("cF", lifetime="930000",
+                                     start_time="2026-07-20", stop_time="2026-07-31")],
+        "act_life_active": [_pc_camp("cA", lifetime="930000",
+                                     start_time="2026-07-01", stop_time="2026-07-31")],
+        # The campaign row itself reads ACTIVE (delivery-eligible under the account) so summarize emits
+        # the lifetime entity and proration runs; the ACCOUNT status is what gates the verdict.
+        "act_life_paused": [_pc_camp("cP", lifetime="930000",
+                                     start_time="2026-07-01", stop_time="2026-07-31")],
+    }
+    reader = _pacing_reader(accounts, insights, campaigns, {}, {})
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
+    by_id = {a["ad_account_id"]: a for a in out["accounts"]}
+
+    # (1) overlaps the window (period_budget == full pot) but not yet started -> can't project to-date.
+    future = by_id["act_life_future"]
+    assert future["period_budget"] == pytest.approx(9300.0)   # whole pot in-window (overlap_full)
+    assert future["projected_spend"] is None                   # expected_to_date == 0 -> no divide
+    assert future["variance_pct"] is None
+    assert future["status"] == "budget_not_projectable"
+
+    # (2) control: identical schedule but started -> real verdict.
+    active = by_id["act_life_active"]
+    assert active["status"] == "over"
+    assert active["projected_spend"] == pytest.approx(6300.0 * 31 / 14)
+
+    # (3) DISABLED account: account_inactive wins, so NO over/under verdict leaks from the prorated
+    # numbers (variance is None). projected_spend is still computed+reported as context — consistent
+    # with how the daily paused-account path already reports a projection under account_inactive.
+    paused = by_id["act_life_paused"]
+    assert paused["status"] == "account_inactive"
+    assert paused["variance_pct"] is None
+    assert paused["projected_spend"] == pytest.approx(400.0 * 31 / 14)  # computed but not classified
+    assert paused["lifetime_budget_total"] == pytest.approx(9300.0)  # still reported as context
+
+    rollup = out["rollup"]
+    assert rollup["status_counts"]["over"] == 1
+    assert rollup["status_counts"]["budget_not_projectable"] == 1
+    assert rollup["status_counts"]["account_inactive"] == 1
+    assert out["errors"] == []
 
 
 def test_pacing_report_no_fx_account_native_only_in_shortlist_not_normalized_totals(monkeypatch) -> None:

@@ -323,10 +323,26 @@ by severity then absolute normalized-spend move then account id), `informational
 floors compare in one `reporting_currency` (default USD) via the same static FX table, and percent
 moves use native figures (currency-invariant for a single account across two windows). Because it runs
 two fan-outs it issues **~2× the per-account reads** of a single `cross_account_performance`
-(~400 reads for a 200-account scope) — acceptable and documented. **Budget pacing is deliberately NOT
-here:** spend-to-date vs. the configured budget is a different question over a different surface, owned
-by the `pacing_report` tool; ad-level creative/disapproval detection (a heavier per-ad fan-out) is
-parked for a later ticket.
+(~400 reads for a 200-account scope) — acceptable and documented. **Budget pacing is off by default but
+opt-in:** pass `include_pacing=true` and the scan calls `pacing_report` once over the same scope, paces
+the **current** window (`as_of=current_to`, so the period is complete and the projection equals realized
+spend), and folds each account's over/under verdict in as a `budget_pacing_off` flag (materially
+over-spending → **high**, under-spending → **medium**, gated by a **25%** variance knee — larger than
+pacing's own 5% tolerance). Because that flag is baseline-independent, it can be the *only* flag on an
+account and promote an otherwise-clean or informational account into `flagged`; its per-account pacing
+errors are surfaced tagged `stage:"pacing"`. Turning it on adds pacing's own **~1 + 4N** reads on top
+(of which the current-window insight read duplicates the scan's own — an accepted, documented duplicate).
+For period (e.g. month) pacing, call `pacing_report` directly. **Ad-level health is likewise off by
+default but opt-in:** pass `include_ad_health=true` and, *after* the flagged list is finalized, the scan
+fans out a per-ad enumeration into **only the already-flagged accounts** (never the full fleet) and
+attaches up to two flags per account — `ads_disapproved` (**high**, ads blocked by policy) and
+`ads_not_delivering` (**medium**, ACTIVE-configured ads stuck not delivering: pending review/billing,
+etc.). An `ads_disapproved` flag can itself promote a medium account to high (severity is recomputed and
+the flagged list re-sorted); `ad_health_scanned_count` reports how many accounts were ad-scanned (present
+only when the opt-in is on), and per-account ad-read failures are surfaced tagged `stage:"ad_health"`.
+Because the fan-out is gated on the flagged set, a fleet where 3 of 200 accounts surface pays 3 ad
+enumerations, not 200 — the deliberate tradeoff is that a window-over-window clean **and** on-pace
+account with disapproved ads is never flagged, so never ad-scanned, and its disapprovals stay hidden.
 
 `pacing_report` answers the manager's month-end question — "will each account land **over**, **under**,
 or **on** its budget?" — across every account the token can reach (or an explicit list). Unlike
@@ -349,9 +365,10 @@ these are counted as under-pacing. Money is normalized into one `reporting_curre
 the rollup (status counts + worst over/under shortlists). Because step 2 issues **3 extra reads per
 readable account** on top of step 1's `1 + N`, the whole call costs **~1 + 4N** reads for an
 N-account scope — the same accepted posture as the attention tool's 2× note; a single combined
-per-account read is a future optimization. Cents→major-unit conversion divides by 100, exact for
-2-decimal currencies; **zero-decimal currencies (JPY, KRW) and 3-decimal currencies are a known 100×
-inaccuracy** flagged for a follow-up.
+per-account read is a future optimization. The minor-unit→major-unit divisor is **ISO-4217
+currency-aware** (`10 ** minor_unit_exponent` — 2/0/3-decimal, so JPY/KRW and BHD/KWD convert
+correctly, not 100× off); an unrecognized currency code assumes 2 decimals and is surfaced in the
+report `note`.
 
 `rank_accounts` answers the manager's "who's top/bottom?" — it ranks the whole reachable fleet (or an
 explicit `account_ids` subset) by a **single** metric and returns the top or bottom `limit` (default

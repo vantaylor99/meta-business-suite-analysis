@@ -61,6 +61,13 @@ ATTENTION_SPEND_COLLAPSE_PCT = 0.5
 ATTENTION_CPR_DEGRADE_PCT = 0.3
 ATTENTION_CPC_DEGRADE_PCT = 0.3
 ATTENTION_CTR_DROP_PCT = 0.3
+# The "materially off-pace" knee for the OPT-IN budget_pacing_off flag (see
+# flag_accounts_needing_attention(include_pacing=True), which folds pacing_report's over/under
+# verdict into the attention list). 25% — deliberately a LARGER knee than pacing's own 5%
+# PACING_ON_TRACK_TOLERANCE_PCT: pacing calls a >5% projected variance "over"/"under", but a small
+# 5% miss is not attention-worthy, so only a variance clearing this bigger threshold surfaces as an
+# attention alert. Compared against ``abs(variance_pct)`` (an FX-invariant same-currency ratio).
+ATTENTION_PACING_VARIANCE_PCT = 0.25
 
 # Pacing report (see account_discovery.pacing_report). The sixth discovery tool answers "given how
 # much each account has spent so far this period and its configured (active daily) budget, will it

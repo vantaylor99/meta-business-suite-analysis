@@ -69,27 +69,43 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   move** or **30% cost/quality degradation** as "noticeable, not noise" (low-volume windows are gated
   out so a 2→1 result swing never trips an alarm), and results are bucketed **worst-first** into
   `flagged` (medium+ severity), `informational` (newly-active / too-little-history), and a `clean_count`.
-  It is a pure post-processor over `cross_account_performance` (two reads — one per window). **Budget
-  pacing is a separate concern:** spend-to-date vs. the configured budget is answered by the
-  `pacing_report` tool, not this one. That sixth discovery tool answers "will each account land
+  By default it is a pure post-processor over `cross_account_performance` (two reads — one per window).
+  **Budget pacing is off by default and opt-in:** pass `include_pacing=true` to fold `pacing_report`'s
+  current-window over/under verdict into the scan as a `budget_pacing_off` flag (materially
+  over-spending → high, under-spending → medium), which can itself promote an otherwise-quiet account
+  into the `flagged` list; leaving it off keeps the two-read cost and byte-identical output. **Ad-level
+  health is also off by default and opt-in:** pass `include_ad_health=true` to fan out a per-ad
+  enumeration into **only the already-flagged accounts** and attach an `ads_disapproved` flag (high —
+  ads blocked by policy) and/or an `ads_not_delivering` flag (medium — ACTIVE ads stuck not delivering);
+  a disapproval can itself promote a medium account to high, and `ad_health_scanned_count` reports how
+  many accounts were ad-scanned. Gating on the flagged set keeps the cost bounded (a disapproved ad on
+  an otherwise-clean, on-pace account is deliberately not surfaced). For period
+  (e.g. month) pacing, call the `pacing_report` tool directly. That sixth discovery tool answers "will each account land
   **over**, **under**, or **on** its budget for the month?" across the whole fleet: you give it the
   full reporting period (`date_from`/`date_to`) and, optionally, the day to measure spend through
   (`as_of`, default today), and it reports each account's spend-to-date, its **projected**
-  end-of-period spend (`spend_to_date ÷ elapsed_fraction`), and a verdict. The pacing denominator is
+  end-of-period spend (`spend_to_date ÷ elapsed_fraction` for a daily account; the schedule-aware
+  `spend_to_date × period_budget ÷ expected_to_date` once lifetime budgets are in play), and a
+  verdict. The pacing denominator is
   the sum of each account's **ACTIVE daily budgets**, **CBO-deduplicated** — a campaign-budget-
   optimization campaign contributes its campaign-level budget and its ad-set budgets are ignored, so a
   naïve sum never double-counts — times the number of days in the period. The account spend cap is a
-  *lifetime* ceiling, so it is surfaced as context but is **never** the pacing denominator; a
-  lifetime-only account is `budget_not_projectable` (prorating a lifetime budget against an arbitrary
-  reporting window is a deliberate non-goal here), an uncapped account is `no_budget_set`, and a
+  *lifetime* ceiling, so it is surfaced as context but is **never** the pacing denominator.
+  **Lifetime budgets are prorated** across the overlap of each entity's own `start_time..stop_time`
+  schedule with the window (`lifetime × overlap ÷ schedule_total`) and folded additively into the
+  denominator, so a lifetime or mixed daily+lifetime account earns a real verdict;
+  `budget_not_projectable` is now reserved for accounts with no projectable schedule (an open-ended
+  lifetime budget with no end date, a schedule that does not overlap the window, or a spend-cap-only
+  account), an uncapped account is `no_budget_set`, and a
   paused/closed account is `account_inactive` — none of these are miscounted as "under-pacing". Money
   is normalized into one `reporting_currency` (default USD) for the rollup (status counts + worst
   over/under shortlists); native and normalized give the same variance since it is a same-currency
   ratio. Unlike the pure post-processors, pacing genuinely needs a **second read surface** (budget
   config is not in the insights row), so it costs **~1 + 4N** reads for an N-account scope (the shared
   spend read plus a per-account campaigns + ad-sets + account read); a per-account budget read that
-  fails is reported `budget_unread`, never a silent "uncapped". Cents→major-unit conversion is exact
-  for 2-decimal currencies; **zero-decimal currencies (JPY, KRW) are a known 100× limitation.**
+  fails is reported `budget_unread`, never a silent "uncapped". The minor-unit→major-unit divisor is
+  **ISO-4217 currency-aware** (2/0/3-decimal, so JPY/KRW and BHD/KWD convert correctly); an
+  unrecognized currency code assumes 2 decimals and is surfaced in the report `note`.
   Finally, the `rank_accounts` tool is the seventh discovery tool and the manager's "who's top/bottom?"
   shortlist: another **pure post-processor over `cross_account_performance`** (one read), it sorts the
   whole reachable fleet — or an explicit `account_ids` subset — by a **single** metric (spend, CPM, CPC,

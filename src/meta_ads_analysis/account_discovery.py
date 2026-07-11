@@ -34,12 +34,18 @@ from .config import (
     ATTENTION_CTR_DROP_PCT,
     ATTENTION_MIN_RESULTS_FLOOR,
     ATTENTION_MIN_SPEND,
+    ATTENTION_PACING_VARIANCE_PCT,
     ATTENTION_SPEND_COLLAPSE_PCT,
     ATTENTION_SPEND_SPIKE_PCT,
     PACING_ON_TRACK_TOLERANCE_PCT,
     PACING_SHORTLIST_LIMIT,
 )
-from .currency import FxTable, load_fx_table
+from .currency import (
+    FxTable,
+    load_fx_table,
+    minor_unit_exponent,
+    minor_unit_exponent_is_known,
+)
 from .meta_api import MetaApiError
 from .sync_api import (
     PURCHASE_KEYS,
@@ -546,6 +552,12 @@ def cross_account_performance(
     currency; accounts whose currency is absent from the FX table keep their native figures, record an
     ``errors`` entry, and are excluded from ``normalized_total`` (counted in ``excluded_no_fx``).
 
+    Every aggregate block (each ``totals_by_currency`` subtotal and ``normalized_total``) also carries
+    ``results_accounts`` / ``purchase_value_accounts`` — how many of its ``account_count`` accounts
+    actually contributed ``results`` / ``purchase_value`` to the sum. This makes coverage legible: a
+    portfolio ROAS built from 1 of 10 accounts reads differently from one built from all 10. The counts
+    are always emitted (``0`` is meaningful — it explains why ``cost_per_result``/``roas`` are absent).
+
     ``level`` accepts only ``"account"`` for now (a future ticket can add campaign/adset roll-ups); any
     other value raises ``ValueError``. A ``reporting_currency`` absent from the FX table is a whole-call
     ``ValueError`` — nothing could be normalized. ``fx_table`` is injectable for tests; when ``None`` the
@@ -777,6 +789,8 @@ def _finalize_subtotal(acc: dict[str, Any]) -> dict[str, Any]:
     if acc["pv_contrib"]:
         out["purchase_value"] = acc["purchase_value"]
     out["account_count"] = acc["account_count"]
+    out["results_accounts"] = acc["results_contrib"]
+    out["purchase_value_accounts"] = acc["pv_contrib"]
     out.update(compute_derived_metrics(base))
     return out
 
@@ -806,6 +820,8 @@ def _finalize_normalized_total(norm: dict[str, Any], reporting: str) -> dict[str
         out["purchase_value"] = norm["purchase_value"]
     out["account_count"] = norm["account_count"]
     out["excluded_no_fx"] = norm["excluded_no_fx"]
+    out["results_accounts"] = norm["results_contrib"]
+    out["purchase_value_accounts"] = norm["pv_contrib"]
     out.update(compute_derived_metrics(base))
     return out
 
@@ -1087,10 +1103,14 @@ def account_benchmark(
 # deterministic bounded-concurrency fan-out. No new Meta read shape is introduced.
 #
 # SCOPE: budget-pacing (spend-to-date vs configured budget) is a DIFFERENT question over a DIFFERENT
-# surface and is owned by the sibling `pacing_report` tool — this tool never reads budget config.
-# Ad-level creative/disapproval problems need a per-account ad-level fan-out (heavy) and are parked in
-# a backlog ticket. What ships here is purely the two performance reads + each row's account-status
-# label, so every flag is zero extra reads beyond the two fan-outs.
+# surface and is owned by the sibling `pacing_report` tool. By DEFAULT this tool never reads budget
+# config; when called with `include_pacing=True` it calls `pacing_report` ONCE over the same scope and
+# folds its per-account over/under verdict in as an opt-in `budget_pacing_off` flag (never re-reading
+# budget config itself — reuse, no cycle: attention -> pacing -> cross_account_performance).
+# Ad-level creative/disapproval problems need a per-account ad-level fan-out (heavy), so — like pacing —
+# they are OFF by default and gated behind `include_ad_health=True`, which fans out ONLY into the ads of
+# the accounts the cheap scan already flagged (never the full fleet). With both opt-ins off, every flag
+# is zero extra reads beyond the two account-level fan-outs.
 # --------------------------------------------------------------------------- #
 
 # Severity rank: high(3) > medium(2) > low(1) > info(0). An account's severity is the max over its
@@ -1104,6 +1124,22 @@ _STATUS_ALERT_HIGH: frozenset[str] = frozenset({"DISABLED", "PENDING_CLOSURE", "
 _STATUS_ALERT_MEDIUM: frozenset[str] = frozenset(
     {"UNSETTLED", "PENDING_RISK_REVIEW", "PENDING_SETTLEMENT", "IN_GRACE_PERIOD"}
 )
+
+# Ad-level status vocabulary for the opt-in ad-health scan (``include_ad_health``). Defined LOCALLY —
+# not imported from ``monitor`` — to keep this module import-light (see the module docstring; importing
+# monitor drags in confidence/control/early_triage/meta_api). Keep ``_AD_DELIVERING`` in sync with its
+# sibling definition ``monitor.DELIVERING``.
+_AD_DELIVERING: frozenset[str] = frozenset({"ACTIVE", "IN_PROCESS"})  # mirrors monitor.DELIVERING
+_AD_PAUSE_STATUSES: frozenset[str] = frozenset(
+    {"PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED", "DELETED", "ARCHIVED"}
+)
+# An ACTIVE-configured ad counts as "not delivering" only when its effective_status is NONE of these:
+# a delivering status, a deliberate pause (operator intent, not a stall), or DISAPPROVED (counted by
+# its own high-severity flag, never double-counted here).
+_AD_NOT_DELIVERING_EXCLUSIONS: frozenset[str] = (
+    _AD_DELIVERING | _AD_PAUSE_STATUSES | frozenset({"DISAPPROVED"})
+)
+_AD_HEALTH_FIELDS: list[str] = ["id", "name", "status", "effective_status", "issues_info"]
 
 
 @dataclass(frozen=True)
@@ -1119,6 +1155,14 @@ class AttentionThresholds:
       means the same across a USD and an MXN account (native fallback for a no-FX account).
     - ``min_results_floor`` is the cost-degradation significance floor: BOTH windows must clear it
       before a cost-per-result flag fires.
+    - ``pacing_variance_pct`` is the "materially off-pace" knee for the opt-in ``budget_pacing_off``
+      flag (only consulted when ``flag_accounts_needing_attention`` is called with
+      ``include_pacing=True``). Larger than pacing's own 5% on_track tolerance — a small variance is
+      not attention-worthy.
+    - ``ad_health_min_count`` is the minimum ad count for an ad-level flag (``ads_disapproved`` /
+      ``ads_not_delivering``) to fire in the opt-in ``include_ad_health`` scan. Defaults to ``1`` (any
+      disapproved/stalled ad is worth surfacing on an already-flagged account) — a count, not a percent
+      knee, so it is a plain int rather than an ``ATTENTION_*`` fraction constant.
     """
 
     spend_spike_pct: float
@@ -1128,10 +1172,13 @@ class AttentionThresholds:
     ctr_drop_pct: float
     min_spend_floor: float
     min_results_floor: float
+    pacing_variance_pct: float
+    ad_health_min_count: int = 1
 
     @classmethod
     def defaults(cls) -> "AttentionThresholds":
-        """The committed defaults from :mod:`config` (50% spend move / 30% efficiency degradation)."""
+        """The committed defaults from :mod:`config` (50% spend move / 30% efficiency degradation;
+        25% budget-pacing variance knee; ad-health flags fire on any single bad ad)."""
         return cls(
             spend_spike_pct=ATTENTION_SPEND_SPIKE_PCT,
             spend_collapse_pct=ATTENTION_SPEND_COLLAPSE_PCT,
@@ -1140,6 +1187,8 @@ class AttentionThresholds:
             ctr_drop_pct=ATTENTION_CTR_DROP_PCT,
             min_spend_floor=ATTENTION_MIN_SPEND,
             min_results_floor=ATTENTION_MIN_RESULTS_FLOOR,
+            pacing_variance_pct=ATTENTION_PACING_VARIANCE_PCT,
+            ad_health_min_count=1,
         )
 
 
@@ -1224,6 +1273,122 @@ def _account_status_flag(label: Any) -> dict[str, Any] | None:
         delta_pct=None,
         detail=f"account status is {label}",
     )
+
+
+def _budget_pacing_flag(
+    pacing_entry: dict[str, Any], thresholds: AttentionThresholds
+) -> dict[str, Any] | None:
+    """The ``budget_pacing_off`` flag for one :func:`pacing_report` per-account entry, or ``None``.
+
+    Baseline-independent (derived purely from the pacing verdict), so — like
+    :func:`_account_status_flag` — it is appended by the orchestrator rather than produced inside the
+    pure :func:`evaluate_attention_flags`. Pure and unit-testable with a hand-built pacing entry (no
+    reader).
+
+    Fires **only** when the entry's pacing ``status`` is ``over`` or ``under`` AND
+    ``abs(variance_pct) >= thresholds.pacing_variance_pct`` (a larger knee than pacing's own 5%
+    on_track tolerance — a tiny variance is not attention-worthy). Every other status
+    (``on_track`` / ``no_budget_set`` / ``budget_not_projectable`` / ``account_inactive`` /
+    ``not_started`` / ``budget_unread``) -> ``None``.
+
+    Severity mirrors the ticket's mapping: ``over`` -> **high** (over-spend burns budget fast —
+    urgent), ``under`` -> **medium** (under-delivery is a missed-pacing concern, less urgent).
+
+    ``variance_pct`` is a same-currency ratio -> **FX-invariant**, used directly as ``delta_pct``.
+    ``current`` / ``baseline`` use the normalized projected-spend / period-budget twins with a native
+    fallback for a no-FX account, exactly as :func:`_flag` shapes the behavior flags.
+    """
+    status = pacing_entry.get("status")
+    if status not in ("over", "under"):
+        return None
+    variance_pct = pacing_entry.get("variance_pct")
+    if variance_pct is None or abs(variance_pct) < thresholds.pacing_variance_pct:
+        return None
+
+    projected = pacing_entry.get("projected_spend_normalized")
+    if projected is None:
+        projected = pacing_entry.get("projected_spend")
+    budget = pacing_entry.get("period_budget_normalized")
+    if budget is None:
+        budget = pacing_entry.get("period_budget")
+    delta = projected - budget if projected is not None and budget is not None else None
+
+    severity = "high" if status == "over" else "medium"
+    return _flag(
+        "budget_pacing_off",
+        severity,
+        current=projected,
+        baseline=budget,
+        delta=delta,
+        delta_pct=variance_pct,
+        detail=f"projected to spend {abs(variance_pct) * 100:.0f}% {status} the period budget",
+    )
+
+
+def _ad_health_flags(
+    ads: list[dict[str, Any]], thresholds: AttentionThresholds
+) -> list[dict[str, Any]]:
+    """PURE ad-level health flags for one account's ads (the opt-in ``include_ad_health`` scan).
+
+    Fully unit-testable with hand-built ad dicts — no reader. Returns 0-2 flags, each in the
+    :func:`_flag` shape with ``baseline/delta/delta_pct = None`` (ad health is a point-in-time count,
+    not a window delta). A flag fires only when its count ``>= thresholds.ad_health_min_count``
+    (default 1). Like :func:`_account_status_flag` / :func:`_budget_pacing_flag`, this is appended by
+    the orchestrator rather than produced inside the pure two-row :func:`evaluate_attention_flags`.
+
+    - ``ads_disapproved`` (**high**) — count of ads with ``effective_status == "DISAPPROVED"``: a
+      blocked/policy ad, burning nothing but delivering nothing. Counted regardless of ``status``.
+    - ``ads_not_delivering`` (**medium**) — count of ads the operator INTENDS to run
+      (``status == "ACTIVE"``) whose ``effective_status`` is in none of
+      :data:`_AD_NOT_DELIVERING_EXCLUSIONS` (a delivering status, a deliberate pause, or DISAPPROVED —
+      already counted above and never double-counted). This residual-with-exclusions definition catches
+      ``WITH_ISSUES`` / ``PENDING_REVIEW`` / ``PENDING_BILLING_INFO`` / ``PREAPPROVED`` and any future
+      block status, while a paused ad (``PAUSED`` / ``CAMPAIGN_PAUSED`` / ``ADSET_PAUSED``) is treated
+      as intentional, not a stall.
+    """
+    total = len(ads)
+    disapproved = 0
+    not_delivering = 0
+    for ad in ads:
+        effective_status = ad.get("effective_status")
+        if effective_status == "DISAPPROVED":
+            disapproved += 1
+        elif (
+            ad.get("status") == "ACTIVE"
+            and effective_status not in _AD_NOT_DELIVERING_EXCLUSIONS
+        ):
+            not_delivering += 1
+
+    min_count = thresholds.ad_health_min_count
+    flags: list[dict[str, Any]] = []
+    if disapproved >= min_count:
+        flags.append(
+            _flag(
+                "ads_disapproved",
+                "high",
+                current=disapproved,
+                baseline=None,
+                delta=None,
+                delta_pct=None,
+                detail=f"{disapproved} of {total} ads are DISAPPROVED",
+            )
+        )
+    if not_delivering >= min_count:
+        flags.append(
+            _flag(
+                "ads_not_delivering",
+                "medium",
+                current=not_delivering,
+                baseline=None,
+                delta=None,
+                delta_pct=None,
+                detail=(
+                    f"{not_delivering} of {total} ads are ACTIVE-configured but not delivering "
+                    "(blocked/pending)"
+                ),
+            )
+        )
+    return flags
 
 
 def evaluate_attention_flags(
@@ -1454,6 +1619,8 @@ def flag_accounts_needing_attention(
     baseline_from: str | None = None,
     baseline_to: str | None = None,
     reporting_currency: str = "USD",
+    include_pacing: bool = False,
+    include_ad_health: bool = False,
     thresholds: AttentionThresholds | None = None,
     fx_table: FxTable | None = None,
 ) -> dict[str, Any]:
@@ -1476,14 +1643,50 @@ def flag_accounts_needing_attention(
     account); absolute spend floors compare on ``spend_normalized`` (native fallback for a no-FX
     account).
 
-    **Read cost (documented, not a bug).** This issues ``2x`` the per-account insight reads of a single
-    :func:`cross_account_performance` (one fan-out per window) — ~400 reads for a 200-account scope
-    under the bounded pool. Acceptable; a single multi-window read is a future optimization out of
-    scope here.
+    **Opt-in budget pacing (``include_pacing``).** Off by default. When ``True``, :func:`pacing_report`
+    is called ONCE over the SAME resolved scope / ``reporting_currency`` / shared ``fx_table``, pacing
+    the **current** window (``date_from=current_from``, ``date_to=current_to``, ``as_of=current_to``).
+    ``as_of=current_to`` makes the period *complete* (``elapsed_fraction == 1``) so
+    ``projected_spend == spend_to_date`` and ``variance_pct`` is the realized actual-vs-budgeted
+    variance for that window — a well-defined off-pace signal (an operator wanting month-pacing calls
+    :func:`pacing_report` directly). Each account whose pacing status is ``over``/``under`` past
+    ``thresholds.pacing_variance_pct`` gains a :func:`_budget_pacing_flag` (``budget_pacing_off``),
+    which — because it can be the only fired flag — can promote a *clean* or *informational* account
+    into ``flagged``. There is no cycle (attention -> pacing -> cross_account_performance; pacing never
+    calls attention). An off-pace account unreadable in BOTH attention windows is not surfaced (the
+    join skips it — attention is fundamentally a window-comparison tool); it appears only via errors.
 
-    **Not in scope:** budget pacing (spend-to-date vs. configured budget) is a separate tool
-    (``pacing_report``); ad-level creative/disapproval detection is parked in backlog. Account-level
-    health is covered by the ``account_status_alert`` flag at zero extra read cost.
+    **Read cost (documented, not a bug).** With pacing off this issues ``2x`` the per-account insight
+    reads of a single :func:`cross_account_performance` (one fan-out per window) — ~400 reads for a
+    200-account scope; a hard regression guard. With ``include_pacing=True`` add pacing's own
+    ``~1 + 4N`` (its ``cross_account_performance`` ``1 + N`` + a ``3N`` budget fan-out), of which the
+    current-window insight read (``N``) duplicates attention's own current read — an accepted, documented
+    duplicate (threading a shared perf into :func:`pacing_report` is a future optimization out of scope).
+
+    **Opt-in ad health (``include_ad_health``).** Off by default. When ``True``, AFTER the flagged list
+    is finalized (behavior + pacing flags, severity >= medium), a per-account ad enumeration fans out
+    (:func:`fan_out_accounts`) into the ads of **only the flagged accounts** — informational/clean
+    accounts are never ad-scanned. Each flagged account's ads yield 0-2 :func:`_ad_health_flags`:
+    ``ads_disapproved`` (**high**, an ``effective_status == DISAPPROVED`` count) and
+    ``ads_not_delivering`` (**medium**, ACTIVE-configured ads that are neither delivering nor
+    deliberately paused nor disapproved). Attaching an ad-health flag can RAISE an account's severity
+    (a medium-only account with disapproved ads -> high), so severity is recomputed on each touched
+    entry and the flagged list is re-sorted with the existing deterministic key. ``ad_health_scanned_count``
+    reports how many accounts were fanned into (present only when ``include_ad_health=True``).
+    Per-account ad-enumeration failures isolate into ``errors`` tagged ``{"stage": "ad_health", …}``
+    (never fatal to the whole call). **Documented limitation:** a window-over-window clean AND on-pace
+    account with disapproved ads never becomes flagged, so it is never ad-scanned and its disapprovals
+    stay hidden — the deliberate cost/completeness tradeoff (a full-fleet unconditional ad-disapproval
+    scan is a possible future enhancement, out of scope here).
+
+    **Read cost of ad health.** With ``include_ad_health=False`` (default): zero ad reads — a hard
+    regression guard. With ``include_ad_health=True``: ``+ len(flagged)`` ad enumerations (each may
+    paginate). Because the fan-out is gated on the flagged set (never the full scope), a fleet where
+    only 3 of 200 accounts surface pays 3 ad enumerations, not 200.
+
+    **Not in scope:** account-level health is covered by the ``account_status_alert`` flag at zero
+    extra read cost. Budget pacing and ad health are both off by default; pass ``include_pacing=True``
+    / ``include_ad_health=True`` to fold them in.
     """
     thr = thresholds if thresholds is not None else AttentionThresholds.defaults()
 
@@ -1537,18 +1740,51 @@ def flag_accounts_needing_attention(
                 }
             )
 
+    # Opt-in budget pacing. Pace the CURRENT window with as_of=current_to (elapsed_fraction == 1, so
+    # the projection equals the realized spend) over the SAME scope / currency / shared fx_table. Only
+    # over/under accounts that clear the pacing-variance knee yield a flag; pacing errors are merged
+    # tagged stage:"pacing" (distinct from the window-tagged attention errors above).
+    pacing_flag_by_id: dict[str, dict[str, Any]] = {}
+    if include_pacing:
+        pacing = pacing_report(
+            reader,
+            date_from=current_from,
+            date_to=current_to,
+            account_ids=account_ids,
+            as_of=current_to,
+            reporting_currency=reporting_currency,
+            fx_table=table,
+        )
+        for entry in pacing["accounts"]:
+            pacing_flag = _budget_pacing_flag(entry, thr)
+            if pacing_flag is not None:
+                pacing_flag_by_id[entry["ad_account_id"]] = pacing_flag
+        for entry in pacing["errors"]:
+            errors.append(
+                {
+                    "ad_account_id": entry.get("ad_account_id"),
+                    "stage": "pacing",
+                    "error": entry.get("error"),
+                }
+            )
+
     flagged: list[dict[str, Any]] = []
     informational: list[dict[str, Any]] = []
     clean_count = 0
 
     # Iterate in current-window scope order (deterministic); evaluate only accounts readable in BOTH
     # windows. The join/sort is order-deterministic, so identical inputs -> identical buckets and order.
+    # Bucketing follows behavior-flag evaluation AND the pacing-flag append (two-phase): a pacing flag
+    # can be the ONLY fired flag, promoting an otherwise-clean/informational account into flagged.
     for ad_account_id, current_row in cur_rows.items():
         baseline_row = base_rows.get(ad_account_id)
         if baseline_row is None:
             # Read-failed in the baseline window -> already surfaced in errors; cannot compare.
             continue
         flags = evaluate_attention_flags(current_row, baseline_row, thr)
+        pacing_flag = pacing_flag_by_id.get(ad_account_id)
+        if pacing_flag is not None:
+            flags = [*flags, pacing_flag]
         if not flags:
             clean_count += 1
             continue
@@ -1557,6 +1793,44 @@ def flag_accounts_needing_attention(
             flagged.append(entry)
         else:
             informational.append(entry)
+
+    # Opt-in ad-health scan. GATED on the finalized flagged set (never the full scope): fan out into
+    # the ads of ONLY the flagged accounts, so a 200-account fleet where 3 surfaced pays 3 ad reads.
+    # Ad-health flags only ever attach to already-flagged accounts, so no re-bucketing is needed — but
+    # they CAN raise an entry's severity (medium -> high), so severity + the sort rank are recomputed
+    # here, BEFORE the sort below, so the promotion is reflected deterministically. Per-account read
+    # failures isolate into errors tagged stage:"ad_health" (never fatal), mirroring the pacing fan-out.
+    ad_health_scanned_count = 0
+    if include_ad_health and flagged:
+        flagged_by_id = {e["ad_account_id"]: e for e in flagged}
+        flagged_account_ids = list(flagged_by_id.keys())
+        ad_health_scanned_count = len(flagged_account_ids)
+
+        def read_ads(ad_account_id: str) -> list[dict[str, Any]]:
+            # Materialize the lazy iterator: _ad_health_flags scans it more than once (len + loop).
+            return list(
+                reader.iter_paginated(
+                    f"/{ad_account_id}/ads",
+                    params={"fields": ",".join(_AD_HEALTH_FIELDS), "limit": 200},
+                )
+            )
+
+        # Main-thread assembly over the input-ordered fan-out results -> deterministic regardless of
+        # which worker finished first (same discipline as the account-level fan-outs above).
+        for ad_account_id, ads, error in fan_out_accounts(read_ads, flagged_account_ids):
+            if error is not None:
+                errors.append(
+                    {"stage": "ad_health", "ad_account_id": ad_account_id, "error": error}
+                )
+                continue
+            health_flags = _ad_health_flags(ads, thr)
+            if not health_flags:
+                continue
+            entry = flagged_by_id[ad_account_id]
+            entry["flags"] = [*entry["flags"], *health_flags]
+            max_rank = max(_SEVERITY_RANK.get(f["severity"], 0) for f in entry["flags"])
+            entry["_sort_rank"] = max_rank
+            entry["severity"] = _RANK_TO_SEVERITY[max_rank]
 
     # flagged: (severity desc, |normalized-spend delta| desc, ad_account_id asc) — a stable total order.
     flagged.sort(key=lambda e: (-e["_sort_rank"], -e["_sort_delta"], e["ad_account_id"] or ""))
@@ -1578,6 +1852,10 @@ def flag_accounts_needing_attention(
         "clean_count": clean_count,
         "errors": errors,
     }
+    # Cost legibility: how many accounts the ad-health fan-out issued a read for. Present ONLY when
+    # the opt-in is on, so the default path stays byte-identical to the pre-ad-health output.
+    if include_ad_health:
+        result["ad_health_scanned_count"] = ad_health_scanned_count
     if current.get("note"):
         result["note"] = current["note"]
     return result
@@ -1608,13 +1886,22 @@ def flag_accounts_needing_attention(
 
 # Budget-only field lists for the step-2 config read. Deliberately NOT the heavier control.*_FIELDS
 # (which carry targeting/objective) — pacing needs only the budget shape + status + parentage.
-PACING_CAMPAIGN_FIELDS: list[str] = ["id", "effective_status", "daily_budget", "lifetime_budget"]
+PACING_CAMPAIGN_FIELDS: list[str] = [
+    "id",
+    "effective_status",
+    "daily_budget",
+    "lifetime_budget",
+    "start_time",
+    "stop_time",
+]
 PACING_ADSET_FIELDS: list[str] = [
     "id",
     "campaign_id",
     "effective_status",
     "daily_budget",
     "lifetime_budget",
+    "start_time",
+    "stop_time",
 ]
 # Cap fields fetched per account in the budget worker. The perf["accounts"] rows carry only
 # account_id/name/currency/account_status[_label] (see the row built above), so the spend cap +
@@ -1694,26 +1981,33 @@ def project_spend(spend_to_date: float, elapsed_fraction: float) -> float | None
     return spend_to_date / elapsed_fraction
 
 
-def _minor_to_major(value: Any) -> float | None:
-    """Meta budget/cap minor units (cents) -> major currency units; ``None`` for missing/blank.
+def _minor_to_major(value: Any, currency: str = "USD") -> float | None:
+    """Meta budget/cap minor units -> major currency units; ``None`` for missing/blank.
 
-    Correct for 2-decimal currencies (USD/EUR/GBP/… — the vast majority). **Zero-decimal (JPY, KRW)
-    and 3-decimal currencies are a KNOWN 100x inaccuracy** here — a currency-aware minor-unit divisor
-    is a backlog follow-up; do NOT silently guess the exponent per currency.
+    The divisor is ISO-4217 **currency-aware**: ``value / 10 ** minor_unit_exponent(currency)`` — /100
+    for the ~150 two-decimal currencies (USD/EUR/GBP/…), /1 for zero-decimal (JPY, KRW, …), /1000 for
+    three-decimal (BHD, KWD, …). ``currency`` defaults to ``"USD"`` (2-decimal) so a bare call is
+    unchanged. An unrecognized/blank/``"UNKNOWN"`` code falls through to the 2-decimal default; that
+    fallback is an *assumption* surfaced by the caller (see :func:`minor_unit_exponent_is_known`), not
+    a silent per-currency guess.
     """
     num = _number(value)
     if num is None:
         return None
-    return num / 100.0
+    return num / (10 ** minor_unit_exponent(currency))
 
 
 def summarize_account_budget(
-    campaigns: list[dict[str, Any]], adsets: list[dict[str, Any]]
-) -> dict[str, float]:
-    """CBO-deduplicated ACTIVE budget for an account: ``{active_daily, lifetime_total}`` (major units).
+    campaigns: list[dict[str, Any]], adsets: list[dict[str, Any]], currency: str = "USD"
+) -> dict[str, Any]:
+    """CBO-deduplicated ACTIVE budget for an account: ``{active_daily, lifetime_total,
+    lifetime_entities}`` (major units).
 
-    Native minor units in (Meta ``daily_budget`` / ``lifetime_budget`` are cents), native MAJOR units
-    out. Only ``effective_status == "ACTIVE"`` entities count — a paused campaign/adset does not
+    Native minor units in (Meta ``daily_budget`` / ``lifetime_budget``), native MAJOR units out —
+    converted via the ISO-4217 currency-aware :func:`_minor_to_major`. ``currency`` defaults to
+    ``"USD"`` (2-decimal) so a bare call is unchanged; the pacing loop threads the real per-account
+    currency so zero-/3-decimal accounts (JPY, KWD, …) get the right divisor. Only
+    ``effective_status == "ACTIVE"`` entities count — a paused campaign/adset does not
     deliver. Per **ACTIVE** campaign, the precedence (this is the double-counting guard):
 
     - campaign ``daily_budget > 0`` -> **CBO daily**: add the campaign daily to ``active_daily`` and
@@ -1725,12 +2019,20 @@ def summarize_account_budget(
 
     Adsets whose parent campaign is not ACTIVE are ignored (the parent gates delivery). This mirrors
     :func:`control.classify_adset_budget`'s adset-daily-first-else-campaign shape rather than a
-    contradictory rule. Lifetime budgets are summed for *reporting* only — they are NOT projected
-    against an arbitrary reporting period (a lifetime budget spans the entity's own schedule; prorating
-    it needs campaign start/stop times not read here — a backlog follow-up).
+    contradictory rule.
+
+    Lifetime budgets are additionally emitted as ``lifetime_entities`` — one entry per ACTIVE
+    lifetime-owning entity, ``{"lifetime_budget": float (major units), "start_time": str | None,
+    "stop_time": str | None}`` with the schedule strings verbatim from Meta — so the caller can
+    prorate each pot across the overlap of its own schedule with the reporting window (see
+    :func:`lifetime_pacing`). The lifetime entity is whichever level owns the budget under the CBO
+    precedence above: the campaign for a CBO-lifetime campaign, the adset for a non-CBO adset-lifetime.
+    ``lifetime_total`` (the raw Σ, still returned) drives the reported context figure; the schedules
+    are what proration needs (different entities have different runs, so the sum alone is insufficient).
     """
     active_daily = 0.0
     lifetime_total = 0.0
+    lifetime_entities: list[dict[str, Any]] = []
 
     # Group ACTIVE adsets by parent campaign id for O(1) lookup inside the non-CBO branch.
     active_adsets_by_campaign: dict[str, list[dict[str, Any]]] = {}
@@ -1744,25 +2046,134 @@ def summarize_account_budget(
         if str(campaign.get("effective_status") or "").upper() != "ACTIVE":
             continue  # paused campaign -> no delivery; its adsets are gated off too.
         campaign_id = str(campaign.get("id") or "")
-        camp_daily = _minor_to_major(campaign.get("daily_budget")) or 0.0
-        camp_lifetime = _minor_to_major(campaign.get("lifetime_budget")) or 0.0
+        camp_daily = _minor_to_major(campaign.get("daily_budget"), currency) or 0.0
+        camp_lifetime = _minor_to_major(campaign.get("lifetime_budget"), currency) or 0.0
 
         if camp_daily > 0:
             active_daily += camp_daily  # CBO daily — ignore adsets (double-count guard).
             continue
         if camp_lifetime > 0:
             lifetime_total += camp_lifetime  # CBO lifetime — ignore adsets.
+            lifetime_entities.append(
+                {
+                    "lifetime_budget": camp_lifetime,
+                    "start_time": campaign.get("start_time"),
+                    "stop_time": campaign.get("stop_time"),
+                }
+            )
             continue
         # Non-CBO campaign: budget lives on each ACTIVE adset (adset daily first, else adset lifetime).
         for adset in active_adsets_by_campaign.get(campaign_id, []):
-            adset_daily = _minor_to_major(adset.get("daily_budget")) or 0.0
-            adset_lifetime = _minor_to_major(adset.get("lifetime_budget")) or 0.0
+            adset_daily = _minor_to_major(adset.get("daily_budget"), currency) or 0.0
+            adset_lifetime = _minor_to_major(adset.get("lifetime_budget"), currency) or 0.0
             if adset_daily > 0:
                 active_daily += adset_daily
             elif adset_lifetime > 0:
                 lifetime_total += adset_lifetime
+                lifetime_entities.append(
+                    {
+                        "lifetime_budget": adset_lifetime,
+                        "start_time": adset.get("start_time"),
+                        "stop_time": adset.get("stop_time"),
+                    }
+                )
 
-    return {"active_daily": active_daily, "lifetime_total": lifetime_total}
+    return {
+        "active_daily": active_daily,
+        "lifetime_total": lifetime_total,
+        "lifetime_entities": lifetime_entities,
+    }
+
+
+def _overlap_days(a_start: date, a_end: date, b_start: date, b_end: date) -> int:
+    """Inclusive-day overlap of ``[a_start, a_end]`` with ``[b_start, b_end]``; 0 if disjoint."""
+    start = max(a_start, b_start)
+    end = min(a_end, b_end)
+    return max(0, (end - start).days + 1)
+
+
+def _parse_schedule_date(value: Any) -> date | None:
+    """Leading ``YYYY-MM-DD`` of a Meta ISO time string -> :class:`date`; ``None`` if missing/blank/bad.
+
+    Timezone-agnostic calendar days, consistent with the rest of the pacing arithmetic: we take
+    ``str(value)[:10]`` and parse it, discarding any ``T…`` time/offset suffix Meta appends.
+    """
+    if value is None:
+        return None
+    text = str(value)[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def lifetime_pacing(
+    lifetime_entities: list[dict[str, Any]],
+    *,
+    date_from: str,
+    date_to: str,
+    effective_as_of: str,
+) -> dict[str, Any]:
+    """Prorate a set of lifetime-budget entities across the reporting window.
+
+    Meta paces a lifetime budget over the entity's own ``start_time..stop_time`` schedule, not the
+    arbitrary reporting window. To fold it into the period verdict we prorate each pot by the fraction
+    of its schedule that falls inside the window: ``lifetime_i * overlap_i / schedule_total_i``, where
+    the overlap is inclusive-day (mirroring :func:`pacing_period`'s ``(end - start).days + 1``).
+
+    Returns aggregated major-unit figures over all *projectable* entities::
+
+        {
+          "period_budget":    float,  # Σ lifetime_i * overlap_full_i   / schedule_total_i
+          "expected_to_date": float,  # Σ lifetime_i * overlap_todate_i / schedule_total_i
+          "n_entities":       int,    # total lifetime entities considered
+          "n_projectable":    int,    # entities with a valid schedule AND overlap_full > 0
+        }
+
+    where ``overlap_full`` is the overlap of the entity schedule with ``[date_from, date_to]`` and
+    ``overlap_todate`` its overlap with ``[date_from, effective_as_of]``. An entity is non-projectable
+    (contributes 0) when its lifetime budget is missing/<=0, either schedule bound is
+    blank/unparseable (open-ended lifetime budgets and missing starts fall here — a data anomaly, since
+    Meta requires an end time), ``stop_time <= start_time`` (bad data), or the schedule does not
+    overlap the window at all. An empty / all-non-projectable input returns zeros — the caller then
+    keeps ``budget_not_projectable``. All dates are explicit (clock-free), matching
+    :func:`pacing_period`'s testability posture.
+    """
+    window_start = date.fromisoformat(date_from)
+    window_end = date.fromisoformat(date_to)
+    as_of_end = date.fromisoformat(effective_as_of)
+
+    period_budget = 0.0
+    expected_to_date = 0.0
+    n_projectable = 0
+
+    for entity in lifetime_entities:
+        lifetime_budget = entity.get("lifetime_budget")
+        if lifetime_budget is None or lifetime_budget <= 0:
+            continue
+        start = _parse_schedule_date(entity.get("start_time"))
+        stop = _parse_schedule_date(entity.get("stop_time"))
+        if start is None or stop is None:
+            continue  # open-ended / missing bound -> non-projectable.
+        schedule_total = (stop - start).days + 1
+        if schedule_total <= 0:
+            continue  # stop <= start -> bad data, non-projectable.
+        overlap_full = _overlap_days(start, stop, window_start, window_end)
+        if overlap_full <= 0:
+            continue  # schedule wholly outside the window -> non-projectable.
+        n_projectable += 1
+        period_budget += lifetime_budget * overlap_full / schedule_total
+        # overlap_todate clips against [date_from, effective_as_of]; when the window has not started
+        # effective_as_of is date_from - 1, so this range is empty and the contribution is 0.
+        overlap_todate = _overlap_days(start, stop, window_start, as_of_end)
+        expected_to_date += lifetime_budget * overlap_todate / schedule_total
+
+    return {
+        "period_budget": period_budget,
+        "expected_to_date": expected_to_date,
+        "n_entities": len(lifetime_entities),
+        "n_projectable": n_projectable,
+    }
 
 
 def classify_pacing(
@@ -1783,8 +2194,11 @@ def classify_pacing(
        "under-pacing"). Excluded from the over/under math; spend-to-date is still reported.
     3. ``no_budget_set`` — no active daily budget, no lifetime budget, no spend cap (uncapped / free
        delivery). Excluded from over/under; reported explicitly (never counted as under-pacing).
-    4. ``budget_not_projectable`` — has a lifetime budget and/or spend cap but ZERO active daily budget
-       (can't project against the period). Excluded from over/under.
+    4. ``budget_not_projectable`` — a lifetime/cap-only account with no projectable schedule overlap
+       (combined ``period_budget <= 0`` or no projection): a spend-cap-only account, or a lifetime-only
+       account whose entities are all open-ended / non-overlapping / not-yet-started. Excluded from
+       over/under. (A lifetime budget whose schedule *does* overlap the window is prorated by the caller
+       and folded into ``period_budget``, so such an account gets a real over/under/on_track instead.)
     5. ``over`` / ``under`` / ``on_track`` — ``variance_pct = (projected_spend - period_budget) /
        period_budget``; ``over`` if ``> +tolerance``, ``under`` if ``< -tolerance``, else ``on_track``.
 
@@ -1799,8 +2213,13 @@ def classify_pacing(
     has_cap = spend_cap is not None and spend_cap > 0
     if active_daily_budget <= 0 and lifetime_budget_total <= 0 and not has_cap:
         return {"status": "no_budget_set", "variance_pct": None}
-    if active_daily_budget <= 0 or period_budget <= 0 or projected_spend is None:
-        # A lifetime/cap-only account (or a defensively-zero period budget) can't be projected.
+    if period_budget <= 0 or projected_spend is None:
+        # A lifetime/cap-only account with no projectable schedule overlap (or a defensively-zero
+        # combined period budget) can't be projected. The caller passes the COMBINED daily + prorated
+        # lifetime period_budget / projection, so dropping the old ``active_daily_budget <= 0`` clause
+        # lets a projectable lifetime-only account through while a cap-only account (period_budget == 0)
+        # still lands here. For a daily account period_budget = active_daily * total_days, so
+        # period_budget > 0 <=> active_daily > 0 — daily outcomes are unchanged.
         return {"status": "budget_not_projectable", "variance_pct": None}
 
     variance_pct = (projected_spend - period_budget) / period_budget
@@ -1853,17 +2272,23 @@ def pacing_report(
     tests always pass an explicit ``as_of``). :func:`pacing_period` clamps and derives
     ``elapsed_fraction``; :func:`project_spend` extrapolates ``spend_to_date / elapsed_fraction``.
 
-    **Authoritative period budget = ACTIVE daily-budget sum (CBO-deduped) x total_days.** The account
-    spend cap is a *lifetime* ceiling, so it is reported as context, **never the denominator**.
-    **Lifetime budgets are reported but NOT projected** (they span the entity's own schedule, not this
-    period) — a lifetime-only account is ``budget_not_projectable`` (prorating lifetime budgets via
-    campaign start/stop times is a backlog follow-up).
+    **Authoritative period budget = ACTIVE daily-budget sum (CBO-deduped) x total_days, plus prorated
+    lifetime budgets.** The account spend cap is a *lifetime* ceiling, so it is reported as context,
+    **never the denominator**. A **lifetime budget** is paced by Meta over the entity's own
+    ``start_time..stop_time`` schedule, not this window; :func:`lifetime_pacing` prorates each pot by
+    the inclusive-day overlap of that schedule with the window (``lifetime * overlap / schedule_total``)
+    and the result folds additively into ``period_budget`` / expected-to-date, so a lifetime or mixed
+    account earns a real over/under/on_track verdict. ``budget_not_projectable`` now means only a
+    residual: an open-ended lifetime budget (no ``stop_time``), a schedule that does not overlap the
+    window, or a spend-cap-only account — nothing with a projectable schedule falls here. Daily-only
+    accounts keep the literal ``daily * total_days`` computation (byte-identical output).
 
-    **Units.** Budget/cap/amount_spent are minor units (cents); insights ``spend`` is major units.
-    :func:`_minor_to_major` divides by 100 — correct for 2-decimal currencies; **zero-/3-decimal
-    currencies (JPY/KRW/…) are a known 100x inaccuracy** (backlog follow-up). Currency discipline: a
-    budget is only ever compared to spend in the SAME (native) currency per account; only the rollup
-    uses normalized figures.
+    **Units.** Budget/cap/amount_spent are minor units; insights ``spend`` is major units.
+    :func:`_minor_to_major`'s divisor is ISO-4217 currency-aware (``10 ** minor_unit_exponent`` —
+    2/0/3-decimal, so JPY/KRW and BHD/KWD convert correctly, not 100x off). An **unrecognized** currency
+    code assumes 2 decimals and that assumption is surfaced in the report ``note`` (never a silent
+    guess). Currency discipline: a budget is only ever compared to spend in the SAME (native) currency
+    per account; only the rollup uses normalized figures.
 
     **Read cost** ~``1 + 4N`` for an N-account scope (``cross_account_performance``'s ``1 + N`` plus 3
     per readable account) — documented, accepted; a single combined per-account read is a future
@@ -1926,6 +2351,10 @@ def pacing_report(
         budget_by_id[ad_account_id] = payload
 
     accounts: list[dict[str, Any]] = []
+    # Distinct currency codes whose minor-unit exponent we had to *assume* (fell through to the
+    # 2-decimal default because the code is unrecognized). Surfaced in the report note so the
+    # assumption is never silent. Collected only where a divisor is actually applied (budget read OK).
+    assumed_currencies: set[str] = set()
     # Main-thread assembly over the scope-ordered perf rows -> deterministic output.
     for row in perf["accounts"]:
         ad_account_id = row["ad_account_id"]
@@ -1968,16 +2397,43 @@ def pacing_report(
             continue
 
         campaigns, adsets, account = payload
-        budget = summarize_account_budget(campaigns, adsets)
+        # This account's minor-unit divisor rides on ``currency``; flag it if we're only assuming.
+        if not minor_unit_exponent_is_known(currency):
+            assumed_currencies.add(currency)
+        budget = summarize_account_budget(campaigns, adsets, currency)
         active_daily = budget["active_daily"]
         lifetime_total = budget["lifetime_total"]
-        spend_cap = _minor_to_major(account.get("spend_cap"))
+        spend_cap = _minor_to_major(account.get("spend_cap"), currency)
         if spend_cap is not None and spend_cap <= 0:
             spend_cap = None  # 0 / absent -> uncapped.
-        amount_spent = _minor_to_major(account.get("amount_spent"))
+        amount_spent = _minor_to_major(account.get("amount_spent"), currency)
 
-        period_budget = active_daily * total_days
-        projected = project_spend(spend_to_date, elapsed_fraction)
+        # Prorate any ACTIVE lifetime budgets across the overlap of their own schedule with the window,
+        # then fold them additively into the daily period budget / expected-to-date. Only accounts with
+        # a projectable lifetime overlap use the combined form; daily-only (and lifetime-only-but-not-
+        # projectable) accounts keep the LITERAL existing daily computation so their output stays
+        # byte-identical (the combined ``spend * period_budget / expected`` form can differ in the last
+        # ULP from ``spend / elapsed_fraction``).
+        lifetime = lifetime_pacing(
+            budget["lifetime_entities"],
+            date_from=date_from,
+            date_to=date_to,
+            effective_as_of=effective_as_of,
+        )
+        daily_period_budget = active_daily * total_days
+        if lifetime["period_budget"] > 0:
+            period_budget = daily_period_budget + lifetime["period_budget"]
+            expected_to_date = (
+                daily_period_budget * elapsed_fraction + lifetime["expected_to_date"]
+            )
+            projected = (
+                spend_to_date * period_budget / expected_to_date
+                if expected_to_date > 0
+                else None
+            )
+        else:
+            period_budget = daily_period_budget  # byte-identical daily-only path.
+            projected = project_spend(spend_to_date, elapsed_fraction)
 
         verdict = classify_pacing(
             elapsed_fraction=elapsed_fraction,
@@ -2044,6 +2500,11 @@ def pacing_report(
         notes.append(
             f"reporting period ({date_from}..{date_to}) has not started as of {effective_as_of}; "
             "every account is not_started and no projection is computed."
+        )
+    if assumed_currencies:
+        codes = ", ".join(sorted(assumed_currencies))
+        notes.append(
+            f"assumed 2-decimal minor units for unrecognized currency codes: {codes}."
         )
     if notes:
         result["note"] = " ".join(notes)
