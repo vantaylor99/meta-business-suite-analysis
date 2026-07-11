@@ -501,6 +501,20 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "bucket with a reason instead of sorted as zero or infinity. Valid metrics: spend, cpm, cpc, ctr, "
         "cost_per_result (aliases: cpl, cpa), roas, impressions, clicks, results."
     ),
+    "grade_accounts_against_goals": (
+        "Grade each managed ad account against ITS OWN configured cost-per-lead / ROAS goal for a date "
+        "range and return where the whole portfolio stands in one call — which accounts are on_goal, "
+        "which to watch, and which are pause_candidates (with a shortlist). Reads are open to every "
+        "account the token can reach, but only accounts in the config file carry goals: an account with "
+        "no config entry is graded no_goal_configured, and a configured account whose goal has no "
+        "cost/ROAS bar (e.g. an install/subscription objective) is graded no_goal_thresholds — neither "
+        "is an error. An account with too few results, or spend below its min_spend_before_pause, is "
+        "graded insufficient_data rather than misread as failing. Metric is chosen per account "
+        "(cost-per-result unless the goal is ROAS-based); thresholds are compared in the account's own "
+        "native currency (no FX). as_of defaults to today and only governs a post-launch grace window "
+        "(an account inside its evaluation_grace_days softens from pause_candidate to watch). "
+        "Per-account read failures are isolated in errors, never fatal."
+    ),
 }
 
 
@@ -629,6 +643,22 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             reporting_currency=reporting_currency,
         )
 
+    def grade_accounts_against_goals(
+        date_from: str,
+        date_to: str,
+        account_ids: list[str] | None = None,
+        as_of: str | None = None,
+    ) -> dict[str, Any]:
+        # ``as_of`` IS exposed (defaults to today) so an operator can grade as-of a past date; it only
+        # governs the post-launch grace window. No ``fx_table`` seam here — goals are graded native.
+        return account_discovery.grade_accounts_against_goals(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            account_ids=account_ids,
+            as_of=as_of,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
@@ -637,6 +667,7 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
         "flag_accounts_needing_attention": flag_accounts_needing_attention,
         "pacing_report": pacing_report,
         "rank_accounts": rank_accounts,
+        "grade_accounts_against_goals": grade_accounts_against_goals,
     }
 
 

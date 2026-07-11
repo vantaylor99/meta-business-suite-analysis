@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from . import account_registry
+from . import account_registry, goal_grading
 from .config import (
     ATTENTION_CPC_DEGRADE_PCT,
     ATTENTION_CPR_DEGRADE_PCT,
@@ -2725,3 +2725,189 @@ def rank_accounts(
         "unranked": unranked,
         "errors": perf["errors"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# GOAL GRADING: where does each CONFIGURED account stand against its OWN goal?
+#
+# A *pure post-processor* over cross_account_performance — same relationship account_benchmark /
+# rank_accounts have to it. It calls that tool ONCE over the resolved scope (inheriting the
+# bounded-concurrency fan-out, Simpson's-paradox-safe derived metrics, per-account failure isolation,
+# and deterministic ordering), then joins each returned row's NATIVE cost_per_result / roas to the
+# account's configured goal bars (from config/meta_ads_accounts.json's action_policy) via the pure
+# goal_grading engine. No FX on thresholds: a goal is stated in the account's own currency, so we
+# compare native-to-native (see [[currency-precision-low-priority]]).
+# --------------------------------------------------------------------------- #
+
+
+def _grade_policy_for_account(account: account_registry.MetaAdsAccount) -> dict[str, Any]:
+    """Flatten a registry account into the single policy dict the goal_grading engine reads.
+
+    The engine wants one flat dict carrying the ``action_policy`` bars PLUS ``roas_role`` (which lives
+    in ``measurement_focus`` today, surfaced on the dataclass as ``account.roas_role``). An
+    ``action_policy`` that already carries its own ``roas_role`` wins; otherwise the measurement-focus
+    value is folded in, so metric selection sees it either way.
+    """
+    policy: dict[str, Any] = dict(account.action_policy or {})
+    if not policy.get("roas_role") and account.roas_role:
+        policy["roas_role"] = account.roas_role
+    return policy
+
+
+def grade_accounts_against_goals(
+    reader: "MetaReaderProvider",
+    *,
+    date_from: str,
+    date_to: str,
+    account_ids: list[str] | None = None,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    """Grade each CONFIGURED account's real efficiency against its OWN configured goal bars.
+
+    Joins two things that already exist but were never connected: the per-account **metric**
+    (:func:`cross_account_performance`'s native ``cost_per_result`` / ``roas``) and the per-account
+    **goal** (the account's ``action_policy`` in ``config/meta_ads_accounts.json``). Returns a
+    per-account verdict, a portfolio ``counts`` rollup, and a ``pause_candidates`` shortlist — the whole
+    portfolio's standing in one call.
+
+    **Scope.** Default (``account_ids=None``) grades the configured accounts (the registry's
+    ``ad_account_id``s). An explicit ``account_ids`` grades exactly those — reads stay open, so an id
+    with no config entry is graded :data:`~meta_ads_analysis.goal_grading.GOAL_NO_CONFIG` (counted, not
+    an error). An empty configured registry with the default scope returns an empty result with a
+    ``note`` (never raises).
+
+    **Grading.** For each row :func:`cross_account_performance` returns, the account's policy picks the
+    metric (:func:`~meta_ads_analysis.goal_grading.select_goal_metric` — ``roas_role``/``primary_goal``
+    rule), the row's **native** value + ``spend`` are read, and the pure
+    :func:`~meta_ads_analysis.goal_grading.grade_against_goal` engine returns the verdict. Thresholds
+    are compared native-to-native (no FX): a goal is stated in the account's own currency.
+
+    **``as_of``** defaults to today (UTC) — the single clock touch; the pure engine always takes an
+    explicit date. It governs only the post-launch grace window (an ``evaluation_start_date`` inside its
+    ``evaluation_grace_days`` softens a ``pause_candidate`` to ``watch``); with no launch date set (the
+    common case) accounts are graded as mature. A malformed ``as_of`` is a whole-call ``ValueError``.
+
+    **Errors.** Per-account read failures and no-FX entries from :func:`cross_account_performance`
+    propagate into ``errors`` unchanged; one account's failure never aborts the grade.
+    """
+    # Single clock touch: as_of default = today (UTC). Parse to a date for the pure engine's grace math;
+    # a bad ISO string is a clear whole-call failure (mirrors pacing_report's fail-fast discipline).
+    effective_as_of = as_of or datetime.now(tz=timezone.utc).date().isoformat()
+    as_of_date = date.fromisoformat(effective_as_of)
+
+    registry_by_id = _registry_by_ad_account_id()  # {ad_account_id: MetaAdsAccount}; {} if no config.
+
+    # Default scope = the configured accounts (registry insertion order → deterministic). An explicit
+    # list is graded as-is (open reads); an id absent from config lands in no_goal_configured below.
+    scope_ids = list(registry_by_id.keys()) if account_ids is None else account_ids
+
+    empty_default = account_ids is None and not scope_ids
+    counts: dict[str, int] = {
+        goal_grading.GOAL_ON: 0,
+        goal_grading.GOAL_WATCH: 0,
+        goal_grading.GOAL_PAUSE_CANDIDATE: 0,
+        goal_grading.GOAL_INSUFFICIENT: 0,
+        goal_grading.GOAL_NO_THRESHOLDS: 0,
+        goal_grading.GOAL_NO_CONFIG: 0,
+    }
+
+    if empty_default:
+        # No configured accounts and no explicit scope: nothing to grade. Never touch Meta.
+        return {
+            "date_from": date_from,
+            "date_to": date_to,
+            "as_of": effective_as_of,
+            "accounts": [],
+            "counts": counts,
+            "pause_candidates": [],
+            "errors": [],
+            "note": "no configured accounts to grade",
+        }
+
+    perf = cross_account_performance(
+        reader,
+        date_from=date_from,
+        date_to=date_to,
+        account_ids=scope_ids,
+        level="account",
+    )
+
+    accounts: list[dict[str, Any]] = []
+    pause_candidates: list[dict[str, Any]] = []
+
+    for row in perf["accounts"]:  # scope-ordered → deterministic output.
+        ad_account_id = row["ad_account_id"]
+        account = registry_by_id.get(ad_account_id)
+
+        if account is None:
+            # Read stayed open, but the account carries no configured goal.
+            verdict = goal_grading.GOAL_NO_CONFIG
+            entry: dict[str, Any] = {
+                "account_id": row.get("account_id"),
+                "ad_account_id": ad_account_id,
+                "name": row.get("name"),
+                "currency": row.get("currency"),
+                "metric": None,
+                "value": None,
+                "target": None,
+                "pause_threshold": None,
+                "spend": row.get("spend"),
+                "in_grace": False,
+                "verdict": verdict,
+                "reasons": ["account is not in config/meta_ads_accounts.json — no goal to grade against"],
+            }
+        else:
+            policy = _grade_policy_for_account(account)
+            metric = goal_grading.select_goal_metric(policy)
+            grade = goal_grading.grade_against_goal(
+                metric=metric,
+                value=row.get(metric),  # native cost_per_result / roas (never the *_normalized twin).
+                spend=row.get("spend"),
+                policy=policy,
+                as_of=as_of_date,
+            )
+            verdict = grade.verdict
+            entry = {
+                "account_id": row.get("account_id"),
+                "ad_account_id": ad_account_id,
+                "name": row.get("name"),
+                "currency": row.get("currency"),
+                "metric": grade.metric,
+                "value": grade.value,
+                "target": grade.target,
+                "pause_threshold": grade.pause_threshold,
+                "spend": row.get("spend"),
+                "in_grace": grade.in_grace,
+                "verdict": verdict,
+                "reasons": grade.reasons,
+            }
+            if verdict == goal_grading.GOAL_PAUSE_CANDIDATE:
+                pause_candidates.append(
+                    {
+                        "account_id": row.get("account_id"),
+                        "name": row.get("name"),
+                        "metric": grade.metric,
+                        "value": grade.value,
+                        "pause_threshold": grade.pause_threshold,
+                    }
+                )
+
+        counts[verdict] = counts.get(verdict, 0) + 1
+        accounts.append(entry)
+
+    # Stable shortlist: sort by account_id so the pause-candidate order is deterministic run-to-run
+    # regardless of the (already-deterministic) scope order.
+    pause_candidates.sort(key=lambda e: str(e.get("account_id") or ""))
+
+    result: dict[str, Any] = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "as_of": effective_as_of,
+        "accounts": accounts,
+        "counts": counts,
+        "pause_candidates": pause_candidates,
+        "errors": perf["errors"],
+    }
+    if perf.get("note"):
+        result["note"] = perf["note"]
+    return result

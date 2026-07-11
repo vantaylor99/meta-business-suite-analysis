@@ -9000,6 +9000,7 @@ def test_followups_mark_done_missing_ok_is_idempotent(tmp_path: Path) -> None:
 
 from meta_ads_analysis import account_discovery as _account_discovery  # noqa: E402
 from meta_ads_analysis import currency as _currency  # noqa: E402
+from meta_ads_analysis import goal_grading as _goal_grading  # noqa: E402
 from meta_ads_analysis import mcp_server as _mcp_server  # noqa: E402
 from meta_ads_analysis.meta_api import access_token_from_env, meta_api_version_from_env  # noqa: E402
 from meta_ads_analysis.reader_provider import reader_backend_from_env  # noqa: E402
@@ -9676,7 +9677,7 @@ def test_cross_account_summary_mock_smoke_single_usd_account() -> None:
 def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     reader = _summary_reader()
     discovery = _mcp_server.build_discovery_tools(reader)
-    # All seven discovery tools are exposed.
+    # All eight discovery tools are exposed.
     assert set(discovery) == {
         "list_ad_accounts",
         "cross_account_spend_summary",
@@ -9685,6 +9686,7 @@ def test_build_discovery_tools_exposes_cross_account_summary() -> None:
         "flag_accounts_needing_attention",
         "pacing_report",
         "rank_accounts",
+        "grade_accounts_against_goals",
     }
     summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
     assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
@@ -9693,6 +9695,8 @@ def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     assert "account_benchmark" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "flag_accounts_needing_attention" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "pacing_report" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "rank_accounts" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "grade_accounts_against_goals" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
 
 
 def test_cross_account_summary_insight_fields_restricts_metrics_summed() -> None:
@@ -15122,3 +15126,454 @@ def test_main_mock_flag_and_env_propagate_to_build_server(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
     _mcp_server.main()
     assert captured["mock"] is True
+
+
+# --- goal_grading pure engine: metric selection + verdicts + grace (NO reader, NO FX, NO registry) ---
+
+_GRADE_AS_OF = date(2026, 7, 11)
+
+
+def _grade(metric, value, spend, **policy):
+    """Grade a resolved metric value against an inline policy dict (pure engine, no reader)."""
+    return _goal_grading.grade_against_goal(
+        metric=metric, value=value, spend=spend, policy=policy, as_of=_GRADE_AS_OF
+    )
+
+
+def test_goal_pause_candidate_matches_early_triage_vocabulary() -> None:
+    # The whole tool speaks one pause vocabulary — enforced by this sync test, not a heavy import.
+    from meta_ads_analysis.early_triage import VERDICT_PAUSE_CANDIDATE
+
+    assert _goal_grading.GOAL_PAUSE_CANDIDATE == VERDICT_PAUSE_CANDIDATE == "pause_candidate"
+
+
+def test_select_goal_metric_roas_role_not_applicable_forces_cost() -> None:
+    # not_applicable ALWAYS grades on cost_per_result, even when a ROAS goal + bar are present.
+    assert (
+        _goal_grading.select_goal_metric(
+            {"roas_role": "not_applicable", "primary_goal": "roas", "target_roas": 3.0}
+        )
+        == "cost_per_result"
+    )
+
+
+def test_select_goal_metric_roas_vs_cost() -> None:
+    sel = _goal_grading.select_goal_metric
+    assert sel({"primary_goal": "roas", "target_roas": 3.0}) == "roas"
+    assert sel({"target_roas": 3.0}) == "roas"  # bar presence alone
+    assert sel({"pause_roas_floor": 1.8}) == "roas"
+    assert sel({"primary_goal": "minimize_cost_per_lead", "target_cost_per_result": 10.0}) == "cost_per_result"
+    assert sel({}) == "cost_per_result"  # nothing configured -> default metric
+
+
+def test_goal_grade_cost_per_result_directions() -> None:
+    import pytest
+
+    bars = dict(target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0)
+    on = _grade("cost_per_result", 5.0, 500.0, **bars)
+    assert on.verdict == _goal_grading.GOAL_ON
+    assert on.metric == "cost_per_result"
+    assert (on.value, on.target, on.pause_threshold) == (pytest.approx(5.0), 10.0, 40.0)
+    assert on.in_grace is False
+    # target < value <= pause -> watch.
+    assert _grade("cost_per_result", 25.0, 500.0, **bars).verdict == _goal_grading.GOAL_WATCH
+    assert _grade("cost_per_result", 40.0, 500.0, **bars).verdict == _goal_grading.GOAL_WATCH  # boundary
+    # value > pause -> pause_candidate.
+    assert _grade("cost_per_result", 60.0, 6000.0, **bars).verdict == _goal_grading.GOAL_PAUSE_CANDIDATE
+    # value == target -> on_goal (boundary).
+    assert _grade("cost_per_result", 10.0, 500.0, **bars).verdict == _goal_grading.GOAL_ON
+
+
+def test_goal_grade_roas_directions() -> None:
+    bars = dict(primary_goal="roas", target_roas=3.0, pause_roas_floor=1.8, min_spend_before_pause=100.0)
+    assert _grade("roas", 3.5, 500.0, **bars).verdict == _goal_grading.GOAL_ON
+    assert _grade("roas", 3.0, 500.0, **bars).verdict == _goal_grading.GOAL_ON  # boundary
+    assert _grade("roas", 2.0, 500.0, **bars).verdict == _goal_grading.GOAL_WATCH
+    assert _grade("roas", 1.8, 500.0, **bars).verdict == _goal_grading.GOAL_WATCH  # boundary (>= floor)
+    assert _grade("roas", 1.0, 500.0, **bars).verdict == _goal_grading.GOAL_PAUSE_CANDIDATE
+
+
+def test_goal_grade_partial_thresholds_cost() -> None:
+    # Only pause bar: can escalate to pause_candidate, cannot confirm on_goal.
+    only_pause = _grade("cost_per_result", 50.0, 500.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0)
+    assert only_pause.verdict == _goal_grading.GOAL_PAUSE_CANDIDATE and only_pause.target is None
+    assert _grade("cost_per_result", 5.0, 500.0, pause_cost_per_result_above=40.0).verdict == _goal_grading.GOAL_WATCH
+    # Only target bar: can confirm on_goal, cannot escalate to pause_candidate.
+    only_target = _grade("cost_per_result", 5.0, 500.0, target_cost_per_result=10.0)
+    assert only_target.verdict == _goal_grading.GOAL_ON and only_target.pause_threshold is None
+    assert _grade("cost_per_result", 90.0, 500.0, target_cost_per_result=10.0).verdict == _goal_grading.GOAL_WATCH
+
+
+def test_goal_grade_partial_thresholds_roas() -> None:
+    # Only pause floor: value < floor -> pause_candidate; else watch.
+    assert _grade("roas", 1.0, 500.0, pause_roas_floor=1.8, min_spend_before_pause=100.0).verdict == _goal_grading.GOAL_PAUSE_CANDIDATE
+    assert _grade("roas", 2.5, 500.0, pause_roas_floor=1.8).verdict == _goal_grading.GOAL_WATCH
+    # Only target: value >= target -> on_goal; else watch (cannot escalate).
+    assert _grade("roas", 3.5, 500.0, target_roas=3.0).verdict == _goal_grading.GOAL_ON
+    assert _grade("roas", 0.5, 500.0, target_roas=3.0).verdict == _goal_grading.GOAL_WATCH
+
+
+def test_goal_grade_no_thresholds() -> None:
+    # A configured account whose goal has NO cost/ROAS bar (install/subscription) -> no_goal_thresholds.
+    g = _grade("cost_per_result", 5.0, 500.0, primary_goal="maximize_in_app_subscriptions",
+               secondary_cost_per_app_install_target=3.0)
+    assert g.verdict == _goal_grading.GOAL_NO_THRESHOLDS
+    assert g.metric == "cost_per_result" and g.value == 5.0
+    assert g.target is None and g.pause_threshold is None
+
+
+def test_goal_grade_insufficient_data() -> None:
+    bars = dict(target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0)
+    # value None (no results -> no cost_per_result) -> insufficient, NEVER pause_candidate.
+    none_val = _grade("cost_per_result", None, 5000.0, **bars)
+    assert none_val.verdict == _goal_grading.GOAL_INSUFFICIENT and none_val.value is None
+    # A real (over-pause) value but spend below min_spend_before_pause -> insufficient, not pause.
+    thin = _grade("cost_per_result", 60.0, 50.0, **bars)
+    assert thin.verdict == _goal_grading.GOAL_INSUFFICIENT
+    # roas needs spend: value None -> insufficient.
+    assert _grade("roas", None, 500.0, target_roas=3.0, pause_roas_floor=1.8).verdict == _goal_grading.GOAL_INSUFFICIENT
+
+
+def test_goal_grade_absent_min_spend_has_no_floor() -> None:
+    # min_spend_before_pause absent -> treated as 0 -> no floor: a thin-spend over-pause account
+    # still grades pause_candidate (the guard only fires when a real min_spend floor is set).
+    g = _grade("cost_per_result", 60.0, 1.0, target_cost_per_result=10.0, pause_cost_per_result_above=40.0)
+    assert g.verdict == _goal_grading.GOAL_PAUSE_CANDIDATE
+
+
+def test_goal_grade_grace_softens_pause_to_watch() -> None:
+    # evaluation_start_date inside the evaluation_grace_days window -> a pause_candidate softens to watch.
+    policy = dict(
+        target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        evaluation_start_date="2026-07-10", evaluation_grace_days=3,
+    )
+    g = _goal_grading.grade_against_goal(
+        metric="cost_per_result", value=60.0, spend=6000.0, policy=policy, as_of=_GRADE_AS_OF
+    )
+    assert g.verdict == _goal_grading.GOAL_WATCH
+    assert g.in_grace is True
+    # Same account, launch date well before the grace window -> mature -> pause_candidate stands.
+    mature = _goal_grading.grade_against_goal(
+        metric="cost_per_result", value=60.0, spend=6000.0,
+        policy={**policy, "evaluation_start_date": "2026-07-01"}, as_of=_GRADE_AS_OF,
+    )
+    assert mature.verdict == _goal_grading.GOAL_PAUSE_CANDIDATE and mature.in_grace is False
+    # on_goal is unchanged by grace (only pause_candidate softens).
+    on = _goal_grading.grade_against_goal(
+        metric="cost_per_result", value=5.0, spend=6000.0, policy=policy, as_of=_GRADE_AS_OF
+    )
+    assert on.verdict == _goal_grading.GOAL_ON and on.in_grace is True
+
+
+def test_goal_grade_grace_absent_launch_date_is_mature() -> None:
+    # evaluation_grace_days set but NO evaluation_start_date -> mature (never fabricate a launch date).
+    g = _grade("cost_per_result", 60.0, 6000.0, target_cost_per_result=10.0,
+               pause_cost_per_result_above=40.0, min_spend_before_pause=100.0, evaluation_grace_days=3)
+    assert g.verdict == _goal_grading.GOAL_PAUSE_CANDIDATE and g.in_grace is False
+
+
+# --- grade_accounts_against_goals orchestration (FakeMetaReader; monkeypatched registry) ---
+
+
+def _grade_reader(meta_by_id, insights, **overrides):
+    """Reader for grade tests: explicit-id scope -> get_account per id + fetch_insights per id."""
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    def _get_account(ad_account_id, *, fields):
+        return dict(meta_by_id[ad_account_id])
+
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [dict(r) for r in insights.get(ad_account_id, [])]
+
+    stubs = {"get_account": _get_account, "fetch_insights": _fetch_insights}
+    stubs.update(overrides)
+    return FakeMetaReader(**stubs)
+
+
+def _grade_account(ad_account_id, *, roas_role=None, primary_result_action_type=None, **policy):
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+
+    return MetaAdsAccount(
+        account_slug=ad_account_id, account_name=ad_account_id, ad_account_id=ad_account_id,
+        roas_role=roas_role, primary_result_action_type=primary_result_action_type,
+        action_policy=policy,
+    )
+
+
+def test_grade_accounts_against_goals_portfolio(monkeypatch) -> None:
+    import pytest
+
+    registry = {
+        # Seattle-like: cost-per-lead, ~$60/lead vs $10 target / $40 pause -> pause_candidate.
+        "act_103014553": _grade_account(
+            "act_103014553", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            primary_goal="minimize_cost_per_lead", target_cost_per_result=10.0,
+            pause_cost_per_result_above=40.0, min_spend_before_pause=100.0, evaluation_grace_days=3,
+        ),
+        # Cheap lead account: $5/lead -> on_goal.
+        "act_2": _grade_account(
+            "act_2", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        ),
+        # ROAS account below floor: 1.0 vs 3.0 target / 1.8 floor -> pause_candidate.
+        "act_3": _grade_account(
+            "act_3", roas_role="supporting", primary_result_action_type="purchase",
+            primary_goal="roas", target_roas=3.0, pause_roas_floor=1.8, min_spend_before_pause=100.0,
+        ),
+        # Install/subscription: no cost/ROAS bar -> no_goal_thresholds.
+        "act_4": _grade_account(
+            "act_4", roas_role="supporting_only_until_subscription_value_is_stable",
+            primary_goal="maximize_in_app_subscriptions", secondary_cost_per_app_install_target=3.0,
+        ),
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+
+    meta_by_id = {
+        "act_103014553": {"account_id": "103014553", "name": "Seattle", "account_status": 1, "currency": "USD"},
+        "act_2": {"account_id": "2", "name": "Cheap", "account_status": 1, "currency": "USD"},
+        "act_3": {"account_id": "3", "name": "RoasCo", "account_status": 1, "currency": "USD"},
+        "act_4": {"account_id": "4", "name": "Pollen", "account_status": 1, "currency": "USD"},
+    }
+    insights = {
+        "act_103014553": [{"spend": "6000.00", "impressions": "100000", "clicks": "5000",
+                           "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}],
+        "act_2": [{"spend": "500.00", "impressions": "50000", "clicks": "2000",
+                   "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}],
+        "act_3": [{"spend": "200.00", "impressions": "10000", "clicks": "300",
+                   "actions": [{"action_type": "purchase", "value": "5"}],
+                   "action_values": [{"action_type": "purchase", "value": "200"}]}],
+        "act_4": [{"spend": "300.00", "impressions": "20000", "clicks": "400"}],
+    }
+    reader = _grade_reader(meta_by_id, insights)
+
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    by_id = {a["ad_account_id"]: a for a in out["accounts"]}
+    assert by_id["act_103014553"]["verdict"] == "pause_candidate"
+    assert by_id["act_103014553"]["metric"] == "cost_per_result"
+    assert by_id["act_103014553"]["value"] == pytest.approx(60.0)
+    assert by_id["act_103014553"]["in_grace"] is False  # no evaluation_start_date set -> mature
+    assert by_id["act_2"]["verdict"] == "on_goal"
+    assert by_id["act_3"]["verdict"] == "pause_candidate"
+    assert by_id["act_3"]["metric"] == "roas"
+    assert by_id["act_4"]["verdict"] == "no_goal_thresholds"
+    assert out["counts"]["pause_candidate"] == 2
+    assert out["counts"]["on_goal"] == 1
+    assert out["counts"]["no_goal_thresholds"] == 1
+    # Shortlist sorted by account_id (string): "103014553" < "3".
+    assert [p["account_id"] for p in out["pause_candidates"]] == ["103014553", "3"]
+    assert out["pause_candidates"][0]["pause_threshold"] == 40.0
+    assert out["as_of"] == "2026-07-11"
+    assert out["errors"] == []
+
+
+def test_grade_accounts_unconfigured_explicit_id_is_no_goal_configured(monkeypatch) -> None:
+    # Reads stay open: an explicit id with no config entry is graded no_goal_configured (counted, not an error).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    meta_by_id = {"act_99": {"account_id": "99", "name": "Stranger", "account_status": 1, "currency": "USD"}}
+    insights = {"act_99": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=["act_99"], as_of="2026-07-11"
+    )
+    assert len(out["accounts"]) == 1
+    entry = out["accounts"][0]
+    assert entry["verdict"] == "no_goal_configured"
+    assert entry["metric"] is None and entry["target"] is None
+    assert out["counts"]["no_goal_configured"] == 1
+    assert out["pause_candidates"] == []
+
+
+def test_grade_accounts_empty_registry_default_scope_returns_note(monkeypatch) -> None:
+    # No configured accounts + default scope -> empty accounts, zeroed counts, a note; never a raise,
+    # and Meta is never touched (the reader is unstubbed on purpose).
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    out = _account_discovery.grade_accounts_against_goals(
+        FakeMetaReader(), date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    assert out["accounts"] == []
+    assert out["pause_candidates"] == []
+    assert out["counts"] == {
+        "on_goal": 0, "watch": 0, "pause_candidate": 0,
+        "insufficient_data": 0, "no_goal_thresholds": 0, "no_goal_configured": 0,
+    }
+    assert "note" in out
+
+
+def test_grade_accounts_zero_results_is_insufficient_not_pause(monkeypatch) -> None:
+    # Real spend but ZERO results -> cost_per_result absent -> value None -> insufficient_data,
+    # guarding the cheap-but-zero-results trap.
+    registry = {
+        "act_5": _grade_account(
+            "act_5", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_5": {"account_id": "5", "name": "Zero", "account_status": 1, "currency": "USD"}}
+    insights = {"act_5": [{"spend": "5000.00", "impressions": "100000", "clicks": "3000"}]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    assert entry["verdict"] == "insufficient_data" and entry["value"] is None
+    assert out["counts"]["pause_candidate"] == 0
+
+
+def test_grade_accounts_not_applicable_ignores_row_roas(monkeypatch) -> None:
+    # A not_applicable (lead-gen) account whose row ALSO carries a (huge) ROAS is STILL graded on
+    # cost_per_result — the row's roas is ignored.
+    import pytest
+
+    registry = {
+        "act_8": _grade_account(
+            "act_8", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_8": {"account_id": "8", "name": "Leadgen", "account_status": 1, "currency": "USD"}}
+    insights = {"act_8": [{
+        "spend": "6000.00", "impressions": "100000", "clicks": "5000",
+        "actions": [
+            {"action_type": "onsite_conversion.lead_grouped", "value": "100"},
+            {"action_type": "purchase", "value": "50"},
+        ],
+        "action_values": [{"action_type": "purchase", "value": "999999"}],
+    }]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    # Graded on cost_per_result (60), NOT on the astronomically-good roas in the row.
+    assert entry["metric"] == "cost_per_result"
+    assert entry["value"] == pytest.approx(60.0)
+    assert entry["verdict"] == "pause_candidate"
+
+
+def test_grade_accounts_propagates_per_account_read_errors(monkeypatch) -> None:
+    # One account's read failure lands in errors and never aborts the grade of the others.
+    registry = {
+        "act_6": _grade_account("act_6", roas_role="not_applicable",
+                                primary_result_action_type="onsite_conversion.lead_grouped",
+                                target_cost_per_result=10.0, pause_cost_per_result_above=40.0,
+                                min_spend_before_pause=100.0),
+        "act_7": _grade_account("act_7", roas_role="not_applicable",
+                                primary_result_action_type="onsite_conversion.lead_grouped",
+                                target_cost_per_result=10.0, pause_cost_per_result_above=40.0,
+                                min_spend_before_pause=100.0),
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_6": {"account_id": "6", "name": "OK", "account_status": 1, "currency": "USD"}}
+    insights = {"act_6": [{"spend": "500.00", "impressions": "50000", "clicks": "2000",
+                           "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]}
+
+    def _get_account(ad_account_id, *, fields):
+        if ad_account_id == "act_7":
+            raise MetaApiError("(#100) unreadable account")
+        return dict(meta_by_id[ad_account_id])
+
+    reader = _grade_reader(meta_by_id, insights, get_account=_get_account)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    # act_6 graded; act_7 isolated into errors.
+    assert {a["ad_account_id"] for a in out["accounts"]} == {"act_6"}
+    assert out["accounts"][0]["verdict"] == "on_goal"
+    assert any(e["ad_account_id"] == "act_7" for e in out["errors"])
+
+
+def test_grade_accounts_as_of_defaults_to_today(monkeypatch) -> None:
+    # as_of omitted -> today (UTC), the single clock touch; the reported as_of echoes it.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    out = _account_discovery.grade_accounts_against_goals(
+        FakeMetaReader(), date_from="2026-06-01", date_to="2026-06-30"
+    )
+    from datetime import datetime, timezone
+
+    assert out["as_of"] == datetime.now(tz=timezone.utc).date().isoformat()
+
+
+def test_build_discovery_tools_grade_accounts_against_goals_mock_smoke(monkeypatch) -> None:
+    # The MCP wrapper delegates to the orchestration function and is present in the discovery surface.
+    registry = {
+        "act_9": _grade_account("act_9", roas_role="not_applicable",
+                                primary_result_action_type="onsite_conversion.lead_grouped",
+                                target_cost_per_result=10.0, pause_cost_per_result_above=40.0,
+                                min_spend_before_pause=100.0),
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_9": {"account_id": "9", "name": "Nine", "account_status": 1, "currency": "USD"}}
+    insights = {"act_9": [{"spend": "500.00", "impressions": "50000", "clicks": "2000",
+                           "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]}
+    reader = _grade_reader(meta_by_id, insights)
+    tools = _mcp_server.build_discovery_tools(reader)
+    assert "grade_accounts_against_goals" in tools
+    assert "grade_accounts_against_goals" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    out = tools["grade_accounts_against_goals"]("2026-06-01", "2026-06-30", None, "2026-07-11")
+    assert out["accounts"][0]["verdict"] == "on_goal"
+
+
+def test_grade_accounts_end_to_end_real_config_shape(tmp_path: Path, monkeypatch) -> None:
+    # End-to-end through the REAL registry JSON parsing (not the _grade_account shortcut): roas_role
+    # lives in measurement_focus and thresholds in action_policy, exactly like config/meta_ads_accounts.json.
+    # This proves load_account_registry -> account.roas_role -> _grade_policy_for_account flows correctly.
+    import pytest
+
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "seattle_mission",
+                        "account_name": "Washington Seattle Mission",
+                        "ad_account_id": "103014553",
+                        "measurement_focus": {
+                            "primary_result_action_type": "onsite_conversion.lead_grouped",
+                            "primary_result_label": "Leads (form)",
+                            "roas_role": "not_applicable",
+                        },
+                        "action_policy": {
+                            "primary_goal": "minimize_cost_per_lead",
+                            "target_cost_per_result": 10.0,
+                            "pause_cost_per_result_above": 40.0,
+                            "min_spend_before_pause": 100.0,
+                            "evaluation_grace_days": 3,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    meta_by_id = {
+        "act_103014553": {"account_id": "103014553", "name": "Washington Seattle Mission",
+                          "account_status": 1, "currency": "USD"}
+    }
+    insights = {
+        "act_103014553": [{"spend": "6000.00", "impressions": "100000", "clicks": "5000",
+                           "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]
+    }
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    assert entry["metric"] == "cost_per_result"  # roas_role=not_applicable (from measurement_focus)
+    assert entry["verdict"] == "pause_candidate"  # $60/lead vs $40 pause; no launch date -> mature
+    assert entry["value"] == pytest.approx(60.0)
+    assert entry["in_grace"] is False
+    assert out["counts"]["pause_candidate"] == 1
