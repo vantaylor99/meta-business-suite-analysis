@@ -323,10 +323,17 @@ by severity then absolute normalized-spend move then account id), `informational
 floors compare in one `reporting_currency` (default USD) via the same static FX table, and percent
 moves use native figures (currency-invariant for a single account across two windows). Because it runs
 two fan-outs it issues **~2× the per-account reads** of a single `cross_account_performance`
-(~400 reads for a 200-account scope) — acceptable and documented. **Budget pacing is deliberately NOT
-here:** spend-to-date vs. the configured budget is a different question over a different surface, owned
-by the `pacing_report` tool; ad-level creative/disapproval detection (a heavier per-ad fan-out) is
-parked for a later ticket.
+(~400 reads for a 200-account scope) — acceptable and documented. **Budget pacing is off by default but
+opt-in:** pass `include_pacing=true` and the scan calls `pacing_report` once over the same scope, paces
+the **current** window (`as_of=current_to`, so the period is complete and the projection equals realized
+spend), and folds each account's over/under verdict in as a `budget_pacing_off` flag (materially
+over-spending → **high**, under-spending → **medium**, gated by a **25%** variance knee — larger than
+pacing's own 5% tolerance). Because that flag is baseline-independent, it can be the *only* flag on an
+account and promote an otherwise-clean or informational account into `flagged`; its per-account pacing
+errors are surfaced tagged `stage:"pacing"`. Turning it on adds pacing's own **~1 + 4N** reads on top
+(of which the current-window insight read duplicates the scan's own — an accepted, documented duplicate).
+For period (e.g. month) pacing, call `pacing_report` directly. Ad-level creative/disapproval detection
+(a heavier per-ad fan-out) is parked for a later ticket.
 
 `pacing_report` answers the manager's month-end question — "will each account land **over**, **under**,
 or **on** its budget?" — across every account the token can reach (or an explicit list). Unlike

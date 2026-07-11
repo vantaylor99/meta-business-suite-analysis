@@ -69,9 +69,12 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   move** or **30% cost/quality degradation** as "noticeable, not noise" (low-volume windows are gated
   out so a 2→1 result swing never trips an alarm), and results are bucketed **worst-first** into
   `flagged` (medium+ severity), `informational` (newly-active / too-little-history), and a `clean_count`.
-  It is a pure post-processor over `cross_account_performance` (two reads — one per window). **Budget
-  pacing is a separate concern:** spend-to-date vs. the configured budget is answered by the
-  `pacing_report` tool, not this one. That sixth discovery tool answers "will each account land
+  By default it is a pure post-processor over `cross_account_performance` (two reads — one per window).
+  **Budget pacing is off by default and opt-in:** pass `include_pacing=true` to fold `pacing_report`'s
+  current-window over/under verdict into the scan as a `budget_pacing_off` flag (materially
+  over-spending → high, under-spending → medium), which can itself promote an otherwise-quiet account
+  into the `flagged` list; leaving it off keeps the two-read cost and byte-identical output. For period
+  (e.g. month) pacing, call the `pacing_report` tool directly. That sixth discovery tool answers "will each account land
   **over**, **under**, or **on** its budget for the month?" across the whole fleet: you give it the
   full reporting period (`date_from`/`date_to`) and, optionally, the day to measure spend through
   (`as_of`, default today), and it reports each account's spend-to-date, its **projected**
