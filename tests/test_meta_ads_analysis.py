@@ -15577,3 +15577,64 @@ def test_grade_accounts_end_to_end_real_config_shape(tmp_path: Path, monkeypatch
     assert entry["value"] == pytest.approx(60.0)
     assert entry["in_grace"] is False
     assert out["counts"]["pause_candidate"] == 1
+
+
+def test_grade_accounts_thresholds_are_native_not_fx_normalized(monkeypatch) -> None:
+    # The single most load-bearing correctness claim: a goal is stated in the account's OWN currency,
+    # so the metric is graded native-to-native with NO FX. A EUR account whose native cost_per_result
+    # is 38 EUR sits UNDER its 40 EUR pause bar (-> watch). If the tool wrongly graded the USD-normalized
+    # twin (38 EUR x 1.08 = 41.04 USD) it would cross the bar and misread as pause_candidate. Locking
+    # native grading here catches any future regression that reaches for the *_normalized value.
+    import pytest
+
+    registry = {
+        "act_eur": _grade_account(
+            "act_eur", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_eur": {"account_id": "eur", "name": "Berlin", "account_status": 1, "currency": "EUR"}}
+    # 3800 EUR / 100 leads = 38.00 EUR native cost_per_result (under the 40 EUR pause bar).
+    insights = {"act_eur": [{"spend": "3800.00", "impressions": "100000", "clicks": "5000",
+                             "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    assert entry["currency"] == "EUR"
+    assert entry["value"] == pytest.approx(38.0)  # native EUR, NOT the 41.04 USD normalized twin
+    assert entry["verdict"] == "watch"  # 38 <= 40 native; would be pause_candidate if FX-normalized
+    assert out["counts"]["pause_candidate"] == 0
+    assert out["errors"] == []  # EUR is in the FX table -> no no-FX error
+
+
+def test_grade_accounts_grades_currency_missing_from_fx_table(monkeypatch) -> None:
+    # FX-independence, other half: an account in a currency ABSENT from config/fx_rates.json (JPY) is
+    # still graded on its native metric (cross_account_performance keeps the native row), and the no-FX
+    # entry propagates into errors — grading never depends on a normalizable currency.
+    import pytest
+
+    registry = {
+        "act_jpy": _grade_account(
+            "act_jpy", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_jpy": {"account_id": "jpy", "name": "Tokyo", "account_status": 1, "currency": "JPY"}}
+    # 6000 JPY / 100 leads = 60.00 native cost_per_result (over the 40 pause bar) -> pause_candidate.
+    insights = {"act_jpy": [{"spend": "6000.00", "impressions": "100000", "clicks": "5000",
+                             "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    assert entry["currency"] == "JPY"
+    assert entry["value"] == pytest.approx(60.0)  # graded native despite no FX rate
+    assert entry["verdict"] == "pause_candidate"
+    assert any("no FX rate" in e.get("error", "") for e in out["errors"])  # no-FX propagates, non-fatal

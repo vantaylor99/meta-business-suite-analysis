@@ -257,9 +257,10 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the seven discovery tools (`list_ad_accounts`,
+plus any of the 14 read tools, the eight discovery tools (`list_ad_accounts`,
 `cross_account_spend_summary`, `cross_account_performance`, `account_benchmark`,
-`flag_accounts_needing_attention`, `pacing_report`, and `rank_accounts` — none takes an
+`flag_accounts_needing_attention`, `pacing_report`, `rank_accounts`, and
+`grade_accounts_against_goals` — none takes an
 `account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
@@ -386,6 +387,29 @@ and the returned list is truncated to `limit` while `ranked_total` reports the f
 account that lacks the metric — no delivery in range, or a money metric in a currency missing from the
 FX table — is not sorted as a misleading `0`/`∞`; it lands in a separate `unranked` bucket tagged with
 its reason (`metric unavailable` vs `no FX rate for <currency>`).
+
+`grade_accounts_against_goals` answers the manager's "is each account hitting **its own** goal?" — it
+joins each account's real efficiency to the goal bars configured in its `action_policy`
+(`config/meta_ads_accounts.json`) and returns a per-account verdict plus a portfolio `counts` rollup and
+a `pause_candidates` shortlist. Like `rank_accounts` it is a **pure post-processor over
+`cross_account_performance`** (one call, no new read shape). The graded metric is chosen per account by
+the account's policy: a `roas_role` of `not_applicable` **always** grades on `cost_per_result` (a
+lead-gen account that happens to carry a ROAS number is still a cost-per-lead account); otherwise a
+ROAS-based goal (`primary_goal == "roas"` or a `target_roas`/`pause_roas_floor` bar present) grades on
+`roas`; else `cost_per_result`. Thresholds are compared in the account's **own native currency (no FX)**
+— a goal is stated in the currency the account is billed in — so this tool is FX-independent and grades
+even accounts whose currency is missing from the FX table (their `cross_account_performance` no-FX
+`errors` still propagate). Reads stay open, so scope defaults to the configured accounts but an explicit
+`account_ids` is graded as-is: an id absent from config is `no_goal_configured`, and a configured
+account whose chosen metric has neither a target nor a pause bar is `no_goal_thresholds` — both counted,
+neither an error. A metric that is absent (no results → no `cost_per_result`, no revenue → no `roas`) or
+spend below the account's `min_spend_before_pause` floor is `insufficient_data`, which guards the
+cheap-but-zero-results trap (a zero-result account is never misread as `pause_candidate`). `as_of`
+defaults to today (the single clock touch) and governs only the post-launch grace window: an account
+inside its `evaluation_grace_days` (measured from an optional `evaluation_start_date` in its policy)
+softens a `pause_candidate` down to `watch`. The `pause_candidates` shortlist is sorted by `account_id`
+for run-to-run determinism (not worst-first). Per-account read failures are isolated into `errors`,
+never fatal.
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the

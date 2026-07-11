@@ -106,7 +106,7 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   fails is reported `budget_unread`, never a silent "uncapped". The minor-unit→major-unit divisor is
   **ISO-4217 currency-aware** (2/0/3-decimal, so JPY/KRW and BHD/KWD convert correctly); an
   unrecognized currency code assumes 2 decimals and is surfaced in the report `note`.
-  Finally, the `rank_accounts` tool is the seventh discovery tool and the manager's "who's top/bottom?"
+  The `rank_accounts` tool is the seventh discovery tool and the manager's "who's top/bottom?"
   shortlist: another **pure post-processor over `cross_account_performance`** (one read), it sorts the
   whole reachable fleet — or an explicit `account_ids` subset — by a **single** metric (spend, CPM, CPC,
   CTR, cost-per-result [aliases `cpl`/`cpa`], ROAS, impressions, clicks, or results) and returns the top
@@ -116,6 +116,20 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   strictly-better + 1), and accounts that lack the metric — no delivery, or a money metric in a currency
   missing from the FX table — land in a separate `unranked` bucket with a reason rather than being sorted
   as a misleading zero or infinity.
+  Finally, the `grade_accounts_against_goals` tool is the eighth discovery tool and the manager's
+  "is each account hitting *its own* goal?" one-call verdict: yet another **pure post-processor over
+  `cross_account_performance`** (one read), it joins each account's real efficiency to the goal bars in
+  its `action_policy` (from `config/meta_ads_accounts.json`) and returns a per-account verdict —
+  `on_goal`, `watch`, or `pause_candidate` (with a shortlist) — plus a portfolio rollup. The metric is
+  chosen per account (cost-per-result unless the goal is ROAS-based; a `roas_role` of `not_applicable`
+  always forces cost-per-result), and thresholds are compared in the account's **own native currency**
+  (no FX — a goal is stated in the currency it is billed in). Reads stay open, so an account with no
+  config entry is graded `no_goal_configured` and a configured account whose goal carries no cost/ROAS
+  bar (e.g. an install/subscription objective) is graded `no_goal_thresholds` — neither is an error. An
+  account with no results yet, or spend below its `min_spend_before_pause`, is graded `insufficient_data`
+  rather than misread as failing, and an account still inside its post-launch `evaluation_grace_days`
+  window softens from `pause_candidate` to `watch`. `as_of` defaults to today and governs only that
+  grace window.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable
