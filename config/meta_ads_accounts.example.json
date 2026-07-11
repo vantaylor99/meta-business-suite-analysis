@@ -63,12 +63,12 @@
       "ad_account_id": "REPLACE_WITH_REAL_AD_ACCOUNT_ID",
       "measurement_focus": {
         "primary_metric": "results",
-        "primary_result_action_type": "leadgen_grouped",
+        "primary_result_action_type": "onsite_conversion.lead_grouped",
         "primary_result_label": "Leads (form)",
         "secondary_metric": null,
         "secondary_metric_label": null,
         "roas_role": "not_applicable",
-        "analysis_notes": "Lead generation via Meta Instant Forms (objective OUTCOME_LEADS). Success = form leads; efficiency = cost per lead (CPR). This account does NOT sell products — do not apply purchases, purchase value, or ROAS to it. VERIFY primary_result_action_type on first sync-api run (instant-form lead action type may resolve as 'leadgen_grouped' or 'onsite_conversion.lead_grouped'); if Results come back blank, let the sync infer or adjust here."
+        "analysis_notes": "Lead generation via Meta Instant Forms (objective OUTCOME_LEADS). Success = form leads; efficiency = cost per lead (CPR). This account does NOT sell products — do not apply purchases, purchase value, or ROAS to it. Meta reports Instant-Forms leads under action type 'onsite_conversion.lead_grouped'; sync-api / cross_account_performance resolve leads against the whole lead-key family, so a stale/drifted key still self-heals."
       },
       "action_policy": {
         "primary_goal": "minimize_cost_per_lead",
