@@ -25,8 +25,10 @@ pipeline serve all of them.
 ### 2. `measurement_focus` — what counts as a result
 Tells the reports which number is "success" for this account.
 - `primary_metric` — `results` for goal-driven accounts.
-- `primary_result_action_type` — the Meta action behind a result (`purchase`, `leadgen_grouped`,
-  `app_custom_event.*`, …). **Verify on first sync** — if Results come back blank, adjust it.
+- `primary_result_action_type` — the Meta action behind a result (`purchase`,
+  `onsite_conversion.lead_grouped` for Instant-Forms leads, `app_custom_event.*`, …). **Verify on
+  first sync** — if Results come back blank, adjust it (lead accounts resolve against the whole
+  lead-key family, so a drifted key self-heals and sync warns you to update config).
 - `primary_result_label` — human label (`Website purchases`, `Leads (form)`).
 - `secondary_metric` / `_label` — a fallback signal (e.g. outbound clicks, app installs). `null` if none.
 - `roas_role` — how much to trust ROAS: a real KPI, a supporting metric, or `not_applicable`

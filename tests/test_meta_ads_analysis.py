@@ -10732,6 +10732,34 @@ def test_infer_primary_result_action_lead_precedence_and_fallback() -> None:
     )
 
 
+def test_build_performance_row_unconfigured_lead_only_labels_leads() -> None:
+    # Unconfigured lead-only account: inference resolves the lead key (LEAD_KEYS group) AND the
+    # _label_for_action "lead" -> "Leads" fallback fires (no config label to override it). This is
+    # the only path that exercises that new label branch end-to-end.
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+    from meta_ads_analysis.sync_api import _build_performance_row
+
+    account = MetaAdsAccount(
+        account_slug="unconfigured_lead",
+        account_name="Unconfigured Lead",
+        ad_account_id="act_ul",
+        primary_result_action_type=None,
+        primary_result_label=None,
+    )
+    row = {
+        "spend": "100",
+        "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "5"}],
+        "cost_per_action_type": [{"action_type": "onsite_conversion.lead_grouped", "value": "20"}],
+    }
+    warnings: list[str] = []
+    out = _build_performance_row(row, account, warnings)
+    assert out["Result type"] == "Leads"  # _label_for_action fallback, not a config label
+    assert out["Results"] == "5"
+    assert out["Cost per result"] == "20"
+    # Inferred key IS the reported key, so no drift warning fires.
+    assert warnings == []
+
+
 def test_cross_account_performance_resolves_lead_family(monkeypatch) -> None:
     import pytest
 
