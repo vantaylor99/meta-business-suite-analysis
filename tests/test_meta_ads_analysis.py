@@ -10631,6 +10631,8 @@ def test_cross_account_performance_empty_reach_note(monkeypatch) -> None:
     nt = out["normalized_total"]
     assert nt["spend"] == 0.0 and nt["account_count"] == 0 and nt["excluded_no_fx"] == 0
     assert "cpm" not in nt and "roas" not in nt
+    # Empty fleet: coverage counts are present and zero (no contributor).
+    assert nt["results_accounts"] == 0 and nt["purchase_value_accounts"] == 0
     assert nt["reporting_currency"] == "USD"
     assert out["reachable_count"] == out["account_count"] == 0
 

@@ -546,6 +546,12 @@ def cross_account_performance(
     currency; accounts whose currency is absent from the FX table keep their native figures, record an
     ``errors`` entry, and are excluded from ``normalized_total`` (counted in ``excluded_no_fx``).
 
+    Every aggregate block (each ``totals_by_currency`` subtotal and ``normalized_total``) also carries
+    ``results_accounts`` / ``purchase_value_accounts`` — how many of its ``account_count`` accounts
+    actually contributed ``results`` / ``purchase_value`` to the sum. This makes coverage legible: a
+    portfolio ROAS built from 1 of 10 accounts reads differently from one built from all 10. The counts
+    are always emitted (``0`` is meaningful — it explains why ``cost_per_result``/``roas`` are absent).
+
     ``level`` accepts only ``"account"`` for now (a future ticket can add campaign/adset roll-ups); any
     other value raises ``ValueError``. A ``reporting_currency`` absent from the FX table is a whole-call
     ``ValueError`` — nothing could be normalized. ``fx_table`` is injectable for tests; when ``None`` the
