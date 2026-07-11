@@ -92,6 +92,18 @@ APP_INSTALL_KEYS = [
     "app_install",
     "omni_app_install",
 ]
+# Instant-Forms / lead action types, canonical-first. Meta reports this account's leads under
+# ``onsite_conversion.lead_grouped`` (verified live for seattle_mission, act_103014553, 2026-07-10),
+# NOT the older ``leadgen_grouped``. Resolving the whole family (rather than a single configured key)
+# lets a lead account self-heal when the configured key drifts from what Meta actually returns.
+LEAD_KEYS = [
+    "onsite_conversion.lead_grouped",
+    "leadgen_grouped",
+    "leadgen.other",
+    "onsite_conversion.lead",
+    "lead",
+]
+_LEAD_KEYS_LOWER = frozenset(key.lower() for key in LEAD_KEYS)
 OUTBOUND_CLICK_KEYS = [
     "outbound_click",
 ]
@@ -306,8 +318,24 @@ def _build_performance_row(
             f"No primary result action could be inferred for account {account.account_slug}; Results may be blank."
         )
     result_label = account.primary_result_label or _label_for_action(primary_result_key)
-    results = _find_metric(actions, [primary_result_key] if primary_result_key else [])
-    cost_per_result = _find_metric(cost_per_action_type, [primary_result_key] if primary_result_key else [])
+    if primary_result_key and primary_result_key.lower() in _LEAD_KEYS_LOWER:
+        # Lead account: resolve results/cost_per_result against the WHOLE lead-key family so a
+        # configured key that has drifted from Meta's reported action type still self-heals within
+        # the lead family (never across goal types). first-match, so a single value — never a sum.
+        results = _find_metric(actions, LEAD_KEYS)
+        cost_per_result = _find_metric(cost_per_action_type, LEAD_KEYS)
+        configured_matched = _find_metric(actions, [primary_result_key]) is not None
+        if results is not None and not configured_matched:
+            matched_key = _find_metric_key(actions, LEAD_KEYS)
+            warnings.append(
+                f"Account {account.account_slug}: configured lead action type "
+                f"'{primary_result_key}' did not match Meta's reported actions; resolved leads via "
+                f"'{matched_key}' instead. Update primary_result_action_type in config."
+            )
+    else:
+        result_keys = [primary_result_key] if primary_result_key else []
+        results = _find_metric(actions, result_keys)
+        cost_per_result = _find_metric(cost_per_action_type, result_keys)
 
     purchase_count = _find_metric(actions, PURCHASE_KEYS)
     purchase_value = _find_metric(action_values, PURCHASE_KEYS)
@@ -429,12 +457,30 @@ def _find_metric(metrics: list[dict[str, Any]], keys: list[str]) -> float | None
     return None
 
 
+def _find_metric_key(metrics: list[dict[str, Any]], keys: list[str]) -> str | None:
+    """The action_type of the first blob item matching any of ``keys`` (lowercased), else ``None``.
+
+    Mirrors :func:`_find_metric`'s first-match-by-blob-order semantics but returns the matched key
+    name instead of its value — used to name which lead-family key actually resolved when the
+    configured key had drifted.
+    """
+    lowered_keys = [key.lower() for key in keys if key]
+    for item in metrics:
+        action_type = str(item.get("action_type") or item.get("metric") or "").strip().lower()
+        if action_type in lowered_keys:
+            return action_type
+    return None
+
+
 def _infer_primary_result_action(actions: list[dict[str, Any]]) -> str | None:
     action_types = [str(item.get("action_type") or "").strip().lower() for item in actions]
     for action_type in action_types:
         if "subscribe" in action_type or "subscription" in action_type:
             return action_type
-    for candidate_group in (PURCHASE_KEYS, APP_INSTALL_KEYS):
+    # LEAD_KEYS is the FINAL candidate group: config is authoritative for real lead accounts, so
+    # inference only matters as a safety net for an unconfigured one. Placing it last ensures a
+    # blob carrying both a purchase/install AND incidental leads still infers the true goal.
+    for candidate_group in (PURCHASE_KEYS, APP_INSTALL_KEYS, LEAD_KEYS):
         for candidate in candidate_group:
             if candidate in action_types:
                 return candidate
@@ -451,6 +497,8 @@ def _label_for_action(action_type: str | None) -> str | None:
         return "Purchases"
     if "install" in lowered:
         return "App installs"
+    if "lead" in lowered:
+        return "Leads"
     return action_type.replace("_", " ").title()
 
 

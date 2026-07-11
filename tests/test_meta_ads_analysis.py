@@ -10548,6 +10548,258 @@ def test_cross_account_performance_uses_configured_result_key(monkeypatch) -> No
     assert row["cost_per_result"] == pytest.approx(100 / 40)
 
 
+def test_build_performance_row_resolves_lead_family_for_seattle_mission() -> None:
+    # seattle_mission-shaped row: Meta reports leads under onsite_conversion.lead_grouped and the
+    # config now names that key. Results = lead count, Cost per result = cost per lead, no ROAS.
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+    from meta_ads_analysis.sync_api import _build_performance_row
+
+    account = MetaAdsAccount(
+        account_slug="seattle_mission",
+        account_name="Washington Seattle Mission",
+        ad_account_id="act_103014553",
+        primary_result_action_type="onsite_conversion.lead_grouped",
+        primary_result_label="Leads (form)",
+        roas_role="not_applicable",
+    )
+    row = {
+        "spend": "436.81",
+        # Meta returns both keys with the SAME value (12 == 12 live); first-match must NOT sum to 24.
+        "actions": [
+            {"action_type": "onsite_conversion.lead_grouped", "value": "12"},
+            {"action_type": "lead", "value": "12"},
+        ],
+        "cost_per_action_type": [
+            {"action_type": "onsite_conversion.lead_grouped", "value": "36.40"},
+        ],
+    }
+    warnings: list[str] = []
+    out = _build_performance_row(row, account, warnings)
+    assert out["Results"] == "12"  # single value, not 24
+    assert out["Cost per result"] == "36.4"
+    assert out["Result type"] == "Leads (form)"  # config label wins over _label_for_action fallback
+    assert out["Purchases"] == ""
+    assert out["Purchase ROAS (return on ad spend)"] == ""  # never any ROAS for this account
+    assert warnings == []  # configured key matched directly -> no self-heal warning
+
+
+def test_build_performance_row_lead_family_self_heals_stale_config_key() -> None:
+    # Config still holds the stale 'leadgen_grouped' but Meta reports 'onsite_conversion.lead_grouped':
+    # results still resolve via the family AND a warning fires naming both keys.
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+    from meta_ads_analysis.sync_api import _build_performance_row
+
+    account = MetaAdsAccount(
+        account_slug="seattle_mission",
+        account_name="Washington Seattle Mission",
+        ad_account_id="act_103014553",
+        primary_result_action_type="leadgen_grouped",  # stale
+        primary_result_label="Leads (form)",
+    )
+    row = {
+        "spend": "436.81",
+        "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "12"}],
+        "cost_per_action_type": [{"action_type": "onsite_conversion.lead_grouped", "value": "36.40"}],
+    }
+    warnings: list[str] = []
+    out = _build_performance_row(row, account, warnings)
+    assert out["Results"] == "12"
+    assert out["Cost per result"] == "36.4"
+    assert any(
+        "leadgen_grouped" in w and "onsite_conversion.lead_grouped" in w for w in warnings
+    ), warnings
+
+
+def test_build_performance_row_zero_lead_window_leaves_results_absent() -> None:
+    # Spend but zero leads (e.g. 6/27–6/28): results/cost_per_result stay ABSENT — never a
+    # fabricated 0 — and no stale-key warning fires (nothing in the lead family matched).
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+    from meta_ads_analysis.sync_api import _build_performance_row
+
+    account = MetaAdsAccount(
+        account_slug="seattle_mission",
+        account_name="Washington Seattle Mission",
+        ad_account_id="act_103014553",
+        primary_result_action_type="onsite_conversion.lead_grouped",
+        primary_result_label="Leads (form)",
+        roas_role="not_applicable",
+    )
+    row = {
+        "spend": "306.61",
+        "actions": [{"action_type": "link_click", "value": "50"}],
+        "cost_per_action_type": [],
+    }
+    warnings: list[str] = []
+    out = _build_performance_row(row, account, warnings)
+    assert out["Results"] == ""  # absent, not 0
+    assert out["Cost per result"] == ""
+    assert out["Purchase ROAS (return on ad spend)"] == ""
+    assert warnings == []
+
+
+def test_build_performance_row_unconfigured_purchase_and_lead_infers_purchase() -> None:
+    # Unconfigured account whose blob has BOTH purchase and leads must infer 'purchase' (LEAD_KEYS
+    # is the LAST inference group) — not flip to a lead label — and never pull leads into Results.
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+    from meta_ads_analysis.sync_api import _build_performance_row
+
+    account = MetaAdsAccount(
+        account_slug="mystery",
+        account_name="Mystery",
+        ad_account_id="act_9",
+        primary_result_action_type=None,
+        primary_result_label=None,
+    )
+    row = {
+        "spend": "100",
+        "actions": [
+            {"action_type": "onsite_conversion.lead_grouped", "value": "10"},
+            {"action_type": "purchase", "value": "4"},
+        ],
+        "cost_per_action_type": [{"action_type": "purchase", "value": "25"}],
+    }
+    out = _build_performance_row(row, account, [])
+    assert out["Result type"] == "Purchases"
+    assert out["Results"] == "4"  # purchase count, not the 10 leads
+
+
+def test_build_performance_row_purchase_and_subscribe_accounts_unchanged() -> None:
+    # Regression: divine_designs (purchase) and pollen_sense (subscribe) resolution is byte-for-byte
+    # unchanged by the lead-family work, even when incidental lead actions appear in the blob.
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+    from meta_ads_analysis.sync_api import _build_performance_row
+
+    divine = MetaAdsAccount(
+        account_slug="divine_designs",
+        account_name="Divine Designs",
+        ad_account_id="act_dd",
+        primary_result_action_type="purchase",
+        primary_result_label="Website purchases",
+    )
+    divine_row = {
+        "spend": "200",
+        "actions": [
+            {"action_type": "purchase", "value": "10"},
+            {"action_type": "onsite_conversion.lead_grouped", "value": "99"},  # noise
+        ],
+        "cost_per_action_type": [{"action_type": "purchase", "value": "20"}],
+        "action_values": [{"action_type": "purchase", "value": "600"}],
+    }
+    out = _build_performance_row(divine_row, divine, [])
+    assert out["Results"] == "10"  # purchase, not the 99 lead noise
+    assert out["Result type"] == "Website purchases"
+    assert out["Cost per result"] == "20"
+
+    pollen = MetaAdsAccount(
+        account_slug="pollen_sense",
+        account_name="Pollen Sense",
+        ad_account_id="act_ps",
+        primary_result_action_type="app_custom_event.fb_mobile_subscribe",
+        primary_result_label="In-app subscriptions",
+    )
+    pollen_row = {
+        "spend": "55",
+        "actions": [
+            {"action_type": "app_custom_event.fb_mobile_subscribe", "value": "2"},
+            {"action_type": "mobile_app_install", "value": "10"},
+        ],
+        "cost_per_action_type": [
+            {"action_type": "app_custom_event.fb_mobile_subscribe", "value": "27.5"}
+        ],
+    }
+    out2 = _build_performance_row(pollen_row, pollen, [])
+    assert out2["Results"] == "2"
+    assert out2["Result type"] == "In-app subscriptions"
+    assert out2["App installs"] == "10"
+
+
+def test_infer_primary_result_action_lead_precedence_and_fallback() -> None:
+    # purchase + lead -> purchase (LEAD_KEYS last); lead-only -> the lead key.
+    from meta_ads_analysis.sync_api import _infer_primary_result_action
+
+    assert (
+        _infer_primary_result_action(
+            [
+                {"action_type": "onsite_conversion.lead_grouped", "value": "5"},
+                {"action_type": "purchase", "value": "3"},
+            ]
+        )
+        == "purchase"
+    )
+    assert (
+        _infer_primary_result_action([{"action_type": "onsite_conversion.lead_grouped", "value": "5"}])
+        == "onsite_conversion.lead_grouped"
+    )
+
+
+def test_cross_account_performance_resolves_lead_family(monkeypatch) -> None:
+    import pytest
+
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+
+    accounts = [
+        {"id": "act_103014553", "account_id": "103014553", "name": "Seattle",
+         "account_status": 1, "currency": "USD"}
+    ]
+    insights = {"act_103014553": [{
+        "spend": "436.81", "impressions": "10000", "clicks": "200",
+        "actions": [
+            {"action_type": "onsite_conversion.lead_grouped", "value": "12"},
+            {"action_type": "lead", "value": "12"},
+        ],
+    }]}
+    reader = _perf_reader(accounts, insights)
+    fake_registry = {
+        "act_103014553": MetaAdsAccount(
+            account_slug="seattle_mission", account_name="Seattle", ad_account_id="act_103014553",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            primary_result_label="Leads (form)", roas_role="not_applicable",
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: fake_registry)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-07-01", date_to="2026-07-01", fx_table=_fx()
+    )
+    row = out["accounts"][0]
+    assert row["results"] == 12  # single value, not summed to 24
+    assert row["result_label"] == "Leads (form)"
+    assert row["cost_per_result"] == pytest.approx(436.81 / 12)  # spend / leads == cost per lead
+    assert "roas" not in row  # no purchase value -> no ROAS ever
+
+
+def test_cross_account_performance_lead_family_self_heals_stale_config_key(monkeypatch) -> None:
+    # cross_account mirrors sync's self-heal (silently): stale configured key, but the family match
+    # still populates results/cost_per_result. A non-lead key that misses stays absent (tested
+    # elsewhere) — we never back-fill across goal types.
+    import pytest
+
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+
+    accounts = [
+        {"id": "act_103014553", "account_id": "103014553", "name": "Seattle",
+         "account_status": 1, "currency": "USD"}
+    ]
+    insights = {"act_103014553": [{
+        "spend": "369.04", "impressions": "9000", "clicks": "180",
+        "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "12"}],
+    }]}
+    reader = _perf_reader(accounts, insights)
+    fake_registry = {
+        "act_103014553": MetaAdsAccount(
+            account_slug="seattle_mission", account_name="Seattle", ad_account_id="act_103014553",
+            primary_result_action_type="leadgen_grouped",  # stale
+            primary_result_label="Leads (form)",
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: fake_registry)
+    out = _account_discovery.cross_account_performance(
+        reader, date_from="2026-07-04", date_to="2026-07-04", fx_table=_fx()
+    )
+    row = out["accounts"][0]
+    assert row["results"] == 12
+    assert row["cost_per_result"] == pytest.approx(369.04 / 12)
+
+
 def test_registry_by_ad_account_id_empty_when_no_config(monkeypatch) -> None:
     def _boom(*a, **k):
         raise FileNotFoundError("no config")

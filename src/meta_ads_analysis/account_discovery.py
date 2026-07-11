@@ -48,10 +48,12 @@ from .currency import (
 )
 from .meta_api import MetaApiError
 from .sync_api import (
+    LEAD_KEYS,
     PURCHASE_KEYS,
     _find_metric,
     _infer_primary_result_action,
     _label_for_action,
+    _LEAD_KEYS_LOWER,
     _metric_blob_list,
     _number,
 )
@@ -632,7 +634,16 @@ def cross_account_performance(
         impressions = _number(insight_row.get("impressions"))
         clicks = _number(insight_row.get("clicks"))
         result_key, result_label = _resolve_result_key(ad_account_id, actions, registry_by_id)
-        results_value = _find_metric(actions, [result_key]) if result_key else None
+        if result_key and result_key.lower() in _LEAD_KEYS_LOWER:
+            # Lead account: resolve against the whole lead-key family (see sync_api.LEAD_KEYS) so a
+            # drifted config key still populates results/cost_per_result, mirroring sync's self-heal.
+            # Silent here (no warnings channel) — a family match is strictly better than blank. Never
+            # falls back across goal types: a non-lead key that fails to match stays a real absence.
+            results_value = _find_metric(actions, LEAD_KEYS)
+        elif result_key:
+            results_value = _find_metric(actions, [result_key])
+        else:
+            results_value = None
         purchase_value = _find_metric(action_values, PURCHASE_KEYS)
 
         native_base = {
