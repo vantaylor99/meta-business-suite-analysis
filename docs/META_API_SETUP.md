@@ -257,10 +257,10 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the nine discovery tools (`list_ad_accounts`,
+plus any of the 14 read tools, the ten discovery tools (`list_ad_accounts`,
 `cross_account_spend_summary`, `cross_account_performance`, `account_benchmark`,
 `flag_accounts_needing_attention`, `pacing_report`, `rank_accounts`,
-`grade_accounts_against_goals`, and `cross_account_creative_triage` — none takes an
+`grade_accounts_against_goals`, `cross_account_creative_triage`, and `portfolio_digest` — none takes an
 `account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
@@ -431,6 +431,34 @@ A currency missing from the FX table records **one** `errors` entry for the acco
 ads fall to `unranked` under a money metric but still rank under a ratio/count metric. An unknown metric,
 a bad `order`, a non-positive `limit`, or a `reporting_currency` missing from the FX table is a fail-fast
 `ValueError` before any Meta read.
+
+`portfolio_digest` answers the daily-driver "what's my whole portfolio doing and what needs me right
+now?" in a **single call**, instead of the operator stitching four tools together by hand. It is a
+**composite** — it reimplements no logic. It fetches `cross_account_performance` **once** for the window
+and threads that shared result into `grade_accounts_against_goals`, `flag_accounts_needing_attention`, and
+`pacing_report` via their internal precomputed-perf seams, so the default digest costs about one attention
+scan (~`1 + 2N` insight reads: the shared perf fan-out `N` plus flag's baseline fan-out `N`; grade adds
+zero) rather than 3–4× the reads. One ranked digest returns: `totals` (per-currency native subtotals plus
+a `reporting_currency`-normalized figure — money never sums across currencies), `top`/`bottom` spenders (a
+deterministic sort over the perf rows already in hand, **not** a re-fetching `rank_accounts` call),
+`goal_summary` (grade's `counts` + `pause_candidates`), `attention` (flag's `flagged`/`informational`/
+`clean_count`, on by default; `null` when `include_flags=False`), optional `pacing` (`null` unless
+`include_pacing=True`, which adds pacing's `3N` budget reads and no extra insight reads), and a synthesized
+worst-first `needs_you` shortlist that **merges and dedupes** the goal `pause_candidates` and the
+**high-severity** flagged accounts by `ad_account_id` (a dual-source account appears once carrying both
+reasons + `sources`, sorted source-count-desc then `ad_account_id` asc). `include_ad_health=True` threads
+straight through to flag (one ad read per flagged account). Because the digest threads its *full* resolved
+scope into grade, an account absent from `config/meta_ads_accounts.json` is counted `no_goal_configured` —
+the portfolio-wide view, **not** an error (this differs from standalone `grade_accounts_against_goals`,
+which defaults to configured accounts only). Pacing pins `as_of=date_to` so the period is complete and
+`variance_pct` is realized actual-vs-budget for the window — for forward month-projection call
+`pacing_report` directly with a mid-period `as_of`. The shared perf is the single fan-out: a whole-call
+`ValueError` (bad `reporting_currency`) or discovery error there fails the whole digest (nothing is
+computable without perf), but each downstream section is wrapped so an unexpected failure sets that section
+to `null` with a tagged `errors` entry while the rest still returns; each sub-tool's inherited shared-perf
+errors are de-duplicated (tagged `section="performance"` once, sub-tools contribute only their **new**
+errors). **Scope ceiling:** with `account_ids=None` the perf fans over the whole reach (hundreds of
+accounts) and times out — pass an explicit `account_ids` for anything beyond a small fleet.
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the

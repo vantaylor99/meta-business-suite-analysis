@@ -146,6 +146,24 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   and ads that lack the metric — zero results, or a money metric in a currency missing from the FX table —
   land in a separate `unranked` bucket with a reason rather than being sorted as a misleading zero or
   infinity; a no-FX account records **one** `errors` entry (not one per ad).
+  The `portfolio_digest` tool is the tenth discovery tool and the daily-driver "give me my portfolio
+  overview" one-call answer to "what's my whole portfolio doing and what needs me right now?". Instead of
+  stitching four tools together by hand it **composes** them: it fetches `cross_account_performance`
+  **once** for the window and threads that shared result into `grade_accounts_against_goals`,
+  `flag_accounts_needing_attention`, and `pacing_report`, so the default digest costs about one attention
+  scan (~`1 + 2N` reads) rather than 3–4× the reads. One ranked digest comes back: totals (per-currency
+  native subtotals **and** a `reporting_currency`-normalized figure — money never sums across
+  currencies), the top/bottom spenders, each account's goal standing (counts + a pause shortlist), what
+  changed and needs attention (flagged / informational / clean), optional budget pacing, and a
+  synthesized worst-first `needs_you` shortlist that **merges and dedupes** the goal pause-candidates and
+  the high-severity flagged accounts (an account failing on both appears once, carrying both reasons).
+  Goal grading and attention are on by default; budget pacing (`+3N` reads) and ad-level health (one read
+  per flagged account) are off unless requested. Because it grades the *whole resolved scope*, an account
+  absent from `config/meta_ads_accounts.json` is counted `no_goal_configured` — the portfolio-wide view,
+  not an error. Pass an explicit `account_ids` for anything beyond a small fleet; with none it fans over
+  every account the token reaches (hundreds) and can time out. Pacing here is realized variance for the
+  window — for forward month-projection call `pacing_report` directly. A section that unexpectedly fails
+  is returned as `null` with a tagged `errors` entry while the rest of the digest still returns.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

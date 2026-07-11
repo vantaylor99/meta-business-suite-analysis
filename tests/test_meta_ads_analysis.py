@@ -16632,3 +16632,46 @@ def test_build_discovery_tools_portfolio_digest_mock_smoke(monkeypatch) -> None:
     assert out["pacing"] is None  # off by default
     assert out["needs_you"] == []
     assert out["errors"] == []
+
+
+def test_portfolio_digest_include_ad_health_scans_flagged_only_and_feeds_needs_you(monkeypatch) -> None:
+    # include_ad_health=True threads straight through to flag: ONLY the flagged accounts are ad-scanned
+    # (+one iter_paginated per flagged account), a DISAPPROVED ad attaches a high-severity ads_disapproved
+    # flag (promoting the account to high), and its detail flows into the needs_you shortlist. The clean
+    # account is never enumerated — the _iter stub raises if an unexpected account is scanned.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    ids = ["act_spike", "act_calm"]
+    meta_by_id = {i: {"account_id": i, "name": i, "account_status": 1, "currency": "USD"} for i in ids}
+    current = {
+        "act_spike": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],  # +200% -> flagged
+        "act_calm": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],   # unchanged -> clean
+    }
+    baseline = {
+        "act_spike": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_calm": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+    }
+    ads_by_id = {"act_spike": [_ad("a1", "ACTIVE", "DISAPPROVED")]}  # only the flagged account is scanned
+
+    def _iter(path, *, params=None):
+        ad_account_id = path.strip("/").split("/")[0]
+        if ad_account_id not in ads_by_id:
+            raise AssertionError(f"unexpected ad-health scan of {ad_account_id} (path {path})")
+        return [dict(a) for a in ads_by_id[ad_account_id]]
+
+    reader = _digest_reader(
+        meta_by_id, {"2026-06-08": current, "2026-06-01": baseline}, iter_paginated=_iter
+    )
+
+    out = _account_discovery.portfolio_digest(
+        reader, account_ids=ids, include_ad_health=True, fx_table=_fx(), **_DIGEST_WINDOW
+    )
+
+    ad_scans = [c for c in reader.calls if c[0] == "iter_paginated"]
+    assert len(ad_scans) == 1  # only act_spike (flagged) was scanned; act_calm (clean) never was
+    spike = next(e for e in out["attention"]["flagged"] if e["ad_account_id"] == "act_spike")
+    assert "ads_disapproved" in {f["name"] for f in spike["flags"]}
+    assert spike["severity"] == "high"  # DISAPPROVED promoted it
+    # The high-severity flagged account flows into needs_you carrying the ad-health detail.
+    needs = next(e for e in out["needs_you"] if e["ad_account_id"] == "act_spike")
+    assert "attention" in needs["sources"]
+    assert any("disapprov" in r.lower() for r in needs["reasons"])
