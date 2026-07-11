@@ -11776,6 +11776,330 @@ def test_build_discovery_tools_flag_accounts_attention_pacing_smoke(monkeypatch)
     assert out_off["flagged"] == [] and out_off["clean_count"] == 1
 
 
+# --- flag_accounts_needing_attention: opt-in ad health (include_ad_health) --
+
+
+def _ad(ad_id, status, effective_status):
+    """A hand-built ad dict as the ad-health scan reads it (status + effective_status only)."""
+    return {"id": ad_id, "name": ad_id, "status": status, "effective_status": effective_status}
+
+
+def test_ad_health_flags_unit_disapproved_notdelivering_pause_empty() -> None:
+    thr = _account_discovery.AttentionThresholds.defaults()
+    F = _account_discovery._ad_health_flags
+
+    # Empty ads -> no flags.
+    assert F([], thr) == []
+
+    # A DISAPPROVED ad -> ads_disapproved (high); counted regardless of status.
+    disapproved = F([_ad("a1", "ACTIVE", "DISAPPROVED"), _ad("a2", "PAUSED", "DISAPPROVED")], thr)
+    assert len(disapproved) == 1
+    d = disapproved[0]
+    assert d["name"] == "ads_disapproved" and d["severity"] == "high"
+    assert d["current"] == 2 and d["baseline"] is None and d["delta"] is None and d["delta_pct"] is None
+    assert d["detail"] == "2 of 2 ads are DISAPPROVED"
+
+    # ACTIVE-configured but not delivering (WITH_ISSUES / PENDING_REVIEW) -> ads_not_delivering (medium).
+    stalled = F(
+        [_ad("a1", "ACTIVE", "WITH_ISSUES"), _ad("a2", "ACTIVE", "PENDING_REVIEW")], thr
+    )
+    assert len(stalled) == 1
+    s = stalled[0]
+    assert s["name"] == "ads_not_delivering" and s["severity"] == "medium"
+    assert s["current"] == 2
+    assert s["detail"] == "2 of 2 ACTIVE-configured ads are not delivering (blocked/pending)"
+
+    # Delivering (ACTIVE/IN_PROCESS) and deliberate pauses -> NO flag. A paused ad is intentional, not
+    # a stall: status==ACTIVE+effective PAUSED/CAMPAIGN_PAUSED/ADSET_PAUSED, AND status==PAUSED entirely.
+    clean = F(
+        [
+            _ad("a1", "ACTIVE", "ACTIVE"),
+            _ad("a2", "ACTIVE", "IN_PROCESS"),
+            _ad("a3", "ACTIVE", "PAUSED"),
+            _ad("a4", "ACTIVE", "CAMPAIGN_PAUSED"),
+            _ad("a5", "ACTIVE", "ADSET_PAUSED"),
+            _ad("a6", "PAUSED", "WITH_ISSUES"),  # operator turned it off -> not a stall
+        ],
+        thr,
+    )
+    assert clean == []
+
+    # A DISAPPROVED ad is NOT double-counted in ads_not_delivering even when status==ACTIVE.
+    both = F([_ad("a1", "ACTIVE", "DISAPPROVED"), _ad("a2", "ACTIVE", "PENDING_BILLING_INFO")], thr)
+    by_name = {f["name"]: f for f in both}
+    assert set(by_name) == {"ads_disapproved", "ads_not_delivering"}
+    assert by_name["ads_disapproved"]["current"] == 1
+    assert by_name["ads_not_delivering"]["current"] == 1  # the DISAPPROVED ad is excluded here
+
+    # The count knob gates firing: with min_count 2, a single bad ad of each kind fires nothing.
+    import dataclasses
+
+    thr2 = dataclasses.replace(thr, ad_health_min_count=2)
+    assert F([_ad("a1", "ACTIVE", "DISAPPROVED"), _ad("a2", "ACTIVE", "WITH_ISSUES")], thr2) == []
+
+
+def _attention_ad_health_reader(accounts, rows_by_window, ads_by_id, **overrides):
+    """An attention reader that also serves the ad-health fan-out's ``/{id}/ads`` enumeration.
+
+    ``ads_by_id`` maps ``ad_account_id -> [ad dict, ...]``. The iter_paginated stub dispatches on the
+    ``/{id}/ads`` path so each flagged account gets its own ad list; a path absent from the map means
+    that account was never scanned (used to assert the flagged-only gate). MOCKS ONLY.
+    """
+
+    def _iter(path, *, params=None):
+        # path is f"/{ad_account_id}/ads"; key back to the account id.
+        ad_account_id = path.strip("/").split("/")[0]
+        if ad_account_id not in ads_by_id:
+            raise AssertionError(f"unexpected ad-health scan of {ad_account_id} (path {path})")
+        return [dict(a) for a in ads_by_id[ad_account_id]]
+
+    overrides.setdefault("iter_paginated", _iter)
+    return _attention_reader(accounts, rows_by_window, **overrides)
+
+
+def test_flag_accounts_attention_ad_health_promotes_and_attaches(monkeypatch) -> None:
+    # A behaviorally MEDIUM account (a +60% spend spike -> medium) whose ads include a DISAPPROVED and a
+    # WITH_ISSUES ad gains BOTH ad-health flags and is PROMOTED to high; ad_health_scanned_count == 1.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"}]
+    # +60% across the board -> spend_spike medium only (cpc/ctr unchanged; no results -> no cpr flag).
+    baseline_rows = {"act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}]}
+    current_rows = {"act_1": [{"spend": "320.00", "impressions": "3200", "clicks": "160"}]}
+    ads = {"act_1": [_ad("a1", "ACTIVE", "DISAPPROVED"), _ad("a2", "ACTIVE", "WITH_ISSUES")]}
+    reader = _attention_ad_health_reader(
+        accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, ads
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_ad_health=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_1"]
+    entry = out["flagged"][0]
+    assert entry["severity"] == "high"  # promoted from the medium spend_spike by ads_disapproved
+    assert {f["name"] for f in entry["flags"]} == {"spend_spike", "ads_disapproved", "ads_not_delivering"}
+    by_name = {f["name"]: f for f in entry["flags"]}
+    assert by_name["ads_disapproved"]["current"] == 1 and by_name["ads_not_delivering"]["current"] == 1
+    assert out["ad_health_scanned_count"] == 1
+    assert all(e.get("stage") != "ad_health" for e in out["errors"])
+
+
+def test_flag_accounts_attention_ad_health_promotion_reorders_flagged(monkeypatch) -> None:
+    # An ad-health promotion RE-SORTS the flagged list. act_high is high on behavior alone but has a
+    # small spend delta; act_med is only medium on behavior but a larger delta. Without ad health,
+    # severity dominates -> [act_high, act_med]. Promoting act_med to high (disapproved ads) flips the
+    # order to the |delta| tiebreak -> [act_med, act_high], deterministically.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_high", "account_id": "1", "name": "High", "account_status": 1, "currency": "USD"},
+        {"id": "act_med", "account_id": "2", "name": "Med", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {
+        "act_high": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],
+        "act_med": [{"spend": "1000.00", "impressions": "10000", "clicks": "500"}],
+    }
+    current_rows = {
+        "act_high": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],   # +200% high, |Δ|=200
+        "act_med": [{"spend": "1600.00", "impressions": "16000", "clicks": "800"}],  # +60% medium, |Δ|=600
+    }
+    ads = {
+        "act_high": [_ad("a1", "ACTIVE", "ACTIVE")],           # healthy -> stays behavior-only high
+        "act_med": [_ad("b1", "ACTIVE", "DISAPPROVED")],       # -> ads_disapproved (high) promotion
+    }
+    kwargs = dict(current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx())
+
+    # Baseline (ad health off): severity dominates the sort -> act_high first.
+    reader_off = _attention_reader(accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows})
+    out_off = _account_discovery.flag_accounts_needing_attention(reader_off, **kwargs)
+    assert [e["ad_account_id"] for e in out_off["flagged"]] == ["act_high", "act_med"]
+
+    # With ad health: act_med promoted to high; both high now -> |delta| desc puts act_med first.
+    reader_on = _attention_ad_health_reader(
+        accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, ads
+    )
+    out_on = _account_discovery.flag_accounts_needing_attention(
+        reader_on, include_ad_health=True, **kwargs
+    )
+    assert [e["ad_account_id"] for e in out_on["flagged"]] == ["act_med", "act_high"]
+    assert out_on["flagged"][0]["severity"] == out_on["flagged"][1]["severity"] == "high"
+    # Determinism: identical inputs -> identical output regardless of fan-out completion order.
+    out_on2 = _account_discovery.flag_accounts_needing_attention(
+        _attention_ad_health_reader(
+            accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, ads
+        ),
+        include_ad_health=True, **kwargs
+    )
+    assert out_on == out_on2
+
+
+def test_flag_accounts_attention_ad_health_off_issues_no_ad_reads(monkeypatch) -> None:
+    # Regression guard: default (include_ad_health omitted) issues NO iter_paginated call and adds no
+    # ad_health_scanned_count key, even for an account that IS flagged (would otherwise be scanned).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"}]
+    baseline_rows = {"act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}]}
+    current_rows = {"act_1": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}]}  # +200% high
+    reader = _attention_reader(accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows})
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_1"]  # flagged -> would be scanned if on
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"spend_spike"}  # no ad-health flags
+    assert "ad_health_scanned_count" not in out  # key absent -> output shape unchanged from the prereq
+    assert not any(c[0] == "iter_paginated" for c in reader.calls)  # no ad read issued at all
+
+
+def test_flag_accounts_attention_ad_health_only_flagged_are_scanned(monkeypatch) -> None:
+    # A clean, on-pace account that HAS disapproved ads is never ad-scanned (it never became flagged),
+    # so no flag surfaces for it and it stays in clean_count; only the flagged account is scanned.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_flag", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"},
+        {"id": "act_clean", "account_id": "2", "name": "Clean", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {
+        "act_flag": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_clean": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],
+    }
+    current_rows = {
+        "act_flag": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],  # +200% -> flagged
+        "act_clean": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}],  # unchanged -> clean
+    }
+    scanned_paths: list[str] = []
+
+    def _iter(path, *, params=None):
+        scanned_paths.append(path)
+        # act_flag's ads are healthy; act_clean would flag IF scanned (but must not be scanned).
+        if path == "/act_flag/ads":
+            return [_ad("a1", "ACTIVE", "ACTIVE")]
+        return [_ad("bad", "ACTIVE", "DISAPPROVED")]
+
+    reader = _attention_reader(
+        accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, iter_paginated=_iter
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_ad_health=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_flag"]
+    assert out["clean_count"] == 1  # act_clean stays clean, disapproved ads and all
+    assert scanned_paths == ["/act_flag/ads"]  # act_clean NEVER scanned (the documented limitation)
+    assert out["ad_health_scanned_count"] == 1
+    # act_flag's ads were healthy -> only its behavior flag, no ad-health flag.
+    assert {f["name"] for f in out["flagged"][0]["flags"]} == {"spend_spike"}
+
+
+def test_flag_accounts_attention_ad_health_with_pacing_promotes_then_scans(monkeypatch) -> None:
+    # Composition: pacing PROMOTES a behaviorally-clean account into flagged, which then becomes eligible
+    # for the ad-health scan (order: behavior -> pacing -> finalize flagged -> ad-health fan-out).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_over", "account_id": "1", "name": "OverPace", "account_status": 1, "currency": "USD"}]
+    rows = {"act_over": [{"spend": "700.00", "impressions": "7000", "clicks": "350"}]}  # same both windows
+    window_rows = {"2026-06-01": rows, "2026-06-08": rows}
+    campaigns = {"act_over": [_pc_camp("c1", daily="5000")]}  # $50/day -> +100% over -> high pacing flag
+    caps = {"act_over": {"currency": "USD"}}
+    ads = {"act_over": [_ad("a1", "ACTIVE", "PENDING_REVIEW")]}  # -> ads_not_delivering (medium)
+
+    def _iter(path, *, params=None):
+        return [dict(a) for a in ads[path.strip("/").split("/")[0]]]
+
+    reader = _attention_pacing_reader(
+        accounts, window_rows, campaigns, {}, caps, iter_paginated=_iter
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_pacing=True, include_ad_health=True, fx_table=_fx(),
+    )
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_over"]
+    entry = out["flagged"][0]
+    assert entry["severity"] == "high"  # from the pacing flag
+    assert {f["name"] for f in entry["flags"]} == {"budget_pacing_off", "ads_not_delivering"}
+    assert out["ad_health_scanned_count"] == 1  # the pacing-promoted account WAS ad-scanned
+
+
+def test_flag_accounts_attention_ad_health_read_failure_tagged(monkeypatch) -> None:
+    # A per-account ad-enumeration failure -> error tagged stage:"ad_health"; other flagged accounts
+    # are unaffected and still get their ad-health flags. Both accounts are counted as fanned-into.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "S1", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "S2", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {
+        "act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_2": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+    }
+    current_rows = {  # both +200% -> both flagged (high spike)
+        "act_1": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],
+        "act_2": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],
+    }
+
+    def _iter(path, *, params=None):
+        if path == "/act_1/ads":
+            raise MetaApiError("(#17) user request limit reached for act_1 ads")
+        return [_ad("bad", "ACTIVE", "DISAPPROVED")]
+
+    reader = _attention_reader(
+        accounts, {"2026-06-01": baseline_rows, "2026-06-08": current_rows}, iter_paginated=_iter
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_ad_health=True, fx_table=_fx(),
+    )
+    assert {e["ad_account_id"] for e in out["flagged"]} == {"act_1", "act_2"}
+    by_id = {e["ad_account_id"]: e for e in out["flagged"]}
+    assert {f["name"] for f in by_id["act_1"]["flags"]} == {"spend_spike"}  # ad read failed -> no ad flag
+    assert "ads_disapproved" in {f["name"] for f in by_id["act_2"]["flags"]}  # act_2 unaffected
+    assert {
+        "stage": "ad_health", "ad_account_id": "act_1",
+        "error": "(#17) user request limit reached for act_1 ads",
+    } in out["errors"]
+    assert out["ad_health_scanned_count"] == 2  # both accounts were fanned into (a failure still costs a read)
+
+
+def test_flag_accounts_attention_ad_health_no_flagged_no_fanout(monkeypatch) -> None:
+    # No flagged account -> no ad fan-out at all; ad_health_scanned_count == 0 and no iter_paginated call.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Clean", "account_status": 1, "currency": "USD"}]
+    rows = {"act_1": [{"spend": "300.00", "impressions": "3000", "clicks": "150"}]}  # unchanged -> clean
+    reader = _attention_reader(accounts, {"2026-06-01": rows, "2026-06-08": rows})
+    out = _account_discovery.flag_accounts_needing_attention(
+        reader, current_from="2026-06-08", current_to="2026-06-14",
+        include_ad_health=True, fx_table=_fx(),
+    )
+    assert out["flagged"] == [] and out["clean_count"] == 1
+    assert out["ad_health_scanned_count"] == 0
+    assert not any(c[0] == "iter_paginated" for c in reader.calls)
+
+
+def test_build_discovery_tools_flag_accounts_attention_ad_health_smoke(monkeypatch) -> None:
+    # The wired MCP discovery tool threads include_ad_health through; an ad read is issued only via the
+    # opt-in and only for the flagged account.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"}]
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        base = {"spend": "200.00", "impressions": "2000", "clicks": "100"}
+        cur = {"spend": "600.00", "impressions": "6000", "clicks": "300"}  # +200% -> flagged
+        return [base if date_from == "2026-06-01" else cur]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch,
+        iter_paginated=lambda path, *, params=None: [_ad("bad", "ACTIVE", "DISAPPROVED")],
+    )
+    tools = _mcp_server.build_discovery_tools(reader)
+    out = tools["flag_accounts_needing_attention"]("2026-06-08", "2026-06-14", include_ad_health=True)
+    assert [e["ad_account_id"] for e in out["flagged"]] == ["act_1"]
+    assert "ads_disapproved" in {f["name"] for f in out["flagged"][0]["flags"]}
+    assert out["ad_health_scanned_count"] == 1
+    # Default (ad health off) issues no ad read and adds no scanned-count key.
+    ad_reads_before = sum(1 for c in reader.calls if c[0] == "iter_paginated")
+    out_off = tools["flag_accounts_needing_attention"]("2026-06-08", "2026-06-14")
+    assert "ad_health_scanned_count" not in out_off
+    ad_reads_after = sum(1 for c in reader.calls if c[0] == "iter_paginated")
+    assert ad_reads_after == ad_reads_before  # the off-path issued no additional ad read
+
+
 # --- pacing_report: pure helpers (clock-free, no reader) --------------------
 
 

@@ -1107,8 +1107,10 @@ def account_benchmark(
 # config; when called with `include_pacing=True` it calls `pacing_report` ONCE over the same scope and
 # folds its per-account over/under verdict in as an opt-in `budget_pacing_off` flag (never re-reading
 # budget config itself — reuse, no cycle: attention -> pacing -> cross_account_performance).
-# Ad-level creative/disapproval problems need a per-account ad-level fan-out (heavy) and are parked in
-# a backlog ticket. With pacing off, every flag is zero extra reads beyond the two fan-outs.
+# Ad-level creative/disapproval problems need a per-account ad-level fan-out (heavy), so — like pacing —
+# they are OFF by default and gated behind `include_ad_health=True`, which fans out ONLY into the ads of
+# the accounts the cheap scan already flagged (never the full fleet). With both opt-ins off, every flag
+# is zero extra reads beyond the two account-level fan-outs.
 # --------------------------------------------------------------------------- #
 
 # Severity rank: high(3) > medium(2) > low(1) > info(0). An account's severity is the max over its
@@ -1122,6 +1124,22 @@ _STATUS_ALERT_HIGH: frozenset[str] = frozenset({"DISABLED", "PENDING_CLOSURE", "
 _STATUS_ALERT_MEDIUM: frozenset[str] = frozenset(
     {"UNSETTLED", "PENDING_RISK_REVIEW", "PENDING_SETTLEMENT", "IN_GRACE_PERIOD"}
 )
+
+# Ad-level status vocabulary for the opt-in ad-health scan (``include_ad_health``). Defined LOCALLY —
+# not imported from ``monitor`` — to keep this module import-light (see the module docstring; importing
+# monitor drags in confidence/control/early_triage/meta_api). Keep ``_AD_DELIVERING`` in sync with its
+# sibling definition ``monitor.DELIVERING``.
+_AD_DELIVERING: frozenset[str] = frozenset({"ACTIVE", "IN_PROCESS"})  # mirrors monitor.DELIVERING
+_AD_PAUSE_STATUSES: frozenset[str] = frozenset(
+    {"PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED", "DELETED", "ARCHIVED"}
+)
+# An ACTIVE-configured ad counts as "not delivering" only when its effective_status is NONE of these:
+# a delivering status, a deliberate pause (operator intent, not a stall), or DISAPPROVED (counted by
+# its own high-severity flag, never double-counted here).
+_AD_NOT_DELIVERING_EXCLUSIONS: frozenset[str] = (
+    _AD_DELIVERING | _AD_PAUSE_STATUSES | frozenset({"DISAPPROVED"})
+)
+_AD_HEALTH_FIELDS: list[str] = ["id", "name", "status", "effective_status", "issues_info"]
 
 
 @dataclass(frozen=True)
@@ -1141,6 +1159,10 @@ class AttentionThresholds:
       flag (only consulted when ``flag_accounts_needing_attention`` is called with
       ``include_pacing=True``). Larger than pacing's own 5% on_track tolerance — a small variance is
       not attention-worthy.
+    - ``ad_health_min_count`` is the minimum ad count for an ad-level flag (``ads_disapproved`` /
+      ``ads_not_delivering``) to fire in the opt-in ``include_ad_health`` scan. Defaults to ``1`` (any
+      disapproved/stalled ad is worth surfacing on an already-flagged account) — a count, not a percent
+      knee, so it is a plain int rather than an ``ATTENTION_*`` fraction constant.
     """
 
     spend_spike_pct: float
@@ -1151,11 +1173,12 @@ class AttentionThresholds:
     min_spend_floor: float
     min_results_floor: float
     pacing_variance_pct: float
+    ad_health_min_count: int = 1
 
     @classmethod
     def defaults(cls) -> "AttentionThresholds":
         """The committed defaults from :mod:`config` (50% spend move / 30% efficiency degradation;
-        25% budget-pacing variance knee)."""
+        25% budget-pacing variance knee; ad-health flags fire on any single bad ad)."""
         return cls(
             spend_spike_pct=ATTENTION_SPEND_SPIKE_PCT,
             spend_collapse_pct=ATTENTION_SPEND_COLLAPSE_PCT,
@@ -1165,6 +1188,7 @@ class AttentionThresholds:
             min_spend_floor=ATTENTION_MIN_SPEND,
             min_results_floor=ATTENTION_MIN_RESULTS_FLOOR,
             pacing_variance_pct=ATTENTION_PACING_VARIANCE_PCT,
+            ad_health_min_count=1,
         )
 
 
@@ -1299,6 +1323,72 @@ def _budget_pacing_flag(
         delta_pct=variance_pct,
         detail=f"projected to spend {abs(variance_pct) * 100:.0f}% {status} the period budget",
     )
+
+
+def _ad_health_flags(
+    ads: list[dict[str, Any]], thresholds: AttentionThresholds
+) -> list[dict[str, Any]]:
+    """PURE ad-level health flags for one account's ads (the opt-in ``include_ad_health`` scan).
+
+    Fully unit-testable with hand-built ad dicts — no reader. Returns 0-2 flags, each in the
+    :func:`_flag` shape with ``baseline/delta/delta_pct = None`` (ad health is a point-in-time count,
+    not a window delta). A flag fires only when its count ``>= thresholds.ad_health_min_count``
+    (default 1). Like :func:`_account_status_flag` / :func:`_budget_pacing_flag`, this is appended by
+    the orchestrator rather than produced inside the pure two-row :func:`evaluate_attention_flags`.
+
+    - ``ads_disapproved`` (**high**) — count of ads with ``effective_status == "DISAPPROVED"``: a
+      blocked/policy ad, burning nothing but delivering nothing. Counted regardless of ``status``.
+    - ``ads_not_delivering`` (**medium**) — count of ads the operator INTENDS to run
+      (``status == "ACTIVE"``) whose ``effective_status`` is in none of
+      :data:`_AD_NOT_DELIVERING_EXCLUSIONS` (a delivering status, a deliberate pause, or DISAPPROVED —
+      already counted above and never double-counted). This residual-with-exclusions definition catches
+      ``WITH_ISSUES`` / ``PENDING_REVIEW`` / ``PENDING_BILLING_INFO`` / ``PREAPPROVED`` and any future
+      block status, while a paused ad (``PAUSED`` / ``CAMPAIGN_PAUSED`` / ``ADSET_PAUSED``) is treated
+      as intentional, not a stall.
+    """
+    total = len(ads)
+    disapproved = 0
+    not_delivering = 0
+    for ad in ads:
+        effective_status = ad.get("effective_status")
+        if effective_status == "DISAPPROVED":
+            disapproved += 1
+        elif (
+            ad.get("status") == "ACTIVE"
+            and effective_status not in _AD_NOT_DELIVERING_EXCLUSIONS
+        ):
+            not_delivering += 1
+
+    min_count = thresholds.ad_health_min_count
+    flags: list[dict[str, Any]] = []
+    if disapproved >= min_count:
+        flags.append(
+            _flag(
+                "ads_disapproved",
+                "high",
+                current=disapproved,
+                baseline=None,
+                delta=None,
+                delta_pct=None,
+                detail=f"{disapproved} of {total} ads are DISAPPROVED",
+            )
+        )
+    if not_delivering >= min_count:
+        flags.append(
+            _flag(
+                "ads_not_delivering",
+                "medium",
+                current=not_delivering,
+                baseline=None,
+                delta=None,
+                delta_pct=None,
+                detail=(
+                    f"{not_delivering} of {total} ACTIVE-configured ads are not delivering "
+                    "(blocked/pending)"
+                ),
+            )
+        )
+    return flags
 
 
 def evaluate_attention_flags(
@@ -1530,6 +1620,7 @@ def flag_accounts_needing_attention(
     baseline_to: str | None = None,
     reporting_currency: str = "USD",
     include_pacing: bool = False,
+    include_ad_health: bool = False,
     thresholds: AttentionThresholds | None = None,
     fx_table: FxTable | None = None,
 ) -> dict[str, Any]:
@@ -1572,9 +1663,30 @@ def flag_accounts_needing_attention(
     current-window insight read (``N``) duplicates attention's own current read — an accepted, documented
     duplicate (threading a shared perf into :func:`pacing_report` is a future optimization out of scope).
 
-    **Not in scope:** ad-level creative/disapproval detection is parked in backlog. Account-level
-    health is covered by the ``account_status_alert`` flag at zero extra read cost. Budget pacing is
-    off by default; pass ``include_pacing=True`` to fold ``pacing_report``'s over/under verdict in.
+    **Opt-in ad health (``include_ad_health``).** Off by default. When ``True``, AFTER the flagged list
+    is finalized (behavior + pacing flags, severity >= medium), a per-account ad enumeration fans out
+    (:func:`fan_out_accounts`) into the ads of **only the flagged accounts** — informational/clean
+    accounts are never ad-scanned. Each flagged account's ads yield 0-2 :func:`_ad_health_flags`:
+    ``ads_disapproved`` (**high**, an ``effective_status == DISAPPROVED`` count) and
+    ``ads_not_delivering`` (**medium**, ACTIVE-configured ads that are neither delivering nor
+    deliberately paused nor disapproved). Attaching an ad-health flag can RAISE an account's severity
+    (a medium-only account with disapproved ads -> high), so severity is recomputed on each touched
+    entry and the flagged list is re-sorted with the existing deterministic key. ``ad_health_scanned_count``
+    reports how many accounts were fanned into (present only when ``include_ad_health=True``).
+    Per-account ad-enumeration failures isolate into ``errors`` tagged ``{"stage": "ad_health", …}``
+    (never fatal to the whole call). **Documented limitation:** a window-over-window clean AND on-pace
+    account with disapproved ads never becomes flagged, so it is never ad-scanned and its disapprovals
+    stay hidden — the deliberate cost/completeness tradeoff (a full-fleet unconditional ad-disapproval
+    scan is a possible future enhancement, out of scope here).
+
+    **Read cost of ad health.** With ``include_ad_health=False`` (default): zero ad reads — a hard
+    regression guard. With ``include_ad_health=True``: ``+ len(flagged)`` ad enumerations (each may
+    paginate). Because the fan-out is gated on the flagged set (never the full scope), a fleet where
+    only 3 of 200 accounts surface pays 3 ad enumerations, not 200.
+
+    **Not in scope:** account-level health is covered by the ``account_status_alert`` flag at zero
+    extra read cost. Budget pacing and ad health are both off by default; pass ``include_pacing=True``
+    / ``include_ad_health=True`` to fold them in.
     """
     thr = thresholds if thresholds is not None else AttentionThresholds.defaults()
 
@@ -1682,6 +1794,44 @@ def flag_accounts_needing_attention(
         else:
             informational.append(entry)
 
+    # Opt-in ad-health scan. GATED on the finalized flagged set (never the full scope): fan out into
+    # the ads of ONLY the flagged accounts, so a 200-account fleet where 3 surfaced pays 3 ad reads.
+    # Ad-health flags only ever attach to already-flagged accounts, so no re-bucketing is needed — but
+    # they CAN raise an entry's severity (medium -> high), so severity + the sort rank are recomputed
+    # here, BEFORE the sort below, so the promotion is reflected deterministically. Per-account read
+    # failures isolate into errors tagged stage:"ad_health" (never fatal), mirroring the pacing fan-out.
+    ad_health_scanned_count = 0
+    if include_ad_health and flagged:
+        flagged_by_id = {e["ad_account_id"]: e for e in flagged}
+        flagged_account_ids = list(flagged_by_id.keys())
+        ad_health_scanned_count = len(flagged_account_ids)
+
+        def read_ads(ad_account_id: str) -> list[dict[str, Any]]:
+            # Materialize the lazy iterator: _ad_health_flags scans it more than once (len + loop).
+            return list(
+                reader.iter_paginated(
+                    f"/{ad_account_id}/ads",
+                    params={"fields": ",".join(_AD_HEALTH_FIELDS), "limit": 200},
+                )
+            )
+
+        # Main-thread assembly over the input-ordered fan-out results -> deterministic regardless of
+        # which worker finished first (same discipline as the account-level fan-outs above).
+        for ad_account_id, ads, error in fan_out_accounts(read_ads, flagged_account_ids):
+            if error is not None:
+                errors.append(
+                    {"stage": "ad_health", "ad_account_id": ad_account_id, "error": error}
+                )
+                continue
+            health_flags = _ad_health_flags(ads, thr)
+            if not health_flags:
+                continue
+            entry = flagged_by_id[ad_account_id]
+            entry["flags"] = [*entry["flags"], *health_flags]
+            max_rank = max(_SEVERITY_RANK.get(f["severity"], 0) for f in entry["flags"])
+            entry["_sort_rank"] = max_rank
+            entry["severity"] = _RANK_TO_SEVERITY[max_rank]
+
     # flagged: (severity desc, |normalized-spend delta| desc, ad_account_id asc) — a stable total order.
     flagged.sort(key=lambda e: (-e["_sort_rank"], -e["_sort_delta"], e["ad_account_id"] or ""))
     informational.sort(key=lambda e: (e["ad_account_id"] or ""))
@@ -1702,6 +1852,10 @@ def flag_accounts_needing_attention(
         "clean_count": clean_count,
         "errors": errors,
     }
+    # Cost legibility: how many accounts the ad-health fan-out issued a read for. Present ONLY when
+    # the opt-in is on, so the default path stays byte-identical to the pre-ad-health output.
+    if include_ad_health:
+        result["ad_health_scanned_count"] = ad_health_scanned_count
     if current.get("note"):
         result["note"] = current["note"]
     return result

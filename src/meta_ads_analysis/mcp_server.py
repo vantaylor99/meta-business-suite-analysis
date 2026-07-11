@@ -464,7 +464,12 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "pacing_report's over/under verdict for the current window in as a budget_pacing_off flag "
         "(materially over-spending → high, materially under-spending → medium), which can itself "
         "promote an otherwise-quiet account into the flagged list. For period (e.g. month) pacing, "
-        "call pacing_report directly."
+        "call pacing_report directly. Ad-level health is off by default; pass include_ad_health=true to "
+        "add an ads_disapproved flag (high — ads blocked by policy) and an ads_not_delivering flag "
+        "(medium — ACTIVE ads stuck not delivering: pending review, billing, etc.) for each flagged "
+        "account. To keep it cheap, the per-ad read is issued ONLY for accounts the cheap account-level "
+        "scan already flagged (bounded cost; ad_health_scanned_count reports how many were scanned) — a "
+        "disapproved ad on an otherwise-clean, on-pace account is not surfaced."
     ),
     "pacing_report": (
         "Tell whether each ad account is on track to spend its configured budget for a reporting "
@@ -565,10 +570,12 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
         baseline_to: str | None = None,
         reporting_currency: str = "USD",
         include_pacing: bool = False,
+        include_ad_health: bool = False,
     ) -> dict[str, Any]:
         # ``thresholds`` and ``fx_table`` are test-only/programmatic seams and are deliberately NOT
         # exposed to the LLM; the tool uses the committed defaults and loads config/fx_rates.json itself.
-        # ``include_pacing`` IS exposed (off by default) so an operator can fold pacing into the scan.
+        # ``include_pacing`` / ``include_ad_health`` ARE exposed (both off by default) so an operator can
+        # fold pacing and/or the ad-level health scan (only over already-flagged accounts) into the scan.
         return account_discovery.flag_accounts_needing_attention(
             reader,
             current_from=current_from,
@@ -578,6 +585,7 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             baseline_to=baseline_to,
             reporting_currency=reporting_currency,
             include_pacing=include_pacing,
+            include_ad_health=include_ad_health,
         )
 
     def pacing_report(
