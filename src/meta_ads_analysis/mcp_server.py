@@ -515,6 +515,22 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "(an account inside its evaluation_grace_days softens from pause_candidate to watch). "
         "Per-account read failures are isolated in errors, never fatal."
     ),
+    "cross_account_creative_triage": (
+        "Rank INDIVIDUAL ADS pooled across every account this token can reach (or an explicit list) by "
+        "a single metric for a date range, returning the top or bottom N — the winners and losers at "
+        "the creative level, so you can see which specific ads to scale or pause. This is the ad-level "
+        "sibling of rank_accounts. It ranks only ads that actually DELIVERED in the window (had "
+        "impressions/spend), so it is fast and never walks the dormant-ad graveyard. Winners vs losers "
+        "= two calls (order='desc' then 'asc'); each re-runs the read, so scope account_ids when you "
+        "can. Money metrics (spend/CPC/CPM/CPL) are compared in one reporting_currency (default USD) so "
+        "ads in different currencies are comparable; ratio/count metrics (CTR/ROAS/impressions/clicks/"
+        "results) are currency-invariant and ranked as-is. Ads lacking the metric (e.g. zero results → "
+        "no cost-per-result, or a money metric in a currency with no FX rate) are grouped into an "
+        "'unranked' bucket with a reason instead of sorted as zero or infinity. Valid metrics: spend, "
+        "cpm, cpc, ctr, cost_per_result (aliases: cpl, cpa), roas, impressions, clicks, results. This "
+        "is about the PERFORMANCE of ads that ran — it is NOT ad health: disapproved or "
+        "active-but-not-delivering ads never appear (they have no delivery), which is a separate concern."
+    ),
 }
 
 
@@ -659,6 +675,28 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             as_of=as_of,
         )
 
+    def cross_account_creative_triage(
+        date_from: str,
+        date_to: str,
+        metric: str = "spend",
+        order: str = "desc",
+        limit: int = 10,
+        account_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself.
+        return account_discovery.cross_account_creative_triage(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            metric=metric,
+            order=order,
+            limit=limit,
+            account_ids=account_ids,
+            reporting_currency=reporting_currency,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
@@ -668,6 +706,7 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
         "pacing_report": pacing_report,
         "rank_accounts": rank_accounts,
         "grade_accounts_against_goals": grade_accounts_against_goals,
+        "cross_account_creative_triage": cross_account_creative_triage,
     }
 
 

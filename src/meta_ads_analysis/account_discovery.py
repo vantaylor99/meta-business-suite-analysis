@@ -438,6 +438,19 @@ DEFAULT_PERFORMANCE_INSIGHT_FIELDS: list[str] = [
     "action_values",
 ]
 
+# Fields fetched per account for the ad-level creative triage read (level="ad", all_days -> one row
+# per ad that DELIVERED in the window). Same base metrics as the performance read plus the ad id/name
+# so each pooled row is attributable to a specific creative.
+DEFAULT_TRIAGE_INSIGHT_FIELDS: list[str] = [
+    "ad_id",
+    "ad_name",
+    "spend",
+    "impressions",
+    "clicks",
+    "actions",
+    "action_values",
+]
+
 # The money metrics that get a ``*_normalized`` twin in the reporting currency. ``ctr`` and ``roas``
 # are currency-invariant ratios — they are NEVER normalized (no ``*_normalized`` key).
 _NORMALIZED_MONEY_DERIVED: tuple[str, ...] = ("cpm", "cpc", "cost_per_result")
@@ -2725,6 +2738,314 @@ def rank_accounts(
         "unranked": unranked,
         "errors": perf["errors"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# CROSS-ACCOUNT CREATIVE TRIAGE: rank individual ADS pooled across every account.
+#
+# The ad-level sibling of rank_accounts. Where rank_accounts ranks whole accounts (one account-level
+# insights row each), this pools one row PER DELIVERING AD across every reachable account and ranks
+# those ads by a single metric — the winners/losers at the creative level.
+#
+# It rides the SAME fan-out engine as cross_account_performance (resolve_scope -> fan_out_accounts ->
+# main-thread assembly), so it inherits determinism and per-account partial-failure isolation, and it
+# reuses cross_account_performance's per-row metric machinery (result-key resolution, self-heal,
+# compute_derived_metrics, FX money twins) applied per ad instead of per account. The ranking block is
+# rank_accounts's partition/sort/rank logic keyed on ``ad_id`` instead of ``ad_account_id``.
+#
+# Crucially it reads ONLY ad-level insights (level="ad", time_increment="all_days") — one aggregated
+# row per ad that HAD delivery in the window. It never enumerates /{account}/ads, so it is naturally
+# scoped to recently-active creative and skips the dormant graveyard that times out the ad-health scan
+# (flag-ad-health-scan-scale). This makes it a *performance* read, NOT an ad-health read: an ad that
+# never delivered surfaces no insights row and so is invisible here, by design.
+# --------------------------------------------------------------------------- #
+
+
+def cross_account_creative_triage(
+    reader: "MetaReaderProvider",
+    *,
+    date_from: str,
+    date_to: str,
+    metric: str = "spend",
+    order: str = "desc",
+    limit: int = 10,
+    account_ids: list[str] | None = None,
+    reporting_currency: str = "USD",
+    fx_table: FxTable | None = None,
+) -> dict[str, Any]:
+    """Rank individual ads pooled across every reachable account (or a subset) by one metric.
+
+    The ad-level sibling of :func:`rank_accounts`. Fans out over the resolved scope reading one
+    ``level="ad"`` / ``time_increment="all_days"`` insights row per ad that DELIVERED in the window
+    (had impressions/spend), pools every such ad across accounts, then partitions the pool into
+    rankable (metric value present) vs ``unranked`` (missing value, or no-FX normalized twin for a
+    money metric), sorts, assigns 1-based ranks (ties share the strictly-better count + 1, tiebroken
+    by ``ad_id`` ascending), and truncates to ``limit``. ``order="desc"`` surfaces winners; a second
+    call with ``order="asc"`` surfaces losers (each call re-runs the ad-level fan-out).
+
+    Per ad the base metrics (``spend``/``impressions``/``clicks``/``results``/``purchase_value``) come
+    from that ad's own insights row and the efficiency ratios (``cpm``/``cpc``/``ctr``/
+    ``cost_per_result``/``roas``) are recomputed from them via :func:`compute_derived_metrics` — never
+    an averaged ratio, and a metric whose denominator/component is missing is omitted (never
+    ``inf``/``0``). Money metrics get a ``*_normalized`` twin in ``reporting_currency`` (default USD)
+    from the static FX table; ``ctr``/``roas`` are currency-invariant and get no twin.
+
+    The result key is resolved ONCE per account (config first, else inferred from the account's pooled
+    ad ``actions``) and applied to every ad in that account — all ads in an account share its goal.
+    A configured lead account self-heals against the whole lead-key family exactly as
+    :func:`cross_account_performance` does.
+
+    ``metric`` is normalized to lowercase and resolved through :data:`RANK_METRIC_ALIASES` (so ``cpl``
+    /``cpa`` -> ``cost_per_result``); the canonical name appears in the output. Money metrics are
+    ranked on each ad's ``*_normalized`` twin so ads in different currencies compare directly, with
+    ``value_native`` carrying the native figure; ratio/count metrics rank natively. An account whose
+    currency is absent from the FX table records ONE ``errors`` entry (not one per ad) and its ads fall
+    to ``unranked`` under a money metric (they still rank under a ratio/count metric).
+
+    An unknown ``metric``/``order``, a non-positive ``limit``, or a ``reporting_currency`` absent from
+    the FX table each raise ``ValueError``; a whole-discovery failure propagates unchanged from
+    :func:`resolve_scope`. ``fx_table`` is a test-only injection seam — not exposed to the LLM.
+    """
+    canonical = RANK_METRIC_ALIASES.get(str(metric or "").lower())
+    if canonical is None:
+        valid = sorted(RANK_METRIC_ALIASES)
+        raise ValueError(f"Unknown metric {metric!r}; valid names: {', '.join(valid)}")
+    if order not in ("asc", "desc"):
+        raise ValueError(f"order must be 'asc' or 'desc'; got {order!r}")
+    if limit <= 0:
+        raise ValueError(f"limit must be a positive integer; got {limit}")
+
+    reporting = str(reporting_currency or "").strip().upper()
+    table = fx_table if fx_table is not None else load_fx_table()
+    if not table.has(reporting):
+        raise ValueError(
+            f"reporting_currency {reporting!r} has no rate in the FX table (as_of {table.as_of}); "
+            "cannot normalize to it."
+        )
+
+    is_money = canonical in _RANK_MONEY_METRICS
+    sort_field = f"{canonical}_normalized" if is_money else canonical
+
+    registry_by_id = _registry_by_ad_account_id()
+    scope = resolve_scope(reader, account_ids)  # discovery path may raise -> whole-call failure
+
+    def read_one(ad_account_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        meta_row = scope.metadata_by_id.get(ad_account_id)
+        if meta_row is None:
+            meta_row = normalize_ad_account(
+                reader.get_account(ad_account_id, fields=DEFAULT_AD_ACCOUNT_FIELDS)
+            )
+        # level="ad", all_days -> one aggregated row per ad THAT DELIVERED (never walks dormant ads).
+        insight_rows = reader.fetch_insights(
+            ad_account_id,
+            fields=DEFAULT_TRIAGE_INSIGHT_FIELDS,
+            date_from=date_from,
+            date_to=date_to,
+            level="ad",
+            time_increment="all_days",
+        )
+        return meta_row, insight_rows
+
+    results = fan_out_accounts(read_one, scope.account_ids)
+
+    ad_rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for ad_account_id, payload, error in results:
+        if error is not None:
+            errors.append({"ad_account_id": ad_account_id, "error": error})
+            continue
+
+        meta_row, insight_rows = payload
+        # Account identity comes from the account metadata row, never the insights row (same source the
+        # other fan-out tools use). ad_id/ad_name come from each insights row.
+        currency = meta_row.get("currency") or "UNKNOWN"
+        account_id = meta_row.get("account_id")
+        account_name = meta_row.get("name")
+
+        # Resolve the result key ONCE per account: config first, else infer from the account's POOLED
+        # ad actions (so the mock/no-config path still works). All ads in an account share its goal.
+        combined_actions: list[dict[str, Any]] = []
+        for insight_row in insight_rows:
+            combined_actions.extend(_metric_blob_list(insight_row.get("actions")))
+        result_key, result_label = _resolve_result_key(
+            ad_account_id, combined_actions, registry_by_id
+        )
+
+        # No FX rate for this currency -> emit ONE error for the account (matching the per-account
+        # granularity of cross_account_performance), not one per ad. Its ads keep native figures and
+        # fall to unranked under a money metric, but still rank under a ratio/count metric.
+        has_fx = table.has(currency)
+        if not has_fx:
+            errors.append(
+                {
+                    "ad_account_id": ad_account_id,
+                    "error": f"no FX rate for currency '{currency}' (as_of {table.as_of})",
+                }
+            )
+
+        for insight_row in insight_rows:
+            actions = _metric_blob_list(insight_row.get("actions"))
+            action_values = _metric_blob_list(insight_row.get("action_values"))
+
+            spend = _number(insight_row.get("spend"))
+            impressions = _number(insight_row.get("impressions"))
+            clicks = _number(insight_row.get("clicks"))
+            # Same three-branch result logic as cross_account_performance, applied per ad against the
+            # account's resolved key (lead family self-heal / configured or inferred key / absent).
+            if result_key and result_key.lower() in _LEAD_KEYS_LOWER:
+                results_value = _find_metric(actions, LEAD_KEYS)
+            elif result_key:
+                results_value = _find_metric(actions, [result_key])
+            else:
+                results_value = None
+            purchase_value = _find_metric(action_values, PURCHASE_KEYS)
+
+            native_base = {
+                "spend": spend,
+                "impressions": impressions,
+                "clicks": clicks,
+                "results": results_value,
+                "purchase_value": purchase_value,
+            }
+            native_derived = compute_derived_metrics(native_base)
+
+            ad_id = str(insight_row.get("ad_id") or "")
+            # Meta occasionally returns a blank ad_name -> fall back to the id so every row is labelled.
+            ad_name = insight_row.get("ad_name") or ad_id
+
+            row: dict[str, Any] = {
+                "ad_account_id": ad_account_id,
+                "account_id": account_id,
+                "account_name": account_name,
+                "ad_id": ad_id,
+                "ad_name": ad_name,
+                "currency": currency,
+            }
+            # Native base: omit a metric Meta left blank; counts as int, money as float.
+            if spend is not None:
+                row["spend"] = spend
+            if impressions is not None:
+                row["impressions"] = _as_count(impressions)
+            if clicks is not None:
+                row["clicks"] = _as_count(clicks)
+            if results_value is not None:
+                row["results"] = _as_count(results_value)
+            if result_key:
+                row["result_label"] = result_label
+            if purchase_value is not None:
+                row["purchase_value"] = purchase_value
+            row.update(native_derived)  # cpm/cpc/ctr/cost_per_result/roas (absent omitted)
+
+            # Money twins in the reporting currency (only when this account HAS an FX rate).
+            if has_fx:
+                spend_norm = (
+                    table.convert(spend, from_currency=currency, to_currency=reporting)
+                    if spend is not None
+                    else None
+                )
+                pv_norm = (
+                    table.convert(purchase_value, from_currency=currency, to_currency=reporting)
+                    if purchase_value is not None
+                    else None
+                )
+                norm_derived = compute_derived_metrics(
+                    {
+                        "spend": spend_norm,
+                        "impressions": impressions,
+                        "clicks": clicks,
+                        "results": results_value,
+                        "purchase_value": pv_norm,
+                    }
+                )
+                if spend_norm is not None:
+                    row["spend_normalized"] = spend_norm
+                for metric_name in _NORMALIZED_MONEY_DERIVED:
+                    if metric_name in norm_derived:
+                        row[f"{metric_name}_normalized"] = norm_derived[metric_name]
+                if pv_norm is not None:
+                    row["purchase_value_normalized"] = pv_norm
+
+            ad_rows.append(row)
+
+    # Partition pooled ads into rankable and unranked (rank_accounts's logic, keyed on ad_id).
+    rankable: list[tuple[float, str, dict[str, Any]]] = []
+    unranked: list[dict[str, Any]] = []
+
+    for row in ad_rows:
+        ad_id = row["ad_id"]
+        sort_value = row.get(sort_field)
+        if sort_value is not None:
+            rankable.append((float(sort_value), ad_id, row))
+        else:
+            if is_money and canonical in row:
+                # Native value present but no normalized twin → no FX rate for this currency.
+                reason = f"no FX rate for {row.get('currency', 'UNKNOWN')}"
+            else:
+                reason = "metric unavailable"
+            unranked.append(
+                {
+                    "ad_account_id": row["ad_account_id"],
+                    "ad_id": ad_id,
+                    "ad_name": row.get("ad_name"),
+                    "reason": reason,
+                }
+            )
+
+    # Sort: flip sign for desc so both directions share one ascending tuple sort. Tiebreak: ad_id
+    # ascending → stable, deterministic total order run-to-run regardless of worker completion order.
+    if order == "desc":
+        rankable.sort(key=lambda t: (-t[0], t[1]))
+    else:
+        rankable.sort(key=lambda t: (t[0], t[1]))
+
+    # Assign 1-based ranks: ties share strictly-better count + 1 (first occurrence of a value sits at
+    # index = count of strictly-better entries, since the list is already value-sorted).
+    ranked: list[dict[str, Any]] = []
+    current_rank: int = 1
+    prev_value: float | None = None
+    for i, (sort_value, ad_id, row) in enumerate(rankable):
+        if prev_value is None or sort_value != prev_value:
+            current_rank = i + 1
+        prev_value = sort_value
+
+        entry: dict[str, Any] = {
+            "rank": current_rank,
+            "ad_account_id": row["ad_account_id"],
+            "account_id": row.get("account_id"),
+            "account_name": row.get("account_name"),
+            "ad_id": ad_id,
+            "ad_name": row.get("ad_name"),
+            "currency": row.get("currency"),
+            # Emit the row's original-typed value (int for counts, float for money-normalized).
+            "value": row.get(sort_field),
+            "result_label": row.get("result_label"),
+        }
+        if is_money:
+            entry["value_native"] = row.get(canonical)
+        ranked.append(entry)
+
+    ranked_total = len(ranked)
+
+    result: dict[str, Any] = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "metric": canonical,
+        "order": order,
+        "limit": limit,
+        "reporting_currency": reporting,
+        "fx_as_of": table.as_of,
+        "fx_note": table.note,
+        "account_count": len(scope.account_ids),  # accounts attempted
+        "ad_count": len(ad_rows),  # delivering ads pooled across all accounts
+        "ranked": ranked[:limit],
+        "ranked_total": ranked_total,
+        "unranked": unranked,
+        "errors": errors,
+    }
+    if scope.requested_all and not scope.account_ids:
+        result["note"] = "no accounts reachable"
+    return result
 
 
 # --------------------------------------------------------------------------- #

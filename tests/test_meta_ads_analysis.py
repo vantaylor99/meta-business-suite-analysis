@@ -9677,7 +9677,7 @@ def test_cross_account_summary_mock_smoke_single_usd_account() -> None:
 def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     reader = _summary_reader()
     discovery = _mcp_server.build_discovery_tools(reader)
-    # All eight discovery tools are exposed.
+    # All nine discovery tools are exposed.
     assert set(discovery) == {
         "list_ad_accounts",
         "cross_account_spend_summary",
@@ -9687,6 +9687,7 @@ def test_build_discovery_tools_exposes_cross_account_summary() -> None:
         "pacing_report",
         "rank_accounts",
         "grade_accounts_against_goals",
+        "cross_account_creative_triage",
     }
     summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
     assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
@@ -9697,6 +9698,7 @@ def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     assert "pacing_report" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "rank_accounts" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "grade_accounts_against_goals" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "cross_account_creative_triage" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
 
 
 def test_cross_account_summary_insight_fields_restricts_metrics_summed() -> None:
@@ -13594,6 +13596,351 @@ def test_rank_accounts_respects_account_ids_subset(monkeypatch) -> None:
     assert out["ranked_total"] == 2
     assert out["account_count"] == 2
     assert not any(c[0] == "list_ad_accounts" for c in reader.calls)
+
+
+# --- cross_account_creative_triage: ad-level sibling of rank_accounts (MOCKS ONLY) ---
+
+
+def test_creative_triage_pools_and_ranks_ads_across_accounts_by_spend(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "Beta", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "ad_name": "A-100", "spend": "50.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "101", "ad_name": "A-101", "spend": "200.00", "impressions": "4000", "clicks": "40"},
+        ],
+        "act_2": [
+            {"ad_id": "200", "ad_name": "B-200", "spend": "500.00", "impressions": "9000", "clicks": "90"},
+            {"ad_id": "201", "ad_name": "B-201", "spend": "10.00", "impressions": "200", "clicks": "2"},
+        ],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=3, fx_table=_fx()
+    )
+    assert out["metric"] == "spend"
+    assert out["order"] == "desc"
+    assert out["account_count"] == 2
+    assert out["ad_count"] == 4          # every delivering ad pooled
+    assert out["ranked_total"] == 4      # all four are rankable on spend
+    assert len(out["ranked"]) == 3       # truncated to limit
+    # Highest-spend ads across the pool, correct rank + ad identity.
+    assert [r["ad_id"] for r in out["ranked"]] == ["200", "101", "100"]
+    assert [r["rank"] for r in out["ranked"]] == [1, 2, 3]
+    top = out["ranked"][0]
+    assert top["ad_account_id"] == "act_2"
+    assert top["account_name"] == "Beta"
+    assert top["ad_name"] == "B-200"
+    assert top["value"] == pytest.approx(500.0)
+    assert top["value_native"] == pytest.approx(500.0)
+
+
+def test_creative_triage_ascending_returns_losers(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "Beta", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "ad_name": "A-100", "spend": "50.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "101", "ad_name": "A-101", "spend": "200.00", "impressions": "4000", "clicks": "40"},
+        ],
+        "act_2": [
+            {"ad_id": "200", "ad_name": "B-200", "spend": "500.00", "impressions": "9000", "clicks": "90"},
+            {"ad_id": "201", "ad_name": "B-201", "spend": "10.00", "impressions": "200", "clicks": "2"},
+        ],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="asc", limit=3, fx_table=_fx()
+    )
+    assert out["order"] == "asc"
+    # asc: cheapest/worst end first.
+    assert [r["ad_id"] for r in out["ranked"]] == ["201", "100", "101"]
+    assert out["ranked"][0]["rank"] == 1
+
+
+def test_creative_triage_cost_per_result_zero_result_ad_is_unranked(monkeypatch) -> None:
+    import math
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"}]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "ad_name": "Has results", "spend": "100.00", "impressions": "1000",
+             "clicks": "50", "actions": [{"action_type": "lead", "value": "5"}]},   # cpr = 20
+            {"ad_id": "101", "ad_name": "No results", "spend": "80.00", "impressions": "800",
+             "clicks": "40", "actions": []},                                        # no results -> no cpr
+        ]
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="cost_per_result", order="asc", limit=10, fx_table=_fx()
+    )
+    ranked_ids = [r["ad_id"] for r in out["ranked"]]
+    assert ranked_ids == ["100"]
+    assert len(out["unranked"]) == 1
+    assert out["unranked"][0]["ad_id"] == "101"
+    assert out["unranked"][0]["reason"] == "metric unavailable"
+    # Never inf: the ranked value is a finite cost-per-result.
+    assert math.isfinite(out["ranked"][0]["value"])
+    assert out["ranked"][0]["value"] == 20.0
+
+
+def test_creative_triage_money_metric_ranks_on_normalized_twin(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "MX", "account_status": 1, "currency": "MXN"},
+        {"id": "act_2", "account_id": "2", "name": "EU", "account_status": 1, "currency": "EUR"},
+    ]
+    insights = {
+        "act_1": [{"ad_id": "100", "ad_name": "MXN ad", "spend": "1000.00", "impressions": "5000", "clicks": "50"}],
+        "act_2": [{"ad_id": "200", "ad_name": "EUR ad", "spend": "100.00", "impressions": "2000", "clicks": "20"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    # MXN 1000 -> 55 USD; EUR 100 -> 108 USD. desc ranks on the normalized twin: EUR first.
+    assert [r["ad_id"] for r in out["ranked"]] == ["200", "100"]
+    assert out["ranked"][0]["value"] == pytest.approx(108.0)     # normalized (USD)
+    assert out["ranked"][0]["value_native"] == pytest.approx(100.0)   # native EUR
+    assert out["ranked"][1]["value"] == pytest.approx(55.0)      # normalized (USD)
+    assert out["ranked"][1]["value_native"] == pytest.approx(1000.0)  # native MXN
+
+
+def test_creative_triage_no_fx_currency_ad_is_unranked_and_errored_once(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "JP", "account_status": 1, "currency": "JPY"}]
+    insights = {
+        "act_1": [{"ad_id": "100", "ad_name": "JPY ad", "spend": "5000.00", "impressions": "2000", "clicks": "40"}],
+    }
+    reader = _perf_reader(accounts, insights)  # JPY has no rate in _fx()
+
+    # Money metric: ad falls to unranked (reason names the currency), exactly ONE error for the account.
+    money = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    assert money["ranked"] == []
+    assert len(money["unranked"]) == 1
+    assert money["unranked"][0]["ad_id"] == "100"
+    assert "JPY" in money["unranked"][0]["reason"] and "no FX rate" in money["unranked"][0]["reason"]
+    assert len(money["errors"]) == 1
+    assert money["errors"][0]["ad_account_id"] == "act_1"
+
+    # Ratio metric (ctr = 40/2000*100 = 2.0) is currency-invariant: the ad ranks fine.
+    ratio = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="ctr", order="desc", limit=10, fx_table=_fx()
+    )
+    assert len(ratio["ranked"]) == 1
+    assert ratio["ranked"][0]["ad_id"] == "100"
+    assert ratio["ranked"][0]["value"] == 2.0
+
+
+def test_creative_triage_resolves_lead_family_per_account(monkeypatch) -> None:
+    import pytest
+
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+
+    accounts = [{"id": "act_103014553", "account_id": "103014553", "name": "Seattle",
+                 "account_status": 1, "currency": "USD"}]
+    insights = {"act_103014553": [{
+        "ad_id": "500", "ad_name": "Lead ad", "spend": "436.81", "impressions": "10000", "clicks": "200",
+        "actions": [
+            {"action_type": "onsite_conversion.lead_grouped", "value": "12"},
+            {"action_type": "lead", "value": "12"},
+        ],
+    }]}
+    reader = _perf_reader(accounts, insights)
+    fake_registry = {
+        "act_103014553": MetaAdsAccount(
+            account_slug="seattle_mission", account_name="Seattle", ad_account_id="act_103014553",
+            primary_result_action_type="leadgen_grouped",  # STALE key -> self-heals via lead family
+            primary_result_label="Leads (form)", roas_role="not_applicable",
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: fake_registry)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-07-01", date_to="2026-07-01",
+        metric="cost_per_result", order="asc", limit=10, fx_table=_fx()
+    )
+    row = out["ranked"][0]
+    assert row["ad_id"] == "500"
+    assert row["result_label"] == "Leads (form)"
+    assert row["value"] == pytest.approx(436.81 / 12)  # spend / leads (single value, not summed to 24)
+
+
+def test_creative_triage_config_result_key_wins_over_inference(monkeypatch) -> None:
+    # Ad carries BOTH a purchase (10) and a lead (3). Inference would pick purchase (PURCHASE before
+    # LEAD); the configured lead key must win -> results reads the lead value.
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Cfg", "account_status": 1, "currency": "USD"}]
+    insights = {"act_1": [{
+        "ad_id": "100", "ad_name": "Mixed ad", "spend": "90.00", "impressions": "1000", "clicks": "50",
+        "actions": [{"action_type": "purchase", "value": "10"}, {"action_type": "lead", "value": "3"}],
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+    }]}
+    reader = _perf_reader(accounts, insights)
+    fake_registry = {
+        "act_1": MetaAdsAccount(
+            account_slug="cfg", account_name="Cfg", ad_account_id="act_1",
+            primary_result_action_type="lead", primary_result_label="Sign-ups",
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: fake_registry)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="results", order="desc", limit=10, fx_table=_fx()
+    )
+    row = out["ranked"][0]
+    assert row["value"] == 3               # lead value (config key), NOT the purchase 10 (inference)
+    assert row["result_label"] == "Sign-ups"
+
+
+def test_creative_triage_partial_account_failure_isolated_and_deterministic(monkeypatch) -> None:
+    import time
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    insights = {
+        "act_1": [{"ad_id": "10", "ad_name": "a", "spend": "100.00", "impressions": "1000", "clicks": "10"}],
+        "act_3": [{"ad_id": "30", "ad_name": "c", "spend": "300.00", "impressions": "3000", "clicks": "30"}],
+    }
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        idx = int(ad_account_id.split("_")[1])
+        time.sleep((4 - idx) * 0.005)  # later ids finish first -> exercises reordering
+        if ad_account_id == "act_2":
+            raise MetaApiError("(#200) denied for act_2")
+        return [dict(r) for r in insights[ad_account_id]]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch,
+    )
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    # act_2 failed -> recorded + skipped; the survivors' ads still rank, order-independent.
+    assert [r["ad_id"] for r in out["ranked"]] == ["30", "10"]
+    assert {"ad_account_id": "act_2", "error": "(#200) denied for act_2"} in out["errors"]
+    assert out["account_count"] == 3   # accounts attempted (incl. the failed one)
+    assert out["ad_count"] == 2        # only the two survivors contributed ad rows
+
+
+def test_creative_triage_missing_ad_name_falls_back_to_ad_id(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"}]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "spend": "100.00", "impressions": "1000", "clicks": "10"},              # ad_name absent
+            {"ad_id": "101", "ad_name": "", "spend": "50.00", "impressions": "500", "clicks": "5"},  # ad_name blank
+        ]
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    by_id = {r["ad_id"]: r for r in out["ranked"]}
+    assert by_id["100"]["ad_name"] == "100"  # falls back to the id
+    assert by_id["101"]["ad_name"] == "101"  # blank also falls back
+
+
+def test_creative_triage_tie_ranks_share_and_tiebreak_by_ad_id(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"}]
+    # Ads "200" and "100" tie on spend; "300" is lower. Insertion order deliberately not sorted.
+    insights = {
+        "act_1": [
+            {"ad_id": "200", "ad_name": "b", "spend": "200.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "100", "ad_name": "a", "spend": "200.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "300", "ad_name": "c", "spend": "100.00", "impressions": "1000", "clicks": "10"},
+        ]
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    # Tie tiebroken by ad_id ascending: "100" before "200"; both share rank 1; "300" -> rank 3.
+    assert [r["ad_id"] for r in out["ranked"]] == ["100", "200", "300"]
+    assert [r["rank"] for r in out["ranked"]] == [1, 1, 3]
+
+
+def test_creative_triage_invalid_metric_order_limit_and_reporting_currency_raise() -> None:
+    import pytest
+
+    reader = _perf_reader([], {})
+    with pytest.raises(ValueError, match="foobar"):
+        _account_discovery.cross_account_creative_triage(
+            reader, date_from="2026-06-01", date_to="2026-06-30", metric="foobar", fx_table=_fx()
+        )
+    with pytest.raises(ValueError, match="order must be"):
+        _account_discovery.cross_account_creative_triage(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            metric="spend", order="sideways", fx_table=_fx()
+        )
+    with pytest.raises(ValueError, match="limit must be a positive integer"):
+        _account_discovery.cross_account_creative_triage(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            metric="spend", limit=0, fx_table=_fx()
+        )
+    with pytest.raises(ValueError, match="no rate in the FX table"):
+        _account_discovery.cross_account_creative_triage(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            metric="spend", reporting_currency="JPY", fx_table=_fx()
+        )
+
+
+def test_creative_triage_no_accounts_reachable_note(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    reader = _perf_reader([], {})  # discovery finds nothing
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30", metric="spend", fx_table=_fx()
+    )
+    assert out["note"] == "no accounts reachable"
+    assert out["ranked"] == [] and out["ad_count"] == 0
+
+
+def test_build_discovery_tools_creative_triage_mock_smoke(monkeypatch) -> None:
+    # End-to-end through the MCP wrapper: it exposes metric/order/limit but NOT fx_table (test-only
+    # seam), loading the committed config/fx_rates.json itself. USD accounts keep this deterministic.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "ad_name": "cheap", "spend": "100.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "101", "ad_name": "pricey", "spend": "200.00", "impressions": "2000", "clicks": "20"},
+        ]
+    }
+    reader = _perf_reader(accounts, insights)
+    tools = _mcp_server.build_discovery_tools(reader)
+    assert "cross_account_creative_triage" in tools
+    out = tools["cross_account_creative_triage"]("2026-06-01", "2026-06-30", "spend", "desc", 10)
+    assert out["ranked"][0]["ad_id"] == "101"
+    assert out["ranked"][0]["rank"] == 1
+    assert out["ad_count"] == 2
+    assert out["reporting_currency"] == "USD"
 
 
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
