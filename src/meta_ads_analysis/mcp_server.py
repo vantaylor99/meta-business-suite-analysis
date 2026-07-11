@@ -531,6 +531,26 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "is about the PERFORMANCE of ads that ran — it is NOT ad health: disapproved or "
         "active-but-not-delivering ads never appear (they have no delivery), which is a separate concern."
     ),
+    "portfolio_digest": (
+        "One call for 'give me my portfolio overview' — instead of stitching four tools together by "
+        "hand. For a date range and scope it returns a single ranked digest: totals (per-currency "
+        "native subtotals AND a figure normalized into one reporting_currency, default USD — money is "
+        "never summed across currencies), the top/bottom spenders, each account's goal standing "
+        "(on_goal / watch / pause_candidate / no_goal_configured counts + a pause shortlist), what "
+        "CHANGED and needs attention (flagged / informational / clean), optional budget pacing, and a "
+        "synthesized worst-first 'needs_you' shortlist merging the pause-candidates and the "
+        "high-severity flagged accounts (deduped, so an account failing on both appears once with both "
+        "reasons). It fetches the shared performance read ONCE and reuses it across the goal, "
+        "attention, and pacing sections, so the default digest costs about one attention scan (~1+2N "
+        "reads), not 3-4x. Defaults: goal + attention on; budget pacing and ad-level health OFF (each "
+        "adds reads — pacing +3N, ad-health +one read per flagged account). Because it grades the whole "
+        "resolved scope, accounts not in the config file are counted as no_goal_configured (a "
+        "portfolio-wide view, not an error). Pass an explicit account_ids for anything beyond a small "
+        "fleet — with no account_ids it fans over every account the token can reach (hundreds) and can "
+        "time out. Pacing here is realized variance for the window; for forward month-projection call "
+        "pacing_report directly. A section that unexpectedly fails is returned as null with a tagged "
+        "error while the rest of the digest still returns."
+    ),
 }
 
 
@@ -697,6 +717,31 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             reporting_currency=reporting_currency,
         )
 
+    def portfolio_digest(
+        date_from: str,
+        date_to: str,
+        account_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+        include_flags: bool = True,
+        include_pacing: bool = False,
+        include_ad_health: bool = False,
+    ) -> dict[str, Any]:
+        # ``fx_table`` is an internal/test injection seam and is deliberately NOT exposed to the LLM;
+        # the tool loads the committed config/fx_rates.json itself. ``include_flags`` (on),
+        # ``include_pacing`` / ``include_ad_health`` (off) ARE exposed so an operator can trade read
+        # cost for depth. There is no ``as_of`` here — the digest paces the window realized (as_of is
+        # pinned to date_to); forward month-projection is pacing_report called directly.
+        return account_discovery.portfolio_digest(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            account_ids=account_ids,
+            reporting_currency=reporting_currency,
+            include_flags=include_flags,
+            include_pacing=include_pacing,
+            include_ad_health=include_ad_health,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
@@ -707,6 +752,7 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
         "rank_accounts": rank_accounts,
         "grade_accounts_against_goals": grade_accounts_against_goals,
         "cross_account_creative_triage": cross_account_creative_triage,
+        "portfolio_digest": portfolio_digest,
     }
 
 

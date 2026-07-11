@@ -3,6 +3,20 @@ prereq:
 files: src/meta_ads_analysis/account_discovery.py, tests/test_meta_ads_analysis.py
 difficulty: medium
 ----
+> **⚠️ SEAM CODE ALREADY LANDED (2026-07-11).** The dependent ticket `2-portfolio-digest` was picked
+> up before this one ran, and its digest is unbuildable without these seams — so that ticket
+> **implemented all three seams inline** (faithful to this spec) to unblock itself:
+> `grade_accounts_against_goals(precomputed_perf=...)`, `flag_accounts_needing_attention(
+> precomputed_current_perf=...)` (with the reporting-currency `ValueError` guard), and
+> `pacing_report(precomputed_perf=...)` (currency guard + `elapsed_fraction <= 0` ignore branch). All
+> existing grade/flag/pacing suites still pass unchanged (backward-compatible). **Do NOT re-add the
+> kwargs — read the code first; they already exist.** The remaining, still-valuable work for this
+> ticket is the **dedicated seam-unit tests** in the `## Tests` section below (grade zero-read + non-USD
+> parity, flag baseline-only fan-out, flag/pacing currency-mismatch `ValueError`, pacing seam zero
+> step-1 reads, pacing `elapsed_fraction <= 0` ignore). The digest's own tests exercise the seams
+> indirectly (read-count + EUR-currency) but do NOT cover those specific unit cases. Verify the landed
+> seam matches this spec, then add the unit tests and hand off to review.
+
 ## Why this ticket exists
 
 The portfolio-digest composite (next ticket) must call four cross-account tools over the **same
