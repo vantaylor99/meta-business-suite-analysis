@@ -88,8 +88,9 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   ratio. Unlike the pure post-processors, pacing genuinely needs a **second read surface** (budget
   config is not in the insights row), so it costs **~1 + 4N** reads for an N-account scope (the shared
   spend read plus a per-account campaigns + ad-sets + account read); a per-account budget read that
-  fails is reported `budget_unread`, never a silent "uncapped". Cents→major-unit conversion is exact
-  for 2-decimal currencies; **zero-decimal currencies (JPY, KRW) are a known 100× limitation.**
+  fails is reported `budget_unread`, never a silent "uncapped". The minor-unit→major-unit divisor is
+  **ISO-4217 currency-aware** (2/0/3-decimal, so JPY/KRW and BHD/KWD convert correctly); an
+  unrecognized currency code assumes 2 decimals and is surfaced in the report `note`.
   Finally, the `rank_accounts` tool is the seventh discovery tool and the manager's "who's top/bottom?"
   shortlist: another **pure post-processor over `cross_account_performance`** (one read), it sorts the
   whole reachable fleet — or an explicit `account_ids` subset — by a **single** metric (spend, CPM, CPC,

@@ -475,8 +475,9 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "account_inactive — none of these are counted as under-pacing. Money is normalized into one "
         "reporting_currency (default USD); a rollup gives status counts and worst over/under shortlists. "
         "Costs ~1+4N reads for N accounts (spend read + a per-account budget-config read); a failed "
-        "budget read reads budget_unread, never a silent 'uncapped'. Cents->major-units conversion is "
-        "accurate for 2-decimal currencies; zero-decimal currencies (JPY/KRW) are a known limitation."
+        "budget read reads budget_unread, never a silent 'uncapped'. The minor-units->major-units "
+        "divisor is ISO-4217 currency-aware (2/0/3-decimal, so JPY/KRW and BHD/KWD convert correctly); "
+        "an unrecognized currency code assumes 2 decimals and is surfaced in the report note."
     ),
     "rank_accounts": (
         "Rank every ad account this token can reach (or an explicit list) by a single efficiency or spend "

@@ -349,9 +349,10 @@ these are counted as under-pacing. Money is normalized into one `reporting_curre
 the rollup (status counts + worst over/under shortlists). Because step 2 issues **3 extra reads per
 readable account** on top of step 1's `1 + N`, the whole call costs **~1 + 4N** reads for an
 N-account scope — the same accepted posture as the attention tool's 2× note; a single combined
-per-account read is a future optimization. Cents→major-unit conversion divides by 100, exact for
-2-decimal currencies; **zero-decimal currencies (JPY, KRW) and 3-decimal currencies are a known 100×
-inaccuracy** flagged for a follow-up.
+per-account read is a future optimization. The minor-unit→major-unit divisor is **ISO-4217
+currency-aware** (`10 ** minor_unit_exponent` — 2/0/3-decimal, so JPY/KRW and BHD/KWD convert
+correctly, not 100× off); an unrecognized currency code assumes 2 decimals and is surfaced in the
+report `note`.
 
 `rank_accounts` answers the manager's "who's top/bottom?" — it ranks the whole reachable fleet (or an
 explicit `account_ids` subset) by a **single** metric and returns the top or bottom `limit` (default

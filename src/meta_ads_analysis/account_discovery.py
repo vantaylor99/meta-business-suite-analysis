@@ -39,7 +39,12 @@ from .config import (
     PACING_ON_TRACK_TOLERANCE_PCT,
     PACING_SHORTLIST_LIMIT,
 )
-from .currency import FxTable, load_fx_table
+from .currency import (
+    FxTable,
+    load_fx_table,
+    minor_unit_exponent,
+    minor_unit_exponent_is_known,
+)
 from .meta_api import MetaApiError
 from .sync_api import (
     PURCHASE_KEYS,
@@ -1704,26 +1709,32 @@ def project_spend(spend_to_date: float, elapsed_fraction: float) -> float | None
     return spend_to_date / elapsed_fraction
 
 
-def _minor_to_major(value: Any) -> float | None:
-    """Meta budget/cap minor units (cents) -> major currency units; ``None`` for missing/blank.
+def _minor_to_major(value: Any, currency: str = "USD") -> float | None:
+    """Meta budget/cap minor units -> major currency units; ``None`` for missing/blank.
 
-    Correct for 2-decimal currencies (USD/EUR/GBP/… — the vast majority). **Zero-decimal (JPY, KRW)
-    and 3-decimal currencies are a KNOWN 100x inaccuracy** here — a currency-aware minor-unit divisor
-    is a backlog follow-up; do NOT silently guess the exponent per currency.
+    The divisor is ISO-4217 **currency-aware**: ``value / 10 ** minor_unit_exponent(currency)`` — /100
+    for the ~150 two-decimal currencies (USD/EUR/GBP/…), /1 for zero-decimal (JPY, KRW, …), /1000 for
+    three-decimal (BHD, KWD, …). ``currency`` defaults to ``"USD"`` (2-decimal) so a bare call is
+    unchanged. An unrecognized/blank/``"UNKNOWN"`` code falls through to the 2-decimal default; that
+    fallback is an *assumption* surfaced by the caller (see :func:`minor_unit_exponent_is_known`), not
+    a silent per-currency guess.
     """
     num = _number(value)
     if num is None:
         return None
-    return num / 100.0
+    return num / (10 ** minor_unit_exponent(currency))
 
 
 def summarize_account_budget(
-    campaigns: list[dict[str, Any]], adsets: list[dict[str, Any]]
+    campaigns: list[dict[str, Any]], adsets: list[dict[str, Any]], currency: str = "USD"
 ) -> dict[str, float]:
     """CBO-deduplicated ACTIVE budget for an account: ``{active_daily, lifetime_total}`` (major units).
 
-    Native minor units in (Meta ``daily_budget`` / ``lifetime_budget`` are cents), native MAJOR units
-    out. Only ``effective_status == "ACTIVE"`` entities count — a paused campaign/adset does not
+    Native minor units in (Meta ``daily_budget`` / ``lifetime_budget``), native MAJOR units out —
+    converted via the ISO-4217 currency-aware :func:`_minor_to_major`. ``currency`` defaults to
+    ``"USD"`` (2-decimal) so a bare call is unchanged; the pacing loop threads the real per-account
+    currency so zero-/3-decimal accounts (JPY, KWD, …) get the right divisor. Only
+    ``effective_status == "ACTIVE"`` entities count — a paused campaign/adset does not
     deliver. Per **ACTIVE** campaign, the precedence (this is the double-counting guard):
 
     - campaign ``daily_budget > 0`` -> **CBO daily**: add the campaign daily to ``active_daily`` and
@@ -1754,8 +1765,8 @@ def summarize_account_budget(
         if str(campaign.get("effective_status") or "").upper() != "ACTIVE":
             continue  # paused campaign -> no delivery; its adsets are gated off too.
         campaign_id = str(campaign.get("id") or "")
-        camp_daily = _minor_to_major(campaign.get("daily_budget")) or 0.0
-        camp_lifetime = _minor_to_major(campaign.get("lifetime_budget")) or 0.0
+        camp_daily = _minor_to_major(campaign.get("daily_budget"), currency) or 0.0
+        camp_lifetime = _minor_to_major(campaign.get("lifetime_budget"), currency) or 0.0
 
         if camp_daily > 0:
             active_daily += camp_daily  # CBO daily — ignore adsets (double-count guard).
@@ -1765,8 +1776,8 @@ def summarize_account_budget(
             continue
         # Non-CBO campaign: budget lives on each ACTIVE adset (adset daily first, else adset lifetime).
         for adset in active_adsets_by_campaign.get(campaign_id, []):
-            adset_daily = _minor_to_major(adset.get("daily_budget")) or 0.0
-            adset_lifetime = _minor_to_major(adset.get("lifetime_budget")) or 0.0
+            adset_daily = _minor_to_major(adset.get("daily_budget"), currency) or 0.0
+            adset_lifetime = _minor_to_major(adset.get("lifetime_budget"), currency) or 0.0
             if adset_daily > 0:
                 active_daily += adset_daily
             elif adset_lifetime > 0:
@@ -1869,11 +1880,12 @@ def pacing_report(
     period) — a lifetime-only account is ``budget_not_projectable`` (prorating lifetime budgets via
     campaign start/stop times is a backlog follow-up).
 
-    **Units.** Budget/cap/amount_spent are minor units (cents); insights ``spend`` is major units.
-    :func:`_minor_to_major` divides by 100 — correct for 2-decimal currencies; **zero-/3-decimal
-    currencies (JPY/KRW/…) are a known 100x inaccuracy** (backlog follow-up). Currency discipline: a
-    budget is only ever compared to spend in the SAME (native) currency per account; only the rollup
-    uses normalized figures.
+    **Units.** Budget/cap/amount_spent are minor units; insights ``spend`` is major units.
+    :func:`_minor_to_major`'s divisor is ISO-4217 currency-aware (``10 ** minor_unit_exponent`` —
+    2/0/3-decimal, so JPY/KRW and BHD/KWD convert correctly, not 100x off). An **unrecognized** currency
+    code assumes 2 decimals and that assumption is surfaced in the report ``note`` (never a silent
+    guess). Currency discipline: a budget is only ever compared to spend in the SAME (native) currency
+    per account; only the rollup uses normalized figures.
 
     **Read cost** ~``1 + 4N`` for an N-account scope (``cross_account_performance``'s ``1 + N`` plus 3
     per readable account) — documented, accepted; a single combined per-account read is a future
@@ -1936,6 +1948,10 @@ def pacing_report(
         budget_by_id[ad_account_id] = payload
 
     accounts: list[dict[str, Any]] = []
+    # Distinct currency codes whose minor-unit exponent we had to *assume* (fell through to the
+    # 2-decimal default because the code is unrecognized). Surfaced in the report note so the
+    # assumption is never silent. Collected only where a divisor is actually applied (budget read OK).
+    assumed_currencies: set[str] = set()
     # Main-thread assembly over the scope-ordered perf rows -> deterministic output.
     for row in perf["accounts"]:
         ad_account_id = row["ad_account_id"]
@@ -1978,13 +1994,16 @@ def pacing_report(
             continue
 
         campaigns, adsets, account = payload
-        budget = summarize_account_budget(campaigns, adsets)
+        # This account's minor-unit divisor rides on ``currency``; flag it if we're only assuming.
+        if not minor_unit_exponent_is_known(currency):
+            assumed_currencies.add(currency)
+        budget = summarize_account_budget(campaigns, adsets, currency)
         active_daily = budget["active_daily"]
         lifetime_total = budget["lifetime_total"]
-        spend_cap = _minor_to_major(account.get("spend_cap"))
+        spend_cap = _minor_to_major(account.get("spend_cap"), currency)
         if spend_cap is not None and spend_cap <= 0:
             spend_cap = None  # 0 / absent -> uncapped.
-        amount_spent = _minor_to_major(account.get("amount_spent"))
+        amount_spent = _minor_to_major(account.get("amount_spent"), currency)
 
         period_budget = active_daily * total_days
         projected = project_spend(spend_to_date, elapsed_fraction)
@@ -2054,6 +2073,11 @@ def pacing_report(
         notes.append(
             f"reporting period ({date_from}..{date_to}) has not started as of {effective_as_of}; "
             "every account is not_started and no projection is computed."
+        )
+    if assumed_currencies:
+        codes = ", ".join(sorted(assumed_currencies))
+        notes.append(
+            f"assumed 2-decimal minor units for unrecognized currency codes: {codes}."
         )
     if notes:
         result["note"] = " ".join(notes)

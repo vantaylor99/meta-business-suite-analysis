@@ -10014,6 +10014,36 @@ def test_fx_table_convert_present_absent_and_other_reporting() -> None:
     assert table.has("USD") and not table.has("JPY")
 
 
+def test_minor_unit_exponent_lookup_and_known_predicate() -> None:
+    me = _currency.minor_unit_exponent
+    known = _currency.minor_unit_exponent_is_known
+
+    # 2-decimal default (unlisted currencies), 0-decimal, 3-decimal, 4-decimal exceptions.
+    assert me("USD") == 2 and me("EUR") == 2
+    assert me("JPY") == 0 and me("KRW") == 0 and me("XOF") == 0
+    assert me("KWD") == 3 and me("BHD") == 3 and me("TND") == 3
+    assert me("CLF") == 4 and me("UYW") == 4
+
+    # Case-insensitive: lower/mixed case resolve identically.
+    assert me("jpy") == me("JPY") == 0
+    assert me("kwd") == me("KWD") == 3
+
+    # Blank / None / whitespace / unrecognized -> 2-decimal default (no raise, no guess).
+    assert me("") == 2 and me(None) == 2 and me("   ") == 2  # type: ignore[arg-type]
+    assert me("UNKNOWN") == 2 and me("XTS") == 2  # XTS: ISO test code, deliberately unlisted.
+
+    # Known-predicate: exceptions + common 2-decimal codes are known; unrecognized/blank are not.
+    assert known("JPY") and known("KWD") and known("USD") and known("aud")
+    assert not known("XTS") and not known("UNKNOWN") and not known("") and not known(None)  # type: ignore[arg-type]
+
+
+def test_fx_rates_codes_are_subset_of_known_minor_unit_currencies() -> None:
+    # Guard: every FX-supported currency must have a recognized minor-unit exponent, so an
+    # FX-normalizable account is NEVER flagged as an "assumed" exponent by the pacing note.
+    table = _currency.load_fx_table()
+    assert set(table.rates) <= _currency.KNOWN_MINOR_UNIT_CURRENCIES
+
+
 # --- compute_derived_metrics: recompute-from-components, divide-by-zero-safe ---
 
 
@@ -11547,6 +11577,33 @@ def test_minor_to_major_cents_and_blank() -> None:
     assert _account_discovery._minor_to_major("0") == 0.0
 
 
+def test_minor_to_major_currency_aware_divisor() -> None:
+    import pytest
+
+    M = _account_discovery._minor_to_major
+
+    # Default currency is USD (2-decimal) -> /100, matching the bare-call behavior above.
+    assert M("30000") == pytest.approx(300.0)
+    assert M("30000", "USD") == pytest.approx(300.0)
+    assert M("30000", "EUR") == pytest.approx(300.0)
+
+    # Zero-decimal (JPY): minor unit == major unit -> divisor 1, NOT 100 (the bug this fixes).
+    assert M("30000", "JPY") == pytest.approx(30000.0)
+    assert M("30000", "jpy") == pytest.approx(30000.0)  # case-insensitive
+    assert M(30000, "KRW") == pytest.approx(30000.0)
+
+    # Three-decimal (KWD/BHD) -> /1000.
+    assert M("30000", "KWD") == pytest.approx(30.0)
+    assert M("30000", "BHD") == pytest.approx(30.0)
+
+    # Blank / None / UNKNOWN currency -> 2-decimal default (today's behavior; no raise).
+    assert M("30000", "") == pytest.approx(300.0)
+    assert M("30000", "UNKNOWN") == pytest.approx(300.0)
+
+    # spend_cap "0" is still 0 under a 0-decimal divisor (the uncapped guard survives the change).
+    assert M("0", "JPY") == 0.0
+
+
 def _pc_camp(cid, status="ACTIVE", daily=None, lifetime=None):
     row = {"id": cid, "effective_status": status}
     if daily is not None:
@@ -11603,6 +11660,29 @@ def test_summarize_account_budget_cbo_dedup_precedence() -> None:
         [_pc_adset("as1", "c1", daily="99999"), _pc_adset("as2", "c2", daily="15000")],
     )
     assert mixed["active_daily"] == pytest.approx(450.0)
+
+
+def test_summarize_account_budget_currency_aware() -> None:
+    import pytest
+
+    S = _account_discovery.summarize_account_budget
+
+    # Default USD (2-decimal): a "1000" daily budget -> 10.0 major units (unchanged).
+    usd = S([_pc_camp("c1", daily="1000")], [])
+    assert usd["active_daily"] == pytest.approx(10.0)
+
+    # JPY (0-decimal): a "1000" daily budget IS ¥1000 major units, not ¥10.
+    jpy = S([_pc_camp("c1", daily="1000")], [], "JPY")
+    assert jpy["active_daily"] == pytest.approx(1000.0)
+    assert jpy["lifetime_total"] == 0.0
+
+    # JPY lifetime budget threads the divisor too.
+    jpy_life = S([_pc_camp("c1", lifetime="500000")], [], "JPY")
+    assert jpy_life["lifetime_total"] == pytest.approx(500000.0)
+
+    # KWD (3-decimal): a "30000" adset daily under a non-CBO campaign -> 30.0 (/1000).
+    kwd = S([_pc_camp("c1")], [_pc_adset("as1", "c1", daily="30000")], "KWD")
+    assert kwd["active_daily"] == pytest.approx(30.0)
 
 
 def test_classify_pacing_status_enum_and_boundaries() -> None:
@@ -11732,6 +11812,73 @@ def test_pacing_report_end_to_end_statuses_rollup_and_shortlists(monkeypatch) ->
     )
     assert rollup["excluded_from_rollup"] == 3  # uncapped + lifetime + paused
     assert out["errors"] == []
+
+
+def test_pacing_report_jpy_zero_decimal_end_to_end(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_jpy", "account_id": "1", "name": "Tokyo", "account_status": 1, "currency": "JPY"},
+    ]
+    # Insights spend is ALREADY major units (¥420,000). Budget/cap/amount_spent are minor units, but
+    # JPY is 0-decimal so minor == major: "30000" is ¥30,000/day, not ¥300.
+    insights = {"act_jpy": [{"spend": "420000.00"}]}
+    campaigns = {"act_jpy": [_pc_camp("c1", daily="30000")]}  # CBO daily ¥30,000
+    caps = {"act_jpy": {"currency": "JPY", "spend_cap": "1500000", "amount_spent": "500000"}}
+
+    reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    # JPY must be in the FX table so the account is normalizable (not routed to no-FX errors).
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(JPY=0.0067), **_PACING_KW)
+
+    jpy = {a["ad_account_id"]: a for a in out["accounts"]}["act_jpy"]
+    # Corrected magnitudes: divisor 1 (not 100). Old buggy code would report /100 of each of these.
+    assert jpy["active_daily_budget"] == pytest.approx(30000.0)
+    assert jpy["period_budget"] == pytest.approx(930000.0)  # 30,000 * 31
+    assert jpy["spend_cap"] == pytest.approx(1500000.0)
+    assert jpy["amount_spent"] == pytest.approx(500000.0)
+    # Sane verdict: projected 420,000 / (14/31) == 930,000 == period_budget -> on_track, variance ~0.
+    assert jpy["projected_spend"] == pytest.approx(930000.0)
+    assert jpy["status"] == "on_track"
+    assert jpy["variance_pct"] == pytest.approx(0.0)
+    # Normalized twins use the injected JPY rate; variance ratio is FX-invariant regardless.
+    assert jpy["period_budget_normalized"] == pytest.approx(930000.0 * 0.0067)
+    # JPY is a recognized exponent -> NO assumption note.
+    assert "assumed 2-decimal" not in (out.get("note") or "")
+    assert out["errors"] == []
+
+
+def test_pacing_report_assumption_note_only_for_unrecognized_currency(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+
+    # Scope with a known currency (USD) plus two accounts in an unrecognized-but-FX-injected code
+    # (XTS, ISO test code) and one more unrecognized code (ZZZ) -> the note lists the assumed codes
+    # deduped and in deterministic (sorted) order; the known USD code is never listed.
+    accounts = [
+        {"id": "act_usd", "account_id": "1", "name": "USD", "account_status": 1, "currency": "USD"},
+        {"id": "act_x1", "account_id": "2", "name": "X1", "account_status": 1, "currency": "XTS"},
+        {"id": "act_x2", "account_id": "3", "name": "X2", "account_status": 1, "currency": "XTS"},
+        {"id": "act_z", "account_id": "4", "name": "Z", "account_status": 1, "currency": "ZZZ"},
+    ]
+    insights = {a["id"]: [{"spend": "1000.00"}] for a in accounts}
+    campaigns = {a["id"]: [_pc_camp(f"c_{a['id']}", daily="10000")] for a in accounts}
+    caps = {a["id"]: {} for a in accounts}
+    reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(XTS=0.5, ZZZ=0.4), **_PACING_KW)
+
+    note = out.get("note") or ""
+    assert "assumed 2-decimal minor units for unrecognized currency codes: XTS, ZZZ." in note
+    assert note.count("XTS") == 1  # deduped despite two XTS accounts
+    assert "USD" not in note  # a recognized code is never flagged as an assumption
+
+    # An all-recognized scope (USD only) must NOT emit the assumption note at all.
+    usd_only = [{"id": "act_only", "account_id": "1", "name": "U", "account_status": 1, "currency": "USD"}]
+    reader2 = _pacing_reader(
+        usd_only, {"act_only": [{"spend": "1000.00"}]},
+        {"act_only": [_pc_camp("c1", daily="10000")]}, {}, {"act_only": {}},
+    )
+    out2 = _account_discovery.pacing_report(reader2, fx_table=_fx(), **_PACING_KW)
+    assert "assumed 2-decimal" not in (out2.get("note") or "")
 
 
 def test_pacing_report_shortlist_tiebreak_by_account_id(monkeypatch) -> None:
