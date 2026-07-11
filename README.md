@@ -44,7 +44,62 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   accounts before any are added to the config file. The `cross_account_spend_summary` tool builds on it:
   a one-call cross-account spend view for a date range that subtotals **per currency** (never summing
   across different currencies, so there is no misleading grand total) and reports any account it could
-  not read instead of failing the whole call.
+  not read instead of failing the whole call. It fans out over the accounts **concurrently** (a
+  bounded thread pool) so an all-accounts call over a large fleet completes in tens of seconds rather
+  than timing out; `META_FANOUT_MAX_WORKERS` (default `8`, clamped to `1`–`32`) tunes the pool for very
+  large fleets. The `cross_account_performance` tool goes one step further: it reports **efficiency**,
+  not just raw totals — CPM, CPC, CTR, cost-per-result, and ROAS, each **recomputed from summed
+  components** (never an averaged ratio, so it is Simpson's-paradox-safe) — and lets you compare
+  accounts that bill in different currencies by **normalizing money metrics into one
+  `reporting_currency`** (default USD). Conversion uses a small **static FX table checked into
+  `config/fx_rates.json`** whose `as_of` date and "approximate — not live" caveat are surfaced in the
+  output; an account in a currency missing from that table keeps its native figures and is reported in
+  `errors`. (Live/Meta FX is deliberately deferred — the table is a committed reference, not a billing
+  rate.) The `account_benchmark` tool is the **specialist-facing** counterpart to
+  `cross_account_performance` — "how do I stack up?": it ranks *one* account's efficiency metrics as
+  **percentiles within a cohort** of its peers (default: every reachable account, or an explicit list),
+  so a bare number like "cost-per-lead $18" becomes interpretable ("72nd percentile — better than most
+  peers"). A high percentile always means good, for both cost and quality metrics; money is compared in
+  one `reporting_currency`; and a cohort too small to be reliable is flagged rather than hidden. Finally,
+  the `flag_accounts_needing_attention` tool turns a full-fleet review into a short **attention list**:
+  it compares a current window against the immediately-preceding **equal-length** baseline (override
+  with `baseline_from` / `baseline_to`) and flags only the accounts that *moved* — sudden spend
+  spikes/collapses, worsening cost-per-result/CPC, dropping CTR, delivery that stalled on an otherwise
+  ACTIVE account, and account-status problems (DISABLED / UNSETTLED / …). Defaults treat a **50% spend
+  move** or **30% cost/quality degradation** as "noticeable, not noise" (low-volume windows are gated
+  out so a 2→1 result swing never trips an alarm), and results are bucketed **worst-first** into
+  `flagged` (medium+ severity), `informational` (newly-active / too-little-history), and a `clean_count`.
+  It is a pure post-processor over `cross_account_performance` (two reads — one per window). **Budget
+  pacing is a separate concern:** spend-to-date vs. the configured budget is answered by the
+  `pacing_report` tool, not this one. That sixth discovery tool answers "will each account land
+  **over**, **under**, or **on** its budget for the month?" across the whole fleet: you give it the
+  full reporting period (`date_from`/`date_to`) and, optionally, the day to measure spend through
+  (`as_of`, default today), and it reports each account's spend-to-date, its **projected**
+  end-of-period spend (`spend_to_date ÷ elapsed_fraction`), and a verdict. The pacing denominator is
+  the sum of each account's **ACTIVE daily budgets**, **CBO-deduplicated** — a campaign-budget-
+  optimization campaign contributes its campaign-level budget and its ad-set budgets are ignored, so a
+  naïve sum never double-counts — times the number of days in the period. The account spend cap is a
+  *lifetime* ceiling, so it is surfaced as context but is **never** the pacing denominator; a
+  lifetime-only account is `budget_not_projectable` (prorating a lifetime budget against an arbitrary
+  reporting window is a deliberate non-goal here), an uncapped account is `no_budget_set`, and a
+  paused/closed account is `account_inactive` — none of these are miscounted as "under-pacing". Money
+  is normalized into one `reporting_currency` (default USD) for the rollup (status counts + worst
+  over/under shortlists); native and normalized give the same variance since it is a same-currency
+  ratio. Unlike the pure post-processors, pacing genuinely needs a **second read surface** (budget
+  config is not in the insights row), so it costs **~1 + 4N** reads for an N-account scope (the shared
+  spend read plus a per-account campaigns + ad-sets + account read); a per-account budget read that
+  fails is reported `budget_unread`, never a silent "uncapped". Cents→major-unit conversion is exact
+  for 2-decimal currencies; **zero-decimal currencies (JPY, KRW) are a known 100× limitation.**
+  Finally, the `rank_accounts` tool is the seventh discovery tool and the manager's "who's top/bottom?"
+  shortlist: another **pure post-processor over `cross_account_performance`** (one read), it sorts the
+  whole reachable fleet — or an explicit `account_ids` subset — by a **single** metric (spend, CPM, CPC,
+  CTR, cost-per-result [aliases `cpl`/`cpa`], ROAS, impressions, clicks, or results) and returns the top
+  or bottom N. Money metrics are ranked on their **`reporting_currency`-normalized twin** so accounts in
+  different currencies are directly comparable (`value` is normalized, `value_native` keeps the native
+  figure); ratio and count metrics are currency-invariant and ranked as-is. Ties share a rank (1-based,
+  strictly-better + 1), and accounts that lack the metric — no delivery, or a money metric in a currency
+  missing from the FX table — land in a separate `unranked` bucket with a reason rather than being sorted
+  as a misleading zero or infinity.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

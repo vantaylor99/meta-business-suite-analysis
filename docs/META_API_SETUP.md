@@ -257,10 +257,118 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the two discovery tools (`list_ad_accounts` and
-`cross_account_spend_summary` — neither takes an `account` argument), and the
+plus any of the 14 read tools, the seven discovery tools (`list_ad_accounts`,
+`cross_account_spend_summary`, `cross_account_performance`, `account_benchmark`,
+`flag_accounts_needing_attention`, `pacing_report`, and `rank_accounts` — none takes an
+`account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
+
+`cross_account_spend_summary` fans out over the target accounts **concurrently** (a bounded thread
+pool over the synchronous reader), so an all-accounts call over a large fleet (hundreds of accounts)
+finishes in tens of seconds instead of timing out on a serial walk. The pool size is
+`META_FANOUT_MAX_WORKERS` (default `8`, clamped to `1`–`32`); raise it for a very large fleet, lower it
+to be gentler on rate limits. It never silently drops accounts — every resolved account is covered,
+and any it could not read is reported in `errors`.
+
+`cross_account_performance` rides the same fan-out engine but reports **efficiency, not just raw
+totals**: per-account CPM, CPC, CTR, cost-per-result, and ROAS, each **recomputed from summed base
+components** (never an averaged ratio — Simpson's-paradox-safe). It also **normalizes money metrics
+into a single `reporting_currency`** (default `USD`) so accounts billing in different currencies are
+comparable; `ctr` and `roas` are currency-invariant and get no normalized twin. Conversion rates come
+from a **static table checked into `config/fx_rates.json`** — a committed reference file (unlike the
+gitignored `config/meta_ads_accounts.json`), seeded with USD/EUR/GBP/BRL/MXN/CAD/AUD. **These rates
+are approximate and NOT live FX** — do not use them for billing or precise financial reporting; the
+tool surfaces the table's `as_of` date (`fx_as_of`) and its caveat (`fx_note`) in every response so no
+consumer mistakes them for live rates. **Live/Meta FX is deliberately deferred.** An account whose
+currency is absent from the table keeps its native figures and native efficiency metrics, is reported
+in `errors`, and is excluded from `normalized_total` (counted in `excluded_no_fx`). The primary-result
+event per account comes from the config registry's `primary_result_action_type` when the account is
+configured, and is otherwise inferred from the account's own `actions` — so the tool works before any
+account is added to the config file.
+
+`account_benchmark` is the **specialist-facing** counterpart to that manager-facing ranking view: it
+answers "how does *this one* account stack up?" — e.g. "is this account's cost-per-lead good or bad
+compared to its peers?". It is a pure post-processor over `cross_account_performance` (it re-reads
+nothing from Meta): it calls that tool once for the cohort (the target account always included) and
+ranks the target's efficiency metrics (CPM, CPC, cost-per-result, CTR, ROAS) as **percentiles within
+the cohort**. A **high percentile always means "good"** for *both* cost metrics (a low CPM ranks high)
+and quality metrics (a high ROAS ranks high), so the verdict ("better than most peers" … "worse than
+most peers") reads the same direction everywhere. The cohort defaults to every account the token can
+reach, or you can pass an explicit `cohort_ids` list. Money metrics are compared in one
+`reporting_currency` (default USD) via the same static FX table, so a USD account benchmarks correctly
+against peers billing in other currencies; ratio metrics (CTR/ROAS) are currency-invariant. Volume
+metrics (spend/impressions/clicks/results) are deliberately **not** benchmarked — a "good" spend
+percentile is ambiguous. It surfaces the cohort size and any excluded accounts (unreadable, or in a
+currency with no FX rate), and a cohort with fewer than `MIN_COHORT_FOR_PERCENTILE` (5) readable
+accounts is **flagged** (`too_small` / per-metric `unreliable`) rather than hidden — the numbers are
+still returned, just labeled as thin.
+
+`flag_accounts_needing_attention` turns a full-fleet review into a short **attention list** — "which of
+my 200 accounts changed and need me *now*?". Like `account_benchmark` it is a pure post-processor over
+`cross_account_performance`, but it calls it **twice**: once for a current window and once for the
+immediately-preceding **equal-length** baseline window (override with `baseline_from` / `baseline_to`;
+supplying exactly one of the two is an error). It joins the per-account rows by account and flags the
+ones that *moved or breached a threshold*: `spend_spike` / `spend_collapse` (default a **50%** move),
+`cost_per_result_degraded` / `cpc_degraded` / `ctr_dropped` (default a **30%** degradation),
+`stalled_delivery` (an account that was delivering but now shows ~zero spend **and** impressions —
+fired only when the account still reads `ACTIVE`, so a deliberately DISABLED account is not a false
+stall), and `account_status_alert` (DISABLED / UNSETTLED / PENDING_RISK_REVIEW / … straight off each
+row's status label). Low-volume windows are gated out (both windows must clear the material-spend floor,
+and a cost-per-result flag needs enough results in both) so a 2→1 result swing on trivial spend never
+trips an alarm; a brand-new account with no baseline reads `insufficient_history` or `newly_active`
+(info), never a false ∞% spike. Output is bucketed **worst-first**: `flagged` (medium+ severity, sorted
+by severity then absolute normalized-spend move then account id), `informational` (info-only), and a
+`clean_count`; per-account read failures are isolated into `errors` (tagged with the window). Money
+floors compare in one `reporting_currency` (default USD) via the same static FX table, and percent
+moves use native figures (currency-invariant for a single account across two windows). Because it runs
+two fan-outs it issues **~2× the per-account reads** of a single `cross_account_performance`
+(~400 reads for a 200-account scope) — acceptable and documented. **Budget pacing is deliberately NOT
+here:** spend-to-date vs. the configured budget is a different question over a different surface, owned
+by the `pacing_report` tool; ad-level creative/disapproval detection (a heavier per-ad fan-out) is
+parked for a later ticket.
+
+`pacing_report` answers the manager's month-end question — "will each account land **over**, **under**,
+or **on** its budget?" — across every account the token can reach (or an explicit list). Unlike
+`account_benchmark` and `flag_accounts_needing_attention` (pure post-processors that add no new read
+shape), pacing is a **two-source join**, because the budget configuration is not in the insights row.
+Step 1 calls `cross_account_performance` once over `[date_from, effective_as_of]` for spend-to-date +
+FX + scope; step 2 fans out a **second** read over the accounts that read OK — each reading
+`list_campaigns` + `list_adsets` (budget fields only) + `get_account` (spend cap / lifetime spend) —
+and joins the two by account. `date_from`/`date_to` are the **full reporting period** (e.g. a month);
+`as_of` is the day spend is measured **through** (defaults to today, UTC) — the tool projects
+end-of-period spend as `spend_to_date ÷ elapsed_fraction`. The pacing denominator is the sum of each
+account's **ACTIVE daily budgets, CBO-deduplicated** (a campaign-budget-optimization campaign
+contributes its campaign budget and its ad-set budgets are ignored — the double-count guard) × the
+period length. The account **spend cap is a lifetime ceiling, reported as context but never the
+denominator**; **lifetime budgets are reported but not projected** against an arbitrary period, so a
+lifetime-only account is `budget_not_projectable`. Uncapped → `no_budget_set`, paused/closed →
+`account_inactive`, and a per-account budget read that fails → `budget_unread` (distinct from a
+genuinely uncapped account, so a read failure is never silently reported as "no budget"); none of
+these are counted as under-pacing. Money is normalized into one `reporting_currency` (default USD) for
+the rollup (status counts + worst over/under shortlists). Because step 2 issues **3 extra reads per
+readable account** on top of step 1's `1 + N`, the whole call costs **~1 + 4N** reads for an
+N-account scope — the same accepted posture as the attention tool's 2× note; a single combined
+per-account read is a future optimization. Cents→major-unit conversion divides by 100, exact for
+2-decimal currencies; **zero-decimal currencies (JPY, KRW) and 3-decimal currencies are a known 100×
+inaccuracy** flagged for a follow-up.
+
+`rank_accounts` answers the manager's "who's top/bottom?" — it ranks the whole reachable fleet (or an
+explicit `account_ids` subset) by a **single** metric and returns the top or bottom `limit` (default
+10). Like `account_benchmark` and `flag_accounts_needing_attention` it is a **pure post-processor over
+`cross_account_performance`** (one call, no new read shape). Accepted metrics are `spend`, `cpm`, `cpc`,
+`ctr`, `cost_per_result` (aliases `cpl`/`cpa` resolve to it; the canonical name appears in the output),
+`roas`, `impressions`, `clicks`, and `results`; an unknown metric, a bad `order` (must be `asc`/`desc`),
+or a non-positive `limit` is a fail-fast `ValueError` raised **before** any Meta read. Money metrics
+(`spend`/`cpm`/`cpc`/`cost_per_result`) are ranked on their **`reporting_currency`-normalized twin** so
+cross-currency accounts compare directly — `value` carries the normalized figure and `value_native` the
+account's own-currency figure; ratio and count metrics (CTR/ROAS/impressions/clicks/results) are
+currency-invariant and ranked as-is (no `value_native`). Ranks are 1-based with the strictly-better + 1
+tie convention (ties share a rank, tiebroken by `ad_account_id` ascending for run-to-run determinism),
+and the returned list is truncated to `limit` while `ranked_total` reports the full rankable count. An
+account that lacks the metric — no delivery in range, or a money metric in a currency missing from the
+FX table — is not sorted as a misleading `0`/`∞`; it lands in a separate `unranked` bucket tagged with
+its reason (`metric unavailable` vs `no FX rate for <currency>`).
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the

@@ -434,6 +434,59 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "list of account ids) for a date range. Groups totals by currency and never sums across "
         "different currencies; reports any accounts that could not be read."
     ),
+    "cross_account_performance": (
+        "Compare efficiency (not just raw spend) across every ad account this token can reach (or an "
+        "explicit list) for a date range. Returns per-account CPM/CPC/CTR/cost-per-result/ROAS "
+        "recomputed from summed components (never an averaged ratio), and normalizes money metrics "
+        "into one reporting_currency (default USD) using a static approximate FX table — surfacing "
+        "its as-of date. Accounts in a currency with no FX rate keep native figures and are reported "
+        "in errors; per-account read failures are isolated, not fatal."
+    ),
+    "account_benchmark": (
+        "Show how ONE ad account's efficiency stacks up against its peers for a date range — e.g. "
+        "'is this account's cost-per-lead good or bad?'. Ranks the account's CPM/CPC/cost-per-result/"
+        "CTR/ROAS as percentiles within a cohort (default: every account the token can reach; or pass "
+        "an explicit cohort_ids list — the target is always included). A HIGH percentile always means "
+        "good, for both cost and quality metrics. Money metrics are compared in one reporting_currency "
+        "(default USD); cohort size and any excluded accounts are surfaced, and a cohort below the "
+        "reliability floor is flagged rather than hidden."
+    ),
+    "flag_accounts_needing_attention": (
+        "Scan every ad account this token can reach (or an explicit list) and surface only the handful "
+        "that CHANGED and need a human now — instead of eyeballing hundreds. Compares a current window "
+        "against the immediately-preceding equal-length window (override with baseline_from/baseline_to) "
+        "and flags sudden spend spikes/collapses, worsening cost-per-result/CPC, dropping CTR, stalled "
+        "delivery on an ACTIVE account, and account-status problems (DISABLED/UNSETTLED/etc.). Defaults: "
+        "a 50% spend move or 30% cost/quality degradation is 'noticeable'; results are bucketed into "
+        "flagged (medium+ severity, worst-first), informational (newly-active / too-little-history), and "
+        "a clean count. Money floors compare in one reporting_currency (default USD). NOTE: budget "
+        "pacing (spend-to-date vs. configured budget) is a SEPARATE tool (pacing_report), not this one."
+    ),
+    "pacing_report": (
+        "Tell whether each ad account is on track to spend its configured budget for a reporting "
+        "period — which are OVER-pacing, which are UNDER-pacing, which are on track, and the projected "
+        "end-of-period spend — across every account the token can reach (or an explicit list). "
+        "date_from/date_to are the FULL period (e.g. a month); as_of is the day spend is measured "
+        "through (defaults to today). The period budget is the sum of ACTIVE daily budgets "
+        "(CBO-deduplicated so a campaign-budget-optimization campaign is never double-counted with its "
+        "ad sets) x the period length; the account spend cap is reported as context but is a lifetime "
+        "ceiling, never the pacing denominator. Lifetime budgets are reported but not projected "
+        "(budget_not_projectable); uncapped accounts read no_budget_set; paused/closed accounts read "
+        "account_inactive — none of these are counted as under-pacing. Money is normalized into one "
+        "reporting_currency (default USD); a rollup gives status counts and worst over/under shortlists. "
+        "Costs ~1+4N reads for N accounts (spend read + a per-account budget-config read); a failed "
+        "budget read reads budget_unread, never a silent 'uncapped'. Cents->major-units conversion is "
+        "accurate for 2-decimal currencies; zero-decimal currencies (JPY/KRW) are a known limitation."
+    ),
+    "rank_accounts": (
+        "Rank every ad account this token can reach (or an explicit list) by a single efficiency or spend "
+        "metric for a date range, returning the top or bottom N. Money metrics (spend/CPC/CPM/CPL) "
+        "are compared in one reporting_currency (default USD) so accounts in different currencies are "
+        "comparable; ratio and count metrics (CTR/ROAS/impressions/clicks/results) are currency-invariant "
+        "and ranked as-is. Accounts lacking the metric (e.g. no results → no CPL) are grouped into an 'unranked' "
+        "bucket with a reason instead of sorted as zero or infinity. Valid metrics: spend, cpm, cpc, ctr, "
+        "cost_per_result (aliases: cpl, cpa), roas, impressions, clicks, results."
+    ),
 }
 
 
@@ -459,9 +512,111 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             reader, date_from=date_from, date_to=date_to, account_ids=account_ids
         )
 
+    def cross_account_performance(
+        date_from: str,
+        date_to: str,
+        account_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+        level: str = "account",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself.
+        return account_discovery.cross_account_performance(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            account_ids=account_ids,
+            reporting_currency=reporting_currency,
+            level=level,
+        )
+
+    def account_benchmark(
+        account_id: str,
+        date_from: str,
+        date_to: str,
+        cohort_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself (and passes it through to the prereq).
+        return account_discovery.account_benchmark(
+            reader,
+            account_id=account_id,
+            date_from=date_from,
+            date_to=date_to,
+            cohort_ids=cohort_ids,
+            reporting_currency=reporting_currency,
+        )
+
+    def flag_accounts_needing_attention(
+        current_from: str,
+        current_to: str,
+        account_ids: list[str] | None = None,
+        baseline_from: str | None = None,
+        baseline_to: str | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``thresholds`` and ``fx_table`` are test-only/programmatic seams and are deliberately NOT
+        # exposed to the LLM; the tool uses the committed defaults and loads config/fx_rates.json itself.
+        return account_discovery.flag_accounts_needing_attention(
+            reader,
+            current_from=current_from,
+            current_to=current_to,
+            account_ids=account_ids,
+            baseline_from=baseline_from,
+            baseline_to=baseline_to,
+            reporting_currency=reporting_currency,
+        )
+
+    def pacing_report(
+        date_from: str,
+        date_to: str,
+        account_ids: list[str] | None = None,
+        as_of: str | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself. ``as_of`` IS exposed (defaults to
+        # today) so an operator can pace a period as-of a past date.
+        return account_discovery.pacing_report(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            account_ids=account_ids,
+            as_of=as_of,
+            reporting_currency=reporting_currency,
+        )
+
+    def rank_accounts(
+        date_from: str,
+        date_to: str,
+        metric: str,
+        order: str = "desc",
+        limit: int = 10,
+        account_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself.
+        return account_discovery.rank_accounts(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            metric=metric,
+            order=order,
+            limit=limit,
+            account_ids=account_ids,
+            reporting_currency=reporting_currency,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
+        "cross_account_performance": cross_account_performance,
+        "account_benchmark": account_benchmark,
+        "flag_accounts_needing_attention": flag_accounts_needing_attention,
+        "pacing_report": pacing_report,
+        "rank_accounts": rank_accounts,
     }
 
 
