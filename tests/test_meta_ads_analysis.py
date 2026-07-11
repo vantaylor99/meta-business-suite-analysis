@@ -12458,6 +12458,46 @@ def test_flag_precomputed_current_perf_currency_mismatch_raises(monkeypatch) -> 
     assert reader.calls == []  # failed fast, before touching the reader
 
 
+def test_flag_precomputed_current_perf_errors_tagged_current(monkeypatch) -> None:
+    # Seam contract that portfolio_digest leans on: the errors carried by the INJECTED current perf are
+    # merged into flag's output tagged window="current" (never "baseline") — this is exactly what lets
+    # the digest skip them (they are the shared perf's, already tagged section="performance") without
+    # double-counting. A baseline read failure, by contrast, surfaces tagged window="baseline".
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+
+    def _boom(msg):
+        def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+            raise _account_discovery.MetaApiError(msg)
+        return _fetch
+
+    # A REAL cross_account_performance result (all fx_as_of/account_count keys the seam reads) whose one
+    # account failed the current read -> it lands in current_perf["errors"], with zero readable rows.
+    ghost = [{"id": "act_ghost", "account_id": "g", "name": "Ghost", "account_status": 1, "currency": "USD"}]
+    perf_reader = _attention_reader(ghost, {}, fetch_insights=_boom("(#100) current-window unreadable"))
+    current_perf = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-06-08", date_to="2026-06-14", level="account", fx_table=_fx()
+    )
+    assert current_perf["accounts"] == [] and current_perf["reporting_currency"] == "USD"
+    assert any(e["ad_account_id"] == "act_ghost" for e in current_perf["errors"])
+
+    # Inject it; flag's OWN reader (a different, disjoint scope) fails the baseline read for act_1.
+    baseline_reader = _attention_reader(
+        [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}],
+        {}, fetch_insights=_boom("(#1) baseline read failed"),
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        baseline_reader, current_from="2026-06-08", current_to="2026-06-14",
+        reporting_currency="USD", fx_table=_fx(), precomputed_current_perf=current_perf,
+    )
+
+    by_window = {(e["ad_account_id"], e["window"]) for e in out["errors"]}
+    # The injected perf's error is tagged current (so the digest skips it), NOT baseline.
+    assert ("act_ghost", "current") in by_window
+    assert ("act_ghost", "baseline") not in by_window
+    # The genuinely-new baseline read failure surfaces under window="baseline".
+    assert ("act_1", "baseline") in by_window
+
+
 # --- pacing_report: pure helpers (clock-free, no reader) --------------------
 
 
