@@ -13943,6 +13943,41 @@ def test_build_discovery_tools_creative_triage_mock_smoke(monkeypatch) -> None:
     assert out["reporting_currency"] == "USD"
 
 
+def test_creative_triage_mixed_fx_and_no_fx_accounts_in_one_money_call(monkeypatch) -> None:
+    # The core multi-currency fleet interaction: one call pools an FX-able account (EUR) and a no-FX
+    # one (JPY). Under a money metric the EUR ad ranks on its normalized twin while every JPY ad falls
+    # to unranked, and the account with no FX rate records exactly ONE error (not one per ad) — even
+    # though it contributed two delivering ads. ad_count still counts every pooled delivering ad.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "EU", "account_status": 1, "currency": "EUR"},
+        {"id": "act_2", "account_id": "2", "name": "JP", "account_status": 1, "currency": "JPY"},
+    ]
+    insights = {
+        "act_1": [{"ad_id": "100", "ad_name": "eur", "spend": "100.00", "impressions": "2000", "clicks": "20"}],
+        "act_2": [
+            {"ad_id": "200", "ad_name": "jpy-a", "spend": "5000.00", "impressions": "4000", "clicks": "40"},
+            {"ad_id": "201", "ad_name": "jpy-b", "spend": "3000.00", "impressions": "1000", "clicks": "10"},
+        ],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()  # JPY absent from _fx()
+    )
+    assert out["ad_count"] == 3                       # all three delivering ads pooled
+    assert [r["ad_id"] for r in out["ranked"]] == ["100"]   # only the EUR ad is rankable on spend
+    assert out["ranked"][0]["value"] == pytest.approx(108.0)      # EUR 100 -> USD normalized
+    assert out["ranked"][0]["value_native"] == pytest.approx(100.0)
+    # Both JPY ads unranked with the no-FX reason; the account emits exactly one error.
+    unranked_ids = sorted(u["ad_id"] for u in out["unranked"])
+    assert unranked_ids == ["200", "201"]
+    assert all("JPY" in u["reason"] and "no FX rate" in u["reason"] for u in out["unranked"])
+    assert [e["ad_account_id"] for e in out["errors"]] == ["act_2"]
+
+
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
     # The tools wrap DirectMetaReader, which drains paging.next internally: a >=3-page list read
     # returns every page's items in order (reuses the session-mock pattern from

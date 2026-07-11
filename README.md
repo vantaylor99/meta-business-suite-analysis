@@ -130,6 +130,22 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   rather than misread as failing, and an account still inside its post-launch `evaluation_grace_days`
   window softens from `pause_candidate` to `watch`. `as_of` defaults to today and governs only that
   grace window.
+  The `cross_account_creative_triage` tool is the ninth discovery tool and the ad-level sibling of
+  `rank_accounts`: instead of ranking whole accounts it pools **one row per delivering ad** across the
+  whole reachable fleet (or an explicit `account_ids` subset) and ranks those ads by a **single** metric
+  (same names as `rank_accounts`), returning the top or bottom N — the winners and losers at the creative
+  level, so a specialist sees which specific ads to scale or pause. It reads **only ad-level insights**
+  (`level="ad"`, `time_increment="all_days"`), so it sees exactly the ads that actually delivered in the
+  window and never walks the dormant-ad graveyard — it is a *performance* read, **not** ad health
+  (disapproved / active-but-not-delivering ads have no delivery and never appear). Winners vs losers are
+  two calls (`order="desc"` then `"asc"`), each re-running the ad-level fan-out, so scope `account_ids`
+  when you can. Money metrics rank on the **`reporting_currency`-normalized twin** (`value` normalized,
+  `value_native` native) so ads in different currencies are comparable; ratio/count metrics are
+  currency-invariant. The result key is resolved once per account (config first, else inferred from that
+  account's pooled ad actions) and applied to every ad in it. Ties share a rank (tiebroken by `ad_id`),
+  and ads that lack the metric — zero results, or a money metric in a currency missing from the FX table —
+  land in a separate `unranked` bucket with a reason rather than being sorted as a misleading zero or
+  infinity; a no-FX account records **one** `errors` entry (not one per ad).
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

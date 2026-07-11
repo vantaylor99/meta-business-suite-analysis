@@ -257,10 +257,10 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the eight discovery tools (`list_ad_accounts`,
+plus any of the 14 read tools, the nine discovery tools (`list_ad_accounts`,
 `cross_account_spend_summary`, `cross_account_performance`, `account_benchmark`,
-`flag_accounts_needing_attention`, `pacing_report`, `rank_accounts`, and
-`grade_accounts_against_goals` — none takes an
+`flag_accounts_needing_attention`, `pacing_report`, `rank_accounts`,
+`grade_accounts_against_goals`, and `cross_account_creative_triage` — none takes an
 `account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
@@ -410,6 +410,27 @@ inside its `evaluation_grace_days` (measured from an optional `evaluation_start_
 softens a `pause_candidate` down to `watch`. The `pause_candidates` shortlist is sorted by `account_id`
 for run-to-run determinism (not worst-first). Per-account read failures are isolated into `errors`,
 never fatal.
+
+`cross_account_creative_triage` answers the specialist's "which specific **ads** should I scale or
+pause?" — it is the ad-level sibling of `rank_accounts`. Instead of one account-level row per account it
+pools **one row per delivering ad** across the whole reachable fleet (or an explicit `account_ids`
+subset) and ranks those ads by a **single** metric, returning the top or bottom `limit` (default 10).
+Unlike `rank_accounts` it is **not** a post-processor over `cross_account_performance`: it rides the same
+fan-out engine directly, reading one `level="ad"` / `time_increment="all_days"` insights row per account —
+so it sees exactly the ads that **delivered** in the window (had impressions/spend) and never enumerates
+`/{account}/ads`, keeping it fast and naturally scoped to recently-active creative. It is therefore a
+*performance* read, **not** ad health: a disapproved or active-but-not-delivering ad has no delivery row
+and never appears. Accepted metrics, the `*_normalized`-twin money ranking (`value`/`value_native`), the
+`unranked` bucket, and the 1-based strictly-better + 1 tie convention are all identical to
+`rank_accounts`, except the tiebreak and pooling key is `ad_id` (string order) and each ranked entry also
+carries its `ad_account_id`/`account_name`. Winners vs losers are **two calls** (`order="desc"` then
+`"asc"`), each re-running the ad-level fan-out, so scope `account_ids` when you can. The result key is
+resolved **once per account** (config first, else inferred from that account's pooled ad `actions`,
+including the lead-family self-heal) and applied to every ad in it — all ads in an account share its goal.
+A currency missing from the FX table records **one** `errors` entry for the account (not one per ad); its
+ads fall to `unranked` under a money metric but still rank under a ratio/count metric. An unknown metric,
+a bad `order`, a non-positive `limit`, or a `reporting_currency` missing from the FX table is a fail-fast
+`ValueError` before any Meta read.
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the
