@@ -1623,13 +1623,22 @@ def flag_accounts_needing_attention(
 
 # Budget-only field lists for the step-2 config read. Deliberately NOT the heavier control.*_FIELDS
 # (which carry targeting/objective) — pacing needs only the budget shape + status + parentage.
-PACING_CAMPAIGN_FIELDS: list[str] = ["id", "effective_status", "daily_budget", "lifetime_budget"]
+PACING_CAMPAIGN_FIELDS: list[str] = [
+    "id",
+    "effective_status",
+    "daily_budget",
+    "lifetime_budget",
+    "start_time",
+    "stop_time",
+]
 PACING_ADSET_FIELDS: list[str] = [
     "id",
     "campaign_id",
     "effective_status",
     "daily_budget",
     "lifetime_budget",
+    "start_time",
+    "stop_time",
 ]
 # Cap fields fetched per account in the budget worker. The perf["accounts"] rows carry only
 # account_id/name/currency/account_status[_label] (see the row built above), so the spend cap +
@@ -1727,8 +1736,9 @@ def _minor_to_major(value: Any, currency: str = "USD") -> float | None:
 
 def summarize_account_budget(
     campaigns: list[dict[str, Any]], adsets: list[dict[str, Any]], currency: str = "USD"
-) -> dict[str, float]:
-    """CBO-deduplicated ACTIVE budget for an account: ``{active_daily, lifetime_total}`` (major units).
+) -> dict[str, Any]:
+    """CBO-deduplicated ACTIVE budget for an account: ``{active_daily, lifetime_total,
+    lifetime_entities}`` (major units).
 
     Native minor units in (Meta ``daily_budget`` / ``lifetime_budget``), native MAJOR units out —
     converted via the ISO-4217 currency-aware :func:`_minor_to_major`. ``currency`` defaults to
@@ -1746,12 +1756,20 @@ def summarize_account_budget(
 
     Adsets whose parent campaign is not ACTIVE are ignored (the parent gates delivery). This mirrors
     :func:`control.classify_adset_budget`'s adset-daily-first-else-campaign shape rather than a
-    contradictory rule. Lifetime budgets are summed for *reporting* only — they are NOT projected
-    against an arbitrary reporting period (a lifetime budget spans the entity's own schedule; prorating
-    it needs campaign start/stop times not read here — a backlog follow-up).
+    contradictory rule.
+
+    Lifetime budgets are additionally emitted as ``lifetime_entities`` — one entry per ACTIVE
+    lifetime-owning entity, ``{"lifetime_budget": float (major units), "start_time": str | None,
+    "stop_time": str | None}`` with the schedule strings verbatim from Meta — so the caller can
+    prorate each pot across the overlap of its own schedule with the reporting window (see
+    :func:`lifetime_pacing`). The lifetime entity is whichever level owns the budget under the CBO
+    precedence above: the campaign for a CBO-lifetime campaign, the adset for a non-CBO adset-lifetime.
+    ``lifetime_total`` (the raw Σ, still returned) drives the reported context figure; the schedules
+    are what proration needs (different entities have different runs, so the sum alone is insufficient).
     """
     active_daily = 0.0
     lifetime_total = 0.0
+    lifetime_entities: list[dict[str, Any]] = []
 
     # Group ACTIVE adsets by parent campaign id for O(1) lookup inside the non-CBO branch.
     active_adsets_by_campaign: dict[str, list[dict[str, Any]]] = {}
@@ -1773,6 +1791,13 @@ def summarize_account_budget(
             continue
         if camp_lifetime > 0:
             lifetime_total += camp_lifetime  # CBO lifetime — ignore adsets.
+            lifetime_entities.append(
+                {
+                    "lifetime_budget": camp_lifetime,
+                    "start_time": campaign.get("start_time"),
+                    "stop_time": campaign.get("stop_time"),
+                }
+            )
             continue
         # Non-CBO campaign: budget lives on each ACTIVE adset (adset daily first, else adset lifetime).
         for adset in active_adsets_by_campaign.get(campaign_id, []):
@@ -1782,8 +1807,110 @@ def summarize_account_budget(
                 active_daily += adset_daily
             elif adset_lifetime > 0:
                 lifetime_total += adset_lifetime
+                lifetime_entities.append(
+                    {
+                        "lifetime_budget": adset_lifetime,
+                        "start_time": adset.get("start_time"),
+                        "stop_time": adset.get("stop_time"),
+                    }
+                )
 
-    return {"active_daily": active_daily, "lifetime_total": lifetime_total}
+    return {
+        "active_daily": active_daily,
+        "lifetime_total": lifetime_total,
+        "lifetime_entities": lifetime_entities,
+    }
+
+
+def _overlap_days(a_start: date, a_end: date, b_start: date, b_end: date) -> int:
+    """Inclusive-day overlap of ``[a_start, a_end]`` with ``[b_start, b_end]``; 0 if disjoint."""
+    start = max(a_start, b_start)
+    end = min(a_end, b_end)
+    return max(0, (end - start).days + 1)
+
+
+def _parse_schedule_date(value: Any) -> date | None:
+    """Leading ``YYYY-MM-DD`` of a Meta ISO time string -> :class:`date`; ``None`` if missing/blank/bad.
+
+    Timezone-agnostic calendar days, consistent with the rest of the pacing arithmetic: we take
+    ``str(value)[:10]`` and parse it, discarding any ``T…`` time/offset suffix Meta appends.
+    """
+    if value is None:
+        return None
+    text = str(value)[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def lifetime_pacing(
+    lifetime_entities: list[dict[str, Any]],
+    *,
+    date_from: str,
+    date_to: str,
+    effective_as_of: str,
+) -> dict[str, Any]:
+    """Prorate a set of lifetime-budget entities across the reporting window.
+
+    Meta paces a lifetime budget over the entity's own ``start_time..stop_time`` schedule, not the
+    arbitrary reporting window. To fold it into the period verdict we prorate each pot by the fraction
+    of its schedule that falls inside the window: ``lifetime_i * overlap_i / schedule_total_i``, where
+    the overlap is inclusive-day (mirroring :func:`pacing_period`'s ``(end - start).days + 1``).
+
+    Returns aggregated major-unit figures over all *projectable* entities::
+
+        {
+          "period_budget":    float,  # Σ lifetime_i * overlap_full_i   / schedule_total_i
+          "expected_to_date": float,  # Σ lifetime_i * overlap_todate_i / schedule_total_i
+          "n_entities":       int,    # total lifetime entities considered
+          "n_projectable":    int,    # entities with a valid schedule AND overlap_full > 0
+        }
+
+    where ``overlap_full`` is the overlap of the entity schedule with ``[date_from, date_to]`` and
+    ``overlap_todate`` its overlap with ``[date_from, effective_as_of]``. An entity is non-projectable
+    (contributes 0) when its lifetime budget is missing/<=0, either schedule bound is
+    blank/unparseable (open-ended lifetime budgets and missing starts fall here — a data anomaly, since
+    Meta requires an end time), ``stop_time <= start_time`` (bad data), or the schedule does not
+    overlap the window at all. An empty / all-non-projectable input returns zeros — the caller then
+    keeps ``budget_not_projectable``. All dates are explicit (clock-free), matching
+    :func:`pacing_period`'s testability posture.
+    """
+    window_start = date.fromisoformat(date_from)
+    window_end = date.fromisoformat(date_to)
+    as_of_end = date.fromisoformat(effective_as_of)
+
+    period_budget = 0.0
+    expected_to_date = 0.0
+    n_projectable = 0
+
+    for entity in lifetime_entities:
+        lifetime_budget = entity.get("lifetime_budget")
+        if lifetime_budget is None or lifetime_budget <= 0:
+            continue
+        start = _parse_schedule_date(entity.get("start_time"))
+        stop = _parse_schedule_date(entity.get("stop_time"))
+        if start is None or stop is None:
+            continue  # open-ended / missing bound -> non-projectable.
+        schedule_total = (stop - start).days + 1
+        if schedule_total <= 0:
+            continue  # stop <= start -> bad data, non-projectable.
+        overlap_full = _overlap_days(start, stop, window_start, window_end)
+        if overlap_full <= 0:
+            continue  # schedule wholly outside the window -> non-projectable.
+        n_projectable += 1
+        period_budget += lifetime_budget * overlap_full / schedule_total
+        # overlap_todate clips against [date_from, effective_as_of]; when the window has not started
+        # effective_as_of is date_from - 1, so this range is empty and the contribution is 0.
+        overlap_todate = _overlap_days(start, stop, window_start, as_of_end)
+        expected_to_date += lifetime_budget * overlap_todate / schedule_total
+
+    return {
+        "period_budget": period_budget,
+        "expected_to_date": expected_to_date,
+        "n_entities": len(lifetime_entities),
+        "n_projectable": n_projectable,
+    }
 
 
 def classify_pacing(
@@ -1804,8 +1931,11 @@ def classify_pacing(
        "under-pacing"). Excluded from the over/under math; spend-to-date is still reported.
     3. ``no_budget_set`` — no active daily budget, no lifetime budget, no spend cap (uncapped / free
        delivery). Excluded from over/under; reported explicitly (never counted as under-pacing).
-    4. ``budget_not_projectable`` — has a lifetime budget and/or spend cap but ZERO active daily budget
-       (can't project against the period). Excluded from over/under.
+    4. ``budget_not_projectable`` — a lifetime/cap-only account with no projectable schedule overlap
+       (combined ``period_budget <= 0`` or no projection): a spend-cap-only account, or a lifetime-only
+       account whose entities are all open-ended / non-overlapping / not-yet-started. Excluded from
+       over/under. (A lifetime budget whose schedule *does* overlap the window is prorated by the caller
+       and folded into ``period_budget``, so such an account gets a real over/under/on_track instead.)
     5. ``over`` / ``under`` / ``on_track`` — ``variance_pct = (projected_spend - period_budget) /
        period_budget``; ``over`` if ``> +tolerance``, ``under`` if ``< -tolerance``, else ``on_track``.
 
@@ -1820,8 +1950,13 @@ def classify_pacing(
     has_cap = spend_cap is not None and spend_cap > 0
     if active_daily_budget <= 0 and lifetime_budget_total <= 0 and not has_cap:
         return {"status": "no_budget_set", "variance_pct": None}
-    if active_daily_budget <= 0 or period_budget <= 0 or projected_spend is None:
-        # A lifetime/cap-only account (or a defensively-zero period budget) can't be projected.
+    if period_budget <= 0 or projected_spend is None:
+        # A lifetime/cap-only account with no projectable schedule overlap (or a defensively-zero
+        # combined period budget) can't be projected. The caller passes the COMBINED daily + prorated
+        # lifetime period_budget / projection, so dropping the old ``active_daily_budget <= 0`` clause
+        # lets a projectable lifetime-only account through while a cap-only account (period_budget == 0)
+        # still lands here. For a daily account period_budget = active_daily * total_days, so
+        # period_budget > 0 <=> active_daily > 0 — daily outcomes are unchanged.
         return {"status": "budget_not_projectable", "variance_pct": None}
 
     variance_pct = (projected_spend - period_budget) / period_budget
@@ -1874,11 +2009,16 @@ def pacing_report(
     tests always pass an explicit ``as_of``). :func:`pacing_period` clamps and derives
     ``elapsed_fraction``; :func:`project_spend` extrapolates ``spend_to_date / elapsed_fraction``.
 
-    **Authoritative period budget = ACTIVE daily-budget sum (CBO-deduped) x total_days.** The account
-    spend cap is a *lifetime* ceiling, so it is reported as context, **never the denominator**.
-    **Lifetime budgets are reported but NOT projected** (they span the entity's own schedule, not this
-    period) — a lifetime-only account is ``budget_not_projectable`` (prorating lifetime budgets via
-    campaign start/stop times is a backlog follow-up).
+    **Authoritative period budget = ACTIVE daily-budget sum (CBO-deduped) x total_days, plus prorated
+    lifetime budgets.** The account spend cap is a *lifetime* ceiling, so it is reported as context,
+    **never the denominator**. A **lifetime budget** is paced by Meta over the entity's own
+    ``start_time..stop_time`` schedule, not this window; :func:`lifetime_pacing` prorates each pot by
+    the inclusive-day overlap of that schedule with the window (``lifetime * overlap / schedule_total``)
+    and the result folds additively into ``period_budget`` / expected-to-date, so a lifetime or mixed
+    account earns a real over/under/on_track verdict. ``budget_not_projectable`` now means only a
+    residual: an open-ended lifetime budget (no ``stop_time``), a schedule that does not overlap the
+    window, or a spend-cap-only account — nothing with a projectable schedule falls here. Daily-only
+    accounts keep the literal ``daily * total_days`` computation (byte-identical output).
 
     **Units.** Budget/cap/amount_spent are minor units; insights ``spend`` is major units.
     :func:`_minor_to_major`'s divisor is ISO-4217 currency-aware (``10 ** minor_unit_exponent`` —
@@ -2005,8 +2145,32 @@ def pacing_report(
             spend_cap = None  # 0 / absent -> uncapped.
         amount_spent = _minor_to_major(account.get("amount_spent"), currency)
 
-        period_budget = active_daily * total_days
-        projected = project_spend(spend_to_date, elapsed_fraction)
+        # Prorate any ACTIVE lifetime budgets across the overlap of their own schedule with the window,
+        # then fold them additively into the daily period budget / expected-to-date. Only accounts with
+        # a projectable lifetime overlap use the combined form; daily-only (and lifetime-only-but-not-
+        # projectable) accounts keep the LITERAL existing daily computation so their output stays
+        # byte-identical (the combined ``spend * period_budget / expected`` form can differ in the last
+        # ULP from ``spend / elapsed_fraction``).
+        lifetime = lifetime_pacing(
+            budget["lifetime_entities"],
+            date_from=date_from,
+            date_to=date_to,
+            effective_as_of=effective_as_of,
+        )
+        daily_period_budget = active_daily * total_days
+        if lifetime["period_budget"] > 0:
+            period_budget = daily_period_budget + lifetime["period_budget"]
+            expected_to_date = (
+                daily_period_budget * elapsed_fraction + lifetime["expected_to_date"]
+            )
+            projected = (
+                spend_to_date * period_budget / expected_to_date
+                if expected_to_date > 0
+                else None
+            )
+        else:
+            period_budget = daily_period_budget  # byte-identical daily-only path.
+            projected = project_spend(spend_to_date, elapsed_fraction)
 
         verdict = classify_pacing(
             elapsed_fraction=elapsed_fraction,

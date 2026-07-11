@@ -11604,21 +11604,30 @@ def test_minor_to_major_currency_aware_divisor() -> None:
     assert M("0", "JPY") == 0.0
 
 
-def _pc_camp(cid, status="ACTIVE", daily=None, lifetime=None):
+def _pc_camp(cid, status="ACTIVE", daily=None, lifetime=None, start_time=None, stop_time=None):
     row = {"id": cid, "effective_status": status}
     if daily is not None:
         row["daily_budget"] = daily
     if lifetime is not None:
         row["lifetime_budget"] = lifetime
+    if start_time is not None:
+        row["start_time"] = start_time
+    if stop_time is not None:
+        row["stop_time"] = stop_time
     return row
 
 
-def _pc_adset(aid, campaign_id, status="ACTIVE", daily=None, lifetime=None):
+def _pc_adset(aid, campaign_id, status="ACTIVE", daily=None, lifetime=None,
+              start_time=None, stop_time=None):
     row = {"id": aid, "campaign_id": campaign_id, "effective_status": status}
     if daily is not None:
         row["daily_budget"] = daily
     if lifetime is not None:
         row["lifetime_budget"] = lifetime
+    if start_time is not None:
+        row["start_time"] = start_time
+    if stop_time is not None:
+        row["stop_time"] = stop_time
     return row
 
 
@@ -11685,6 +11694,115 @@ def test_summarize_account_budget_currency_aware() -> None:
     assert kwd["active_daily"] == pytest.approx(30.0)
 
 
+def test_summarize_account_budget_lifetime_entities() -> None:
+    import pytest
+
+    S = _account_discovery.summarize_account_budget
+
+    # CBO-lifetime campaign: the CAMPAIGN owns the entity + carries its schedule (adsets ignored).
+    cbo_life = S(
+        [_pc_camp("c1", lifetime="700000", start_time="2026-07-01T00:00:00-0700",
+                  stop_time="2026-07-31T23:59:00-0700")],
+        [_pc_adset("as1", "c1", lifetime="999999")],  # ignored under CBO
+    )
+    assert cbo_life["lifetime_total"] == pytest.approx(7000.0)
+    assert cbo_life["lifetime_entities"] == [
+        {"lifetime_budget": pytest.approx(7000.0),
+         "start_time": "2026-07-01T00:00:00-0700", "stop_time": "2026-07-31T23:59:00-0700"}
+    ]
+
+    # Non-CBO campaign: each ACTIVE adset-lifetime emits its OWN entity + schedule (major units).
+    non_cbo = S(
+        [_pc_camp("c1")],
+        [
+            _pc_adset("as1", "c1", lifetime="160000", start_time="2026-07-05", stop_time="2026-07-20"),
+            _pc_adset("as2", "c1", lifetime="240000", start_time="2026-07-10", stop_time="2026-07-25"),
+        ],
+    )
+    assert non_cbo["lifetime_total"] == pytest.approx(4000.0)
+    assert non_cbo["lifetime_entities"] == [
+        {"lifetime_budget": pytest.approx(1600.0), "start_time": "2026-07-05", "stop_time": "2026-07-20"},
+        {"lifetime_budget": pytest.approx(2400.0), "start_time": "2026-07-10", "stop_time": "2026-07-25"},
+    ]
+
+    # A daily-only account emits NO lifetime entities.
+    daily = S([_pc_camp("c1", daily="30000")], [])
+    assert daily["lifetime_entities"] == []
+
+    # CBO-DAILY campaign: no lifetime entity even if a decoy adset carries one (double-count guard).
+    cbo_daily = S(
+        [_pc_camp("c1", daily="30000")],
+        [_pc_adset("as1", "c1", lifetime="500000", start_time="2026-07-01", stop_time="2026-07-31")],
+    )
+    assert cbo_daily["lifetime_entities"] == []
+
+    # A paused lifetime campaign contributes nothing (parent gates delivery).
+    paused = S([_pc_camp("c1", status="PAUSED", lifetime="500000",
+                         start_time="2026-07-01", stop_time="2026-07-31")], [])
+    assert paused["lifetime_entities"] == [] and paused["lifetime_total"] == 0.0
+
+
+def test_lifetime_pacing_proration() -> None:
+    import pytest
+
+    L = _account_discovery.lifetime_pacing
+    kw = dict(date_from="2026-07-01", date_to="2026-07-31", effective_as_of="2026-07-14")
+
+    def _ent(lifetime, start, stop):
+        return {"lifetime_budget": lifetime, "start_time": start, "stop_time": stop}
+
+    # Schedule == window (31 days): whole pot in-window; expected-to-date = 14/31 of it.
+    same = L([_ent(9300.0, "2026-07-01", "2026-07-31")], **kw)
+    assert same["period_budget"] == pytest.approx(9300.0)
+    assert same["expected_to_date"] == pytest.approx(9300.0 * 14 / 31)
+    assert same["n_entities"] == 1 and same["n_projectable"] == 1
+
+    # Schedule wholly inside the window (2026-07-05..2026-07-20 = 16 days): whole pot expected within
+    # the window; overlap_todate (07-05..07-14) = 10 days.
+    inside = L([_ent(1600.0, "2026-07-05", "2026-07-20")], **kw)
+    assert inside["period_budget"] == pytest.approx(1600.0)
+    assert inside["expected_to_date"] == pytest.approx(1600.0 * 10 / 16)
+
+    # Schedule straddling the start (2026-06-15..2026-07-20 = 36 days): overlap clipped to date_from.
+    # overlap_full = 07-01..07-20 = 20 days; overlap_todate = 07-01..07-14 = 14 days.
+    straddle = L([_ent(3600.0, "2026-06-15", "2026-07-20")], **kw)
+    assert straddle["period_budget"] == pytest.approx(3600.0 * 20 / 36)
+    assert straddle["expected_to_date"] == pytest.approx(3600.0 * 14 / 36)
+
+    # No overlap (wholly after the window) -> zeros, not projectable.
+    none = L([_ent(5000.0, "2026-08-01", "2026-08-31")], **kw)
+    assert none == {"period_budget": 0.0, "expected_to_date": 0.0, "n_entities": 1, "n_projectable": 0}
+
+    # Open-ended (stop_time None) -> non-projectable.
+    open_ended = L([_ent(5000.0, "2026-07-01", None)], **kw)
+    assert open_ended["period_budget"] == 0.0 and open_ended["n_projectable"] == 0
+
+    # Missing start -> non-projectable.
+    no_start = L([_ent(5000.0, None, "2026-07-31")], **kw)
+    assert no_start["n_projectable"] == 0
+
+    # stop <= start (bad data) -> non-projectable.
+    inverted = L([_ent(5000.0, "2026-07-20", "2026-07-05")], **kw)
+    assert inverted["n_projectable"] == 0
+
+    # Window elapsed but entity schedule not yet started (starts after as_of): overlap_full > 0 but
+    # overlap_todate == 0 -> contributes to period_budget, nothing to expected_to_date.
+    not_started_yet = L([_ent(1000.0, "2026-07-20", "2026-07-31")], **kw)
+    assert not_started_yet["period_budget"] == pytest.approx(1000.0)  # whole schedule in-window
+    assert not_started_yet["expected_to_date"] == 0.0
+    assert not_started_yet["n_projectable"] == 1
+
+    # Multiple entities aggregate (order-independent sum).
+    multi = L([_ent(9300.0, "2026-07-01", "2026-07-31"), _ent(1600.0, "2026-07-05", "2026-07-20")], **kw)
+    assert multi["period_budget"] == pytest.approx(9300.0 + 1600.0)
+    assert multi["expected_to_date"] == pytest.approx(9300.0 * 14 / 31 + 1600.0 * 10 / 16)
+    assert multi["n_entities"] == 2 and multi["n_projectable"] == 2
+
+    # Empty input -> zeros.
+    empty = L([], **kw)
+    assert empty == {"period_budget": 0.0, "expected_to_date": 0.0, "n_entities": 0, "n_projectable": 0}
+
+
 def test_classify_pacing_status_enum_and_boundaries() -> None:
     C = _account_discovery.classify_pacing
     common = dict(elapsed_fraction=0.5, account_status_label="ACTIVE", lifetime_budget_total=0.0,
@@ -11703,10 +11821,16 @@ def test_classify_pacing_status_enum_and_boundaries() -> None:
     assert C(elapsed_fraction=0.5, account_status_label="ACTIVE", active_daily_budget=0.0,
              lifetime_budget_total=0.0, spend_cap=None, period_budget=0.0,
              projected_spend=10.0)["status"] == "no_budget_set"
-    # budget_not_projectable: lifetime-only (has a lifetime budget but zero active daily).
+    # budget_not_projectable: lifetime-only with NO projectable overlap -> combined period_budget 0.
     assert C(elapsed_fraction=0.5, account_status_label="ACTIVE", active_daily_budget=0.0,
              lifetime_budget_total=5000.0, spend_cap=None, period_budget=0.0,
              projected_spend=10.0)["status"] == "budget_not_projectable"
+    # Relaxed guard: a lifetime-only account with ZERO active daily but a projectable combined
+    # period_budget > 0 and a non-None projection now gets a real over/under/on_track verdict.
+    proj_life = C(elapsed_fraction=0.5, account_status_label="ACTIVE", active_daily_budget=0.0,
+                  lifetime_budget_total=5000.0, spend_cap=None, period_budget=100.0,
+                  projected_spend=200.0)
+    assert proj_life == {"status": "over", "variance_pct": 1.0}
     # account_inactive short-circuits even with a real budget.
     assert C(**{**common, "account_status_label": "DISABLED"},
              period_budget=100.0, projected_spend=200.0)["status"] == "account_inactive"
@@ -11894,6 +12018,82 @@ def test_pacing_report_shortlist_tiebreak_by_account_id(monkeypatch) -> None:
     out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
     assert [s["ad_account_id"] for s in out["rollup"]["worst_over_pacers"]] == ["act_aaa", "act_bbb"]
     assert [s["ad_account_id"] for s in out["rollup"]["worst_under_pacers"]] == ["act_aaa", "act_bbb"]
+
+
+def test_pacing_report_prorates_lifetime_budgets_end_to_end(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    ef = _EF  # 14/31
+
+    accounts = [
+        # lifetime-only, schedule == window -> was budget_not_projectable, now a REAL verdict.
+        {"id": "act_life_ok", "account_id": "1", "name": "LifeOK", "account_status": 1, "currency": "USD"},
+        # lifetime-only, schedule wholly AFTER the window -> stays budget_not_projectable.
+        {"id": "act_life_no", "account_id": "2", "name": "LifeNo", "account_status": 1, "currency": "USD"},
+        # mixed: CBO-daily + a CBO-lifetime whose schedule straddles date_from (fractional overlap).
+        {"id": "act_mixed", "account_id": "3", "name": "Mixed", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_life_ok": [{"spend": "6300.00"}],
+        "act_life_no": [{"spend": "800.00"}],
+        "act_mixed": [{"spend": "2000.00"}],
+    }
+    campaigns = {
+        # 9300 lifetime over the full 31-day window: period_budget == 9300, expected == 9300*14/31.
+        "act_life_ok": [_pc_camp("cA", lifetime="930000",
+                                 start_time="2026-07-01", stop_time="2026-07-31")],
+        # 5000 lifetime entirely in August: no overlap with July window.
+        "act_life_no": [_pc_camp("cB", lifetime="500000",
+                                 start_time="2026-08-01", stop_time="2026-08-31")],
+        # CBO-daily 100/day (period 3100) + CBO-lifetime 6200 over 2026-06-16..2026-07-15 (30 days),
+        # of which July 1-15 (15 days) fall in-window -> prorated lifetime period budget 6200*15/30 == 3100.
+        "act_mixed": [
+            _pc_camp("cM1", daily="10000"),
+            _pc_camp("cM2", lifetime="620000", start_time="2026-06-16", stop_time="2026-07-15"),
+        ],
+    }
+    reader = _pacing_reader(accounts, insights, campaigns, {}, {})
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
+    by_id = {a["ad_account_id"]: a for a in out["accounts"]}
+
+    # (1) lifetime-only overlapping -> real verdict grounded in the prorated expectation.
+    ok = by_id["act_life_ok"]
+    assert ok["active_daily_budget"] == 0.0
+    assert ok["lifetime_budget_total"] == pytest.approx(9300.0)
+    assert ok["period_budget"] == pytest.approx(9300.0)                 # full pot in-window
+    assert ok["projected_spend"] == pytest.approx(6300.0 * 31 / 14)     # spend * pb / expected
+    assert ok["projected_spend"] == pytest.approx(13950.0)
+    assert ok["variance_pct"] == pytest.approx(0.5)
+    assert ok["status"] == "over"
+
+    # (2) lifetime-only, non-overlapping schedule -> stays budget_not_projectable (residual case).
+    no = by_id["act_life_no"]
+    assert no["status"] == "budget_not_projectable"
+    assert no["variance_pct"] is None
+    assert no["lifetime_budget_total"] == pytest.approx(5000.0)
+    assert no["period_budget"] == 0.0
+
+    # (3) mixed -> combined period_budget == daily period budget + prorated lifetime period budget.
+    mixed = by_id["act_mixed"]
+    assert mixed["active_daily_budget"] == pytest.approx(100.0)
+    assert mixed["lifetime_budget_total"] == pytest.approx(6200.0)
+    assert mixed["period_budget"] == pytest.approx(3100.0 + 3100.0)     # 100*31 + 6200*15/30
+    expected_to_date = 3100.0 * ef + 6200.0 * 14 / 30                   # daily + lifetime overlap-todate
+    assert mixed["projected_spend"] == pytest.approx(2000.0 * 6200.0 / expected_to_date)
+    assert mixed["status"] in {"over", "under", "on_track"}
+    assert mixed["status"] == "under"
+
+    # Rollup: the two projectable accounts now enter the normalized totals + shortlists; only the
+    # non-overlapping lifetime account is excluded.
+    rollup = out["rollup"]
+    assert rollup["status_counts"]["over"] == 1
+    assert rollup["status_counts"]["under"] == 1
+    assert rollup["status_counts"]["budget_not_projectable"] == 1
+    assert rollup["excluded_from_rollup"] == 1  # only act_life_no
+    assert rollup["total_period_budget_normalized"] == pytest.approx(9300.0 + 6200.0)  # USD rate 1
+    assert rollup["worst_over_pacers"][0]["ad_account_id"] == "act_life_ok"
+    assert out["errors"] == []
 
 
 def test_pacing_report_no_fx_account_native_only_in_shortlist_not_normalized_totals(monkeypatch) -> None:
