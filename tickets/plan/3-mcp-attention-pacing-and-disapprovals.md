@@ -1,5 +1,5 @@
 description: Extend the "which accounts need attention" scan with two heavier signals it doesn't yet cover — whether an account is off its budget pace, and whether individual ads have been disapproved — so the attention list is complete rather than just the behavior-change signals.
-prereq: mcp-flag-accounts-attention, mcp-pacing-report
+prereq: pacing-currency-aware-minor-units, pacing-prorate-lifetime-budgets
 files: src/meta_ads_analysis/account_discovery.py, src/meta_ads_analysis/mcp_server.py, tests/test_meta_ads_analysis.py
 ----
 

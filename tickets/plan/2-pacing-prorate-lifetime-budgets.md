@@ -1,4 +1,5 @@
 description: The budget-pacing tool can tell you whether an account is on track when its budget is set as a daily amount, but when the budget is instead a single lifetime pot spread over a campaign's whole run, it just reports the number and says "can't project" — it never works out whether that account is ahead of or behind schedule.
+prereq: pacing-currency-aware-minor-units
 files: src/meta_ads_analysis/account_discovery.py, tests/test_meta_ads_analysis.py
 difficulty: hard
 ----
