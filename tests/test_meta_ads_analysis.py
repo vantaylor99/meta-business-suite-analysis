@@ -9000,6 +9000,7 @@ def test_followups_mark_done_missing_ok_is_idempotent(tmp_path: Path) -> None:
 
 from meta_ads_analysis import account_discovery as _account_discovery  # noqa: E402
 from meta_ads_analysis import currency as _currency  # noqa: E402
+from meta_ads_analysis import goal_grading as _goal_grading  # noqa: E402
 from meta_ads_analysis import mcp_server as _mcp_server  # noqa: E402
 from meta_ads_analysis.meta_api import access_token_from_env, meta_api_version_from_env  # noqa: E402
 from meta_ads_analysis.reader_provider import reader_backend_from_env  # noqa: E402
@@ -9676,7 +9677,7 @@ def test_cross_account_summary_mock_smoke_single_usd_account() -> None:
 def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     reader = _summary_reader()
     discovery = _mcp_server.build_discovery_tools(reader)
-    # All seven discovery tools are exposed.
+    # All ten discovery tools are exposed.
     assert set(discovery) == {
         "list_ad_accounts",
         "cross_account_spend_summary",
@@ -9685,6 +9686,9 @@ def test_build_discovery_tools_exposes_cross_account_summary() -> None:
         "flag_accounts_needing_attention",
         "pacing_report",
         "rank_accounts",
+        "grade_accounts_against_goals",
+        "cross_account_creative_triage",
+        "portfolio_digest",
     }
     summary = discovery["cross_account_spend_summary"]("2026-06-01", "2026-06-30")
     assert set(summary["totals_by_currency"]) == {"USD", "EUR"}
@@ -9693,6 +9697,10 @@ def test_build_discovery_tools_exposes_cross_account_summary() -> None:
     assert "account_benchmark" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "flag_accounts_needing_attention" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
     assert "pacing_report" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "rank_accounts" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "grade_accounts_against_goals" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "cross_account_creative_triage" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    assert "portfolio_digest" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
 
 
 def test_cross_account_summary_insight_fields_restricts_metrics_summed() -> None:
@@ -12380,6 +12388,116 @@ def test_build_discovery_tools_flag_accounts_attention_ad_health_smoke(monkeypat
     assert ad_reads_after == ad_reads_before  # the off-path issued no additional ad read
 
 
+# --- flag_accounts_needing_attention: precomputed_current_perf composition seam (MOCKS ONLY) ---
+
+
+def test_flag_precomputed_current_perf_baseline_only_fanout(monkeypatch) -> None:
+    # Seam: injecting the CURRENT-window perf skips the current fan-out — flag issues fetch_insights
+    # for the BASELINE window ONLY (one fan-out, not two) — and returns output identical to the
+    # non-injected run over the same data.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "Collapse", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {
+        "act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_2": [{"spend": "400.00", "impressions": "4000", "clicks": "200"}],
+    }
+    current_rows = {
+        "act_1": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],  # +200% spike (high)
+        "act_2": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],   # -75% collapse (high)
+    }
+    windows = {"2026-06-01": baseline_rows, "2026-06-08": current_rows}
+
+    # Reference: no injection -> both windows fetched.
+    ref_reader = _attention_reader(accounts, windows)
+    reference = _account_discovery.flag_accounts_needing_attention(
+        ref_reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+
+    # The CURRENT-window perf the digest would already hold (same args flag builds internally).
+    perf_reader = _attention_reader(accounts, windows)
+    current_perf = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-06-08", date_to="2026-06-14", level="account", fx_table=_fx()
+    )
+    assert current_perf["reporting_currency"] == "USD"
+
+    # Inject it: the current fan-out is skipped; ONLY the baseline window reaches fetch_insights.
+    read_windows: list[str] = []
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        read_windows.append(date_from)
+        return [dict(r) for r in windows.get(date_from, {}).get(ad_account_id, [])]
+
+    inj_reader = _attention_reader(accounts, windows, fetch_insights=_fetch)
+    injected = _account_discovery.flag_accounts_needing_attention(
+        inj_reader, current_from="2026-06-08", current_to="2026-06-14",
+        fx_table=_fx(), precomputed_current_perf=current_perf,
+    )
+
+    # Only the baseline window was read, exactly once per account -> a single fan-out, not two.
+    assert set(read_windows) == {"2026-06-01"}
+    assert len(read_windows) == 2  # N accounts, one baseline fan-out (current is injected)
+    assert injected == reference  # byte-identical to the self-fetching run
+
+
+def test_flag_precomputed_current_perf_currency_mismatch_raises(monkeypatch) -> None:
+    # Defensive guard: an injected current perf normalized to a different reporting_currency than the
+    # call resolves is a misuse -> ValueError raised BEFORE any read (never a silently-mixed join).
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    perf_eur = {"accounts": [], "errors": [], "reporting_currency": "EUR"}
+    reader = FakeMetaReader()  # any read would raise NotImplementedError; the guard must fire first
+    with pytest.raises(ValueError, match="reporting_currency"):
+        _account_discovery.flag_accounts_needing_attention(
+            reader, current_from="2026-06-08", current_to="2026-06-14",
+            reporting_currency="USD", fx_table=_fx(), precomputed_current_perf=perf_eur,
+        )
+    assert reader.calls == []  # failed fast, before touching the reader
+
+
+def test_flag_precomputed_current_perf_errors_tagged_current(monkeypatch) -> None:
+    # Seam contract that portfolio_digest leans on: the errors carried by the INJECTED current perf are
+    # merged into flag's output tagged window="current" (never "baseline") — this is exactly what lets
+    # the digest skip them (they are the shared perf's, already tagged section="performance") without
+    # double-counting. A baseline read failure, by contrast, surfaces tagged window="baseline".
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+
+    def _boom(msg):
+        def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+            raise _account_discovery.MetaApiError(msg)
+        return _fetch
+
+    # A REAL cross_account_performance result (all fx_as_of/account_count keys the seam reads) whose one
+    # account failed the current read -> it lands in current_perf["errors"], with zero readable rows.
+    ghost = [{"id": "act_ghost", "account_id": "g", "name": "Ghost", "account_status": 1, "currency": "USD"}]
+    perf_reader = _attention_reader(ghost, {}, fetch_insights=_boom("(#100) current-window unreadable"))
+    current_perf = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-06-08", date_to="2026-06-14", level="account", fx_table=_fx()
+    )
+    assert current_perf["accounts"] == [] and current_perf["reporting_currency"] == "USD"
+    assert any(e["ad_account_id"] == "act_ghost" for e in current_perf["errors"])
+
+    # Inject it; flag's OWN reader (a different, disjoint scope) fails the baseline read for act_1.
+    baseline_reader = _attention_reader(
+        [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}],
+        {}, fetch_insights=_boom("(#1) baseline read failed"),
+    )
+    out = _account_discovery.flag_accounts_needing_attention(
+        baseline_reader, current_from="2026-06-08", current_to="2026-06-14",
+        reporting_currency="USD", fx_table=_fx(), precomputed_current_perf=current_perf,
+    )
+
+    by_window = {(e["ad_account_id"], e["window"]) for e in out["errors"]}
+    # The injected perf's error is tagged current (so the digest skips it), NOT baseline.
+    assert ("act_ghost", "current") in by_window
+    assert ("act_ghost", "baseline") not in by_window
+    # The genuinely-new baseline read failure surfaces under window="baseline".
+    assert ("act_1", "baseline") in by_window
+
+
 # --- pacing_report: pure helpers (clock-free, no reader) --------------------
 
 
@@ -13263,6 +13381,99 @@ def test_pacing_report_as_of_none_defaults_to_utc_today(monkeypatch) -> None:
     assert out["accounts"][0]["status"] == "on_track"
 
 
+# --- pacing_report: precomputed_perf composition seam (MOCKS ONLY) ----------
+
+
+def test_pacing_precomputed_perf_skips_step1_fetch(monkeypatch) -> None:
+    # Seam: injecting the step-1 spend perf skips the perf fan-out entirely — pacing issues NO
+    # fetch_insights and NO list_ad_accounts (scope comes from the injected perf), only the 3N budget
+    # reads (list_campaigns / list_adsets / get_account) — and returns output identical to self-fetch.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_ontrack", "account_id": "1", "name": "OnTrack", "account_status": 1, "currency": "USD"},
+        {"id": "act_over", "account_id": "2", "name": "Over", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {"act_ontrack": [{"spend": "4200.00"}], "act_over": [{"spend": "2000.00"}]}
+    campaigns = {
+        "act_ontrack": [_pc_camp("c1", daily="30000")],  # daily 300 -> on_track over the 14/31 window
+        "act_over": [_pc_camp("c2", daily="10000")],      # daily 100 -> over
+    }
+    caps = {a["id"]: {"currency": "USD", "amount_spent": "5100000"} for a in accounts}
+
+    # Reference: self-fetch (step 1 spend read + step 2 budget reads).
+    ref_reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    reference = _account_discovery.pacing_report(ref_reader, fx_table=_fx(), **_PACING_KW)
+
+    # The step-1 perf the digest holds: over [date_from, effective_as_of] (as_of makes elapsed>0).
+    perf_reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    perf = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-07-01", date_to="2026-07-14", level="account", fx_table=_fx()
+    )
+    assert perf["reporting_currency"] == "USD"
+
+    inj_reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    injected = _account_discovery.pacing_report(
+        inj_reader, fx_table=_fx(), precomputed_perf=perf, **_PACING_KW
+    )
+
+    call_names = [c[0] for c in inj_reader.calls]
+    assert "fetch_insights" not in call_names   # step 1 skipped
+    assert "list_ad_accounts" not in call_names  # scope came from the injected perf
+    # Exactly the 3N budget fan-out (3 reads x 2 accounts), nothing more.
+    assert sorted(call_names) == sorted(["list_campaigns", "list_adsets", "get_account"] * 2)
+    assert injected == reference  # byte-identical to the self-fetching run
+
+
+def test_pacing_precomputed_perf_currency_mismatch_raises(monkeypatch) -> None:
+    # Defensive guard (mirrors flag): an injected perf whose reporting_currency differs from the call's
+    # -> ValueError BEFORE any read. Only checked on the used path (elapsed_fraction > 0).
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    perf_eur = {"accounts": [], "errors": [], "reporting_currency": "EUR"}
+    reader = FakeMetaReader()  # any read would raise NotImplementedError; the guard must fire first
+    with pytest.raises(ValueError, match="reporting_currency"):
+        _account_discovery.pacing_report(
+            reader, date_from="2026-07-01", date_to="2026-07-31", as_of="2026-07-14",  # elapsed > 0
+            reporting_currency="USD", fx_table=_fx(), precomputed_perf=perf_eur,
+        )
+    assert reader.calls == []  # failed fast, before touching the reader
+
+
+def test_pacing_precomputed_perf_ignored_when_not_started(monkeypatch) -> None:
+    # Defensive branch: when the period has not started (elapsed_fraction <= 0) the injected perf is
+    # IGNORED and pacing self-reads the clamped [date_from, date_from] window. A DIFFERENT (bogus)
+    # account in the injected perf must never surface, proving the injection was not used.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    reads: list[tuple[str, str]] = []
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        reads.append((date_from, date_to))  # a self-read must happen, and never invert
+        return [{"spend": "10.00"}]
+
+    reader = _pacing_reader(
+        accounts, {}, {"act_1": [_pc_camp("c1", daily="10000")]}, {}, {"act_1": {}},
+        fetch_insights=_fetch,
+    )
+    bogus_perf = {
+        "accounts": [{
+            "ad_account_id": "act_ghost", "account_id": "ghost", "name": "Ghost", "currency": "USD",
+            "spend": 999.0, "spend_normalized": 999.0, "account_status_label": "ACTIVE",
+        }],
+        "errors": [],
+        "reporting_currency": "USD",
+    }
+    out = _account_discovery.pacing_report(
+        reader, date_from="2026-08-01", date_to="2026-08-31", as_of="2026-07-15",  # elapsed <= 0
+        fx_table=_fx(), precomputed_perf=bogus_perf,
+    )
+    # The injected ghost account never appears; the self-read's act_1 does.
+    assert [a["ad_account_id"] for a in out["accounts"]] == ["act_1"]
+    assert out["accounts"][0]["status"] == "not_started"
+    assert reads and all(df <= dt for df, dt in reads)  # a self-read happened, window not inverted
+
+
 # --- rank_accounts: pure post-processor over cross_account_performance ---
 
 
@@ -13590,6 +13801,386 @@ def test_rank_accounts_respects_account_ids_subset(monkeypatch) -> None:
     assert out["ranked_total"] == 2
     assert out["account_count"] == 2
     assert not any(c[0] == "list_ad_accounts" for c in reader.calls)
+
+
+# --- cross_account_creative_triage: ad-level sibling of rank_accounts (MOCKS ONLY) ---
+
+
+def test_creative_triage_pools_and_ranks_ads_across_accounts_by_spend(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "Beta", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "ad_name": "A-100", "spend": "50.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "101", "ad_name": "A-101", "spend": "200.00", "impressions": "4000", "clicks": "40"},
+        ],
+        "act_2": [
+            {"ad_id": "200", "ad_name": "B-200", "spend": "500.00", "impressions": "9000", "clicks": "90"},
+            {"ad_id": "201", "ad_name": "B-201", "spend": "10.00", "impressions": "200", "clicks": "2"},
+        ],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=3, fx_table=_fx()
+    )
+    assert out["metric"] == "spend"
+    assert out["order"] == "desc"
+    assert out["account_count"] == 2
+    assert out["ad_count"] == 4          # every delivering ad pooled
+    assert out["ranked_total"] == 4      # all four are rankable on spend
+    assert len(out["ranked"]) == 3       # truncated to limit
+    # Highest-spend ads across the pool, correct rank + ad identity.
+    assert [r["ad_id"] for r in out["ranked"]] == ["200", "101", "100"]
+    assert [r["rank"] for r in out["ranked"]] == [1, 2, 3]
+    top = out["ranked"][0]
+    assert top["ad_account_id"] == "act_2"
+    assert top["account_name"] == "Beta"
+    assert top["ad_name"] == "B-200"
+    assert top["value"] == pytest.approx(500.0)
+    assert top["value_native"] == pytest.approx(500.0)
+
+
+def test_creative_triage_ascending_returns_losers(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "Beta", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "ad_name": "A-100", "spend": "50.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "101", "ad_name": "A-101", "spend": "200.00", "impressions": "4000", "clicks": "40"},
+        ],
+        "act_2": [
+            {"ad_id": "200", "ad_name": "B-200", "spend": "500.00", "impressions": "9000", "clicks": "90"},
+            {"ad_id": "201", "ad_name": "B-201", "spend": "10.00", "impressions": "200", "clicks": "2"},
+        ],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="asc", limit=3, fx_table=_fx()
+    )
+    assert out["order"] == "asc"
+    # asc: cheapest/worst end first.
+    assert [r["ad_id"] for r in out["ranked"]] == ["201", "100", "101"]
+    assert out["ranked"][0]["rank"] == 1
+
+
+def test_creative_triage_cost_per_result_zero_result_ad_is_unranked(monkeypatch) -> None:
+    import math
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"}]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "ad_name": "Has results", "spend": "100.00", "impressions": "1000",
+             "clicks": "50", "actions": [{"action_type": "lead", "value": "5"}]},   # cpr = 20
+            {"ad_id": "101", "ad_name": "No results", "spend": "80.00", "impressions": "800",
+             "clicks": "40", "actions": []},                                        # no results -> no cpr
+        ]
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="cost_per_result", order="asc", limit=10, fx_table=_fx()
+    )
+    ranked_ids = [r["ad_id"] for r in out["ranked"]]
+    assert ranked_ids == ["100"]
+    assert len(out["unranked"]) == 1
+    assert out["unranked"][0]["ad_id"] == "101"
+    assert out["unranked"][0]["reason"] == "metric unavailable"
+    # Never inf: the ranked value is a finite cost-per-result.
+    assert math.isfinite(out["ranked"][0]["value"])
+    assert out["ranked"][0]["value"] == 20.0
+
+
+def test_creative_triage_money_metric_ranks_on_normalized_twin(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "MX", "account_status": 1, "currency": "MXN"},
+        {"id": "act_2", "account_id": "2", "name": "EU", "account_status": 1, "currency": "EUR"},
+    ]
+    insights = {
+        "act_1": [{"ad_id": "100", "ad_name": "MXN ad", "spend": "1000.00", "impressions": "5000", "clicks": "50"}],
+        "act_2": [{"ad_id": "200", "ad_name": "EUR ad", "spend": "100.00", "impressions": "2000", "clicks": "20"}],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    # MXN 1000 -> 55 USD; EUR 100 -> 108 USD. desc ranks on the normalized twin: EUR first.
+    assert [r["ad_id"] for r in out["ranked"]] == ["200", "100"]
+    assert out["ranked"][0]["value"] == pytest.approx(108.0)     # normalized (USD)
+    assert out["ranked"][0]["value_native"] == pytest.approx(100.0)   # native EUR
+    assert out["ranked"][1]["value"] == pytest.approx(55.0)      # normalized (USD)
+    assert out["ranked"][1]["value_native"] == pytest.approx(1000.0)  # native MXN
+
+
+def test_creative_triage_no_fx_currency_ad_is_unranked_and_errored_once(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "JP", "account_status": 1, "currency": "JPY"}]
+    insights = {
+        "act_1": [{"ad_id": "100", "ad_name": "JPY ad", "spend": "5000.00", "impressions": "2000", "clicks": "40"}],
+    }
+    reader = _perf_reader(accounts, insights)  # JPY has no rate in _fx()
+
+    # Money metric: ad falls to unranked (reason names the currency), exactly ONE error for the account.
+    money = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    assert money["ranked"] == []
+    assert len(money["unranked"]) == 1
+    assert money["unranked"][0]["ad_id"] == "100"
+    assert "JPY" in money["unranked"][0]["reason"] and "no FX rate" in money["unranked"][0]["reason"]
+    assert len(money["errors"]) == 1
+    assert money["errors"][0]["ad_account_id"] == "act_1"
+
+    # Ratio metric (ctr = 40/2000*100 = 2.0) is currency-invariant: the ad ranks fine.
+    ratio = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="ctr", order="desc", limit=10, fx_table=_fx()
+    )
+    assert len(ratio["ranked"]) == 1
+    assert ratio["ranked"][0]["ad_id"] == "100"
+    assert ratio["ranked"][0]["value"] == 2.0
+
+
+def test_creative_triage_resolves_lead_family_per_account(monkeypatch) -> None:
+    import pytest
+
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+
+    accounts = [{"id": "act_103014553", "account_id": "103014553", "name": "Seattle",
+                 "account_status": 1, "currency": "USD"}]
+    insights = {"act_103014553": [{
+        "ad_id": "500", "ad_name": "Lead ad", "spend": "436.81", "impressions": "10000", "clicks": "200",
+        "actions": [
+            {"action_type": "onsite_conversion.lead_grouped", "value": "12"},
+            {"action_type": "lead", "value": "12"},
+        ],
+    }]}
+    reader = _perf_reader(accounts, insights)
+    fake_registry = {
+        "act_103014553": MetaAdsAccount(
+            account_slug="seattle_mission", account_name="Seattle", ad_account_id="act_103014553",
+            primary_result_action_type="leadgen_grouped",  # STALE key -> self-heals via lead family
+            primary_result_label="Leads (form)", roas_role="not_applicable",
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: fake_registry)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-07-01", date_to="2026-07-01",
+        metric="cost_per_result", order="asc", limit=10, fx_table=_fx()
+    )
+    row = out["ranked"][0]
+    assert row["ad_id"] == "500"
+    assert row["result_label"] == "Leads (form)"
+    assert row["value"] == pytest.approx(436.81 / 12)  # spend / leads (single value, not summed to 24)
+
+
+def test_creative_triage_config_result_key_wins_over_inference(monkeypatch) -> None:
+    # Ad carries BOTH a purchase (10) and a lead (3). Inference would pick purchase (PURCHASE before
+    # LEAD); the configured lead key must win -> results reads the lead value.
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Cfg", "account_status": 1, "currency": "USD"}]
+    insights = {"act_1": [{
+        "ad_id": "100", "ad_name": "Mixed ad", "spend": "90.00", "impressions": "1000", "clicks": "50",
+        "actions": [{"action_type": "purchase", "value": "10"}, {"action_type": "lead", "value": "3"}],
+        "action_values": [{"action_type": "purchase", "value": "500"}],
+    }]}
+    reader = _perf_reader(accounts, insights)
+    fake_registry = {
+        "act_1": MetaAdsAccount(
+            account_slug="cfg", account_name="Cfg", ad_account_id="act_1",
+            primary_result_action_type="lead", primary_result_label="Sign-ups",
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: fake_registry)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="results", order="desc", limit=10, fx_table=_fx()
+    )
+    row = out["ranked"][0]
+    assert row["value"] == 3               # lead value (config key), NOT the purchase 10 (inference)
+    assert row["result_label"] == "Sign-ups"
+
+
+def test_creative_triage_partial_account_failure_isolated_and_deterministic(monkeypatch) -> None:
+    import time
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": f"act_{i}", "account_id": str(i), "name": f"A{i}", "account_status": 1, "currency": "USD"}
+        for i in range(1, 4)
+    ]
+    insights = {
+        "act_1": [{"ad_id": "10", "ad_name": "a", "spend": "100.00", "impressions": "1000", "clicks": "10"}],
+        "act_3": [{"ad_id": "30", "ad_name": "c", "spend": "300.00", "impressions": "3000", "clicks": "30"}],
+    }
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        idx = int(ad_account_id.split("_")[1])
+        time.sleep((4 - idx) * 0.005)  # later ids finish first -> exercises reordering
+        if ad_account_id == "act_2":
+            raise MetaApiError("(#200) denied for act_2")
+        return [dict(r) for r in insights[ad_account_id]]
+
+    reader = FakeMetaReader(
+        list_ad_accounts=lambda *, fields: [dict(a) for a in accounts],
+        fetch_insights=_fetch,
+    )
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    # act_2 failed -> recorded + skipped; the survivors' ads still rank, order-independent.
+    assert [r["ad_id"] for r in out["ranked"]] == ["30", "10"]
+    assert {"ad_account_id": "act_2", "error": "(#200) denied for act_2"} in out["errors"]
+    assert out["account_count"] == 3   # accounts attempted (incl. the failed one)
+    assert out["ad_count"] == 2        # only the two survivors contributed ad rows
+
+
+def test_creative_triage_missing_ad_name_falls_back_to_ad_id(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"}]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "spend": "100.00", "impressions": "1000", "clicks": "10"},              # ad_name absent
+            {"ad_id": "101", "ad_name": "", "spend": "50.00", "impressions": "500", "clicks": "5"},  # ad_name blank
+        ]
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    by_id = {r["ad_id"]: r for r in out["ranked"]}
+    assert by_id["100"]["ad_name"] == "100"  # falls back to the id
+    assert by_id["101"]["ad_name"] == "101"  # blank also falls back
+
+
+def test_creative_triage_tie_ranks_share_and_tiebreak_by_ad_id(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "Acme", "account_status": 1, "currency": "USD"}]
+    # Ads "200" and "100" tie on spend; "300" is lower. Insertion order deliberately not sorted.
+    insights = {
+        "act_1": [
+            {"ad_id": "200", "ad_name": "b", "spend": "200.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "100", "ad_name": "a", "spend": "200.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "300", "ad_name": "c", "spend": "100.00", "impressions": "1000", "clicks": "10"},
+        ]
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()
+    )
+    # Tie tiebroken by ad_id ascending: "100" before "200"; both share rank 1; "300" -> rank 3.
+    assert [r["ad_id"] for r in out["ranked"]] == ["100", "200", "300"]
+    assert [r["rank"] for r in out["ranked"]] == [1, 1, 3]
+
+
+def test_creative_triage_invalid_metric_order_limit_and_reporting_currency_raise() -> None:
+    import pytest
+
+    reader = _perf_reader([], {})
+    with pytest.raises(ValueError, match="foobar"):
+        _account_discovery.cross_account_creative_triage(
+            reader, date_from="2026-06-01", date_to="2026-06-30", metric="foobar", fx_table=_fx()
+        )
+    with pytest.raises(ValueError, match="order must be"):
+        _account_discovery.cross_account_creative_triage(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            metric="spend", order="sideways", fx_table=_fx()
+        )
+    with pytest.raises(ValueError, match="limit must be a positive integer"):
+        _account_discovery.cross_account_creative_triage(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            metric="spend", limit=0, fx_table=_fx()
+        )
+    with pytest.raises(ValueError, match="no rate in the FX table"):
+        _account_discovery.cross_account_creative_triage(
+            reader, date_from="2026-06-01", date_to="2026-06-30",
+            metric="spend", reporting_currency="JPY", fx_table=_fx()
+        )
+
+
+def test_creative_triage_no_accounts_reachable_note(monkeypatch) -> None:
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    reader = _perf_reader([], {})  # discovery finds nothing
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30", metric="spend", fx_table=_fx()
+    )
+    assert out["note"] == "no accounts reachable"
+    assert out["ranked"] == [] and out["ad_count"] == 0
+
+
+def test_build_discovery_tools_creative_triage_mock_smoke(monkeypatch) -> None:
+    # End-to-end through the MCP wrapper: it exposes metric/order/limit but NOT fx_table (test-only
+    # seam), loading the committed config/fx_rates.json itself. USD accounts keep this deterministic.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    insights = {
+        "act_1": [
+            {"ad_id": "100", "ad_name": "cheap", "spend": "100.00", "impressions": "1000", "clicks": "10"},
+            {"ad_id": "101", "ad_name": "pricey", "spend": "200.00", "impressions": "2000", "clicks": "20"},
+        ]
+    }
+    reader = _perf_reader(accounts, insights)
+    tools = _mcp_server.build_discovery_tools(reader)
+    assert "cross_account_creative_triage" in tools
+    out = tools["cross_account_creative_triage"]("2026-06-01", "2026-06-30", "spend", "desc", 10)
+    assert out["ranked"][0]["ad_id"] == "101"
+    assert out["ranked"][0]["rank"] == 1
+    assert out["ad_count"] == 2
+    assert out["reporting_currency"] == "USD"
+
+
+def test_creative_triage_mixed_fx_and_no_fx_accounts_in_one_money_call(monkeypatch) -> None:
+    # The core multi-currency fleet interaction: one call pools an FX-able account (EUR) and a no-FX
+    # one (JPY). Under a money metric the EUR ad ranks on its normalized twin while every JPY ad falls
+    # to unranked, and the account with no FX rate records exactly ONE error (not one per ad) — even
+    # though it contributed two delivering ads. ad_count still counts every pooled delivering ad.
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "EU", "account_status": 1, "currency": "EUR"},
+        {"id": "act_2", "account_id": "2", "name": "JP", "account_status": 1, "currency": "JPY"},
+    ]
+    insights = {
+        "act_1": [{"ad_id": "100", "ad_name": "eur", "spend": "100.00", "impressions": "2000", "clicks": "20"}],
+        "act_2": [
+            {"ad_id": "200", "ad_name": "jpy-a", "spend": "5000.00", "impressions": "4000", "clicks": "40"},
+            {"ad_id": "201", "ad_name": "jpy-b", "spend": "3000.00", "impressions": "1000", "clicks": "10"},
+        ],
+    }
+    reader = _perf_reader(accounts, insights)
+    out = _account_discovery.cross_account_creative_triage(
+        reader, date_from="2026-06-01", date_to="2026-06-30",
+        metric="spend", order="desc", limit=10, fx_table=_fx()  # JPY absent from _fx()
+    )
+    assert out["ad_count"] == 3                       # all three delivering ads pooled
+    assert [r["ad_id"] for r in out["ranked"]] == ["100"]   # only the EUR ad is rankable on spend
+    assert out["ranked"][0]["value"] == pytest.approx(108.0)      # EUR 100 -> USD normalized
+    assert out["ranked"][0]["value_native"] == pytest.approx(100.0)
+    # Both JPY ads unranked with the no-FX reason; the account emits exactly one error.
+    unranked_ids = sorted(u["ad_id"] for u in out["unranked"])
+    assert unranked_ids == ["200", "201"]
+    assert all("JPY" in u["reason"] and "no FX rate" in u["reason"] for u in out["unranked"])
+    assert [e["ad_account_id"] for e in out["errors"]] == ["act_2"]
 
 
 def test_read_tools_drain_multiple_pages_without_truncation() -> None:
@@ -15122,3 +15713,965 @@ def test_main_mock_flag_and_env_propagate_to_build_server(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["meta_mcp_server"])
     _mcp_server.main()
     assert captured["mock"] is True
+
+
+# --- goal_grading pure engine: metric selection + verdicts + grace (NO reader, NO FX, NO registry) ---
+
+_GRADE_AS_OF = date(2026, 7, 11)
+
+
+def _grade(metric, value, spend, **policy):
+    """Grade a resolved metric value against an inline policy dict (pure engine, no reader)."""
+    return _goal_grading.grade_against_goal(
+        metric=metric, value=value, spend=spend, policy=policy, as_of=_GRADE_AS_OF
+    )
+
+
+def test_goal_pause_candidate_matches_early_triage_vocabulary() -> None:
+    # The whole tool speaks one pause vocabulary — enforced by this sync test, not a heavy import.
+    from meta_ads_analysis.early_triage import VERDICT_PAUSE_CANDIDATE
+
+    assert _goal_grading.GOAL_PAUSE_CANDIDATE == VERDICT_PAUSE_CANDIDATE == "pause_candidate"
+
+
+def test_select_goal_metric_roas_role_not_applicable_forces_cost() -> None:
+    # not_applicable ALWAYS grades on cost_per_result, even when a ROAS goal + bar are present.
+    assert (
+        _goal_grading.select_goal_metric(
+            {"roas_role": "not_applicable", "primary_goal": "roas", "target_roas": 3.0}
+        )
+        == "cost_per_result"
+    )
+
+
+def test_select_goal_metric_roas_vs_cost() -> None:
+    sel = _goal_grading.select_goal_metric
+    assert sel({"primary_goal": "roas", "target_roas": 3.0}) == "roas"
+    assert sel({"target_roas": 3.0}) == "roas"  # bar presence alone
+    assert sel({"pause_roas_floor": 1.8}) == "roas"
+    assert sel({"primary_goal": "minimize_cost_per_lead", "target_cost_per_result": 10.0}) == "cost_per_result"
+    assert sel({}) == "cost_per_result"  # nothing configured -> default metric
+
+
+def test_goal_grade_cost_per_result_directions() -> None:
+    import pytest
+
+    bars = dict(target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0)
+    on = _grade("cost_per_result", 5.0, 500.0, **bars)
+    assert on.verdict == _goal_grading.GOAL_ON
+    assert on.metric == "cost_per_result"
+    assert (on.value, on.target, on.pause_threshold) == (pytest.approx(5.0), 10.0, 40.0)
+    assert on.in_grace is False
+    # target < value <= pause -> watch.
+    assert _grade("cost_per_result", 25.0, 500.0, **bars).verdict == _goal_grading.GOAL_WATCH
+    assert _grade("cost_per_result", 40.0, 500.0, **bars).verdict == _goal_grading.GOAL_WATCH  # boundary
+    # value > pause -> pause_candidate.
+    assert _grade("cost_per_result", 60.0, 6000.0, **bars).verdict == _goal_grading.GOAL_PAUSE_CANDIDATE
+    # value == target -> on_goal (boundary).
+    assert _grade("cost_per_result", 10.0, 500.0, **bars).verdict == _goal_grading.GOAL_ON
+
+
+def test_goal_grade_roas_directions() -> None:
+    bars = dict(primary_goal="roas", target_roas=3.0, pause_roas_floor=1.8, min_spend_before_pause=100.0)
+    assert _grade("roas", 3.5, 500.0, **bars).verdict == _goal_grading.GOAL_ON
+    assert _grade("roas", 3.0, 500.0, **bars).verdict == _goal_grading.GOAL_ON  # boundary
+    assert _grade("roas", 2.0, 500.0, **bars).verdict == _goal_grading.GOAL_WATCH
+    assert _grade("roas", 1.8, 500.0, **bars).verdict == _goal_grading.GOAL_WATCH  # boundary (>= floor)
+    assert _grade("roas", 1.0, 500.0, **bars).verdict == _goal_grading.GOAL_PAUSE_CANDIDATE
+
+
+def test_goal_grade_partial_thresholds_cost() -> None:
+    # Only pause bar: can escalate to pause_candidate, cannot confirm on_goal.
+    only_pause = _grade("cost_per_result", 50.0, 500.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0)
+    assert only_pause.verdict == _goal_grading.GOAL_PAUSE_CANDIDATE and only_pause.target is None
+    assert _grade("cost_per_result", 5.0, 500.0, pause_cost_per_result_above=40.0).verdict == _goal_grading.GOAL_WATCH
+    # Only target bar: can confirm on_goal, cannot escalate to pause_candidate.
+    only_target = _grade("cost_per_result", 5.0, 500.0, target_cost_per_result=10.0)
+    assert only_target.verdict == _goal_grading.GOAL_ON and only_target.pause_threshold is None
+    assert _grade("cost_per_result", 90.0, 500.0, target_cost_per_result=10.0).verdict == _goal_grading.GOAL_WATCH
+
+
+def test_goal_grade_partial_thresholds_roas() -> None:
+    # Only pause floor: value < floor -> pause_candidate; else watch.
+    assert _grade("roas", 1.0, 500.0, pause_roas_floor=1.8, min_spend_before_pause=100.0).verdict == _goal_grading.GOAL_PAUSE_CANDIDATE
+    assert _grade("roas", 2.5, 500.0, pause_roas_floor=1.8).verdict == _goal_grading.GOAL_WATCH
+    # Only target: value >= target -> on_goal; else watch (cannot escalate).
+    assert _grade("roas", 3.5, 500.0, target_roas=3.0).verdict == _goal_grading.GOAL_ON
+    assert _grade("roas", 0.5, 500.0, target_roas=3.0).verdict == _goal_grading.GOAL_WATCH
+
+
+def test_goal_grade_no_thresholds() -> None:
+    # A configured account whose goal has NO cost/ROAS bar (install/subscription) -> no_goal_thresholds.
+    g = _grade("cost_per_result", 5.0, 500.0, primary_goal="maximize_in_app_subscriptions",
+               secondary_cost_per_app_install_target=3.0)
+    assert g.verdict == _goal_grading.GOAL_NO_THRESHOLDS
+    assert g.metric == "cost_per_result" and g.value == 5.0
+    assert g.target is None and g.pause_threshold is None
+
+
+def test_goal_grade_insufficient_data() -> None:
+    bars = dict(target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0)
+    # value None (no results -> no cost_per_result) -> insufficient, NEVER pause_candidate.
+    none_val = _grade("cost_per_result", None, 5000.0, **bars)
+    assert none_val.verdict == _goal_grading.GOAL_INSUFFICIENT and none_val.value is None
+    # A real (over-pause) value but spend below min_spend_before_pause -> insufficient, not pause.
+    thin = _grade("cost_per_result", 60.0, 50.0, **bars)
+    assert thin.verdict == _goal_grading.GOAL_INSUFFICIENT
+    # roas needs spend: value None -> insufficient.
+    assert _grade("roas", None, 500.0, target_roas=3.0, pause_roas_floor=1.8).verdict == _goal_grading.GOAL_INSUFFICIENT
+
+
+def test_goal_grade_absent_min_spend_has_no_floor() -> None:
+    # min_spend_before_pause absent -> treated as 0 -> no floor: a thin-spend over-pause account
+    # still grades pause_candidate (the guard only fires when a real min_spend floor is set).
+    g = _grade("cost_per_result", 60.0, 1.0, target_cost_per_result=10.0, pause_cost_per_result_above=40.0)
+    assert g.verdict == _goal_grading.GOAL_PAUSE_CANDIDATE
+
+
+def test_goal_grade_grace_softens_pause_to_watch() -> None:
+    # evaluation_start_date inside the evaluation_grace_days window -> a pause_candidate softens to watch.
+    policy = dict(
+        target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        evaluation_start_date="2026-07-10", evaluation_grace_days=3,
+    )
+    g = _goal_grading.grade_against_goal(
+        metric="cost_per_result", value=60.0, spend=6000.0, policy=policy, as_of=_GRADE_AS_OF
+    )
+    assert g.verdict == _goal_grading.GOAL_WATCH
+    assert g.in_grace is True
+    # Same account, launch date well before the grace window -> mature -> pause_candidate stands.
+    mature = _goal_grading.grade_against_goal(
+        metric="cost_per_result", value=60.0, spend=6000.0,
+        policy={**policy, "evaluation_start_date": "2026-07-01"}, as_of=_GRADE_AS_OF,
+    )
+    assert mature.verdict == _goal_grading.GOAL_PAUSE_CANDIDATE and mature.in_grace is False
+    # on_goal is unchanged by grace (only pause_candidate softens).
+    on = _goal_grading.grade_against_goal(
+        metric="cost_per_result", value=5.0, spend=6000.0, policy=policy, as_of=_GRADE_AS_OF
+    )
+    assert on.verdict == _goal_grading.GOAL_ON and on.in_grace is True
+
+
+def test_goal_grade_grace_absent_launch_date_is_mature() -> None:
+    # evaluation_grace_days set but NO evaluation_start_date -> mature (never fabricate a launch date).
+    g = _grade("cost_per_result", 60.0, 6000.0, target_cost_per_result=10.0,
+               pause_cost_per_result_above=40.0, min_spend_before_pause=100.0, evaluation_grace_days=3)
+    assert g.verdict == _goal_grading.GOAL_PAUSE_CANDIDATE and g.in_grace is False
+
+
+# --- grade_accounts_against_goals orchestration (FakeMetaReader; monkeypatched registry) ---
+
+
+def _grade_reader(meta_by_id, insights, **overrides):
+    """Reader for grade tests: explicit-id scope -> get_account per id + fetch_insights per id."""
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    def _get_account(ad_account_id, *, fields):
+        return dict(meta_by_id[ad_account_id])
+
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        return [dict(r) for r in insights.get(ad_account_id, [])]
+
+    stubs = {"get_account": _get_account, "fetch_insights": _fetch_insights}
+    stubs.update(overrides)
+    return FakeMetaReader(**stubs)
+
+
+def _grade_account(ad_account_id, *, roas_role=None, primary_result_action_type=None, **policy):
+    from meta_ads_analysis.account_registry import MetaAdsAccount
+
+    return MetaAdsAccount(
+        account_slug=ad_account_id, account_name=ad_account_id, ad_account_id=ad_account_id,
+        roas_role=roas_role, primary_result_action_type=primary_result_action_type,
+        action_policy=policy,
+    )
+
+
+def test_grade_accounts_against_goals_portfolio(monkeypatch) -> None:
+    import pytest
+
+    registry = {
+        # Seattle-like: cost-per-lead, ~$60/lead vs $10 target / $40 pause -> pause_candidate.
+        "act_103014553": _grade_account(
+            "act_103014553", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            primary_goal="minimize_cost_per_lead", target_cost_per_result=10.0,
+            pause_cost_per_result_above=40.0, min_spend_before_pause=100.0, evaluation_grace_days=3,
+        ),
+        # Cheap lead account: $5/lead -> on_goal.
+        "act_2": _grade_account(
+            "act_2", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        ),
+        # ROAS account below floor: 1.0 vs 3.0 target / 1.8 floor -> pause_candidate.
+        "act_3": _grade_account(
+            "act_3", roas_role="supporting", primary_result_action_type="purchase",
+            primary_goal="roas", target_roas=3.0, pause_roas_floor=1.8, min_spend_before_pause=100.0,
+        ),
+        # Install/subscription: no cost/ROAS bar -> no_goal_thresholds.
+        "act_4": _grade_account(
+            "act_4", roas_role="supporting_only_until_subscription_value_is_stable",
+            primary_goal="maximize_in_app_subscriptions", secondary_cost_per_app_install_target=3.0,
+        ),
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+
+    meta_by_id = {
+        "act_103014553": {"account_id": "103014553", "name": "Seattle", "account_status": 1, "currency": "USD"},
+        "act_2": {"account_id": "2", "name": "Cheap", "account_status": 1, "currency": "USD"},
+        "act_3": {"account_id": "3", "name": "RoasCo", "account_status": 1, "currency": "USD"},
+        "act_4": {"account_id": "4", "name": "Pollen", "account_status": 1, "currency": "USD"},
+    }
+    insights = {
+        "act_103014553": [{"spend": "6000.00", "impressions": "100000", "clicks": "5000",
+                           "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}],
+        "act_2": [{"spend": "500.00", "impressions": "50000", "clicks": "2000",
+                   "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}],
+        "act_3": [{"spend": "200.00", "impressions": "10000", "clicks": "300",
+                   "actions": [{"action_type": "purchase", "value": "5"}],
+                   "action_values": [{"action_type": "purchase", "value": "200"}]}],
+        "act_4": [{"spend": "300.00", "impressions": "20000", "clicks": "400"}],
+    }
+    reader = _grade_reader(meta_by_id, insights)
+
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    by_id = {a["ad_account_id"]: a for a in out["accounts"]}
+    assert by_id["act_103014553"]["verdict"] == "pause_candidate"
+    assert by_id["act_103014553"]["metric"] == "cost_per_result"
+    assert by_id["act_103014553"]["value"] == pytest.approx(60.0)
+    assert by_id["act_103014553"]["in_grace"] is False  # no evaluation_start_date set -> mature
+    assert by_id["act_2"]["verdict"] == "on_goal"
+    assert by_id["act_3"]["verdict"] == "pause_candidate"
+    assert by_id["act_3"]["metric"] == "roas"
+    assert by_id["act_4"]["verdict"] == "no_goal_thresholds"
+    assert out["counts"]["pause_candidate"] == 2
+    assert out["counts"]["on_goal"] == 1
+    assert out["counts"]["no_goal_thresholds"] == 1
+    # Shortlist sorted by account_id (string): "103014553" < "3".
+    assert [p["account_id"] for p in out["pause_candidates"]] == ["103014553", "3"]
+    assert out["pause_candidates"][0]["pause_threshold"] == 40.0
+    assert out["as_of"] == "2026-07-11"
+    assert out["errors"] == []
+
+
+def test_grade_accounts_unconfigured_explicit_id_is_no_goal_configured(monkeypatch) -> None:
+    # Reads stay open: an explicit id with no config entry is graded no_goal_configured (counted, not an error).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    meta_by_id = {"act_99": {"account_id": "99", "name": "Stranger", "account_status": 1, "currency": "USD"}}
+    insights = {"act_99": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=["act_99"], as_of="2026-07-11"
+    )
+    assert len(out["accounts"]) == 1
+    entry = out["accounts"][0]
+    assert entry["verdict"] == "no_goal_configured"
+    assert entry["metric"] is None and entry["target"] is None
+    assert out["counts"]["no_goal_configured"] == 1
+    assert out["pause_candidates"] == []
+
+
+def test_grade_accounts_empty_registry_default_scope_returns_note(monkeypatch) -> None:
+    # No configured accounts + default scope -> empty accounts, zeroed counts, a note; never a raise,
+    # and Meta is never touched (the reader is unstubbed on purpose).
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    out = _account_discovery.grade_accounts_against_goals(
+        FakeMetaReader(), date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    assert out["accounts"] == []
+    assert out["pause_candidates"] == []
+    assert out["counts"] == {
+        "on_goal": 0, "watch": 0, "pause_candidate": 0,
+        "insufficient_data": 0, "no_goal_thresholds": 0, "no_goal_configured": 0,
+    }
+    assert "note" in out
+
+
+def test_grade_accounts_zero_results_is_insufficient_not_pause(monkeypatch) -> None:
+    # Real spend but ZERO results -> cost_per_result absent -> value None -> insufficient_data,
+    # guarding the cheap-but-zero-results trap.
+    registry = {
+        "act_5": _grade_account(
+            "act_5", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_5": {"account_id": "5", "name": "Zero", "account_status": 1, "currency": "USD"}}
+    insights = {"act_5": [{"spend": "5000.00", "impressions": "100000", "clicks": "3000"}]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    assert entry["verdict"] == "insufficient_data" and entry["value"] is None
+    assert out["counts"]["pause_candidate"] == 0
+
+
+def test_grade_accounts_not_applicable_ignores_row_roas(monkeypatch) -> None:
+    # A not_applicable (lead-gen) account whose row ALSO carries a (huge) ROAS is STILL graded on
+    # cost_per_result — the row's roas is ignored.
+    import pytest
+
+    registry = {
+        "act_8": _grade_account(
+            "act_8", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_8": {"account_id": "8", "name": "Leadgen", "account_status": 1, "currency": "USD"}}
+    insights = {"act_8": [{
+        "spend": "6000.00", "impressions": "100000", "clicks": "5000",
+        "actions": [
+            {"action_type": "onsite_conversion.lead_grouped", "value": "100"},
+            {"action_type": "purchase", "value": "50"},
+        ],
+        "action_values": [{"action_type": "purchase", "value": "999999"}],
+    }]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    # Graded on cost_per_result (60), NOT on the astronomically-good roas in the row.
+    assert entry["metric"] == "cost_per_result"
+    assert entry["value"] == pytest.approx(60.0)
+    assert entry["verdict"] == "pause_candidate"
+
+
+def test_grade_accounts_propagates_per_account_read_errors(monkeypatch) -> None:
+    # One account's read failure lands in errors and never aborts the grade of the others.
+    registry = {
+        "act_6": _grade_account("act_6", roas_role="not_applicable",
+                                primary_result_action_type="onsite_conversion.lead_grouped",
+                                target_cost_per_result=10.0, pause_cost_per_result_above=40.0,
+                                min_spend_before_pause=100.0),
+        "act_7": _grade_account("act_7", roas_role="not_applicable",
+                                primary_result_action_type="onsite_conversion.lead_grouped",
+                                target_cost_per_result=10.0, pause_cost_per_result_above=40.0,
+                                min_spend_before_pause=100.0),
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_6": {"account_id": "6", "name": "OK", "account_status": 1, "currency": "USD"}}
+    insights = {"act_6": [{"spend": "500.00", "impressions": "50000", "clicks": "2000",
+                           "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]}
+
+    def _get_account(ad_account_id, *, fields):
+        if ad_account_id == "act_7":
+            raise MetaApiError("(#100) unreadable account")
+        return dict(meta_by_id[ad_account_id])
+
+    reader = _grade_reader(meta_by_id, insights, get_account=_get_account)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    # act_6 graded; act_7 isolated into errors.
+    assert {a["ad_account_id"] for a in out["accounts"]} == {"act_6"}
+    assert out["accounts"][0]["verdict"] == "on_goal"
+    assert any(e["ad_account_id"] == "act_7" for e in out["errors"])
+
+
+def test_grade_accounts_as_of_defaults_to_today(monkeypatch) -> None:
+    # as_of omitted -> today (UTC), the single clock touch; the reported as_of echoes it.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    from meta_ads_analysis.reader_provider import FakeMetaReader
+
+    out = _account_discovery.grade_accounts_against_goals(
+        FakeMetaReader(), date_from="2026-06-01", date_to="2026-06-30"
+    )
+    from datetime import datetime, timezone
+
+    assert out["as_of"] == datetime.now(tz=timezone.utc).date().isoformat()
+
+
+def test_build_discovery_tools_grade_accounts_against_goals_mock_smoke(monkeypatch) -> None:
+    # The MCP wrapper delegates to the orchestration function and is present in the discovery surface.
+    registry = {
+        "act_9": _grade_account("act_9", roas_role="not_applicable",
+                                primary_result_action_type="onsite_conversion.lead_grouped",
+                                target_cost_per_result=10.0, pause_cost_per_result_above=40.0,
+                                min_spend_before_pause=100.0),
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_9": {"account_id": "9", "name": "Nine", "account_status": 1, "currency": "USD"}}
+    insights = {"act_9": [{"spend": "500.00", "impressions": "50000", "clicks": "2000",
+                           "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]}
+    reader = _grade_reader(meta_by_id, insights)
+    tools = _mcp_server.build_discovery_tools(reader)
+    assert "grade_accounts_against_goals" in tools
+    assert "grade_accounts_against_goals" in _mcp_server.DISCOVERY_TOOL_DESCRIPTIONS
+    out = tools["grade_accounts_against_goals"]("2026-06-01", "2026-06-30", None, "2026-07-11")
+    assert out["accounts"][0]["verdict"] == "on_goal"
+
+
+def test_grade_accounts_end_to_end_real_config_shape(tmp_path: Path, monkeypatch) -> None:
+    # End-to-end through the REAL registry JSON parsing (not the _grade_account shortcut): roas_role
+    # lives in measurement_focus and thresholds in action_policy, exactly like config/meta_ads_accounts.json.
+    # This proves load_account_registry -> account.roas_role -> _grade_policy_for_account flows correctly.
+    import pytest
+
+    accounts_path = tmp_path / "meta_ads_accounts.json"
+    accounts_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "account_slug": "seattle_mission",
+                        "account_name": "Washington Seattle Mission",
+                        "ad_account_id": "103014553",
+                        "measurement_focus": {
+                            "primary_result_action_type": "onsite_conversion.lead_grouped",
+                            "primary_result_label": "Leads (form)",
+                            "roas_role": "not_applicable",
+                        },
+                        "action_policy": {
+                            "primary_goal": "minimize_cost_per_lead",
+                            "target_cost_per_result": 10.0,
+                            "pause_cost_per_result_above": 40.0,
+                            "min_spend_before_pause": 100.0,
+                            "evaluation_grace_days": 3,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("meta_ads_analysis.account_registry.DEFAULT_ACCOUNTS_CONFIG_PATH", accounts_path)
+    meta_by_id = {
+        "act_103014553": {"account_id": "103014553", "name": "Washington Seattle Mission",
+                          "account_status": 1, "currency": "USD"}
+    }
+    insights = {
+        "act_103014553": [{"spend": "6000.00", "impressions": "100000", "clicks": "5000",
+                           "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]
+    }
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    assert entry["metric"] == "cost_per_result"  # roas_role=not_applicable (from measurement_focus)
+    assert entry["verdict"] == "pause_candidate"  # $60/lead vs $40 pause; no launch date -> mature
+    assert entry["value"] == pytest.approx(60.0)
+    assert entry["in_grace"] is False
+    assert out["counts"]["pause_candidate"] == 1
+
+
+def test_grade_accounts_thresholds_are_native_not_fx_normalized(monkeypatch) -> None:
+    # The single most load-bearing correctness claim: a goal is stated in the account's OWN currency,
+    # so the metric is graded native-to-native with NO FX. A EUR account whose native cost_per_result
+    # is 38 EUR sits UNDER its 40 EUR pause bar (-> watch). If the tool wrongly graded the USD-normalized
+    # twin (38 EUR x 1.08 = 41.04 USD) it would cross the bar and misread as pause_candidate. Locking
+    # native grading here catches any future regression that reaches for the *_normalized value.
+    import pytest
+
+    registry = {
+        "act_eur": _grade_account(
+            "act_eur", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_eur": {"account_id": "eur", "name": "Berlin", "account_status": 1, "currency": "EUR"}}
+    # 3800 EUR / 100 leads = 38.00 EUR native cost_per_result (under the 40 EUR pause bar).
+    insights = {"act_eur": [{"spend": "3800.00", "impressions": "100000", "clicks": "5000",
+                             "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    assert entry["currency"] == "EUR"
+    assert entry["value"] == pytest.approx(38.0)  # native EUR, NOT the 41.04 USD normalized twin
+    assert entry["verdict"] == "watch"  # 38 <= 40 native; would be pause_candidate if FX-normalized
+    assert out["counts"]["pause_candidate"] == 0
+    assert out["errors"] == []  # EUR is in the FX table -> no no-FX error
+
+
+def test_grade_accounts_grades_currency_missing_from_fx_table(monkeypatch) -> None:
+    # FX-independence, other half: an account in a currency ABSENT from config/fx_rates.json (JPY) is
+    # still graded on its native metric (cross_account_performance keeps the native row), and the no-FX
+    # entry propagates into errors — grading never depends on a normalizable currency.
+    import pytest
+
+    registry = {
+        "act_jpy": _grade_account(
+            "act_jpy", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        )
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    meta_by_id = {"act_jpy": {"account_id": "jpy", "name": "Tokyo", "account_status": 1, "currency": "JPY"}}
+    # 6000 JPY / 100 leads = 60.00 native cost_per_result (over the 40 pause bar) -> pause_candidate.
+    insights = {"act_jpy": [{"spend": "6000.00", "impressions": "100000", "clicks": "5000",
+                             "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}]}
+    reader = _grade_reader(meta_by_id, insights)
+    out = _account_discovery.grade_accounts_against_goals(
+        reader, date_from="2026-06-01", date_to="2026-06-30", as_of="2026-07-11"
+    )
+    entry = out["accounts"][0]
+    assert entry["currency"] == "JPY"
+    assert entry["value"] == pytest.approx(60.0)  # graded native despite no FX rate
+    assert entry["verdict"] == "pause_candidate"
+    assert any("no FX rate" in e.get("error", "") for e in out["errors"])  # no-FX propagates, non-fatal
+
+
+# --- grade_accounts_against_goals: precomputed_perf composition seam (MOCKS ONLY) ---
+
+
+def _grade_seam_fixture():
+    """A configured lead + roas account plus one NON-configured id, shared by the seam tests.
+
+    The scope deliberately includes ``act_9`` (absent from config) so the injected-perf path exercises
+    ``no_goal_configured`` exactly as a self-fetched scope would.
+    """
+    registry = {
+        "act_2": _grade_account(
+            "act_2", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        ),
+        "act_3": _grade_account(
+            "act_3", roas_role="supporting", primary_result_action_type="purchase",
+            primary_goal="roas", target_roas=3.0, pause_roas_floor=1.8, min_spend_before_pause=100.0,
+        ),
+    }
+    meta_by_id = {
+        "act_2": {"account_id": "2", "name": "Cheap", "account_status": 1, "currency": "USD"},
+        "act_3": {"account_id": "3", "name": "RoasCo", "account_status": 1, "currency": "USD"},
+        "act_9": {"account_id": "9", "name": "Stranger", "account_status": 1, "currency": "USD"},
+    }
+    insights = {
+        "act_2": [{"spend": "500.00", "impressions": "50000", "clicks": "2000",
+                   "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}],  # $5/lead -> on_goal
+        "act_3": [{"spend": "200.00", "impressions": "10000", "clicks": "300",
+                   "actions": [{"action_type": "purchase", "value": "5"}],
+                   "action_values": [{"action_type": "purchase", "value": "200"}]}],  # roas 1.0 -> pause_candidate
+        "act_9": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],  # unconfigured -> no_goal_configured
+    }
+    scope = ["act_2", "act_3", "act_9"]
+    return registry, meta_by_id, insights, scope
+
+
+def test_grade_precomputed_perf_zero_reads_identical(monkeypatch) -> None:
+    # Seam: injecting an already-fetched perf makes grade issue ZERO reads (no fetch_insights, no
+    # list_ad_accounts, no get_account) and produce output byte-identical to the self-fetching run.
+    registry, meta_by_id, insights, scope = _grade_seam_fixture()
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+
+    # Reference: grade self-fetches over the full explicit scope (reads flow through).
+    ref_reader = _grade_reader(meta_by_id, insights)
+    reference = _account_discovery.grade_accounts_against_goals(
+        ref_reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=scope, as_of="2026-07-11"
+    )
+
+    # The perf the digest would hold, then injected into a reader that CANNOT read.
+    perf_reader = _grade_reader(meta_by_id, insights)
+    perf = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-06-01", date_to="2026-06-30",
+        account_ids=scope, level="account", fx_table=_fx(),
+    )
+    dead_reader = FakeMetaReader()  # any read -> NotImplementedError
+    injected = _account_discovery.grade_accounts_against_goals(
+        dead_reader, date_from="2026-06-01", date_to="2026-06-30",
+        as_of="2026-07-11", precomputed_perf=perf,
+    )
+
+    assert dead_reader.calls == []   # the seam issued ZERO reads
+    assert injected == reference     # identical to the self-fetching run
+    by_id = {a["ad_account_id"]: a for a in injected["accounts"]}
+    assert by_id["act_2"]["verdict"] == "on_goal"
+    assert by_id["act_3"]["verdict"] == "pause_candidate"
+    assert by_id["act_9"]["verdict"] == "no_goal_configured"  # injected + absent from config
+
+
+def test_grade_precomputed_perf_non_usd_parity(monkeypatch) -> None:
+    # Native-metric invariant: grade reads only each row's NATIVE cost_per_result / roas / spend, so an
+    # injected perf normalized to EUR yields the SAME grade output as grade's own USD-default fetch.
+    registry, meta_by_id, insights, scope = _grade_seam_fixture()
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+
+    # USD self-fetch reference.
+    ref_reader = _grade_reader(meta_by_id, insights)
+    reference = _account_discovery.grade_accounts_against_goals(
+        ref_reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=scope, as_of="2026-07-11"
+    )
+
+    # Perf normalized to EUR (a different reporting_currency), injected.
+    perf_reader = _grade_reader(meta_by_id, insights)
+    perf_eur = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=scope,
+        level="account", reporting_currency="EUR", fx_table=_fx(),
+    )
+    assert perf_eur["reporting_currency"] == "EUR"
+    injected = _account_discovery.grade_accounts_against_goals(
+        FakeMetaReader(), date_from="2026-06-01", date_to="2026-06-30",
+        as_of="2026-07-11", precomputed_perf=perf_eur,
+    )
+
+    assert injected == reference  # grade output is FX-independent (native-only)
+
+
+def test_grade_precomputed_empty_perf_no_crash(monkeypatch) -> None:
+    # An empty injected perf -> empty accounts, zeroed counts, no pause candidates, no crash; and the
+    # perf's errors flow through identically. Never touches Meta.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    empty_perf = {
+        "accounts": [],
+        "errors": [{"ad_account_id": "act_x", "error": "(#100) unreadable"}],
+        "reporting_currency": "USD",
+    }
+    dead_reader = FakeMetaReader()
+    out = _account_discovery.grade_accounts_against_goals(
+        dead_reader, date_from="2026-06-01", date_to="2026-06-30",
+        as_of="2026-07-11", precomputed_perf=empty_perf,
+    )
+    assert dead_reader.calls == []  # zero reads
+    assert out["accounts"] == []
+    assert out["pause_candidates"] == []
+    assert all(v == 0 for v in out["counts"].values())
+    assert out["errors"] == [{"ad_account_id": "act_x", "error": "(#100) unreadable"}]  # passthrough
+
+
+# --- portfolio_digest: one-call composite over the four cross-account tools (MOCKS ONLY) ---
+
+
+def _digest_reader(meta_by_id, rows_by_window, campaigns=None, adsets=None, **overrides):
+    """Reader for portfolio_digest tests over an EXPLICIT account_ids scope.
+
+    ``meta_by_id`` maps ad_account_id -> the raw account row get_account returns (currency/name/etc.,
+    plus spend_cap/amount_spent for pacing). ``rows_by_window`` maps ``date_from -> {ad_account_id:
+    [insight_row, ...]}`` so the current window and flag's auto-derived baseline window return
+    different data. ``campaigns`` / ``adsets`` (opt-in) feed pacing's step-2 budget fan-out.
+    """
+    def _get_account(ad_account_id, *, fields):
+        return dict(meta_by_id[ad_account_id])
+
+    def _fetch_insights(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        window = rows_by_window.get(date_from, {})
+        return [dict(r) for r in window.get(ad_account_id, [])]
+
+    stubs = {"get_account": _get_account, "fetch_insights": _fetch_insights}
+    if campaigns is not None:
+        stubs["list_campaigns"] = lambda ad_account_id, *, fields, effective_status=None: [
+            dict(c) for c in campaigns.get(ad_account_id, [])
+        ]
+    if adsets is not None:
+        stubs["list_adsets"] = lambda ad_account_id, *, fields, effective_status=None: [
+            dict(a) for a in adsets.get(ad_account_id, [])
+        ]
+    stubs.update(overrides)
+    return FakeMetaReader(**stubs)
+
+
+def _digest_lead_account(ad_account_id, target=10.0, pause=40.0):
+    return _grade_account(
+        ad_account_id, roas_role="not_applicable",
+        primary_result_action_type="onsite_conversion.lead_grouped",
+        primary_goal="minimize_cost_per_lead", target_cost_per_result=target,
+        pause_cost_per_result_above=pause, min_spend_before_pause=100.0,
+    )
+
+
+def _lead_insight(spend, leads):
+    return {"spend": f"{spend:.2f}", "impressions": "100000", "clicks": "5000",
+            "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": str(leads)}]}
+
+
+_DIGEST_WINDOW = dict(date_from="2026-06-08", date_to="2026-06-14")  # baseline auto-derives to 06-01..06-07
+
+
+def test_portfolio_digest_default_read_count_grade_reuses_shared_perf(monkeypatch) -> None:
+    # HEADLINE read-count test. Default digest (flags on, pacing off) over an explicit 3-account scope
+    # issues exactly the perf fan-out (N current fetch_insights) + flag's baseline fan-out (N more) =
+    # 2N. Grade contributes ZERO additional fetch_insights (it consumed the shared perf via the seam);
+    # if grade had self-fetched, this would be 3N. Pacing off -> no budget reads.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    ids = ["act_1", "act_2", "act_3"]
+    meta_by_id = {i: {"account_id": i[-1], "name": i, "account_status": 1, "currency": "USD"} for i in ids}
+    row = [{"spend": "300.00", "impressions": "6000", "clicks": "300"}]
+    windows = {"2026-06-08": {i: row for i in ids}, "2026-06-01": {i: row for i in ids}}
+    reader = _digest_reader(meta_by_id, windows)
+
+    out = _account_discovery.portfolio_digest(
+        reader, account_ids=ids, fx_table=_fx(), **_DIGEST_WINDOW
+    )
+
+    insight_calls = [c for c in reader.calls if c[0] == "fetch_insights"]
+    assert len(insight_calls) == 2 * len(ids)  # perf current N + flag baseline N; grade added 0.
+    assert [c for c in reader.calls if c[0] == "list_campaigns"] == []  # pacing off -> no budget reads
+    assert [c for c in reader.calls if c[0] == "list_adsets"] == []
+    assert out["attention"] is not None
+    assert out["pacing"] is None
+    assert out["scope"] == {"account_count": 3, "reachable_count": 3}
+
+
+def test_portfolio_digest_include_pacing_adds_budget_reads_only(monkeypatch) -> None:
+    # include_pacing=True adds pacing's 3N budget reads (list_campaigns/list_adsets/get_account) and
+    # NO additional perf fetch_insights (pacing consumed the shared perf via its seam).
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    ids = ["act_1", "act_2", "act_3"]
+    meta_by_id = {
+        i: {"account_id": i[-1], "name": i, "account_status": 1, "currency": "USD",
+            "spend_cap": "0", "amount_spent": "0"}
+        for i in ids
+    }
+    row = [{"spend": "300.00", "impressions": "6000", "clicks": "300"}]
+    windows = {"2026-06-08": {i: row for i in ids}, "2026-06-01": {i: row for i in ids}}
+    reader = _digest_reader(meta_by_id, windows, campaigns={i: [] for i in ids}, adsets={i: [] for i in ids})
+
+    out = _account_discovery.portfolio_digest(
+        reader, account_ids=ids, include_pacing=True, fx_table=_fx(), **_DIGEST_WINDOW
+    )
+
+    insight_calls = [c for c in reader.calls if c[0] == "fetch_insights"]
+    assert len(insight_calls) == 2 * len(ids)  # unchanged from the flags-only path: pacing added 0.
+    assert len([c for c in reader.calls if c[0] == "list_campaigns"]) == len(ids)  # the 3N budget reads
+    assert len([c for c in reader.calls if c[0] == "list_adsets"]) == len(ids)
+    assert out["pacing"] is not None
+    assert set(out["pacing"]) == {"status_counts", "worst_over_pacers", "worst_under_pacers"}
+
+
+def test_portfolio_digest_include_flags_false_skips_baseline_and_needs_you_from_pause_only(monkeypatch) -> None:
+    # include_flags=False -> attention is None, the baseline fan-out is NOT issued (only N perf reads),
+    # and needs_you is built from goal pause_candidates alone.
+    registry = {"act_pause": _digest_lead_account("act_pause"), "act_ok": _digest_lead_account("act_ok")}
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    ids = ["act_pause", "act_ok"]
+    meta_by_id = {i: {"account_id": i, "name": i, "account_status": 1, "currency": "USD"} for i in ids}
+    current = {"act_pause": [_lead_insight(6000, 100)],  # $60/lead -> pause_candidate
+               "act_ok": [_lead_insight(500, 100)]}      # $5/lead -> on_goal
+    windows = {"2026-06-08": current}  # no baseline window needed (flag not called)
+    reader = _digest_reader(meta_by_id, windows)
+
+    out = _account_discovery.portfolio_digest(
+        reader, account_ids=ids, include_flags=False, fx_table=_fx(), **_DIGEST_WINDOW
+    )
+
+    insight_calls = [c for c in reader.calls if c[0] == "fetch_insights"]
+    assert len(insight_calls) == len(ids)  # perf only; NO baseline fan-out
+    assert out["attention"] is None
+    assert [e["ad_account_id"] for e in out["needs_you"]] == ["act_pause"]
+    assert out["needs_you"][0]["sources"] == ["goal"]
+
+
+def test_portfolio_digest_section_correctness_and_needs_you_merge(monkeypatch) -> None:
+    # A fixture exercising every section: one on_goal, two pause_candidates (one of which ALSO spikes),
+    # one no_goal_configured that spikes. Asserts goal counts, attention.flagged, and that needs_you
+    # merges the pause_candidate + the high-severity flagged account, deduped, worst-first.
+    registry = {
+        "act_ongoal": _digest_lead_account("act_ongoal"),
+        "act_pause": _digest_lead_account("act_pause"),
+        "act_both": _digest_lead_account("act_both"),
+        # act_noconfig deliberately absent from config.
+    }
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    ids = ["act_ongoal", "act_pause", "act_both", "act_noconfig"]
+    meta_by_id = {i: {"account_id": i, "name": i, "account_status": 1, "currency": "USD"} for i in ids}
+    current = {
+        "act_ongoal": [_lead_insight(500, 100)],   # $5/lead -> on_goal; clean (500 vs 500)
+        "act_pause": [_lead_insight(6000, 100)],    # $60/lead -> pause_candidate; clean (6000 vs 6000)
+        "act_both": [_lead_insight(6000, 100)],     # $60/lead -> pause_candidate; +200% spike -> high
+        "act_noconfig": [{"spend": "6000.00", "impressions": "100000", "clicks": "5000"}],  # spike -> high
+    }
+    baseline = {
+        "act_ongoal": [_lead_insight(500, 100)],
+        "act_pause": [_lead_insight(6000, 100)],
+        "act_both": [_lead_insight(2000, 40)],
+        "act_noconfig": [{"spend": "2000.00", "impressions": "40000", "clicks": "2000"}],
+    }
+    reader = _digest_reader(meta_by_id, {"2026-06-08": current, "2026-06-01": baseline})
+
+    out = _account_discovery.portfolio_digest(reader, account_ids=ids, fx_table=_fx(), **_DIGEST_WINDOW)
+
+    counts = out["goal_summary"]["counts"]
+    assert counts["on_goal"] == 1
+    assert counts["pause_candidate"] == 2
+    assert counts["no_goal_configured"] == 1
+
+    flagged_ids = [e["ad_account_id"] for e in out["attention"]["flagged"]]
+    assert flagged_ids == ["act_both", "act_noconfig"]  # both high; tiebreak by ad_account_id asc
+    assert all(e["severity"] == "high" for e in out["attention"]["flagged"])
+    assert out["attention"]["clean_count"] == 2  # act_ongoal + act_pause
+
+    # needs_you: dual-source (goal+attention) act_both leads; then single-source, ad_account_id asc.
+    assert [e["ad_account_id"] for e in out["needs_you"]] == ["act_both", "act_noconfig", "act_pause"]
+    both = out["needs_you"][0]
+    assert both["sources"] == ["goal", "attention"]  # appears ONCE, carrying both sources
+    assert both["reasons"]  # merged goal reasons + high-severity flag detail
+    assert out["needs_you"][1]["sources"] == ["attention"]  # act_noconfig
+    assert out["needs_you"][2]["sources"] == ["goal"]       # act_pause
+
+
+def test_portfolio_digest_determinism(monkeypatch) -> None:
+    # Identical inputs -> byte-identical output (all sections derive from deterministic fan-outs).
+    registry = {"act_both": _digest_lead_account("act_both"), "act_pause": _digest_lead_account("act_pause")}
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+    ids = ["act_pause", "act_both", "act_noconfig"]
+    meta_by_id = {i: {"account_id": i, "name": i, "account_status": 1, "currency": "USD"} for i in ids}
+    current = {
+        "act_pause": [_lead_insight(6000, 100)],
+        "act_both": [_lead_insight(6000, 100)],
+        "act_noconfig": [{"spend": "6000.00", "impressions": "100000", "clicks": "5000"}],
+    }
+    baseline = {
+        "act_pause": [_lead_insight(6000, 100)],
+        "act_both": [_lead_insight(2000, 40)],
+        "act_noconfig": [{"spend": "2000.00", "impressions": "40000", "clicks": "2000"}],
+    }
+    windows = {"2026-06-08": current, "2026-06-01": baseline}
+    a = _account_discovery.portfolio_digest(_digest_reader(meta_by_id, windows), account_ids=ids, fx_table=_fx(), **_DIGEST_WINDOW)
+    b = _account_discovery.portfolio_digest(_digest_reader(meta_by_id, windows), account_ids=ids, fx_table=_fx(), **_DIGEST_WINDOW)
+    assert a == b
+
+
+def test_portfolio_digest_partial_failure_isolates_grade_section(monkeypatch) -> None:
+    # An unexpected whole-call failure in grade sets goal_summary None + records a section="goal" error,
+    # while the other sections (totals, attention, top/bottom) STILL populate.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+
+    def _boom(*a, **k):
+        raise RuntimeError("grade blew up")
+
+    monkeypatch.setattr(_account_discovery, "grade_accounts_against_goals", _boom)
+    ids = ["act_1", "act_2"]
+    meta_by_id = {i: {"account_id": i[-1], "name": i, "account_status": 1, "currency": "USD"} for i in ids}
+    row = [{"spend": "300.00", "impressions": "6000", "clicks": "300"}]
+    windows = {"2026-06-08": {i: row for i in ids}, "2026-06-01": {i: row for i in ids}}
+    reader = _digest_reader(meta_by_id, windows)
+
+    out = _account_discovery.portfolio_digest(reader, account_ids=ids, fx_table=_fx(), **_DIGEST_WINDOW)
+
+    assert out["goal_summary"] is None
+    goal_errors = [e for e in out["errors"] if e.get("section") == "goal"]
+    assert len(goal_errors) == 1 and "grade blew up" in goal_errors[0]["error"]
+    # Other sections survive the grade failure.
+    assert out["attention"] is not None
+    assert out["totals"]["normalized_total"]["reporting_currency"] == "USD"
+    assert len(out["top"]) == 2
+    # needs_you falls back to attention-only (grade contributed nothing).
+    assert all("goal" not in e["sources"] for e in out["needs_you"])
+
+
+def test_portfolio_digest_currency_normalizes_to_eur_and_no_fx_isolated(monkeypatch) -> None:
+    # reporting_currency="EUR" normalizes totals to EUR and threads EUR consistently through the flag
+    # seam (no ValueError). A no-FX account (JPY, absent from the FX table) keeps native figures and
+    # surfaces in errors under section="performance".
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    ids = ["act_eur", "act_jpy"]
+    meta_by_id = {
+        "act_eur": {"account_id": "eur", "name": "Berlin", "account_status": 1, "currency": "EUR"},
+        "act_jpy": {"account_id": "jpy", "name": "Tokyo", "account_status": 1, "currency": "JPY"},
+    }
+    row_eur = [{"spend": "1000.00", "impressions": "50000", "clicks": "2000"}]
+    row_jpy = [{"spend": "5000.00", "impressions": "40000", "clicks": "1500"}]
+    windows = {
+        "2026-06-08": {"act_eur": row_eur, "act_jpy": row_jpy},
+        "2026-06-01": {"act_eur": row_eur, "act_jpy": row_jpy},
+    }
+    reader = _digest_reader(meta_by_id, windows)
+
+    out = _account_discovery.portfolio_digest(
+        reader, account_ids=ids, reporting_currency="EUR", fx_table=_fx(), **_DIGEST_WINDOW
+    )
+
+    assert out["reporting_currency"] == "EUR"
+    assert out["totals"]["normalized_total"]["reporting_currency"] == "EUR"
+    assert set(out["totals"]["totals_by_currency"]) == {"EUR", "JPY"}
+    # No seam ValueError was raised (EUR threaded into the flag call); attention populated.
+    assert out["attention"] is not None
+    perf_no_fx = [e for e in out["errors"] if e.get("section") == "performance" and "no FX rate" in (e.get("error") or "")]
+    assert perf_no_fx and perf_no_fx[0]["ad_account_id"] == "act_jpy"
+
+
+def test_portfolio_digest_empty_scope_returns_empty_sections_with_note(monkeypatch) -> None:
+    # account_ids=None over an empty reach -> perf note "no accounts reachable"; the digest returns
+    # empty sections + the note; never raises.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    reader = _digest_reader({}, {}, list_ad_accounts=lambda *, fields: [])
+
+    out = _account_discovery.portfolio_digest(reader, fx_table=_fx(), **_DIGEST_WINDOW)
+
+    assert out["note"] == "no accounts reachable"
+    assert out["top"] == [] and out["bottom"] == []
+    assert out["needs_you"] == []
+    assert out["goal_summary"]["counts"]["on_goal"] == 0
+    assert out["attention"] == {"flagged": [], "informational": [], "clean_count": 0}
+    assert out["scope"] == {"account_count": 0, "reachable_count": 0}
+
+
+def test_build_discovery_tools_portfolio_digest_mock_smoke(monkeypatch) -> None:
+    # The wired discovery tool returns a well-formed payload over the single mock USD account with zero
+    # live calls. No config -> the account is graded no_goal_configured; identical insight across
+    # windows -> clean, nothing flagged; needs_you empty.
+    def _boom(*a, **k):
+        raise FileNotFoundError("no config in mock")
+
+    monkeypatch.setattr(_account_discovery.account_registry, "load_account_registry", _boom)
+    reader = _mcp_server.build_mock_reader()
+    tools = _mcp_server.build_discovery_tools(reader)
+    out = tools["portfolio_digest"]("2026-06-08", "2026-06-14")
+
+    assert out["date_from"] == "2026-06-08" and out["date_to"] == "2026-06-14"
+    assert out["reporting_currency"] == "USD"
+    assert out["fx_as_of"]  # surfaced from the committed table
+    assert out["scope"] == {"account_count": 1, "reachable_count": 1}
+    assert out["goal_summary"]["counts"]["no_goal_configured"] == 1
+    assert out["attention"] == {"flagged": [], "informational": [], "clean_count": 1}
+    assert out["pacing"] is None  # off by default
+    assert out["needs_you"] == []
+    assert out["errors"] == []
+
+
+def test_portfolio_digest_include_ad_health_scans_flagged_only_and_feeds_needs_you(monkeypatch) -> None:
+    # include_ad_health=True threads straight through to flag: ONLY the flagged accounts are ad-scanned
+    # (+one iter_paginated per flagged account), a DISAPPROVED ad attaches a high-severity ads_disapproved
+    # flag (promoting the account to high), and its detail flows into the needs_you shortlist. The clean
+    # account is never enumerated — the _iter stub raises if an unexpected account is scanned.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    ids = ["act_spike", "act_calm"]
+    meta_by_id = {i: {"account_id": i, "name": i, "account_status": 1, "currency": "USD"} for i in ids}
+    current = {
+        "act_spike": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],  # +200% -> flagged
+        "act_calm": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],   # unchanged -> clean
+    }
+    baseline = {
+        "act_spike": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_calm": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+    }
+    ads_by_id = {"act_spike": [_ad("a1", "ACTIVE", "DISAPPROVED")]}  # only the flagged account is scanned
+
+    def _iter(path, *, params=None):
+        ad_account_id = path.strip("/").split("/")[0]
+        if ad_account_id not in ads_by_id:
+            raise AssertionError(f"unexpected ad-health scan of {ad_account_id} (path {path})")
+        return [dict(a) for a in ads_by_id[ad_account_id]]
+
+    reader = _digest_reader(
+        meta_by_id, {"2026-06-08": current, "2026-06-01": baseline}, iter_paginated=_iter
+    )
+
+    out = _account_discovery.portfolio_digest(
+        reader, account_ids=ids, include_ad_health=True, fx_table=_fx(), **_DIGEST_WINDOW
+    )
+
+    ad_scans = [c for c in reader.calls if c[0] == "iter_paginated"]
+    assert len(ad_scans) == 1  # only act_spike (flagged) was scanned; act_calm (clean) never was
+    spike = next(e for e in out["attention"]["flagged"] if e["ad_account_id"] == "act_spike")
+    assert "ads_disapproved" in {f["name"] for f in spike["flags"]}
+    assert spike["severity"] == "high"  # DISAPPROVED promoted it
+    # The high-severity flagged account flows into needs_you carrying the ad-health detail.
+    needs = next(e for e in out["needs_you"] if e["ad_account_id"] == "act_spike")
+    assert "attention" in needs["sources"]
+    assert any("disapprov" in r.lower() for r in needs["reasons"])

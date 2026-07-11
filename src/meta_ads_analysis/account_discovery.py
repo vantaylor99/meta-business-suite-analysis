@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from . import account_registry
+from . import account_registry, goal_grading
 from .config import (
     ATTENTION_CPC_DEGRADE_PCT,
     ATTENTION_CPR_DEGRADE_PCT,
@@ -431,6 +431,19 @@ def cross_account_spend_summary(
 
 # Base metrics fetched per account for the performance read (account-level, all_days -> one row).
 DEFAULT_PERFORMANCE_INSIGHT_FIELDS: list[str] = [
+    "spend",
+    "impressions",
+    "clicks",
+    "actions",
+    "action_values",
+]
+
+# Fields fetched per account for the ad-level creative triage read (level="ad", all_days -> one row
+# per ad that DELIVERED in the window). Same base metrics as the performance read plus the ad id/name
+# so each pooled row is attributable to a specific creative.
+DEFAULT_TRIAGE_INSIGHT_FIELDS: list[str] = [
+    "ad_id",
+    "ad_name",
     "spend",
     "impressions",
     "clicks",
@@ -1634,6 +1647,7 @@ def flag_accounts_needing_attention(
     include_ad_health: bool = False,
     thresholds: AttentionThresholds | None = None,
     fx_table: FxTable | None = None,
+    precomputed_current_perf: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Surface the handful of accounts that changed and need a human's attention right now.
 
@@ -1698,6 +1712,14 @@ def flag_accounts_needing_attention(
     **Not in scope:** account-level health is covered by the ``account_status_alert`` flag at zero
     extra read cost. Budget pacing and ad health are both off by default; pass ``include_pacing=True``
     / ``include_ad_health=True`` to fold them in.
+
+    **``precomputed_current_perf`` (internal composition seam — NOT exposed to the LLM).** A caller
+    that already holds a :func:`cross_account_performance` result for the CURRENT window (e.g.
+    :func:`portfolio_digest`) may inject it to skip the internal *current* fetch; the **baseline** is
+    still fetched here (the baseline window differs from the digest window, so it cannot be shared).
+    The injected perf must have been computed with the same ``reporting_currency`` this call resolves
+    — a mismatch raises ``ValueError`` (a defensive guard against misuse; the digest always threads a
+    matching currency + shared ``fx_table``). The default (kwarg omitted) path is byte-identical.
     """
     thr = thresholds if thresholds is not None else AttentionThresholds.defaults()
 
@@ -1716,14 +1738,28 @@ def flag_accounts_needing_attention(
     # reporting_currency and normalizes both windows (an invalid currency raises inside the first call).
     table = fx_table if fx_table is not None else load_fx_table()
 
-    current = cross_account_performance(
-        reader,
-        date_from=current_from,
-        date_to=current_to,
-        account_ids=account_ids,
-        reporting_currency=reporting_currency,
-        fx_table=table,
-    )
+    # Composition seam: an injected current perf skips the current fetch (the baseline is still read
+    # below). Guard against a currency mismatch — the injected perf must match this call's resolved
+    # reporting_currency, else the join would silently mix normalization bases.
+    if precomputed_current_perf is not None:
+        reporting = str(reporting_currency or "").strip().upper()
+        injected_currency = precomputed_current_perf.get("reporting_currency")
+        if injected_currency != reporting:
+            raise ValueError(
+                "precomputed_current_perf.reporting_currency "
+                f"({injected_currency!r}) does not match this call's reporting_currency "
+                f"({reporting!r}); the injected perf must be normalized to the same currency."
+            )
+        current = precomputed_current_perf
+    else:
+        current = cross_account_performance(
+            reader,
+            date_from=current_from,
+            date_to=current_to,
+            account_ids=account_ids,
+            reporting_currency=reporting_currency,
+            fx_table=table,
+        )
     baseline = cross_account_performance(
         reader,
         date_from=resolved_from,
@@ -2263,6 +2299,7 @@ def pacing_report(
     as_of: str | None = None,
     reporting_currency: str = "USD",
     fx_table: FxTable | None = None,
+    precomputed_perf: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Is each account on track to spend its configured budget for the reporting period?
 
@@ -2313,6 +2350,17 @@ def pacing_report(
     genuinely uncapped ``no_budget_set``). An invalid ``reporting_currency`` (absent from the FX table)
     is a whole-call ``ValueError`` inherited from the prereq; ``date_from > date_to`` raises before any
     read. ``fx_table`` is a test-only seam (not exposed to the LLM).
+
+    **``precomputed_perf`` (internal composition seam — NOT exposed to the LLM).** A caller that
+    already holds a :func:`cross_account_performance` result for ``[date_from, effective_as_of]`` (e.g.
+    :func:`portfolio_digest` calling with ``as_of=date_to``, which makes ``elapsed_fraction == 1`` and
+    the perf window exactly ``[date_from, date_to]``) may inject it to skip the step-1 spend read; the
+    step-2 budget fan-out is unchanged. The injected perf must be normalized to this call's resolved
+    ``reporting_currency`` — a mismatch raises ``ValueError``. The seam is used ONLY when
+    ``elapsed_fraction > 0``; when the period has not started (``elapsed_fraction <= 0``) the injected
+    perf is IGNORED and the existing ``[date_from, date_from]`` read runs (defensive — the digest
+    always passes ``date_from <= date_to`` so this edge never fires from it). The default (kwarg
+    omitted) path is byte-identical.
     """
     # Fail fast on an empty period and resolve the pacing arithmetic BEFORE any read. ``as_of=None``
     # -> today (UTC) is the single clock touch in this tool.
@@ -2330,14 +2378,27 @@ def pacing_report(
     # to None anyway, so the reported spend is immaterial. cross_account_performance validates the FX
     # table / reporting_currency (raising ValueError on an unknown currency — the inherited contract).
     read_to = date_from if elapsed_fraction <= 0 else effective_as_of
-    perf = cross_account_performance(
-        reader,
-        date_from=date_from,
-        date_to=read_to,
-        account_ids=account_ids,
-        reporting_currency=reporting,
-        fx_table=table,
-    )
+    if precomputed_perf is not None and elapsed_fraction > 0:
+        # Composition seam: reuse an already-fetched perf covering [date_from, effective_as_of] in the
+        # same reporting_currency, skipping step 1. Guard the currency so a mismatched normalization
+        # base can never slip in. Ignored when the period has not started (see docstring).
+        injected_currency = precomputed_perf.get("reporting_currency")
+        if injected_currency != reporting:
+            raise ValueError(
+                "precomputed_perf.reporting_currency "
+                f"({injected_currency!r}) does not match this call's reporting_currency "
+                f"({reporting!r}); the injected perf must be normalized to the same currency."
+            )
+        perf = precomputed_perf
+    else:
+        perf = cross_account_performance(
+            reader,
+            date_from=date_from,
+            date_to=read_to,
+            account_ids=account_ids,
+            reporting_currency=reporting,
+            fx_table=table,
+        )
 
     # Step 2: budget fan-out over the accounts that read OK in step 1 (in scope order). One worker per
     # account issues all three reads so the fan-out stays 3 reads/account and their failures isolate
@@ -2725,3 +2786,871 @@ def rank_accounts(
         "unranked": unranked,
         "errors": perf["errors"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# CROSS-ACCOUNT CREATIVE TRIAGE: rank individual ADS pooled across every account.
+#
+# The ad-level sibling of rank_accounts. Where rank_accounts ranks whole accounts (one account-level
+# insights row each), this pools one row PER DELIVERING AD across every reachable account and ranks
+# those ads by a single metric — the winners/losers at the creative level.
+#
+# It rides the SAME fan-out engine as cross_account_performance (resolve_scope -> fan_out_accounts ->
+# main-thread assembly), so it inherits determinism and per-account partial-failure isolation, and it
+# reuses cross_account_performance's per-row metric machinery (result-key resolution, self-heal,
+# compute_derived_metrics, FX money twins) applied per ad instead of per account. The ranking block is
+# rank_accounts's partition/sort/rank logic keyed on ``ad_id`` instead of ``ad_account_id``.
+#
+# Crucially it reads ONLY ad-level insights (level="ad", time_increment="all_days") — one aggregated
+# row per ad that HAD delivery in the window. It never enumerates /{account}/ads, so it is naturally
+# scoped to recently-active creative and skips the dormant graveyard that times out the ad-health scan
+# (flag-ad-health-scan-scale). This makes it a *performance* read, NOT an ad-health read: an ad that
+# never delivered surfaces no insights row and so is invisible here, by design.
+# --------------------------------------------------------------------------- #
+
+
+def cross_account_creative_triage(
+    reader: "MetaReaderProvider",
+    *,
+    date_from: str,
+    date_to: str,
+    metric: str = "spend",
+    order: str = "desc",
+    limit: int = 10,
+    account_ids: list[str] | None = None,
+    reporting_currency: str = "USD",
+    fx_table: FxTable | None = None,
+) -> dict[str, Any]:
+    """Rank individual ads pooled across every reachable account (or a subset) by one metric.
+
+    The ad-level sibling of :func:`rank_accounts`. Fans out over the resolved scope reading one
+    ``level="ad"`` / ``time_increment="all_days"`` insights row per ad that DELIVERED in the window
+    (had impressions/spend), pools every such ad across accounts, then partitions the pool into
+    rankable (metric value present) vs ``unranked`` (missing value, or no-FX normalized twin for a
+    money metric), sorts, assigns 1-based ranks (ties share the strictly-better count + 1, tiebroken
+    by ``ad_id`` ascending), and truncates to ``limit``. ``order="desc"`` surfaces winners; a second
+    call with ``order="asc"`` surfaces losers (each call re-runs the ad-level fan-out).
+
+    Per ad the base metrics (``spend``/``impressions``/``clicks``/``results``/``purchase_value``) come
+    from that ad's own insights row and the efficiency ratios (``cpm``/``cpc``/``ctr``/
+    ``cost_per_result``/``roas``) are recomputed from them via :func:`compute_derived_metrics` — never
+    an averaged ratio, and a metric whose denominator/component is missing is omitted (never
+    ``inf``/``0``). Money metrics get a ``*_normalized`` twin in ``reporting_currency`` (default USD)
+    from the static FX table; ``ctr``/``roas`` are currency-invariant and get no twin.
+
+    The result key is resolved ONCE per account (config first, else inferred from the account's pooled
+    ad ``actions``) and applied to every ad in that account — all ads in an account share its goal.
+    A configured lead account self-heals against the whole lead-key family exactly as
+    :func:`cross_account_performance` does.
+
+    ``metric`` is normalized to lowercase and resolved through :data:`RANK_METRIC_ALIASES` (so ``cpl``
+    /``cpa`` -> ``cost_per_result``); the canonical name appears in the output. Money metrics are
+    ranked on each ad's ``*_normalized`` twin so ads in different currencies compare directly, with
+    ``value_native`` carrying the native figure; ratio/count metrics rank natively. An account whose
+    currency is absent from the FX table records ONE ``errors`` entry (not one per ad) and its ads fall
+    to ``unranked`` under a money metric (they still rank under a ratio/count metric).
+
+    An unknown ``metric``/``order``, a non-positive ``limit``, or a ``reporting_currency`` absent from
+    the FX table each raise ``ValueError``; a whole-discovery failure propagates unchanged from
+    :func:`resolve_scope`. ``fx_table`` is a test-only injection seam — not exposed to the LLM.
+    """
+    canonical = RANK_METRIC_ALIASES.get(str(metric or "").lower())
+    if canonical is None:
+        valid = sorted(RANK_METRIC_ALIASES)
+        raise ValueError(f"Unknown metric {metric!r}; valid names: {', '.join(valid)}")
+    if order not in ("asc", "desc"):
+        raise ValueError(f"order must be 'asc' or 'desc'; got {order!r}")
+    if limit <= 0:
+        raise ValueError(f"limit must be a positive integer; got {limit}")
+
+    reporting = str(reporting_currency or "").strip().upper()
+    table = fx_table if fx_table is not None else load_fx_table()
+    if not table.has(reporting):
+        raise ValueError(
+            f"reporting_currency {reporting!r} has no rate in the FX table (as_of {table.as_of}); "
+            "cannot normalize to it."
+        )
+
+    is_money = canonical in _RANK_MONEY_METRICS
+    sort_field = f"{canonical}_normalized" if is_money else canonical
+
+    registry_by_id = _registry_by_ad_account_id()
+    scope = resolve_scope(reader, account_ids)  # discovery path may raise -> whole-call failure
+
+    def read_one(ad_account_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        meta_row = scope.metadata_by_id.get(ad_account_id)
+        if meta_row is None:
+            meta_row = normalize_ad_account(
+                reader.get_account(ad_account_id, fields=DEFAULT_AD_ACCOUNT_FIELDS)
+            )
+        # level="ad", all_days -> one aggregated row per ad THAT DELIVERED (never walks dormant ads).
+        insight_rows = reader.fetch_insights(
+            ad_account_id,
+            fields=DEFAULT_TRIAGE_INSIGHT_FIELDS,
+            date_from=date_from,
+            date_to=date_to,
+            level="ad",
+            time_increment="all_days",
+        )
+        return meta_row, insight_rows
+
+    results = fan_out_accounts(read_one, scope.account_ids)
+
+    ad_rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for ad_account_id, payload, error in results:
+        if error is not None:
+            errors.append({"ad_account_id": ad_account_id, "error": error})
+            continue
+
+        meta_row, insight_rows = payload
+        # Account identity comes from the account metadata row, never the insights row (same source the
+        # other fan-out tools use). ad_id/ad_name come from each insights row.
+        currency = meta_row.get("currency") or "UNKNOWN"
+        account_id = meta_row.get("account_id")
+        account_name = meta_row.get("name")
+
+        # Resolve the result key ONCE per account: config first, else infer from the account's POOLED
+        # ad actions (so the mock/no-config path still works). All ads in an account share its goal.
+        combined_actions: list[dict[str, Any]] = []
+        for insight_row in insight_rows:
+            combined_actions.extend(_metric_blob_list(insight_row.get("actions")))
+        result_key, result_label = _resolve_result_key(
+            ad_account_id, combined_actions, registry_by_id
+        )
+
+        # No FX rate for this currency -> emit ONE error for the account (matching the per-account
+        # granularity of cross_account_performance), not one per ad. Its ads keep native figures and
+        # fall to unranked under a money metric, but still rank under a ratio/count metric.
+        has_fx = table.has(currency)
+        if not has_fx:
+            errors.append(
+                {
+                    "ad_account_id": ad_account_id,
+                    "error": f"no FX rate for currency '{currency}' (as_of {table.as_of})",
+                }
+            )
+
+        for insight_row in insight_rows:
+            actions = _metric_blob_list(insight_row.get("actions"))
+            action_values = _metric_blob_list(insight_row.get("action_values"))
+
+            spend = _number(insight_row.get("spend"))
+            impressions = _number(insight_row.get("impressions"))
+            clicks = _number(insight_row.get("clicks"))
+            # Same three-branch result logic as cross_account_performance, applied per ad against the
+            # account's resolved key (lead family self-heal / configured or inferred key / absent).
+            if result_key and result_key.lower() in _LEAD_KEYS_LOWER:
+                results_value = _find_metric(actions, LEAD_KEYS)
+            elif result_key:
+                results_value = _find_metric(actions, [result_key])
+            else:
+                results_value = None
+            purchase_value = _find_metric(action_values, PURCHASE_KEYS)
+
+            native_base = {
+                "spend": spend,
+                "impressions": impressions,
+                "clicks": clicks,
+                "results": results_value,
+                "purchase_value": purchase_value,
+            }
+            native_derived = compute_derived_metrics(native_base)
+
+            ad_id = str(insight_row.get("ad_id") or "")
+            # Meta occasionally returns a blank ad_name -> fall back to the id so every row is labelled.
+            ad_name = insight_row.get("ad_name") or ad_id
+
+            row: dict[str, Any] = {
+                "ad_account_id": ad_account_id,
+                "account_id": account_id,
+                "account_name": account_name,
+                "ad_id": ad_id,
+                "ad_name": ad_name,
+                "currency": currency,
+            }
+            # Native base: omit a metric Meta left blank; counts as int, money as float.
+            if spend is not None:
+                row["spend"] = spend
+            if impressions is not None:
+                row["impressions"] = _as_count(impressions)
+            if clicks is not None:
+                row["clicks"] = _as_count(clicks)
+            if results_value is not None:
+                row["results"] = _as_count(results_value)
+            if result_key:
+                row["result_label"] = result_label
+            if purchase_value is not None:
+                row["purchase_value"] = purchase_value
+            row.update(native_derived)  # cpm/cpc/ctr/cost_per_result/roas (absent omitted)
+
+            # Money twins in the reporting currency (only when this account HAS an FX rate).
+            if has_fx:
+                spend_norm = (
+                    table.convert(spend, from_currency=currency, to_currency=reporting)
+                    if spend is not None
+                    else None
+                )
+                pv_norm = (
+                    table.convert(purchase_value, from_currency=currency, to_currency=reporting)
+                    if purchase_value is not None
+                    else None
+                )
+                norm_derived = compute_derived_metrics(
+                    {
+                        "spend": spend_norm,
+                        "impressions": impressions,
+                        "clicks": clicks,
+                        "results": results_value,
+                        "purchase_value": pv_norm,
+                    }
+                )
+                if spend_norm is not None:
+                    row["spend_normalized"] = spend_norm
+                for metric_name in _NORMALIZED_MONEY_DERIVED:
+                    if metric_name in norm_derived:
+                        row[f"{metric_name}_normalized"] = norm_derived[metric_name]
+                if pv_norm is not None:
+                    row["purchase_value_normalized"] = pv_norm
+
+            ad_rows.append(row)
+
+    # Partition pooled ads into rankable and unranked (rank_accounts's logic, keyed on ad_id).
+    rankable: list[tuple[float, str, dict[str, Any]]] = []
+    unranked: list[dict[str, Any]] = []
+
+    for row in ad_rows:
+        ad_id = row["ad_id"]
+        sort_value = row.get(sort_field)
+        if sort_value is not None:
+            rankable.append((float(sort_value), ad_id, row))
+        else:
+            if is_money and canonical in row:
+                # Native value present but no normalized twin → no FX rate for this currency.
+                reason = f"no FX rate for {row.get('currency', 'UNKNOWN')}"
+            else:
+                reason = "metric unavailable"
+            unranked.append(
+                {
+                    "ad_account_id": row["ad_account_id"],
+                    "ad_id": ad_id,
+                    "ad_name": row.get("ad_name"),
+                    "reason": reason,
+                }
+            )
+
+    # Sort: flip sign for desc so both directions share one ascending tuple sort. Tiebreak: ad_id
+    # ascending → stable, deterministic total order run-to-run regardless of worker completion order.
+    if order == "desc":
+        rankable.sort(key=lambda t: (-t[0], t[1]))
+    else:
+        rankable.sort(key=lambda t: (t[0], t[1]))
+
+    # Assign 1-based ranks: ties share strictly-better count + 1 (first occurrence of a value sits at
+    # index = count of strictly-better entries, since the list is already value-sorted).
+    ranked: list[dict[str, Any]] = []
+    current_rank: int = 1
+    prev_value: float | None = None
+    for i, (sort_value, ad_id, row) in enumerate(rankable):
+        if prev_value is None or sort_value != prev_value:
+            current_rank = i + 1
+        prev_value = sort_value
+
+        entry: dict[str, Any] = {
+            "rank": current_rank,
+            "ad_account_id": row["ad_account_id"],
+            "account_id": row.get("account_id"),
+            "account_name": row.get("account_name"),
+            "ad_id": ad_id,
+            "ad_name": row.get("ad_name"),
+            "currency": row.get("currency"),
+            # Emit the row's original-typed value (int for counts, float for money-normalized).
+            "value": row.get(sort_field),
+            "result_label": row.get("result_label"),
+        }
+        if is_money:
+            entry["value_native"] = row.get(canonical)
+        ranked.append(entry)
+
+    ranked_total = len(ranked)
+
+    result: dict[str, Any] = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "metric": canonical,
+        "order": order,
+        "limit": limit,
+        "reporting_currency": reporting,
+        "fx_as_of": table.as_of,
+        "fx_note": table.note,
+        "account_count": len(scope.account_ids),  # accounts attempted
+        "ad_count": len(ad_rows),  # delivering ads pooled across all accounts
+        "ranked": ranked[:limit],
+        "ranked_total": ranked_total,
+        "unranked": unranked,
+        "errors": errors,
+    }
+    if scope.requested_all and not scope.account_ids:
+        result["note"] = "no accounts reachable"
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# GOAL GRADING: where does each CONFIGURED account stand against its OWN goal?
+#
+# A *pure post-processor* over cross_account_performance — same relationship account_benchmark /
+# rank_accounts have to it. It calls that tool ONCE over the resolved scope (inheriting the
+# bounded-concurrency fan-out, Simpson's-paradox-safe derived metrics, per-account failure isolation,
+# and deterministic ordering), then joins each returned row's NATIVE cost_per_result / roas to the
+# account's configured goal bars (from config/meta_ads_accounts.json's action_policy) via the pure
+# goal_grading engine. No FX on thresholds: a goal is stated in the account's own currency, so we
+# compare native-to-native (see [[currency-precision-low-priority]]).
+# --------------------------------------------------------------------------- #
+
+
+def _grade_policy_for_account(account: account_registry.MetaAdsAccount) -> dict[str, Any]:
+    """Flatten a registry account into the single policy dict the goal_grading engine reads.
+
+    The engine wants one flat dict carrying the ``action_policy`` bars PLUS ``roas_role`` (which lives
+    in ``measurement_focus`` today, surfaced on the dataclass as ``account.roas_role``). An
+    ``action_policy`` that already carries its own ``roas_role`` wins; otherwise the measurement-focus
+    value is folded in, so metric selection sees it either way.
+    """
+    policy: dict[str, Any] = dict(account.action_policy or {})
+    if not policy.get("roas_role") and account.roas_role:
+        policy["roas_role"] = account.roas_role
+    return policy
+
+
+def grade_accounts_against_goals(
+    reader: "MetaReaderProvider",
+    *,
+    date_from: str,
+    date_to: str,
+    account_ids: list[str] | None = None,
+    as_of: str | None = None,
+    precomputed_perf: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Grade each CONFIGURED account's real efficiency against its OWN configured goal bars.
+
+    Joins two things that already exist but were never connected: the per-account **metric**
+    (:func:`cross_account_performance`'s native ``cost_per_result`` / ``roas``) and the per-account
+    **goal** (the account's ``action_policy`` in ``config/meta_ads_accounts.json``). Returns a
+    per-account verdict, a portfolio ``counts`` rollup, and a ``pause_candidates`` shortlist — the whole
+    portfolio's standing in one call.
+
+    **Scope.** Default (``account_ids=None``) grades the configured accounts (the registry's
+    ``ad_account_id``s). An explicit ``account_ids`` grades exactly those — reads stay open, so an id
+    with no config entry is graded :data:`~meta_ads_analysis.goal_grading.GOAL_NO_CONFIG` (counted, not
+    an error). An empty configured registry with the default scope returns an empty result with a
+    ``note`` (never raises).
+
+    **Grading.** For each row :func:`cross_account_performance` returns, the account's policy picks the
+    metric (:func:`~meta_ads_analysis.goal_grading.select_goal_metric` — ``roas_role``/``primary_goal``
+    rule), the row's **native** value + ``spend`` are read, and the pure
+    :func:`~meta_ads_analysis.goal_grading.grade_against_goal` engine returns the verdict. Thresholds
+    are compared native-to-native (no FX): a goal is stated in the account's own currency.
+
+    **``as_of``** defaults to today (UTC) — the single clock touch; the pure engine always takes an
+    explicit date. It governs only the post-launch grace window (an ``evaluation_start_date`` inside its
+    ``evaluation_grace_days`` softens a ``pause_candidate`` to ``watch``); with no launch date set (the
+    common case) accounts are graded as mature. A malformed ``as_of`` is a whole-call ``ValueError``.
+
+    **Errors.** Per-account read failures and no-FX entries from :func:`cross_account_performance`
+    propagate into ``errors`` unchanged; one account's failure never aborts the grade.
+
+    **``precomputed_perf`` (internal composition seam — NOT exposed to the LLM).** A caller that
+    already holds a :func:`cross_account_performance` result for ``[date_from, date_to]`` (e.g.
+    :func:`portfolio_digest`) may inject it to skip the internal fetch. When provided: the internal
+    fetch AND the ``empty_default`` early-return are bypassed, and the working scope becomes exactly
+    ``precomputed_perf["accounts"]`` — so an injected account absent from config is graded
+    ``GOAL_NO_CONFIG`` exactly as a self-fetched one, and an id ``account_ids`` would resolve but that
+    the injected perf lacks is simply not graded (the injected scope wins, by design — see the digest's
+    portfolio-wide-scope note). **Native-metric invariant:** grading reads only each row's *native*
+    ``cost_per_result`` / ``roas`` / ``spend`` (never the ``*_normalized`` twins), which are present
+    regardless of the injected perf's ``reporting_currency`` — so an injected perf normalized to any
+    currency yields the SAME grade output as this tool's own USD-default fetch. The default (kwarg
+    omitted) path is byte-identical to before.
+    """
+    # Single clock touch: as_of default = today (UTC). Parse to a date for the pure engine's grace math;
+    # a bad ISO string is a clear whole-call failure (mirrors pacing_report's fail-fast discipline).
+    effective_as_of = as_of or datetime.now(tz=timezone.utc).date().isoformat()
+    as_of_date = date.fromisoformat(effective_as_of)
+
+    registry_by_id = _registry_by_ad_account_id()  # {ad_account_id: MetaAdsAccount}; {} if no config.
+
+    # Default scope = the configured accounts (registry insertion order → deterministic). An explicit
+    # list is graded as-is (open reads); an id absent from config lands in no_goal_configured below.
+    scope_ids = list(registry_by_id.keys()) if account_ids is None else account_ids
+
+    empty_default = account_ids is None and not scope_ids
+    counts: dict[str, int] = {
+        goal_grading.GOAL_ON: 0,
+        goal_grading.GOAL_WATCH: 0,
+        goal_grading.GOAL_PAUSE_CANDIDATE: 0,
+        goal_grading.GOAL_INSUFFICIENT: 0,
+        goal_grading.GOAL_NO_THRESHOLDS: 0,
+        goal_grading.GOAL_NO_CONFIG: 0,
+    }
+
+    if precomputed_perf is not None:
+        # Composition seam: reuse an already-fetched perf; the caller resolved scope, so the
+        # scope_ids / empty_default logic above is bypassed entirely.
+        perf = precomputed_perf
+    else:
+        if empty_default:
+            # No configured accounts and no explicit scope: nothing to grade. Never touch Meta.
+            return {
+                "date_from": date_from,
+                "date_to": date_to,
+                "as_of": effective_as_of,
+                "accounts": [],
+                "counts": counts,
+                "pause_candidates": [],
+                "errors": [],
+                "note": "no configured accounts to grade",
+            }
+
+        perf = cross_account_performance(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            account_ids=scope_ids,
+            level="account",
+        )
+
+    accounts: list[dict[str, Any]] = []
+    pause_candidates: list[dict[str, Any]] = []
+
+    for row in perf["accounts"]:  # scope-ordered → deterministic output.
+        ad_account_id = row["ad_account_id"]
+        account = registry_by_id.get(ad_account_id)
+
+        if account is None:
+            # Read stayed open, but the account carries no configured goal.
+            verdict = goal_grading.GOAL_NO_CONFIG
+            entry: dict[str, Any] = {
+                "account_id": row.get("account_id"),
+                "ad_account_id": ad_account_id,
+                "name": row.get("name"),
+                "currency": row.get("currency"),
+                "metric": None,
+                "value": None,
+                "target": None,
+                "pause_threshold": None,
+                "spend": row.get("spend"),
+                "in_grace": False,
+                "verdict": verdict,
+                "reasons": ["account is not in config/meta_ads_accounts.json — no goal to grade against"],
+            }
+        else:
+            policy = _grade_policy_for_account(account)
+            metric = goal_grading.select_goal_metric(policy)
+            grade = goal_grading.grade_against_goal(
+                metric=metric,
+                value=row.get(metric),  # native cost_per_result / roas (never the *_normalized twin).
+                spend=row.get("spend"),
+                policy=policy,
+                as_of=as_of_date,
+            )
+            verdict = grade.verdict
+            entry = {
+                "account_id": row.get("account_id"),
+                "ad_account_id": ad_account_id,
+                "name": row.get("name"),
+                "currency": row.get("currency"),
+                "metric": grade.metric,
+                "value": grade.value,
+                "target": grade.target,
+                "pause_threshold": grade.pause_threshold,
+                "spend": row.get("spend"),
+                "in_grace": grade.in_grace,
+                "verdict": verdict,
+                "reasons": grade.reasons,
+            }
+            if verdict == goal_grading.GOAL_PAUSE_CANDIDATE:
+                pause_candidates.append(
+                    {
+                        "account_id": row.get("account_id"),
+                        "name": row.get("name"),
+                        "metric": grade.metric,
+                        "value": grade.value,
+                        "pause_threshold": grade.pause_threshold,
+                    }
+                )
+
+        counts[verdict] = counts.get(verdict, 0) + 1
+        accounts.append(entry)
+
+    # Stable shortlist: sort by account_id so the pause-candidate order is deterministic run-to-run
+    # regardless of the (already-deterministic) scope order.
+    pause_candidates.sort(key=lambda e: str(e.get("account_id") or ""))
+
+    result: dict[str, Any] = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "as_of": effective_as_of,
+        "accounts": accounts,
+        "counts": counts,
+        "pause_candidates": pause_candidates,
+        "errors": perf["errors"],
+    }
+    if perf.get("note"):
+        result["note"] = perf["note"]
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# PORTFOLIO DIGEST: one-call "give me my portfolio overview".
+#
+# A *composite* over the four cross-account tools — it never reimplements their logic. The daily-driver
+# question is "what's my whole portfolio doing and what needs me right now?", which today takes 3-4
+# separate calls the operator stitches by hand. This tool answers it in ONE call by fetching
+# cross_account_performance ONCE for the window and threading that shared result into
+# grade_accounts_against_goals / flag_accounts_needing_attention / pacing_report via their
+# precomputed-perf seams — so the default digest costs about the same as one flag call (~2N insight
+# reads), not 3-4x the reads. Each section is clearly labeled and independently readable.
+#
+# READ COST (documented). Default (include_flags=True, pacing/ad-health off) over an N-account scope:
+# the shared perf fan-out (N) + flag's baseline fan-out (N) = ~1 + 2N insight reads; grade contributes
+# ZERO extra reads (it consumes the shared perf). include_pacing=True adds pacing's 3N budget reads
+# (list_campaigns/list_adsets/get_account) and NO extra insight reads. include_ad_health=True adds
+# len(flagged) ad enumerations. The read-heaviest opt-ins are OFF by default so the default path never
+# balloons to the 1 + 5N full menu.
+#
+# SCOPE CEILING. With account_ids=None the shared perf fans over the WHOLE reach; the token reaches
+# ~792 accounts and a full-fleet fan-out times out (see token-reach memory). Steer callers to pass an
+# explicit account_ids for anything beyond a small fleet.
+# --------------------------------------------------------------------------- #
+
+# Cap on the top/bottom spenders shortlists — a small, glanceable N (not the whole fleet).
+_DIGEST_TOP_N = 5
+
+
+def _digest_spend_sort_value(row: dict[str, Any]) -> float:
+    """Sort key for the top/bottom spender lists: normalized spend, native fallback for a no-FX
+    account (so a currency with no FX rate still ranks), 0.0 when spend is entirely absent."""
+    value = row.get("spend_normalized")
+    if value is None:
+        value = row.get("spend")
+    return float(value) if value is not None else 0.0
+
+
+def _digest_spender_entry(row: dict[str, Any]) -> dict[str, Any]:
+    """One top/bottom shortlist entry — id/name/currency + native and (when present) normalized spend,
+    so it is independently readable without the caller re-joining against ``perf``."""
+    entry: dict[str, Any] = {
+        "ad_account_id": row.get("ad_account_id"),
+        "account_id": row.get("account_id"),
+        "name": row.get("name"),
+        "currency": row.get("currency"),
+    }
+    if "spend" in row:
+        entry["spend"] = row["spend"]
+    if "spend_normalized" in row:
+        entry["spend_normalized"] = row["spend_normalized"]
+    return entry
+
+
+def portfolio_digest(
+    reader: "MetaReaderProvider",
+    *,
+    date_from: str,
+    date_to: str,
+    account_ids: list[str] | None = None,
+    reporting_currency: str = "USD",
+    include_flags: bool = True,
+    include_pacing: bool = False,
+    include_ad_health: bool = False,
+    fx_table: FxTable | None = None,
+) -> dict[str, Any]:
+    """One-call portfolio overview: totals, per-account goal standing, what changed, and pacing.
+
+    A **composite** that answers "what's my whole portfolio doing and what needs me right now?" in a
+    single call by fetching :func:`cross_account_performance` ONCE and threading that shared result into
+    :func:`grade_accounts_against_goals`, :func:`flag_accounts_needing_attention`, and
+    :func:`pacing_report` via their precomputed-perf seams — so it never re-reads the same numbers. It
+    reimplements none of those tools' logic; it composes them and synthesizes a worst-first shortlist.
+
+    **Sections** (each labeled + independently readable):
+
+    - ``totals`` — ``normalized_total`` (portfolio figures in ``reporting_currency``) +
+      ``totals_by_currency`` (per-currency native subtotals; money never sums across currencies).
+    - ``top`` / ``bottom`` — the biggest / smallest spenders (up to :data:`_DIGEST_TOP_N`), a plain
+      deterministic sort over the perf rows already in hand (NOT a re-fetching ``rank_accounts`` call).
+    - ``goal_summary`` — ``counts`` + ``pause_candidates`` from grade.
+    - ``attention`` — ``flagged`` / ``informational`` / ``clean_count`` from flag (only when
+      ``include_flags``; else ``None``).
+    - ``pacing`` — the ``status_counts`` + worst over/under shortlists from pacing (only when
+      ``include_pacing``; else ``None``).
+    - ``needs_you`` — a synthesized worst-first shortlist merging goal ``pause_candidates`` and the
+      **high-severity** ``attention.flagged`` accounts, deduped by ``ad_account_id`` (a dual-source
+      account appears once carrying both reasons + sources).
+    - ``errors`` — the union of each sub-tool's errors, tagged with a ``section`` (see below).
+
+    **Scope difference from standalone grade (intentional, NOT a bug).** The digest threads its *full*
+    resolved scope into grade, so ``goal_summary.counts`` includes a ``no_goal_configured`` tally for
+    every in-scope account absent from ``config/meta_ads_accounts.json`` — the portfolio-wide view.
+    Standalone :func:`grade_accounts_against_goals` defaults to configured accounts only.
+
+    **Read cost** (documented). Default (``include_flags=True``, pacing/ad-health off) over an
+    N-account scope: shared perf (N) + flag baseline (N) = ~``1 + 2N`` insight reads; grade adds ZERO.
+    ``include_pacing=True`` adds pacing's ``3N`` budget reads and no extra insight reads.
+    ``include_ad_health=True`` adds ``len(flagged)`` ad enumerations. The read-heaviest opt-ins are OFF
+    by default. **Scope ceiling:** with ``account_ids=None`` the perf fans over the whole reach (~792
+    accounts) and times out — pass an explicit ``account_ids`` for anything beyond a small fleet.
+
+    **Pacing semantics.** ``pacing`` uses ``as_of=date_to`` so the period is complete
+    (``elapsed_fraction == 1``): the injected perf's window matches pacing's spend-to-date window (this
+    is what lets the seam fire) and ``variance_pct`` is realized actual-vs-budget for the window — the
+    same realized-variance semantics :func:`flag_accounts_needing_attention`'s ``include_pacing`` uses.
+    True forward month-projection is :func:`pacing_report` called directly with a mid-period ``as_of``.
+
+    **Failure isolation.** The shared perf is the single fan-out; a whole-call ``ValueError`` (bad
+    ``reporting_currency``) or discovery ``MetaApiError`` there fails the whole digest (nothing is
+    computable without perf) — matching every prereq tool's contract. Each downstream section (grade /
+    flag / pacing) is wrapped in its own ``try/except``: an unexpected whole-call exception sets that
+    section to ``None``, appends a ``{section, error}`` entry to ``errors``, and STILL returns the other
+    sections. Per-account failures never reach here — they are already isolated inside each tool and
+    surface as tagged ``errors`` entries.
+
+    **Errors tagging.** The shared perf's per-account errors (read failures, no-FX accounts) are tagged
+    ``section="performance"`` ONCE. grade / flag / pacing all *inherit* that same perf's errors, so to
+    avoid triple-counting, the digest carries only each sub-tool's NEW errors: flag's baseline-window +
+    stage (pacing/ad_health) errors under ``section="attention"``, and pacing's budget-read failures
+    under ``section="pacing"``. ``fx_table`` is an internal/test seam, NOT exposed to the LLM.
+    """
+    table = fx_table if fx_table is not None else load_fx_table()
+
+    # 1. Shared perf — the single account-level insight fan-out. A whole-call failure here (bad
+    #    reporting_currency / discovery error) propagates and fails the whole digest (nothing is
+    #    computable without it) — the inherited prereq contract.
+    perf = cross_account_performance(
+        reader,
+        date_from=date_from,
+        date_to=date_to,
+        account_ids=account_ids,
+        reporting_currency=reporting_currency,
+        fx_table=table,
+    )
+    reporting = perf["reporting_currency"]
+    # The resolved scope for every downstream section. Passed explicitly to flag/pacing so their own
+    # fan-outs cover EXACTLY this scope and never re-discover the whole reach.
+    scope_ids = [row["ad_account_id"] for row in perf["accounts"]]
+
+    errors: list[dict[str, Any]] = [
+        {
+            "section": "performance",
+            "ad_account_id": entry.get("ad_account_id"),
+            "error": entry.get("error"),
+        }
+        for entry in perf["errors"]
+    ]
+
+    # 2. Totals — straight from perf. Zero extra reads.
+    totals = {
+        "normalized_total": perf["normalized_total"],
+        "totals_by_currency": perf["totals_by_currency"],
+    }
+
+    # 3. Top / bottom spenders — deterministic sort over the perf rows we already hold (tiebreak by
+    #    ad_account_id asc for a stable total order). NOT a rank_accounts call (which re-fetches).
+    top = [
+        _digest_spender_entry(row)
+        for row in sorted(
+            perf["accounts"],
+            key=lambda r: (-_digest_spend_sort_value(r), r.get("ad_account_id") or ""),
+        )[:_DIGEST_TOP_N]
+    ]
+    bottom = [
+        _digest_spender_entry(row)
+        for row in sorted(
+            perf["accounts"],
+            key=lambda r: (_digest_spend_sort_value(r), r.get("ad_account_id") or ""),
+        )[:_DIGEST_TOP_N]
+    ]
+
+    # 4. Goal summary — grade threaded with the shared perf (zero extra reads). Isolated: an unexpected
+    #    whole-call failure sets the section None and records the error, but the digest still returns.
+    goal_summary: dict[str, Any] | None = None
+    grade: dict[str, Any] | None = None
+    try:
+        grade = grade_accounts_against_goals(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            precomputed_perf=perf,
+        )
+        goal_summary = {
+            "counts": grade["counts"],
+            "pause_candidates": grade["pause_candidates"],
+        }
+        # grade["errors"] IS perf["errors"] (it passes the injected perf's errors through), already
+        # tagged "performance" above — do not re-add, or no-FX/read errors would double-count.
+    except Exception as exc:  # noqa: BLE001 — defensive section isolation (see docstring).
+        errors.append({"section": "goal", "error": str(exc)})
+
+    # 5. Attention — flag threaded with the shared perf as its CURRENT window (baseline auto-derives via
+    #    prior_window and IS fetched: +N insight reads). Only when include_flags. Isolated like grade.
+    attention: dict[str, Any] | None = None
+    flag_result: dict[str, Any] | None = None
+    if include_flags:
+        try:
+            flag_result = flag_accounts_needing_attention(
+                reader,
+                current_from=date_from,
+                current_to=date_to,
+                account_ids=scope_ids,
+                reporting_currency=reporting,
+                fx_table=table,
+                precomputed_current_perf=perf,
+                include_pacing=False,
+                include_ad_health=include_ad_health,
+            )
+            attention = {
+                "flagged": flag_result["flagged"],
+                "informational": flag_result["informational"],
+                "clean_count": flag_result["clean_count"],
+            }
+            for entry in flag_result["errors"]:
+                # Skip current-window errors — they are the shared perf's, already tagged "performance".
+                # Carry the NEW ones: baseline-window read failures + pacing/ad_health stage failures.
+                if entry.get("window") == "current":
+                    continue
+                errors.append(
+                    {
+                        "section": "attention",
+                        "ad_account_id": entry.get("ad_account_id"),
+                        "error": entry.get("error"),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 — defensive section isolation.
+            attention = None
+            errors.append({"section": "attention", "error": str(exc)})
+
+    # 6. Pacing — heaviest opt-in (+3N budget reads). Threaded with the shared perf + as_of=date_to so
+    #    the period is complete and the seam fires. Only when include_pacing. Isolated like the others.
+    pacing: dict[str, Any] | None = None
+    if include_pacing:
+        try:
+            pacing_result = pacing_report(
+                reader,
+                date_from=date_from,
+                date_to=date_to,
+                account_ids=scope_ids,
+                as_of=date_to,
+                reporting_currency=reporting,
+                fx_table=table,
+                precomputed_perf=perf,
+            )
+            rollup = pacing_result["rollup"]
+            pacing = {
+                "status_counts": rollup["status_counts"],
+                "worst_over_pacers": rollup["worst_over_pacers"],
+                "worst_under_pacers": rollup["worst_under_pacers"],
+            }
+            for entry in pacing_result["errors"]:
+                # Only the NEW step-2 budget-read failures; step-1 perf errors are the shared perf's
+                # (pacing seeds its errors from the injected perf), already tagged "performance".
+                if entry.get("stage") != "budget":
+                    continue
+                errors.append(
+                    {
+                        "section": "pacing",
+                        "ad_account_id": entry.get("ad_account_id"),
+                        "error": entry.get("error"),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 — defensive section isolation.
+            pacing = None
+            errors.append({"section": "pacing", "error": str(exc)})
+
+    # 7. needs_you — worst-first shortlist merging (a) goal pause_candidates and (b) high-severity
+    #    attention.flagged accounts, deduped by ad_account_id. Pause candidates are read off the grade
+    #    ACCOUNTS list (which carries ad_account_id + reasons) rather than the pause_candidates shortlist
+    #    (which omits ad_account_id) — the same set, richer source. Zero extra reads.
+    needs_you_by_id: dict[str, dict[str, Any]] = {}
+
+    def _merge_needs_you(
+        ad_account_id: str | None,
+        account_id: Any,
+        name: Any,
+        reasons: list[str],
+        source: str,
+    ) -> None:
+        key = ad_account_id or ""
+        entry = needs_you_by_id.get(key)
+        if entry is None:
+            entry = {
+                "ad_account_id": ad_account_id,
+                "account_id": account_id,
+                "name": name,
+                "reasons": [],
+                "sources": [],
+            }
+            needs_you_by_id[key] = entry
+        for reason in reasons:
+            if reason and reason not in entry["reasons"]:
+                entry["reasons"].append(reason)
+        if source not in entry["sources"]:
+            entry["sources"].append(source)
+
+    if grade is not None:
+        for account in grade["accounts"]:
+            if account.get("verdict") == goal_grading.GOAL_PAUSE_CANDIDATE:
+                _merge_needs_you(
+                    account.get("ad_account_id"),
+                    account.get("account_id"),
+                    account.get("name"),
+                    list(account.get("reasons") or []),
+                    "goal",
+                )
+
+    if attention is not None:
+        for flagged in attention["flagged"]:
+            if flagged.get("severity") != "high":
+                continue
+            # The high-severity flags are what earned the account its place; carry their details.
+            high_details = [
+                flag.get("detail")
+                for flag in flagged.get("flags", [])
+                if flag.get("severity") == "high" and flag.get("detail")
+            ]
+            _merge_needs_you(
+                flagged.get("ad_account_id"),
+                flagged.get("account_id"),
+                flagged.get("name"),
+                high_details,
+                "attention",
+            )
+
+    # Worst-first: a dual-source account (both goal + attention) leads; tiebreak ad_account_id asc for
+    # a deterministic total order.
+    needs_you = sorted(
+        needs_you_by_id.values(),
+        key=lambda e: (-len(e["sources"]), e["ad_account_id"] or ""),
+    )
+
+    result: dict[str, Any] = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "reporting_currency": reporting,
+        "fx_as_of": perf["fx_as_of"],
+        "fx_note": perf["fx_note"],
+        "scope": {
+            "account_count": perf["account_count"],
+            "reachable_count": perf["reachable_count"],
+        },
+        "totals": totals,
+        "top": top,
+        "bottom": bottom,
+        "goal_summary": goal_summary,
+        "attention": attention,
+        "pacing": pacing,
+        "needs_you": needs_you,
+        "errors": errors,
+    }
+    if perf.get("note"):
+        result["note"] = perf["note"]
+    return result

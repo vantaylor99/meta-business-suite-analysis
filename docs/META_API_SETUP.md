@@ -257,9 +257,10 @@ meta_mcp_server
 An MCP client then connects at the streamable-http URL **`http://127.0.0.1:8765/mcp`** and can call
 `server_info` (server name/version, configured Meta API version, selected read backend,
 `live_calls_enabled: true`, and `write_tools_enabled: true` now that reads and gated writes are live)
-plus any of the 14 read tools, the seven discovery tools (`list_ad_accounts`,
+plus any of the 14 read tools, the ten discovery tools (`list_ad_accounts`,
 `cross_account_spend_summary`, `cross_account_performance`, `account_benchmark`,
-`flag_accounts_needing_attention`, `pacing_report`, and `rank_accounts` — none takes an
+`flag_accounts_needing_attention`, `pacing_report`, `rank_accounts`,
+`grade_accounts_against_goals`, `cross_account_creative_triage`, and `portfolio_digest` — none takes an
 `account` argument), and the
 guarded write tools (`propose_*` / `preview_plan` / `execute_plan`). If the `server` extra is not installed, launching prints an actionable error
 (`pip install -e .[server]`) rather than a traceback.
@@ -386,6 +387,78 @@ and the returned list is truncated to `limit` while `ranked_total` reports the f
 account that lacks the metric — no delivery in range, or a money metric in a currency missing from the
 FX table — is not sorted as a misleading `0`/`∞`; it lands in a separate `unranked` bucket tagged with
 its reason (`metric unavailable` vs `no FX rate for <currency>`).
+
+`grade_accounts_against_goals` answers the manager's "is each account hitting **its own** goal?" — it
+joins each account's real efficiency to the goal bars configured in its `action_policy`
+(`config/meta_ads_accounts.json`) and returns a per-account verdict plus a portfolio `counts` rollup and
+a `pause_candidates` shortlist. Like `rank_accounts` it is a **pure post-processor over
+`cross_account_performance`** (one call, no new read shape). The graded metric is chosen per account by
+the account's policy: a `roas_role` of `not_applicable` **always** grades on `cost_per_result` (a
+lead-gen account that happens to carry a ROAS number is still a cost-per-lead account); otherwise a
+ROAS-based goal (`primary_goal == "roas"` or a `target_roas`/`pause_roas_floor` bar present) grades on
+`roas`; else `cost_per_result`. Thresholds are compared in the account's **own native currency (no FX)**
+— a goal is stated in the currency the account is billed in — so this tool is FX-independent and grades
+even accounts whose currency is missing from the FX table (their `cross_account_performance` no-FX
+`errors` still propagate). Reads stay open, so scope defaults to the configured accounts but an explicit
+`account_ids` is graded as-is: an id absent from config is `no_goal_configured`, and a configured
+account whose chosen metric has neither a target nor a pause bar is `no_goal_thresholds` — both counted,
+neither an error. A metric that is absent (no results → no `cost_per_result`, no revenue → no `roas`) or
+spend below the account's `min_spend_before_pause` floor is `insufficient_data`, which guards the
+cheap-but-zero-results trap (a zero-result account is never misread as `pause_candidate`). `as_of`
+defaults to today (the single clock touch) and governs only the post-launch grace window: an account
+inside its `evaluation_grace_days` (measured from an optional `evaluation_start_date` in its policy)
+softens a `pause_candidate` down to `watch`. The `pause_candidates` shortlist is sorted by `account_id`
+for run-to-run determinism (not worst-first). Per-account read failures are isolated into `errors`,
+never fatal.
+
+`cross_account_creative_triage` answers the specialist's "which specific **ads** should I scale or
+pause?" — it is the ad-level sibling of `rank_accounts`. Instead of one account-level row per account it
+pools **one row per delivering ad** across the whole reachable fleet (or an explicit `account_ids`
+subset) and ranks those ads by a **single** metric, returning the top or bottom `limit` (default 10).
+Unlike `rank_accounts` it is **not** a post-processor over `cross_account_performance`: it rides the same
+fan-out engine directly, reading one `level="ad"` / `time_increment="all_days"` insights row per account —
+so it sees exactly the ads that **delivered** in the window (had impressions/spend) and never enumerates
+`/{account}/ads`, keeping it fast and naturally scoped to recently-active creative. It is therefore a
+*performance* read, **not** ad health: a disapproved or active-but-not-delivering ad has no delivery row
+and never appears. Accepted metrics, the `*_normalized`-twin money ranking (`value`/`value_native`), the
+`unranked` bucket, and the 1-based strictly-better + 1 tie convention are all identical to
+`rank_accounts`, except the tiebreak and pooling key is `ad_id` (string order) and each ranked entry also
+carries its `ad_account_id`/`account_name`. Winners vs losers are **two calls** (`order="desc"` then
+`"asc"`), each re-running the ad-level fan-out, so scope `account_ids` when you can. The result key is
+resolved **once per account** (config first, else inferred from that account's pooled ad `actions`,
+including the lead-family self-heal) and applied to every ad in it — all ads in an account share its goal.
+A currency missing from the FX table records **one** `errors` entry for the account (not one per ad); its
+ads fall to `unranked` under a money metric but still rank under a ratio/count metric. An unknown metric,
+a bad `order`, a non-positive `limit`, or a `reporting_currency` missing from the FX table is a fail-fast
+`ValueError` before any Meta read.
+
+`portfolio_digest` answers the daily-driver "what's my whole portfolio doing and what needs me right
+now?" in a **single call**, instead of the operator stitching four tools together by hand. It is a
+**composite** — it reimplements no logic. It fetches `cross_account_performance` **once** for the window
+and threads that shared result into `grade_accounts_against_goals`, `flag_accounts_needing_attention`, and
+`pacing_report` via their internal precomputed-perf seams, so the default digest costs about one attention
+scan (~`1 + 2N` insight reads: the shared perf fan-out `N` plus flag's baseline fan-out `N`; grade adds
+zero) rather than 3–4× the reads. One ranked digest returns: `totals` (per-currency native subtotals plus
+a `reporting_currency`-normalized figure — money never sums across currencies), `top`/`bottom` spenders (a
+deterministic sort over the perf rows already in hand, **not** a re-fetching `rank_accounts` call),
+`goal_summary` (grade's `counts` + `pause_candidates`), `attention` (flag's `flagged`/`informational`/
+`clean_count`, on by default; `null` when `include_flags=False`), optional `pacing` (`null` unless
+`include_pacing=True`, which adds pacing's `3N` budget reads and no extra insight reads), and a synthesized
+worst-first `needs_you` shortlist that **merges and dedupes** the goal `pause_candidates` and the
+**high-severity** flagged accounts by `ad_account_id` (a dual-source account appears once carrying both
+reasons + `sources`, sorted source-count-desc then `ad_account_id` asc). `include_ad_health=True` threads
+straight through to flag (one ad read per flagged account). Because the digest threads its *full* resolved
+scope into grade, an account absent from `config/meta_ads_accounts.json` is counted `no_goal_configured` —
+the portfolio-wide view, **not** an error (this differs from standalone `grade_accounts_against_goals`,
+which defaults to configured accounts only). Pacing pins `as_of=date_to` so the period is complete and
+`variance_pct` is realized actual-vs-budget for the window — for forward month-projection call
+`pacing_report` directly with a mid-period `as_of`. The shared perf is the single fan-out: a whole-call
+`ValueError` (bad `reporting_currency`) or discovery error there fails the whole digest (nothing is
+computable without perf), but each downstream section is wrapped so an unexpected failure sets that section
+to `null` with a tagged `errors` entry while the rest still returns; each sub-tool's inherited shared-perf
+errors are de-duplicated (tagged `section="performance"` once, sub-tools contribute only their **new**
+errors). **Scope ceiling:** with `account_ids=None` the perf fans over the whole reach (hundreds of
+accounts) and times out — pass an explicit `account_ids` for anything beyond a small fleet.
 
 Its config lives in `.mcp.json` under `mcpServers` as the **`meta-suite`** entry — **promoted** so Claude
 Code connects to it. Because it is an HTTP server, Claude Code only *connects*; you must **start the

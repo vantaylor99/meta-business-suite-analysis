@@ -106,7 +106,7 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   fails is reported `budget_unread`, never a silent "uncapped". The minor-unit→major-unit divisor is
   **ISO-4217 currency-aware** (2/0/3-decimal, so JPY/KRW and BHD/KWD convert correctly); an
   unrecognized currency code assumes 2 decimals and is surfaced in the report `note`.
-  Finally, the `rank_accounts` tool is the seventh discovery tool and the manager's "who's top/bottom?"
+  The `rank_accounts` tool is the seventh discovery tool and the manager's "who's top/bottom?"
   shortlist: another **pure post-processor over `cross_account_performance`** (one read), it sorts the
   whole reachable fleet — or an explicit `account_ids` subset — by a **single** metric (spend, CPM, CPC,
   CTR, cost-per-result [aliases `cpl`/`cpa`], ROAS, impressions, clicks, or results) and returns the top
@@ -116,6 +116,54 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   strictly-better + 1), and accounts that lack the metric — no delivery, or a money metric in a currency
   missing from the FX table — land in a separate `unranked` bucket with a reason rather than being sorted
   as a misleading zero or infinity.
+  Finally, the `grade_accounts_against_goals` tool is the eighth discovery tool and the manager's
+  "is each account hitting *its own* goal?" one-call verdict: yet another **pure post-processor over
+  `cross_account_performance`** (one read), it joins each account's real efficiency to the goal bars in
+  its `action_policy` (from `config/meta_ads_accounts.json`) and returns a per-account verdict —
+  `on_goal`, `watch`, or `pause_candidate` (with a shortlist) — plus a portfolio rollup. The metric is
+  chosen per account (cost-per-result unless the goal is ROAS-based; a `roas_role` of `not_applicable`
+  always forces cost-per-result), and thresholds are compared in the account's **own native currency**
+  (no FX — a goal is stated in the currency it is billed in). Reads stay open, so an account with no
+  config entry is graded `no_goal_configured` and a configured account whose goal carries no cost/ROAS
+  bar (e.g. an install/subscription objective) is graded `no_goal_thresholds` — neither is an error. An
+  account with no results yet, or spend below its `min_spend_before_pause`, is graded `insufficient_data`
+  rather than misread as failing, and an account still inside its post-launch `evaluation_grace_days`
+  window softens from `pause_candidate` to `watch`. `as_of` defaults to today and governs only that
+  grace window.
+  The `cross_account_creative_triage` tool is the ninth discovery tool and the ad-level sibling of
+  `rank_accounts`: instead of ranking whole accounts it pools **one row per delivering ad** across the
+  whole reachable fleet (or an explicit `account_ids` subset) and ranks those ads by a **single** metric
+  (same names as `rank_accounts`), returning the top or bottom N — the winners and losers at the creative
+  level, so a specialist sees which specific ads to scale or pause. It reads **only ad-level insights**
+  (`level="ad"`, `time_increment="all_days"`), so it sees exactly the ads that actually delivered in the
+  window and never walks the dormant-ad graveyard — it is a *performance* read, **not** ad health
+  (disapproved / active-but-not-delivering ads have no delivery and never appear). Winners vs losers are
+  two calls (`order="desc"` then `"asc"`), each re-running the ad-level fan-out, so scope `account_ids`
+  when you can. Money metrics rank on the **`reporting_currency`-normalized twin** (`value` normalized,
+  `value_native` native) so ads in different currencies are comparable; ratio/count metrics are
+  currency-invariant. The result key is resolved once per account (config first, else inferred from that
+  account's pooled ad actions) and applied to every ad in it. Ties share a rank (tiebroken by `ad_id`),
+  and ads that lack the metric — zero results, or a money metric in a currency missing from the FX table —
+  land in a separate `unranked` bucket with a reason rather than being sorted as a misleading zero or
+  infinity; a no-FX account records **one** `errors` entry (not one per ad).
+  The `portfolio_digest` tool is the tenth discovery tool and the daily-driver "give me my portfolio
+  overview" one-call answer to "what's my whole portfolio doing and what needs me right now?". Instead of
+  stitching four tools together by hand it **composes** them: it fetches `cross_account_performance`
+  **once** for the window and threads that shared result into `grade_accounts_against_goals`,
+  `flag_accounts_needing_attention`, and `pacing_report`, so the default digest costs about one attention
+  scan (~`1 + 2N` reads) rather than 3–4× the reads. One ranked digest comes back: totals (per-currency
+  native subtotals **and** a `reporting_currency`-normalized figure — money never sums across
+  currencies), the top/bottom spenders, each account's goal standing (counts + a pause shortlist), what
+  changed and needs attention (flagged / informational / clean), optional budget pacing, and a
+  synthesized worst-first `needs_you` shortlist that **merges and dedupes** the goal pause-candidates and
+  the high-severity flagged accounts (an account failing on both appears once, carrying both reasons).
+  Goal grading and attention are on by default; budget pacing (`+3N` reads) and ad-level health (one read
+  per flagged account) are off unless requested. Because it grades the *whole resolved scope*, an account
+  absent from `config/meta_ads_accounts.json` is counted `no_goal_configured` — the portfolio-wide view,
+  not an error. Pass an explicit `account_ids` for anything beyond a small fleet; with none it fans over
+  every account the token reaches (hundreds) and can time out. Pacing here is realized variance for the
+  window — for forward month-projection call `pacing_report` directly. A section that unexpectedly fails
+  is returned as `null` with a tagged `errors` entry while the rest of the digest still returns.
 - **Writes are guarded and broad.** Beyond the action plan, the agent can enable/pause ads, change
   CBO-aware daily budgets (up or down), edit targeting/creative features, author new campaigns / ad
   sets / ads / video ads / lookalikes (all created **PAUSED**), and rotate audiences / disable

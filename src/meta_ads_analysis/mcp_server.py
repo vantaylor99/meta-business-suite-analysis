@@ -501,6 +501,56 @@ DISCOVERY_TOOL_DESCRIPTIONS: dict[str, str] = {
         "bucket with a reason instead of sorted as zero or infinity. Valid metrics: spend, cpm, cpc, ctr, "
         "cost_per_result (aliases: cpl, cpa), roas, impressions, clicks, results."
     ),
+    "grade_accounts_against_goals": (
+        "Grade each managed ad account against ITS OWN configured cost-per-lead / ROAS goal for a date "
+        "range and return where the whole portfolio stands in one call — which accounts are on_goal, "
+        "which to watch, and which are pause_candidates (with a shortlist). Reads are open to every "
+        "account the token can reach, but only accounts in the config file carry goals: an account with "
+        "no config entry is graded no_goal_configured, and a configured account whose goal has no "
+        "cost/ROAS bar (e.g. an install/subscription objective) is graded no_goal_thresholds — neither "
+        "is an error. An account with too few results, or spend below its min_spend_before_pause, is "
+        "graded insufficient_data rather than misread as failing. Metric is chosen per account "
+        "(cost-per-result unless the goal is ROAS-based); thresholds are compared in the account's own "
+        "native currency (no FX). as_of defaults to today and only governs a post-launch grace window "
+        "(an account inside its evaluation_grace_days softens from pause_candidate to watch). "
+        "Per-account read failures are isolated in errors, never fatal."
+    ),
+    "cross_account_creative_triage": (
+        "Rank INDIVIDUAL ADS pooled across every account this token can reach (or an explicit list) by "
+        "a single metric for a date range, returning the top or bottom N — the winners and losers at "
+        "the creative level, so you can see which specific ads to scale or pause. This is the ad-level "
+        "sibling of rank_accounts. It ranks only ads that actually DELIVERED in the window (had "
+        "impressions/spend), so it is fast and never walks the dormant-ad graveyard. Winners vs losers "
+        "= two calls (order='desc' then 'asc'); each re-runs the read, so scope account_ids when you "
+        "can. Money metrics (spend/CPC/CPM/CPL) are compared in one reporting_currency (default USD) so "
+        "ads in different currencies are comparable; ratio/count metrics (CTR/ROAS/impressions/clicks/"
+        "results) are currency-invariant and ranked as-is. Ads lacking the metric (e.g. zero results → "
+        "no cost-per-result, or a money metric in a currency with no FX rate) are grouped into an "
+        "'unranked' bucket with a reason instead of sorted as zero or infinity. Valid metrics: spend, "
+        "cpm, cpc, ctr, cost_per_result (aliases: cpl, cpa), roas, impressions, clicks, results. This "
+        "is about the PERFORMANCE of ads that ran — it is NOT ad health: disapproved or "
+        "active-but-not-delivering ads never appear (they have no delivery), which is a separate concern."
+    ),
+    "portfolio_digest": (
+        "One call for 'give me my portfolio overview' — instead of stitching four tools together by "
+        "hand. For a date range and scope it returns a single ranked digest: totals (per-currency "
+        "native subtotals AND a figure normalized into one reporting_currency, default USD — money is "
+        "never summed across currencies), the top/bottom spenders, each account's goal standing "
+        "(on_goal / watch / pause_candidate / no_goal_configured counts + a pause shortlist), what "
+        "CHANGED and needs attention (flagged / informational / clean), optional budget pacing, and a "
+        "synthesized worst-first 'needs_you' shortlist merging the pause-candidates and the "
+        "high-severity flagged accounts (deduped, so an account failing on both appears once with both "
+        "reasons). It fetches the shared performance read ONCE and reuses it across the goal, "
+        "attention, and pacing sections, so the default digest costs about one attention scan (~1+2N "
+        "reads), not 3-4x. Defaults: goal + attention on; budget pacing and ad-level health OFF (each "
+        "adds reads — pacing +3N, ad-health +one read per flagged account). Because it grades the whole "
+        "resolved scope, accounts not in the config file are counted as no_goal_configured (a "
+        "portfolio-wide view, not an error). Pass an explicit account_ids for anything beyond a small "
+        "fleet — with no account_ids it fans over every account the token can reach (hundreds) and can "
+        "time out. Pacing here is realized variance for the window; for forward month-projection call "
+        "pacing_report directly. A section that unexpectedly fails is returned as null with a tagged "
+        "error while the rest of the digest still returns."
+    ),
 }
 
 
@@ -629,6 +679,69 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
             reporting_currency=reporting_currency,
         )
 
+    def grade_accounts_against_goals(
+        date_from: str,
+        date_to: str,
+        account_ids: list[str] | None = None,
+        as_of: str | None = None,
+    ) -> dict[str, Any]:
+        # ``as_of`` IS exposed (defaults to today) so an operator can grade as-of a past date; it only
+        # governs the post-launch grace window. No ``fx_table`` seam here — goals are graded native.
+        return account_discovery.grade_accounts_against_goals(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            account_ids=account_ids,
+            as_of=as_of,
+        )
+
+    def cross_account_creative_triage(
+        date_from: str,
+        date_to: str,
+        metric: str = "spend",
+        order: str = "desc",
+        limit: int = 10,
+        account_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+    ) -> dict[str, Any]:
+        # ``fx_table`` is a test-only injection seam and is deliberately NOT exposed to the LLM; the
+        # tool loads the committed config/fx_rates.json itself.
+        return account_discovery.cross_account_creative_triage(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            metric=metric,
+            order=order,
+            limit=limit,
+            account_ids=account_ids,
+            reporting_currency=reporting_currency,
+        )
+
+    def portfolio_digest(
+        date_from: str,
+        date_to: str,
+        account_ids: list[str] | None = None,
+        reporting_currency: str = "USD",
+        include_flags: bool = True,
+        include_pacing: bool = False,
+        include_ad_health: bool = False,
+    ) -> dict[str, Any]:
+        # ``fx_table`` is an internal/test injection seam and is deliberately NOT exposed to the LLM;
+        # the tool loads the committed config/fx_rates.json itself. ``include_flags`` (on),
+        # ``include_pacing`` / ``include_ad_health`` (off) ARE exposed so an operator can trade read
+        # cost for depth. There is no ``as_of`` here — the digest paces the window realized (as_of is
+        # pinned to date_to); forward month-projection is pacing_report called directly.
+        return account_discovery.portfolio_digest(
+            reader,
+            date_from=date_from,
+            date_to=date_to,
+            account_ids=account_ids,
+            reporting_currency=reporting_currency,
+            include_flags=include_flags,
+            include_pacing=include_pacing,
+            include_ad_health=include_ad_health,
+        )
+
     return {
         "list_ad_accounts": list_ad_accounts,
         "cross_account_spend_summary": cross_account_spend_summary,
@@ -637,6 +750,9 @@ def build_discovery_tools(reader: MetaReaderProvider) -> dict[str, Callable[...,
         "flag_accounts_needing_attention": flag_accounts_needing_attention,
         "pacing_report": pacing_report,
         "rank_accounts": rank_accounts,
+        "grade_accounts_against_goals": grade_accounts_against_goals,
+        "cross_account_creative_triage": cross_account_creative_triage,
+        "portfolio_digest": portfolio_digest,
     }
 
 
