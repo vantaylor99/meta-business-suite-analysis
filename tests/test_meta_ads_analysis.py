@@ -12388,6 +12388,76 @@ def test_build_discovery_tools_flag_accounts_attention_ad_health_smoke(monkeypat
     assert ad_reads_after == ad_reads_before  # the off-path issued no additional ad read
 
 
+# --- flag_accounts_needing_attention: precomputed_current_perf composition seam (MOCKS ONLY) ---
+
+
+def test_flag_precomputed_current_perf_baseline_only_fanout(monkeypatch) -> None:
+    # Seam: injecting the CURRENT-window perf skips the current fan-out — flag issues fetch_insights
+    # for the BASELINE window ONLY (one fan-out, not two) — and returns output identical to the
+    # non-injected run over the same data.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_1", "account_id": "1", "name": "Spike", "account_status": 1, "currency": "USD"},
+        {"id": "act_2", "account_id": "2", "name": "Collapse", "account_status": 1, "currency": "USD"},
+    ]
+    baseline_rows = {
+        "act_1": [{"spend": "200.00", "impressions": "2000", "clicks": "100"}],
+        "act_2": [{"spend": "400.00", "impressions": "4000", "clicks": "200"}],
+    }
+    current_rows = {
+        "act_1": [{"spend": "600.00", "impressions": "6000", "clicks": "300"}],  # +200% spike (high)
+        "act_2": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],   # -75% collapse (high)
+    }
+    windows = {"2026-06-01": baseline_rows, "2026-06-08": current_rows}
+
+    # Reference: no injection -> both windows fetched.
+    ref_reader = _attention_reader(accounts, windows)
+    reference = _account_discovery.flag_accounts_needing_attention(
+        ref_reader, current_from="2026-06-08", current_to="2026-06-14", fx_table=_fx()
+    )
+
+    # The CURRENT-window perf the digest would already hold (same args flag builds internally).
+    perf_reader = _attention_reader(accounts, windows)
+    current_perf = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-06-08", date_to="2026-06-14", level="account", fx_table=_fx()
+    )
+    assert current_perf["reporting_currency"] == "USD"
+
+    # Inject it: the current fan-out is skipped; ONLY the baseline window reaches fetch_insights.
+    read_windows: list[str] = []
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        read_windows.append(date_from)
+        return [dict(r) for r in windows.get(date_from, {}).get(ad_account_id, [])]
+
+    inj_reader = _attention_reader(accounts, windows, fetch_insights=_fetch)
+    injected = _account_discovery.flag_accounts_needing_attention(
+        inj_reader, current_from="2026-06-08", current_to="2026-06-14",
+        fx_table=_fx(), precomputed_current_perf=current_perf,
+    )
+
+    # Only the baseline window was read, exactly once per account -> a single fan-out, not two.
+    assert set(read_windows) == {"2026-06-01"}
+    assert len(read_windows) == 2  # N accounts, one baseline fan-out (current is injected)
+    assert injected == reference  # byte-identical to the self-fetching run
+
+
+def test_flag_precomputed_current_perf_currency_mismatch_raises(monkeypatch) -> None:
+    # Defensive guard: an injected current perf normalized to a different reporting_currency than the
+    # call resolves is a misuse -> ValueError raised BEFORE any read (never a silently-mixed join).
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    perf_eur = {"accounts": [], "errors": [], "reporting_currency": "EUR"}
+    reader = FakeMetaReader()  # any read would raise NotImplementedError; the guard must fire first
+    with pytest.raises(ValueError, match="reporting_currency"):
+        _account_discovery.flag_accounts_needing_attention(
+            reader, current_from="2026-06-08", current_to="2026-06-14",
+            reporting_currency="USD", fx_table=_fx(), precomputed_current_perf=perf_eur,
+        )
+    assert reader.calls == []  # failed fast, before touching the reader
+
+
 # --- pacing_report: pure helpers (clock-free, no reader) --------------------
 
 
@@ -13269,6 +13339,99 @@ def test_pacing_report_as_of_none_defaults_to_utc_today(monkeypatch) -> None:
     )
     assert out["as_of"] == "2026-07-14"
     assert out["accounts"][0]["status"] == "on_track"
+
+
+# --- pacing_report: precomputed_perf composition seam (MOCKS ONLY) ----------
+
+
+def test_pacing_precomputed_perf_skips_step1_fetch(monkeypatch) -> None:
+    # Seam: injecting the step-1 spend perf skips the perf fan-out entirely — pacing issues NO
+    # fetch_insights and NO list_ad_accounts (scope comes from the injected perf), only the 3N budget
+    # reads (list_campaigns / list_adsets / get_account) — and returns output identical to self-fetch.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [
+        {"id": "act_ontrack", "account_id": "1", "name": "OnTrack", "account_status": 1, "currency": "USD"},
+        {"id": "act_over", "account_id": "2", "name": "Over", "account_status": 1, "currency": "USD"},
+    ]
+    insights = {"act_ontrack": [{"spend": "4200.00"}], "act_over": [{"spend": "2000.00"}]}
+    campaigns = {
+        "act_ontrack": [_pc_camp("c1", daily="30000")],  # daily 300 -> on_track over the 14/31 window
+        "act_over": [_pc_camp("c2", daily="10000")],      # daily 100 -> over
+    }
+    caps = {a["id"]: {"currency": "USD", "amount_spent": "5100000"} for a in accounts}
+
+    # Reference: self-fetch (step 1 spend read + step 2 budget reads).
+    ref_reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    reference = _account_discovery.pacing_report(ref_reader, fx_table=_fx(), **_PACING_KW)
+
+    # The step-1 perf the digest holds: over [date_from, effective_as_of] (as_of makes elapsed>0).
+    perf_reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    perf = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-07-01", date_to="2026-07-14", level="account", fx_table=_fx()
+    )
+    assert perf["reporting_currency"] == "USD"
+
+    inj_reader = _pacing_reader(accounts, insights, campaigns, {}, caps)
+    injected = _account_discovery.pacing_report(
+        inj_reader, fx_table=_fx(), precomputed_perf=perf, **_PACING_KW
+    )
+
+    call_names = [c[0] for c in inj_reader.calls]
+    assert "fetch_insights" not in call_names   # step 1 skipped
+    assert "list_ad_accounts" not in call_names  # scope came from the injected perf
+    # Exactly the 3N budget fan-out (3 reads x 2 accounts), nothing more.
+    assert sorted(call_names) == sorted(["list_campaigns", "list_adsets", "get_account"] * 2)
+    assert injected == reference  # byte-identical to the self-fetching run
+
+
+def test_pacing_precomputed_perf_currency_mismatch_raises(monkeypatch) -> None:
+    # Defensive guard (mirrors flag): an injected perf whose reporting_currency differs from the call's
+    # -> ValueError BEFORE any read. Only checked on the used path (elapsed_fraction > 0).
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    perf_eur = {"accounts": [], "errors": [], "reporting_currency": "EUR"}
+    reader = FakeMetaReader()  # any read would raise NotImplementedError; the guard must fire first
+    with pytest.raises(ValueError, match="reporting_currency"):
+        _account_discovery.pacing_report(
+            reader, date_from="2026-07-01", date_to="2026-07-31", as_of="2026-07-14",  # elapsed > 0
+            reporting_currency="USD", fx_table=_fx(), precomputed_perf=perf_eur,
+        )
+    assert reader.calls == []  # failed fast, before touching the reader
+
+
+def test_pacing_precomputed_perf_ignored_when_not_started(monkeypatch) -> None:
+    # Defensive branch: when the period has not started (elapsed_fraction <= 0) the injected perf is
+    # IGNORED and pacing self-reads the clamped [date_from, date_from] window. A DIFFERENT (bogus)
+    # account in the injected perf must never surface, proving the injection was not used.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    accounts = [{"id": "act_1", "account_id": "1", "name": "A", "account_status": 1, "currency": "USD"}]
+    reads: list[tuple[str, str]] = []
+
+    def _fetch(ad_account_id, *, fields, date_from, date_to, level, time_increment, breakdowns=None):
+        reads.append((date_from, date_to))  # a self-read must happen, and never invert
+        return [{"spend": "10.00"}]
+
+    reader = _pacing_reader(
+        accounts, {}, {"act_1": [_pc_camp("c1", daily="10000")]}, {}, {"act_1": {}},
+        fetch_insights=_fetch,
+    )
+    bogus_perf = {
+        "accounts": [{
+            "ad_account_id": "act_ghost", "account_id": "ghost", "name": "Ghost", "currency": "USD",
+            "spend": 999.0, "spend_normalized": 999.0, "account_status_label": "ACTIVE",
+        }],
+        "errors": [],
+        "reporting_currency": "USD",
+    }
+    out = _account_discovery.pacing_report(
+        reader, date_from="2026-08-01", date_to="2026-08-31", as_of="2026-07-15",  # elapsed <= 0
+        fx_table=_fx(), precomputed_perf=bogus_perf,
+    )
+    # The injected ghost account never appears; the self-read's act_1 does.
+    assert [a["ad_account_id"] for a in out["accounts"]] == ["act_1"]
+    assert out["accounts"][0]["status"] == "not_started"
+    assert reads and all(df <= dt for df, dt in reads)  # a self-read happened, window not inverted
 
 
 # --- rank_accounts: pure post-processor over cross_account_performance ---
@@ -16022,6 +16185,123 @@ def test_grade_accounts_grades_currency_missing_from_fx_table(monkeypatch) -> No
     assert entry["value"] == pytest.approx(60.0)  # graded native despite no FX rate
     assert entry["verdict"] == "pause_candidate"
     assert any("no FX rate" in e.get("error", "") for e in out["errors"])  # no-FX propagates, non-fatal
+
+
+# --- grade_accounts_against_goals: precomputed_perf composition seam (MOCKS ONLY) ---
+
+
+def _grade_seam_fixture():
+    """A configured lead + roas account plus one NON-configured id, shared by the seam tests.
+
+    The scope deliberately includes ``act_9`` (absent from config) so the injected-perf path exercises
+    ``no_goal_configured`` exactly as a self-fetched scope would.
+    """
+    registry = {
+        "act_2": _grade_account(
+            "act_2", roas_role="not_applicable",
+            primary_result_action_type="onsite_conversion.lead_grouped",
+            target_cost_per_result=10.0, pause_cost_per_result_above=40.0, min_spend_before_pause=100.0,
+        ),
+        "act_3": _grade_account(
+            "act_3", roas_role="supporting", primary_result_action_type="purchase",
+            primary_goal="roas", target_roas=3.0, pause_roas_floor=1.8, min_spend_before_pause=100.0,
+        ),
+    }
+    meta_by_id = {
+        "act_2": {"account_id": "2", "name": "Cheap", "account_status": 1, "currency": "USD"},
+        "act_3": {"account_id": "3", "name": "RoasCo", "account_status": 1, "currency": "USD"},
+        "act_9": {"account_id": "9", "name": "Stranger", "account_status": 1, "currency": "USD"},
+    }
+    insights = {
+        "act_2": [{"spend": "500.00", "impressions": "50000", "clicks": "2000",
+                   "actions": [{"action_type": "onsite_conversion.lead_grouped", "value": "100"}]}],  # $5/lead -> on_goal
+        "act_3": [{"spend": "200.00", "impressions": "10000", "clicks": "300",
+                   "actions": [{"action_type": "purchase", "value": "5"}],
+                   "action_values": [{"action_type": "purchase", "value": "200"}]}],  # roas 1.0 -> pause_candidate
+        "act_9": [{"spend": "100.00", "impressions": "1000", "clicks": "50"}],  # unconfigured -> no_goal_configured
+    }
+    scope = ["act_2", "act_3", "act_9"]
+    return registry, meta_by_id, insights, scope
+
+
+def test_grade_precomputed_perf_zero_reads_identical(monkeypatch) -> None:
+    # Seam: injecting an already-fetched perf makes grade issue ZERO reads (no fetch_insights, no
+    # list_ad_accounts, no get_account) and produce output byte-identical to the self-fetching run.
+    registry, meta_by_id, insights, scope = _grade_seam_fixture()
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+
+    # Reference: grade self-fetches over the full explicit scope (reads flow through).
+    ref_reader = _grade_reader(meta_by_id, insights)
+    reference = _account_discovery.grade_accounts_against_goals(
+        ref_reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=scope, as_of="2026-07-11"
+    )
+
+    # The perf the digest would hold, then injected into a reader that CANNOT read.
+    perf_reader = _grade_reader(meta_by_id, insights)
+    perf = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-06-01", date_to="2026-06-30",
+        account_ids=scope, level="account", fx_table=_fx(),
+    )
+    dead_reader = FakeMetaReader()  # any read -> NotImplementedError
+    injected = _account_discovery.grade_accounts_against_goals(
+        dead_reader, date_from="2026-06-01", date_to="2026-06-30",
+        as_of="2026-07-11", precomputed_perf=perf,
+    )
+
+    assert dead_reader.calls == []   # the seam issued ZERO reads
+    assert injected == reference     # identical to the self-fetching run
+    by_id = {a["ad_account_id"]: a for a in injected["accounts"]}
+    assert by_id["act_2"]["verdict"] == "on_goal"
+    assert by_id["act_3"]["verdict"] == "pause_candidate"
+    assert by_id["act_9"]["verdict"] == "no_goal_configured"  # injected + absent from config
+
+
+def test_grade_precomputed_perf_non_usd_parity(monkeypatch) -> None:
+    # Native-metric invariant: grade reads only each row's NATIVE cost_per_result / roas / spend, so an
+    # injected perf normalized to EUR yields the SAME grade output as grade's own USD-default fetch.
+    registry, meta_by_id, insights, scope = _grade_seam_fixture()
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: registry)
+
+    # USD self-fetch reference.
+    ref_reader = _grade_reader(meta_by_id, insights)
+    reference = _account_discovery.grade_accounts_against_goals(
+        ref_reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=scope, as_of="2026-07-11"
+    )
+
+    # Perf normalized to EUR (a different reporting_currency), injected.
+    perf_reader = _grade_reader(meta_by_id, insights)
+    perf_eur = _account_discovery.cross_account_performance(
+        perf_reader, date_from="2026-06-01", date_to="2026-06-30", account_ids=scope,
+        level="account", reporting_currency="EUR", fx_table=_fx(),
+    )
+    assert perf_eur["reporting_currency"] == "EUR"
+    injected = _account_discovery.grade_accounts_against_goals(
+        FakeMetaReader(), date_from="2026-06-01", date_to="2026-06-30",
+        as_of="2026-07-11", precomputed_perf=perf_eur,
+    )
+
+    assert injected == reference  # grade output is FX-independent (native-only)
+
+
+def test_grade_precomputed_empty_perf_no_crash(monkeypatch) -> None:
+    # An empty injected perf -> empty accounts, zeroed counts, no pause candidates, no crash; and the
+    # perf's errors flow through identically. Never touches Meta.
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+    empty_perf = {
+        "accounts": [],
+        "errors": [{"ad_account_id": "act_x", "error": "(#100) unreadable"}],
+        "reporting_currency": "USD",
+    }
+    dead_reader = FakeMetaReader()
+    out = _account_discovery.grade_accounts_against_goals(
+        dead_reader, date_from="2026-06-01", date_to="2026-06-30",
+        as_of="2026-07-11", precomputed_perf=empty_perf,
+    )
+    assert dead_reader.calls == []  # zero reads
+    assert out["accounts"] == []
+    assert out["pause_candidates"] == []
+    assert all(v == 0 for v in out["counts"].values())
+    assert out["errors"] == [{"ad_account_id": "act_x", "error": "(#100) unreadable"}]  # passthrough
 
 
 # --- portfolio_digest: one-call composite over the four cross-account tools (MOCKS ONLY) ---
