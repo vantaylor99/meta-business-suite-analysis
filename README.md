@@ -75,13 +75,19 @@ The Meta integration is **hybrid and grounded**, and runs as a **single operator
   **over**, **under**, or **on** its budget for the month?" across the whole fleet: you give it the
   full reporting period (`date_from`/`date_to`) and, optionally, the day to measure spend through
   (`as_of`, default today), and it reports each account's spend-to-date, its **projected**
-  end-of-period spend (`spend_to_date ÷ elapsed_fraction`), and a verdict. The pacing denominator is
+  end-of-period spend (`spend_to_date ÷ elapsed_fraction` for a daily account; the schedule-aware
+  `spend_to_date × period_budget ÷ expected_to_date` once lifetime budgets are in play), and a
+  verdict. The pacing denominator is
   the sum of each account's **ACTIVE daily budgets**, **CBO-deduplicated** — a campaign-budget-
   optimization campaign contributes its campaign-level budget and its ad-set budgets are ignored, so a
   naïve sum never double-counts — times the number of days in the period. The account spend cap is a
-  *lifetime* ceiling, so it is surfaced as context but is **never** the pacing denominator; a
-  lifetime-only account is `budget_not_projectable` (prorating a lifetime budget against an arbitrary
-  reporting window is a deliberate non-goal here), an uncapped account is `no_budget_set`, and a
+  *lifetime* ceiling, so it is surfaced as context but is **never** the pacing denominator.
+  **Lifetime budgets are prorated** across the overlap of each entity's own `start_time..stop_time`
+  schedule with the window (`lifetime × overlap ÷ schedule_total`) and folded additively into the
+  denominator, so a lifetime or mixed daily+lifetime account earns a real verdict;
+  `budget_not_projectable` is now reserved for accounts with no projectable schedule (an open-ended
+  lifetime budget with no end date, a schedule that does not overlap the window, or a spend-cap-only
+  account), an uncapped account is `no_budget_set`, and a
   paused/closed account is `account_inactive` — none of these are miscounted as "under-pacing". Money
   is normalized into one `reporting_currency` (default USD) for the rollup (status counts + worst
   over/under shortlists); native and normalized give the same variance since it is a same-currency

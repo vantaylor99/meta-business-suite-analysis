@@ -12096,6 +12096,80 @@ def test_pacing_report_prorates_lifetime_budgets_end_to_end(monkeypatch) -> None
     assert out["errors"] == []
 
 
+def test_pacing_report_lifetime_residual_and_short_circuit_branches(monkeypatch) -> None:
+    """Residual branches the proration must NOT paper over (started-window, per-account):
+
+    - A pure-lifetime account whose schedule overlaps the window but has not STARTED as of ``as_of``
+      has ``period_budget > 0`` (whole pot in-window) yet ``expected_to_date == 0`` (nothing paced
+      yet), so the combined projection is None -> ``budget_not_projectable`` even though the window is
+      well underway. This is the ``expected_to_date == 0 with period_budget > 0`` case the unit test
+      covers on ``lifetime_pacing`` but which was never exercised end-to-end through ``pacing_report``.
+    - A PAUSED account with a fully-projectable lifetime schedule: proration is computed then ignored
+      because ``account_inactive`` short-circuits ``classify_pacing`` ahead of the budget verdict. It
+      must not leak an over/under verdict from the prorated numbers.
+    """
+    import pytest
+
+    monkeypatch.setattr(_account_discovery, "_registry_by_ad_account_id", lambda: {})
+
+    accounts = [
+        # Lifetime schedule 2026-07-20..07-31 (starts AFTER as_of=07-14) -> overlaps window (period
+        # budget > 0) but nothing expected-to-date -> budget_not_projectable.
+        {"id": "act_life_future", "account_id": "1", "name": "LifeFuture", "account_status": 1, "currency": "USD"},
+        # ACTIVE account-level status but with a projectable lifetime schedule == window: real verdict
+        # (control that the two below differ only in what they should).
+        {"id": "act_life_active", "account_id": "2", "name": "LifeActive", "account_status": 1, "currency": "USD"},
+        # non-ACTIVE account (status 3 = UNSETTLED) whose CBO-lifetime campaign is a projectable schedule
+        # == window -> account_inactive wins; proration is computed-then-ignored.
+        {"id": "act_life_paused", "account_id": "3", "name": "LifePaused", "account_status": 3, "currency": "USD"},
+    ]
+    insights = {
+        "act_life_future": [{"spend": "500.00"}],
+        "act_life_active": [{"spend": "6300.00"}],
+        "act_life_paused": [{"spend": "400.00"}],
+    }
+    campaigns = {
+        "act_life_future": [_pc_camp("cF", lifetime="930000",
+                                     start_time="2026-07-20", stop_time="2026-07-31")],
+        "act_life_active": [_pc_camp("cA", lifetime="930000",
+                                     start_time="2026-07-01", stop_time="2026-07-31")],
+        # The campaign row itself reads ACTIVE (delivery-eligible under the account) so summarize emits
+        # the lifetime entity and proration runs; the ACCOUNT status is what gates the verdict.
+        "act_life_paused": [_pc_camp("cP", lifetime="930000",
+                                     start_time="2026-07-01", stop_time="2026-07-31")],
+    }
+    reader = _pacing_reader(accounts, insights, campaigns, {}, {})
+    out = _account_discovery.pacing_report(reader, fx_table=_fx(), **_PACING_KW)
+    by_id = {a["ad_account_id"]: a for a in out["accounts"]}
+
+    # (1) overlaps the window (period_budget == full pot) but not yet started -> can't project to-date.
+    future = by_id["act_life_future"]
+    assert future["period_budget"] == pytest.approx(9300.0)   # whole pot in-window (overlap_full)
+    assert future["projected_spend"] is None                   # expected_to_date == 0 -> no divide
+    assert future["variance_pct"] is None
+    assert future["status"] == "budget_not_projectable"
+
+    # (2) control: identical schedule but started -> real verdict.
+    active = by_id["act_life_active"]
+    assert active["status"] == "over"
+    assert active["projected_spend"] == pytest.approx(6300.0 * 31 / 14)
+
+    # (3) DISABLED account: account_inactive wins, so NO over/under verdict leaks from the prorated
+    # numbers (variance is None). projected_spend is still computed+reported as context — consistent
+    # with how the daily paused-account path already reports a projection under account_inactive.
+    paused = by_id["act_life_paused"]
+    assert paused["status"] == "account_inactive"
+    assert paused["variance_pct"] is None
+    assert paused["projected_spend"] == pytest.approx(400.0 * 31 / 14)  # computed but not classified
+    assert paused["lifetime_budget_total"] == pytest.approx(9300.0)  # still reported as context
+
+    rollup = out["rollup"]
+    assert rollup["status_counts"]["over"] == 1
+    assert rollup["status_counts"]["budget_not_projectable"] == 1
+    assert rollup["status_counts"]["account_inactive"] == 1
+    assert out["errors"] == []
+
+
 def test_pacing_report_no_fx_account_native_only_in_shortlist_not_normalized_totals(monkeypatch) -> None:
     import pytest
 
